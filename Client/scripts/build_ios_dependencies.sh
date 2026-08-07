@@ -46,7 +46,8 @@ openssl_target() {
 }
 
 build_openssl() {
-  local sdk="$1" arch="$2" kind="$3" build="$CACHE_ROOT/build/openssl-$kind"
+  local sdk="$1" arch="$2" kind="$3"
+  local build="$CACHE_ROOT/build/openssl-$kind"
   local target; target="$(openssl_target "$kind")"
   rm -rf "$build"; mkdir -p "$build"
   pushd "$CACHE_ROOT/src/openssl" >/dev/null
@@ -62,7 +63,8 @@ build_openssl() {
 }
 
 build_opus() {
-  local sdk="$1" arch="$2" kind="$3" build="$CACHE_ROOT/build/opus-$kind"
+  local sdk="$1" arch="$2" kind="$3"
+  local build="$CACHE_ROOT/build/opus-$kind"
   cmake -S "$CACHE_ROOT/src/opus" -B "$build" -G Xcode \
     -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT="$sdk" -DCMAKE_OSX_ARCHITECTURES="$arch" \
     -DOPUS_BUILD_SHARED_LIBRARY=OFF -DOPUS_BUILD_PROGRAMS=OFF -DOPUS_BUILD_TESTING=OFF
@@ -70,7 +72,8 @@ build_opus() {
 }
 
 build_srtp() {
-  local sdk="$1" arch="$2" kind="$3" build="$CACHE_ROOT/build/libsrtp-$kind"
+  local sdk="$1" arch="$2" kind="$3"
+  local build="$CACHE_ROOT/build/libsrtp-$kind"
   local openssl_root="$CACHE_ROOT/build/openssl-$kind/install"
   cmake -S "$CACHE_ROOT/src/libsrtp" -B "$build" -G Xcode \
     -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT="$sdk" -DCMAKE_OSX_ARCHITECTURES="$arch" \
