@@ -37,13 +37,14 @@ clone_at() {
 }
 
 openssl_target() {
-  local kind="$1" target
+  local kind="$1" target targets
   if [[ "$kind" == device ]]; then
     target="$OPENSSL_IPAD_DEVICE_TARGET"
   else
     target="$OPENSSL_IPAD_SIMULATOR_TARGET"
   fi
-  (cd "$CACHE_ROOT/src/openssl" && ./Configure LIST | tr ' ' '\n' | grep -Fx "$target") || {
+  targets="$(cd "$CACHE_ROOT/src/openssl" && ./Configure LIST 2>&1 || true)"
+  grep -Fx "$target" < <(printf '%s\n' "$targets" | tr ' ' '\n') || {
     echo "pinned OpenSSL source does not expose the required $kind target: $target" >&2
     exit 1
   }
