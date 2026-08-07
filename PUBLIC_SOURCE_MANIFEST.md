@@ -1,7 +1,6 @@
 # Public source manifest
 
-Private source commit: `6f0b13949606eac1e52cde368ed9e51c1661c046` plus the
-reviewed iOS public-split remediation commit.
+Private source commit: `e8ae10cad50916584c1649f98d1f54fdc25fc64e`.
 
 Exported: `Client/**`
 
