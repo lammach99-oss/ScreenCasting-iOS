@@ -37,9 +37,11 @@ clone_at() {
 openssl_target() {
   local source="$CACHE_ROOT/src/openssl" kind="$1" target
   if [[ "$kind" == device ]]; then
-    target="$(cd "$source" && ./Configure LIST | tr ' ' '\n' | grep -E '^ios64-' | head -n1)"
+    target="$(cd "$source" && ./Configure LIST | tr ' ' '\n' | grep -E '^ios64-.*xcrun$' | head -n1)"
+    [[ -n "$target" ]] || target="$(cd "$source" && ./Configure LIST | tr ' ' '\n' | grep -E '^ios64-' | head -n1)"
   else
-    target="$(cd "$source" && ./Configure LIST | tr ' ' '\n' | grep -E '^iossimulator' | head -n1)"
+    target="$(cd "$source" && ./Configure LIST | tr ' ' '\n' | grep -E '^iossimulator.*xcrun$' | head -n1)"
+    [[ -n "$target" ]] || target="$(cd "$source" && ./Configure LIST | tr ' ' '\n' | grep -E '^iossimulator' | head -n1)"
   fi
   [[ -n "$target" ]] || { echo "pinned OpenSSL source has no $kind target" >&2; exit 1; }
   printf '%s\n' "$target"
@@ -54,7 +56,7 @@ build_openssl() {
   make distclean >/dev/null 2>&1 || true
   ./Configure "$target" no-shared no-tests no-apps \
     --sysroot="$(xcrun --sdk "$sdk" --show-sdk-path)" \
-    -arch "$arch" --prefix="$build/install"
+    --prefix="$build/install"
   make -j"$(sysctl -n hw.ncpu)" build_sw
   make install_sw
   popd >/dev/null
