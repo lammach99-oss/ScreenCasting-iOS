@@ -21,7 +21,8 @@ clone_at() {
 }
 
 build_opus() {
-  local sdk="$1" arch="$2" build="$CACHE_ROOT/build/opus-$sdk"
+  local sdk="$1" arch="$2"
+  local build="$CACHE_ROOT/build/opus-$sdk"
   cmake -S "$CACHE_ROOT/src/opus" -B "$build" -G Xcode \
     -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT="$sdk" -DCMAKE_OSX_ARCHITECTURES="$arch" \
     -DOPUS_BUILD_SHARED_LIBRARY=OFF -DOPUS_BUILD_PROGRAMS=OFF -DOPUS_BUILD_TESTING=OFF
@@ -29,7 +30,8 @@ build_opus() {
 }
 
 build_srtp() {
-  local sdk="$1" arch="$2" build="$CACHE_ROOT/build/libsrtp-$sdk"
+  local sdk="$1" arch="$2"
+  local build="$CACHE_ROOT/build/libsrtp-$sdk"
   cmake -S "$CACHE_ROOT/src/libsrtp" -B "$build" -G Xcode \
     -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT="$sdk" -DCMAKE_OSX_ARCHITECTURES="$arch" \
     -DBUILD_SHARED_LIBS=OFF -DENABLE_OPENSSL=OFF -DBUILD_TESTING=OFF
