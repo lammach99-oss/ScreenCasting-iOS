@@ -1,0 +1,99 @@
+name: iOS public CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      build_ipa:
+        description: Build signed IPA
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and XCTest
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+      - name: Build pinned native dependencies
+        run: ./Client/scripts/build_ios_dependencies.sh
+      - name: Build unsigned iOS Simulator app
+        run: >-
+          xcodebuild -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj
+          -scheme iPadCasting -destination 'generic/platform=iOS Simulator'
+          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+      - name: Run XCTest
+        run: |
+          destination=$(xcrun simctl list devices available | awk -F '[()]' '/iPad/{print "platform=iOS Simulator,id=" $2; exit}')
+          test -n "$destination"
+          xcodebuild test -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj \
+            -scheme iPadCasting -destination "$destination" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+
+  signed-ipa:
+    name: Signed IPA (manual only)
+    if: github.event_name == 'workflow_dispatch' && inputs.build_ipa == true
+    runs-on: macos-15-intel
+    environment: ios-release
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install signing certificate and profile
+        env:
+          IOS_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          test -n "$IOS_CERTIFICATE_BASE64" -a -n "$IOS_PROVISIONING_PROFILE_BASE64" -a -n "$KEYCHAIN_PASSWORD"
+          keychain="$RUNNER_TEMP/build.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          echo "$IOS_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security import "$RUNNER_TEMP/signing.p12" -P "$IOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          echo "$IOS_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$RUNNER_TEMP/profile.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$(uuidgen).mobileprovision"
+          security list-keychains -d user -s "$keychain"
+      - name: Build dependencies and archive
+        run: |
+          ./Client/scripts/build_ios_dependencies.sh
+          xcodebuild archive -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj \
+            -scheme iPadCasting -configuration Release -destination generic/platform=iOS \
+            -archivePath "$RUNNER_TEMP/iPadCasting.xcarchive" \
+            CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=YES
+      - name: Export and validate IPA
+        env:
+          IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          test -n "$IOS_TEAM_ID"
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict><key>method</key><string>app-store</string><key>teamID</key><string>$IOS_TEAM_ID</string></dict></plist>
+          EOF
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/iPadCasting.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/export"
+          ./Client/check_ipa.sh "$RUNNER_TEMP/export/iPadCasting.ipa"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iPadCasting-ipa
+          path: ${{ runner.temp }}/export/*.ipa
+          retention-days: 7

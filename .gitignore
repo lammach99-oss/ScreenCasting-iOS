@@ -1,0 +1,13 @@
+.DS_Store
+DerivedData/
+build/
+Client/ThirdPartyBuild/
+*.xcarchive
+*.ipa
+*.p12
+*.pfx
+*.mobileprovision
+*.pem
+*.key
+.env
+.env.*

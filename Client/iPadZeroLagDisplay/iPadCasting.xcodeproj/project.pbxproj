@@ -1,0 +1,499 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		300111111111111111111101 /* iPadZeroLagDisplayApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200111111111111111111101 /* iPadZeroLagDisplayApp.swift */; };
+		300111111111111111111102 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200211111111111111111102 /* ContentView.swift */; };
+		300111111111111111111103 /* MetalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200311111111111111111103 /* MetalView.swift */; };
+		300111111111111111111104 /* Renderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200411111111111111111104 /* Renderer.swift */; };
+		300111111111111111111105 /* Shaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = 200511111111111111111105 /* Shaders.metal */; };
+		300111111111111111111106 /* DecoderManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200611111111111111111106 /* DecoderManager.swift */; };
+		300111111111111111111116 /* H264VideoConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200611111111111111111116 /* H264VideoConfiguration.swift */; };
+		300111111111111111111107 /* NetworkManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200711111111111111111107 /* NetworkManager.swift */; };
+		300111111111111111111108 /* PencilTouchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200911111111111111111109 /* PencilTouchView.swift */; };
+		300111111111111111111109 /* StreamManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201011111111111111111110 /* StreamManager.swift */; };
+		30011111111111111111110A /* DiscoveryManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201111111111111111111111 /* DiscoveryManager.swift */; };
+		30011111111111111111110B /* AudioManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201211111111111111111112 /* AudioManager.swift */; };
+		30011111111111111111110C /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201311111111111111111113 /* SettingsView.swift */; };
+		30011111111111111111110D /* PencilOverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201411111111111111111114 /* PencilOverlayView.swift */; };
+		30011111111111111111110E /* TransportTelemetry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201511111111111111111115 /* TransportTelemetry.swift */; };
+		30011111111111111111110F /* AccessUnitMailbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201611111111111111111116 /* AccessUnitMailbox.swift */; };
+		300111111111111111111110 /* WireProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201711111111111111111117 /* WireProtocolTests.swift */; };
+		300111111111111111111111 /* AccessUnitMailboxTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201811111111111111111118 /* AccessUnitMailboxTests.swift */; };
+		300111111111111111111112 /* TransportTelemetryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201911111111111111111119 /* TransportTelemetryTests.swift */; };
+		300111111111111111111118 /* DecoderParameterSetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 202111111111111111111123 /* DecoderParameterSetTests.swift */; };
+		A001111111111111111111101 /* USBServerIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = A002111111111111111111101 /* USBServerIdentity.swift */; };
+		300111111111111111111114 /* TransportNegotiation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 202111111111111111111121 /* TransportNegotiation.swift */; };
+		300111111111111111111115 /* ControlChannelWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 202211111111111111111122 /* ControlChannelWriter.swift */; };
+		300111111111111111111117 /* UsbLaneServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 202311111111111111111123 /* UsbLaneServer.swift */; };
+		400111111111111111111001 /* RtpPacket.swift in Sources */ = {isa = PBXBuildFile; fileRef = 400211111111111111111001 /* RtpPacket.swift */; };
+		400111111111111111111002 /* HevcRtpReassembler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 400211111111111111111002 /* HevcRtpReassembler.swift */; };
+		400111111111111111111003 /* HevcRtpReassemblerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 400211111111111111111003 /* HevcRtpReassemblerTests.swift */; };
+		500111111111111111111001 /* SrtpSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 500211111111111111111001 /* SrtpSession.swift */; };
+		500111111111111111111002 /* OpusDecoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 500211111111111111111002 /* OpusDecoder.swift */; };
+		500111111111111111111003 /* SrtpBridge.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 500211111111111111111003 /* SrtpBridge.cpp */; };
+		500111111111111111111004 /* OpusBridge.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 500211111111111111111004 /* OpusBridge.cpp */; };
+		500111111111111111111005 /* libsrtp2.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 500211111111111111111005 /* libsrtp2.xcframework */; };
+		500111111111111111111006 /* libopus.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 500211111111111111111006 /* libopus.xcframework */; };
+		500111111111111111111007 /* RealtimeNativeWrapperTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 500211111111111111111007 /* RealtimeNativeWrapperTests.swift */; };
+		A001111111111111111111102 /* USBServerIdentityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A002111111111111111111102 /* USBServerIdentityTests.swift */; };
+		600111111111111111111001 /* WifiMediaReceiver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 600211111111111111111001 /* WifiMediaReceiver.swift */; };
+		600111111111111111111002 /* TransportNegotiationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 600211111111111111111002 /* TransportNegotiationTests.swift */; };
+		700111111111111111111001 /* AudioJitterBuffer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 700211111111111111111001 /* AudioJitterBuffer.swift */; };
+		700111111111111111111002 /* AudioJitterBufferTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 700211111111111111111002 /* AudioJitterBufferTests.swift */; };
+		800111111111111111111001 /* THIRD-PARTY-NOTICES.txt in Resources */ = {isa = PBXBuildFile; fileRef = 800211111111111111111001 /* THIRD-PARTY-NOTICES.txt */; };
+		900111111111111111111001 /* SettingsFoundation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 900211111111111111111001 /* SettingsFoundation.swift */; };
+		900111111111111111111002 /* SettingsFoundationContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 900211111111111111111002 /* SettingsFoundationContractTests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		400111111111111111111101 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 111111111111111111111101 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 111111111111111111111102;
+			remoteInfo = iPadCasting;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		111111111111111111111100 /* iPadCasting.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = iPadCasting.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		200111111111111111111101 /* iPadZeroLagDisplayApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = iPadZeroLagDisplayApp.swift; sourceTree = "<group>"; };
+		200211111111111111111102 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		200311111111111111111103 /* MetalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalView.swift; sourceTree = "<group>"; };
+		200411111111111111111104 /* Renderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Renderer.swift; sourceTree = "<group>"; };
+		200511111111111111111105 /* Shaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Shaders.metal; sourceTree = "<group>"; };
+		200611111111111111111106 /* DecoderManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DecoderManager.swift; sourceTree = "<group>"; };
+		200611111111111111111116 /* H264VideoConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = H264VideoConfiguration.swift; sourceTree = "<group>"; };
+		200711111111111111111107 /* NetworkManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkManager.swift; sourceTree = "<group>"; };
+		200811111111111111111108 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		200911111111111111111109 /* PencilTouchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PencilTouchView.swift; sourceTree = "<group>"; };
+		201011111111111111111110 /* StreamManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamManager.swift; sourceTree = "<group>"; };
+		201111111111111111111111 /* DiscoveryManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiscoveryManager.swift; sourceTree = "<group>"; };
+		201211111111111111111112 /* AudioManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioManager.swift; sourceTree = "<group>"; };
+		201311111111111111111113 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		201411111111111111111114 /* PencilOverlayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PencilOverlayView.swift; sourceTree = "<group>"; };
+		201511111111111111111115 /* TransportTelemetry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransportTelemetry.swift; sourceTree = "<group>"; };
+		201611111111111111111116 /* AccessUnitMailbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccessUnitMailbox.swift; sourceTree = "<group>"; };
+		201711111111111111111117 /* WireProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WireProtocolTests.swift; sourceTree = "<group>"; };
+		201811111111111111111118 /* AccessUnitMailboxTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccessUnitMailboxTests.swift; sourceTree = "<group>"; };
+		201911111111111111111119 /* TransportTelemetryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransportTelemetryTests.swift; sourceTree = "<group>"; };
+		202111111111111111111123 /* DecoderParameterSetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DecoderParameterSetTests.swift; sourceTree = "<group>"; };
+		A002111111111111111111101 /* USBServerIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = USBServerIdentity.swift; sourceTree = "<group>"; };
+		202111111111111111111121 /* TransportNegotiation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeTransport/TransportNegotiation.swift; sourceTree = "<group>"; };
+		202211111111111111111122 /* ControlChannelWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeTransport/ControlChannelWriter.swift; sourceTree = "<group>"; };
+		202311111111111111111123 /* UsbLaneServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeTransport/UsbLaneServer.swift; sourceTree = "<group>"; };
+		400211111111111111111001 /* RtpPacket.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeTransport/RtpPacket.swift; sourceTree = "<group>"; };
+		400211111111111111111002 /* HevcRtpReassembler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeTransport/HevcRtpReassembler.swift; sourceTree = "<group>"; };
+		400211111111111111111003 /* HevcRtpReassemblerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HevcRtpReassemblerTests.swift; sourceTree = "<group>"; };
+		111111111111111111111120 /* iPadCastingTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = iPadCastingTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		500211111111111111111001 /* SrtpSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeTransport/SrtpSession.swift; sourceTree = "<group>"; };
+		500211111111111111111002 /* OpusDecoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeTransport/OpusDecoder.swift; sourceTree = "<group>"; };
+		500211111111111111111003 /* SrtpBridge.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = ../NativeTransport/SrtpBridge.cpp; sourceTree = "<group>"; };
+		500211111111111111111004 /* OpusBridge.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = ../NativeTransport/OpusBridge.cpp; sourceTree = "<group>"; };
+		500211111111111111111005 /* libsrtp2.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = ../ThirdPartyBuild/xcframeworks/libsrtp2.xcframework; sourceTree = "<group>"; };
+		500211111111111111111006 /* libopus.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = ../ThirdPartyBuild/xcframeworks/libopus.xcframework; sourceTree = "<group>"; };
+		500211111111111111111007 /* RealtimeNativeWrapperTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeNativeWrapperTests.swift; sourceTree = "<group>"; };
+		A002111111111111111111102 /* USBServerIdentityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = USBServerIdentityTests.swift; sourceTree = "<group>"; };
+		600211111111111111111001 /* WifiMediaReceiver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeTransport/WifiMediaReceiver.swift; sourceTree = "<group>"; };
+		600211111111111111111002 /* TransportNegotiationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransportNegotiationTests.swift; sourceTree = "<group>"; };
+		700211111111111111111001 /* AudioJitterBuffer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeTransport/AudioJitterBuffer.swift; sourceTree = "<group>"; };
+		700211111111111111111002 /* AudioJitterBufferTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioJitterBufferTests.swift; sourceTree = "<group>"; };
+		800211111111111111111001 /* THIRD-PARTY-NOTICES.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../THIRD-PARTY-NOTICES.txt; sourceTree = "<group>"; };
+		900211111111111111111001 /* SettingsFoundation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../Shared/SettingsFoundation.swift; sourceTree = "<group>"; };
+		900211111111111111111002 /* SettingsFoundationContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../Shared/SettingsFoundationContractTests.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		111111111111111111111105 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				500111111111111111111005 /* libsrtp2.xcframework in Frameworks */,
+				500111111111111111111006 /* libopus.xcframework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		111111111111111111111121 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		111111111111111111111103 /* Main */ = {
+			isa = PBXGroup;
+			children = (
+				200111111111111111111101 /* iPadZeroLagDisplayApp.swift */,
+				200211111111111111111102 /* ContentView.swift */,
+				200311111111111111111103 /* MetalView.swift */,
+				200411111111111111111104 /* Renderer.swift */,
+				200511111111111111111105 /* Shaders.metal */,
+				200611111111111111111106 /* DecoderManager.swift */,
+				200611111111111111111116 /* H264VideoConfiguration.swift */,
+				200711111111111111111107 /* NetworkManager.swift */,
+				200911111111111111111109 /* PencilTouchView.swift */,
+				201011111111111111111110 /* StreamManager.swift */,
+				201111111111111111111111 /* DiscoveryManager.swift */,
+				201211111111111111111112 /* AudioManager.swift */,
+				201311111111111111111113 /* SettingsView.swift */,
+				900211111111111111111001 /* SettingsFoundation.swift */,
+				201411111111111111111114 /* PencilOverlayView.swift */,
+				201511111111111111111115 /* TransportTelemetry.swift */,
+				201611111111111111111116 /* AccessUnitMailbox.swift */,
+				A002111111111111111111101 /* USBServerIdentity.swift */,
+				202111111111111111111121 /* TransportNegotiation.swift */,
+				202211111111111111111122 /* ControlChannelWriter.swift */,
+				202311111111111111111123 /* UsbLaneServer.swift */,
+				400211111111111111111001 /* RtpPacket.swift */,
+				400211111111111111111002 /* HevcRtpReassembler.swift */,
+				500211111111111111111001 /* SrtpSession.swift */,
+				500211111111111111111002 /* OpusDecoder.swift */,
+				600211111111111111111001 /* WifiMediaReceiver.swift */,
+				700211111111111111111001 /* AudioJitterBuffer.swift */,
+				500211111111111111111003 /* SrtpBridge.cpp */,
+				500211111111111111111004 /* OpusBridge.cpp */,
+				500211111111111111111005 /* libsrtp2.xcframework */,
+				500211111111111111111006 /* libopus.xcframework */,
+				800211111111111111111001 /* THIRD-PARTY-NOTICES.txt */,
+				200811111111111111111108 /* Info.plist */,
+				111111111111111111111122 /* iPadCastingTests */,
+				111111111111111111111100 /* iPadCasting.app */,
+				111111111111111111111120 /* iPadCastingTests.xctest */,
+			);
+			sourceTree = "<group>";
+		};
+		111111111111111111111122 /* iPadCastingTests */ = {
+			isa = PBXGroup;
+			children = (
+				201711111111111111111117 /* WireProtocolTests.swift */,
+				201811111111111111111118 /* AccessUnitMailboxTests.swift */,
+				201911111111111111111119 /* TransportTelemetryTests.swift */,
+				202111111111111111111123 /* DecoderParameterSetTests.swift */,
+				400211111111111111111003 /* HevcRtpReassemblerTests.swift */,
+				500211111111111111111007 /* RealtimeNativeWrapperTests.swift */,
+				A002111111111111111111102 /* USBServerIdentityTests.swift */,
+				600211111111111111111002 /* TransportNegotiationTests.swift */,
+				700211111111111111111002 /* AudioJitterBufferTests.swift */,
+				900211111111111111111002 /* SettingsFoundationContractTests.swift */,
+			);
+			path = ../iPadZeroLagDisplayTests;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		111111111111111111111102 /* iPadCasting */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 111111111111111111111108 /* Build configuration list for PBXNativeTarget "iPadCasting" */;
+			buildPhases = (
+				111111111111111111111104 /* Sources */,
+				111111111111111111111105 /* Frameworks */,
+				111111111111111111111106 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = iPadCasting;
+			productName = iPadCasting;
+			productReference = 111111111111111111111100 /* iPadCasting.app */;
+			productType = "com.apple.product-type.application";
+		};
+		111111111111111111111123 /* iPadCastingTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 111111111111111111111124 /* Build configuration list for PBXNativeTarget "iPadCastingTests" */;
+			buildPhases = (
+				111111111111111111111125 /* Sources */,
+				111111111111111111111121 /* Frameworks */,
+				111111111111111111111126 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				111111111111111111111127 /* PBXTargetDependency */,
+			);
+			name = iPadCastingTests;
+			productName = iPadCastingTests;
+			productReference = 111111111111111111111120 /* iPadCastingTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		111111111111111111111101 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					111111111111111111111102 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+					111111111111111111111123 = {
+						CreatedOnToolsVersion = 15.0;
+						TestTargetID = 111111111111111111111102;
+					};
+				};
+			};
+			buildConfigurationList = 111111111111111111111107 /* Build configuration list for PBXProject "iPadCasting" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 111111111111111111111103 /* Main */;
+			productRefGroup = 111111111111111111111103 /* Main */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				111111111111111111111102 /* iPadCasting */,
+				111111111111111111111123 /* iPadCastingTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		111111111111111111111106 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				800111111111111111111001 /* THIRD-PARTY-NOTICES.txt in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		111111111111111111111126 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		111111111111111111111104 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				300111111111111111111101 /* iPadZeroLagDisplayApp.swift in Sources */,
+				300111111111111111111102 /* ContentView.swift in Sources */,
+				300111111111111111111103 /* MetalView.swift in Sources */,
+				300111111111111111111104 /* Renderer.swift in Sources */,
+				300111111111111111111105 /* Shaders.metal in Sources */,
+				300111111111111111111106 /* DecoderManager.swift in Sources */,
+				300111111111111111111116 /* H264VideoConfiguration.swift in Sources */,
+				300111111111111111111107 /* NetworkManager.swift in Sources */,
+				A001111111111111111111101 /* USBServerIdentity.swift in Sources */,
+				300111111111111111111108 /* PencilTouchView.swift in Sources */,
+				300111111111111111111109 /* StreamManager.swift in Sources */,
+				30011111111111111111110A /* DiscoveryManager.swift in Sources */,
+				30011111111111111111110B /* AudioManager.swift in Sources */,
+				30011111111111111111110C /* SettingsView.swift in Sources */,
+				30011111111111111111110D /* PencilOverlayView.swift in Sources */,
+				30011111111111111111110E /* TransportTelemetry.swift in Sources */,
+				30011111111111111111110F /* AccessUnitMailbox.swift in Sources */,
+				300111111111111111111114 /* TransportNegotiation.swift in Sources */,
+				300111111111111111111115 /* ControlChannelWriter.swift in Sources */,
+				300111111111111111111117 /* UsbLaneServer.swift in Sources */,
+				400111111111111111111001 /* RtpPacket.swift in Sources */,
+				400111111111111111111002 /* HevcRtpReassembler.swift in Sources */,
+				500111111111111111111001 /* SrtpSession.swift in Sources */,
+				500111111111111111111002 /* OpusDecoder.swift in Sources */,
+				500111111111111111111003 /* SrtpBridge.cpp in Sources */,
+				500111111111111111111004 /* OpusBridge.cpp in Sources */,
+				600111111111111111111001 /* WifiMediaReceiver.swift in Sources */,
+				700111111111111111111001 /* AudioJitterBuffer.swift in Sources */,
+				900111111111111111111001 /* SettingsFoundation.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		111111111111111111111125 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				300111111111111111111110 /* WireProtocolTests.swift in Sources */,
+				300111111111111111111111 /* AccessUnitMailboxTests.swift in Sources */,
+				300111111111111111111112 /* TransportTelemetryTests.swift in Sources */,
+				300111111111111111111118 /* DecoderParameterSetTests.swift in Sources */,
+				400111111111111111111003 /* HevcRtpReassemblerTests.swift in Sources */,
+				500111111111111111111007 /* RealtimeNativeWrapperTests.swift in Sources */,
+				A001111111111111111111102 /* USBServerIdentityTests.swift in Sources */,
+				600111111111111111111002 /* TransportNegotiationTests.swift in Sources */,
+				700111111111111111111002 /* AudioJitterBufferTests.swift in Sources */,
+				900111111111111111111002 /* SettingsFoundationContractTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		111111111111111111111127 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 111111111111111111111102 /* iPadCasting */;
+			targetProxy = 400111111111111111111101 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		111111111111111111111109 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "c++17";
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGN_IDENTITY = "";
+				DEVELOPMENT_TEAM = "";
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				INFOPLIST_FILE = Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.iPadZeroLagDisplay.client;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "2";
+			};
+			name = Debug;
+		};
+		11111111111111111111110A /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "c++17";
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGN_IDENTITY = "";
+				DEVELOPMENT_TEAM = "";
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				INFOPLIST_FILE = Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.iPadZeroLagDisplay.client;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "2";
+			};
+			name = Release;
+		};
+		11111111111111111111110B /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGN_IDENTITY = "";
+				ENABLE_TESTABILITY = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.iPadZeroLagDisplay.client;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "2";
+			};
+			name = Debug;
+		};
+		11111111111111111111110C /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGN_IDENTITY = "";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.iPadZeroLagDisplay.client;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "2";
+			};
+			name = Release;
+		};
+		111111111111111111111128 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.iPadZeroLagDisplay.client.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/iPadCasting.app/iPadCasting";
+			};
+			name = Debug;
+		};
+		111111111111111111111129 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.iPadZeroLagDisplay.client.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/iPadCasting.app/iPadCasting";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		111111111111111111111107 /* Build configuration list for PBXProject "iPadCasting" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				111111111111111111111109 /* Debug */,
+				11111111111111111111110A /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		111111111111111111111108 /* Build configuration list for PBXNativeTarget "iPadCasting" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				11111111111111111111110B /* Debug */,
+				11111111111111111111110C /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		111111111111111111111124 /* Build configuration list for PBXNativeTarget "iPadCastingTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				111111111111111111111128 /* Debug */,
+				111111111111111111111129 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 111111111111111111111101 /* Project object */;
+}
