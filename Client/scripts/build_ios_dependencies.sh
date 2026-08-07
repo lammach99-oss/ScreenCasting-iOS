@@ -58,7 +58,7 @@ build_openssl() {
   rm -rf "$build"; mkdir -p "$build"
   pushd "$CACHE_ROOT/src/openssl" >/dev/null
   make distclean >/dev/null 2>&1 || true
-  ./Configure "$target" no-shared no-tests no-apps no-ssl \
+  ./Configure "$target" no-shared no-tests no-apps \
     --sysroot="$(xcrun --sdk "$sdk" --show-sdk-path)" \
     --prefix="$build/install"
   make -j"$(sysctl -n hw.ncpu)" build_sw
