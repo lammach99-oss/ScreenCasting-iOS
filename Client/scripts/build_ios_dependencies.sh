@@ -9,7 +9,8 @@ CLIENT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CACHE_ROOT="${SCREENCASTING_DEP_CACHE:-${TMPDIR:-/tmp}/screencasting-ios-deps}"
 OUTPUT="$CLIENT_ROOT/ThirdPartyBuild"
 OPENSSL_URL="https://github.com/openssl/openssl.git"
-OPENSSL_REV="98b3bf1433f8f4a29e64ca8b9bd42c58d3d1b98a"
+OPENSSL_REV="openssl-3.3.2"
+OPENSSL_TAG_OBJECT="98b3bf1433f8f4a29e64ca8b9bd42c58d3d1b98a"
 LIBSRTP_URL="https://github.com/cisco/libsrtp.git"
 LIBSRTP_REV=24b3bf8f19b6f5ab4cd2bcceb4f4064efca86fd5
 OPUS_URL="https://github.com/xiph/opus.git"
@@ -20,13 +21,17 @@ for tool in git cmake make perl xcodebuild xcrun; do require "$tool"; done
 mkdir -p "$CACHE_ROOT/src" "$CACHE_ROOT/build" "$OUTPUT/xcframeworks"
 
 clone_at() {
-  local url="$1" name="$2" revision="$3" dir="$CACHE_ROOT/src/$2"
+  local url="$1" name="$2" revision="$3" dir="$CACHE_ROOT/src/$2" expected_tag="${4:-}"
   if [[ ! -d "$dir/.git" ]]; then git clone --no-checkout "$url" "$dir"; fi
   git -C "$dir" fetch --no-tags origin "$revision"
   git -C "$dir" checkout --force "$revision"
-  [[ "$(git -C "$dir" rev-parse HEAD)" == "$revision" ]] || {
+  if [[ -n "$expected_tag" ]]; then
+    [[ "$(git -C "$dir" rev-parse "refs/tags/$revision")" == "$expected_tag" ]] || {
+      echo "tag verification failed for $name" >&2; exit 1;
+    }
+  elif [[ "$(git -C "$dir" rev-parse HEAD)" != "$revision" ]]; then
     echo "revision verification failed for $name" >&2; exit 1;
-  }
+  fi
 }
 
 openssl_target() {
@@ -92,7 +97,7 @@ verify_artifacts() {
   ! find "$root" -type f \( -name '*.dylib' -o -name '*.framework' \) -print -quit | grep -q . || { echo "dynamic/macOS dependency leaked into public artifacts" >&2; exit 1; }
 }
 
-clone_at "$OPENSSL_URL" openssl "$OPENSSL_REV"
+clone_at "$OPENSSL_URL" openssl "$OPENSSL_REV" "$OPENSSL_TAG_OBJECT"
 clone_at "$LIBSRTP_URL" libsrtp "$LIBSRTP_REV"
 clone_at "$OPUS_URL" opus "$OPUS_REV"
 
