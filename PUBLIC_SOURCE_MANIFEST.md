@@ -1,6 +1,6 @@
 # Public source manifest
 
-Private source commit: `db658323467c2d6fc1693e8f0ea990a40fd3da35`.
+Private source commit: `10175a050082932ce5553e9d16d8a080b3a99862`.
 
 Exported: `Client/**`
 

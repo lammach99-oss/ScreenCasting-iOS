@@ -32,9 +32,13 @@ build_opus() {
 build_srtp() {
   local sdk="$1" arch="$2"
   local build="$CACHE_ROOT/build/libsrtp-$sdk"
+  local openssl_root="$(brew --prefix openssl@3)"
   cmake -S "$CACHE_ROOT/src/libsrtp" -B "$build" -G Xcode \
     -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT="$sdk" -DCMAKE_OSX_ARCHITECTURES="$arch" \
-    -DBUILD_SHARED_LIBS=OFF -DENABLE_OPENSSL=OFF -DBUILD_TESTING=OFF
+    -DBUILD_SHARED_LIBS=OFF -DENABLE_OPENSSL=ON -DBUILD_TESTING=OFF \
+    -DOPENSSL_ROOT_DIR="$openssl_root" -DOPENSSL_INCLUDE_DIR="$openssl_root/include" \
+    -DOPENSSL_CRYPTO_LIBRARY="$openssl_root/lib/libcrypto.dylib" \
+    -DOPENSSL_SSL_LIBRARY="$openssl_root/lib/libssl.dylib"
   cmake --build "$build" --config Release --target srtp2
 }
 
