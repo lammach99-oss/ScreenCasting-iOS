@@ -11,9 +11,14 @@ enum USBServerIdentityStore {
     static func loadOrCreate() -> SecIdentity? {
         if let existing = copy() { return existing }
         guard let key = createKey(),
-              let certificate = createCertificate(for: key),
-              let identity = SecIdentityCreateWithCertificate(nil, certificate, key)
-        else { return nil }
+              let certificate = createCertificate(for: key) else {
+            delete()
+            return nil
+        }
+        guard let identity = SecIdentityCreate(nil, certificate, key) else {
+            delete()
+            return nil
+        }
 
         let certificateAttributes: [String: Any] = [
             kSecClass as String: kSecClassCertificate,
