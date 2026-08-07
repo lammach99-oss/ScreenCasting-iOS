@@ -26,7 +26,7 @@ build_opus() {
   cmake -S "$CACHE_ROOT/src/opus" -B "$build" -G Xcode \
     -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT="$sdk" -DCMAKE_OSX_ARCHITECTURES="$arch" \
     -DOPUS_BUILD_SHARED_LIBRARY=OFF -DOPUS_BUILD_PROGRAMS=OFF -DOPUS_BUILD_TESTING=OFF
-  cmake --build "$build" --config Release
+  cmake --build "$build" --config Release --target opus
 }
 
 build_srtp() {
@@ -35,7 +35,7 @@ build_srtp() {
   cmake -S "$CACHE_ROOT/src/libsrtp" -B "$build" -G Xcode \
     -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT="$sdk" -DCMAKE_OSX_ARCHITECTURES="$arch" \
     -DBUILD_SHARED_LIBS=OFF -DENABLE_OPENSSL=OFF -DBUILD_TESTING=OFF
-  cmake --build "$build" --config Release
+  cmake --build "$build" --config Release --target srtp2
 }
 
 clone_at https://github.com/cisco/libsrtp.git libsrtp "$LIBSRTP_REV"
