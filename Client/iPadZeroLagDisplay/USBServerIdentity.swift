@@ -10,6 +10,12 @@ enum USBServerIdentityStore {
 
     static func loadOrCreate() -> SecIdentity? {
         if let existing = copy() { return existing }
+
+        // A missing identity can mean an orphaned key, a stale certificate,
+        // or a corrupt keychain record. Purge all identity records before
+        // regenerating so recovery completes in this public call and never
+        // leaves duplicate-key state for the next launch.
+        delete()
         guard let key = createKey(),
               let certificate = createCertificate(for: key) else {
             delete()
@@ -26,10 +32,10 @@ enum USBServerIdentityStore {
             kSecValueRef as String: certificate,
         ]
         let status = SecItemAdd(certificateAttributes as CFDictionary, nil)
-        guard certificateInsertSucceeded(status) else {
+        guard status == errSecSuccess else {
             // The RSA key is permanent. Remove it when certificate persistence
-            // fails, otherwise the next launch is wedged on duplicate-key
-            // recovery with no usable identity.
+            // fails, including duplicate-item races. A subsequent public call
+            // can then regenerate a complete identity deterministically.
             delete()
             return nil
         }
@@ -39,7 +45,7 @@ enum USBServerIdentityStore {
     /// Kept internal so XCTest can lock down the Keychain recovery contract
     /// without manufacturing Security.framework objects or writing secrets.
     static func certificateInsertSucceeded(_ status: OSStatus) -> Bool {
-        status == errSecSuccess || status == errSecDuplicateItem
+        status == errSecSuccess
     }
 
     static func copy() -> SecIdentity? {

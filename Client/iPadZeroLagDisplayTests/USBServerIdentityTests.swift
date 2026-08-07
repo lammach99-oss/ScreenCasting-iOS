@@ -18,8 +18,14 @@ final class USBServerIdentityTests: XCTestCase {
         XCTAssertFalse(USBServerIdentityStore.certificateInsertSucceeded(errSecDecode))
     }
 
-    func testDuplicateCertificateIsAcceptedForRecovery() {
-        XCTAssertTrue(USBServerIdentityStore.certificateInsertSucceeded(errSecDuplicateItem))
+    func testDuplicateCertificateIsRejectedAndTriggersRegeneration() {
+        XCTAssertFalse(USBServerIdentityStore.certificateInsertSucceeded(errSecDuplicateItem))
+    }
+
+    func testAllCertificateInsertionFailuresAreRejected() {
+        for status in [errSecAuthFailed, errSecDecode, errSecDuplicateItem, errSecMissingEntitlement] {
+            XCTAssertFalse(USBServerIdentityStore.certificateInsertSucceeded(status))
+        }
     }
 
     private func fingerprint(_ identity: SecIdentity?) -> Data? {

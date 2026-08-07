@@ -29,10 +29,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
-      - name: Build pinned native dependencies
-        run: ./Client/scripts/build_ios_dependencies.sh
       - name: Verify iPad-only target
         run: ./Client/scripts/verify_ipad_target.sh
+      - name: Build pinned native dependencies
+        run: ./Client/scripts/build_ios_dependencies.sh
+      - name: Verify dependency artifacts
+        run: |
+          cache_root="${SCREENCASTING_DEP_CACHE:-${TMPDIR:-/tmp}/screencasting-ios-deps}"
+          ./Client/scripts/verify_ios_dependency_artifacts.sh \
+            "$GITHUB_WORKSPACE/Client/ThirdPartyBuild/xcframeworks" \
+            "$cache_root/build"
       - name: Build unsigned iOS Simulator app
         run: >-
           xcodebuild -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj
@@ -95,7 +101,7 @@ jobs:
           EOF
           xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/iPadCasting.xcarchive" \
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/export"
-          ./Client/check_ipa.sh "$RUNNER_TEMP/export/iPadCasting.ipa"
+          REQUIRE_EMBEDDED_PROVISIONING=1 ./Client/check_ipa.sh "$RUNNER_TEMP/export/iPadCasting.ipa"
       - uses: actions/upload-artifact@v4
         with:
           name: iPadCasting-ipa

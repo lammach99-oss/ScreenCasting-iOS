@@ -1,134 +1,55 @@
-#!/bin/bash
-# check_ipa.sh - Diagnostic tool for verifying iOS .ipa package integrity
-# NOTE: Since iOS 12.2+, Swift stdlib is pre-installed on device.
-#       A valid Swift .app binary will be ~100-500 KB with no embedded frameworks.
-#       Size alone is NOT a valid indicator of a correct build.
+#!/usr/bin/env bash
+set -euo pipefail
 
-set -e
+IPA_PATH="${1:?usage: $0 <path-to-ipa-file>}"
+EXPECTED_BUNDLE_IDENTIFIER="${EXPECTED_BUNDLE_IDENTIFIER:-com.iPadZeroLagDisplay.client}"
+EXPECTED_APP_NAME="${EXPECTED_APP_NAME:-iPadCasting.app}"
+REQUIRE_EMBEDDED_PROVISIONING="${REQUIRE_EMBEDDED_PROVISIONING:-1}"
 
-IPA_PATH="$1"
+[[ -f "$IPA_PATH" ]] || { echo "missing IPA: $IPA_PATH" >&2; exit 1; }
+for tool in unzip plutil lipo codesign; do command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }; done
+if [[ "$REQUIRE_EMBEDDED_PROVISIONING" == 1 ]]; then command -v security >/dev/null || { echo 'missing required tool: security' >&2; exit 1; }; fi
 
-if [ -z "$IPA_PATH" ]; then
-    echo "Error: No .ipa path provided."
-    echo "Usage: ./check_ipa.sh <path-to-ipa-file>"
-    exit 1
-fi
-
-if [ ! -f "$IPA_PATH" ]; then
-    echo "Error: File '$IPA_PATH' does not exist."
-    exit 1
-fi
-
-echo "==========================================================="
-echo "       iOS .ipa Package Diagnostic Inspector              "
-echo "==========================================================="
-echo "[+] Checking file: $IPA_PATH"
-
-TEMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t 'ipa_check')
+TEMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEMP_DIR"' EXIT
-
-echo "[+] Unpacking IPA into temporary directory..."
 unzip -q "$IPA_PATH" -d "$TEMP_DIR"
 
-# 1. Structure Check: Verify Payload/ directory
-if [ ! -d "$TEMP_DIR/Payload" ]; then
-    echo "❌ ERROR: Invalid IPA structure! Missing 'Payload/' root directory."
-    echo "   The .ipa archive must contain a 'Payload/' folder at its root."
-    exit 1
-fi
-echo "✓ Structure Check Passed: 'Payload/' directory found."
-
-# 2. App Bundle Check: Verify at least one .app folder inside Payload/
-APP_BUNDLES=("$TEMP_DIR/Payload"/*.app)
-
-if [ ! -d "${APP_BUNDLES[0]}" ]; then
-    echo "❌ ERROR: No .app bundle found inside Payload/!"
-    exit 1
-fi
-
-if [ ${#APP_BUNDLES[@]} -gt 1 ]; then
-    echo "⚠️  WARNING: Multiple .app bundles found inside Payload/: ${APP_BUNDLES[*]}"
-fi
-
+PAYLOAD="$TEMP_DIR/Payload"
+[[ -d "$PAYLOAD" ]] || { echo 'missing Payload directory' >&2; exit 1; }
+shopt -s nullglob
+APP_BUNDLES=("$PAYLOAD"/*.app)
+shopt -u nullglob
+[[ "${#APP_BUNDLES[@]}" == 1 ]] || { echo 'IPA must contain exactly one app bundle' >&2; exit 1; }
 APP_DIR="${APP_BUNDLES[0]}"
-APP_NAME=$(basename "$APP_DIR")
-echo "✓ App Bundle Check Passed: Found '$APP_NAME'."
+[[ "$(basename "$APP_DIR")" == "$EXPECTED_APP_NAME" ]] || { echo "unexpected app bundle: $(basename "$APP_DIR")" >&2; exit 1; }
 
-# 3. Info.plist Check
-PLIST_PATH="$APP_DIR/Info.plist"
-if [ ! -f "$PLIST_PATH" ]; then
-    echo "❌ ERROR: Missing Info.plist inside $APP_NAME!"
-    exit 1
-fi
-echo "✓ Info.plist Check Passed."
+PLIST="$APP_DIR/Info.plist"
+[[ -f "$PLIST" ]] || { echo 'missing app Info.plist' >&2; exit 1; }
+bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$PLIST")"
+[[ "$bundle_id" == "$EXPECTED_BUNDLE_IDENTIFIER" ]] || { echo "bundle identifier mismatch: $bundle_id" >&2; exit 1; }
 
-# 4. Locate compiled executable binary
-EXEC_NAME=""
-if command -v /usr/libexec/PlistBuddy >/dev/null 2>&1; then
-    EXEC_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$PLIST_PATH" 2>/dev/null || true)
-fi
-if [ -z "$EXEC_NAME" ] && command -v plutil >/dev/null 2>&1; then
-    EXEC_NAME=$(plutil -extract CFBundleExecutable raw "$PLIST_PATH" 2>/dev/null || true)
-fi
-if [ -z "$EXEC_NAME" ]; then
-    APP_BASE="${APP_NAME%.app}"
-    EXEC_NAME="$APP_BASE"
-fi
+family="$(/usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily' "$PLIST" 2>/dev/null || true)"
+[[ "$family" == *' = 2'* && "$family" != *' = 1'* ]] || { echo "IPA is not iPad-only: $family" >&2; exit 1; }
 
-EXEC_PATH="$APP_DIR/$EXEC_NAME"
-if [ ! -f "$EXEC_PATH" ]; then
-    # Fallback: find any executable file in the bundle root
-    EXEC_PATH=$(find "$APP_DIR" -maxdepth 1 -type f -perm +111 2>/dev/null | head -n 1 || true)
-fi
+executable="$(plutil -extract CFBundleExecutable raw -o - "$PLIST")"
+EXEC_PATH="$APP_DIR/$executable"
+[[ -f "$EXEC_PATH" ]] || { echo "missing declared executable: $EXEC_PATH" >&2; exit 1; }
+architecture="$(lipo -info "$EXEC_PATH")"
+[[ "$architecture" == *'arm64'* && "$architecture" != *'arm64e'* && "$architecture" != *'x86_64'* ]] || {
+  echo "IPA executable is not an exact arm64 device binary: $architecture" >&2
+  exit 1
+}
 
-if [ -z "$EXEC_PATH" ] || [ ! -f "$EXEC_PATH" ]; then
-    echo "❌ ERROR: No compiled executable binary found inside $APP_NAME!"
-    exit 1
+codesign --verify --deep --strict --verbose=2 "$APP_DIR"
+codesign -dvvv "$APP_DIR" 2>&1 | grep -q 'Identifier=' || { echo 'codesign metadata missing identifier' >&2; exit 1; }
+
+profile="$APP_DIR/embedded.mobileprovision"
+if [[ -f "$profile" ]]; then
+  security cms -D -i "$profile" -o "$TEMP_DIR/profile.plist"
+  plutil -extract Entitlements:application-identifier raw -o - "$TEMP_DIR/profile.plist" >/dev/null
+elif [[ "$REQUIRE_EMBEDDED_PROVISIONING" == 1 ]]; then
+  echo 'missing embedded.mobileprovision' >&2
+  exit 1
 fi
 
-echo "✓ Executable Check Passed: Found binary '$(basename "$EXEC_PATH")'."
-
-# 5. ARM64 Mach-O Architecture Validation
-#    This is the CORRECT way to verify a real device binary — NOT size.
-#    Since iOS 12.2+, Swift stdlib is NOT embedded (.app size is legitimately 100–500 KB).
-#    A real ARM64 device binary from xcodebuild will report: Mach-O 64-bit executable arm64
-if command -v file >/dev/null 2>&1; then
-    FILE_OUTPUT=$(file "$EXEC_PATH")
-    echo "[+] Binary type: $FILE_OUTPUT"
-
-    if echo "$FILE_OUTPUT" | grep -qiE "arm64|arm64e"; then
-        echo "✓ Architecture Check Passed: Binary is ARM64 (real device build)."
-    elif echo "$FILE_OUTPUT" | grep -qi "x86_64"; then
-        echo "❌ ERROR: Binary is x86_64 (Simulator build)! Must build for the iPad device SDK."
-        exit 1
-    elif echo "$FILE_OUTPUT" | grep -qi "Mach-O"; then
-        echo "✓ Architecture Check Passed: Binary is a valid Mach-O executable."
-    else
-        echo "⚠️  WARNING: Could not confirm ARM64 architecture. Binary type: $FILE_OUTPUT"
-    fi
-fi
-
-# 6. Minimum binary size check — catch empty/stub binaries (< 50 KB is suspicious)
-BINARY_SIZE_BYTES=$(stat -f%z "$EXEC_PATH" 2>/dev/null || stat -c%s "$EXEC_PATH" 2>/dev/null || echo 0)
-BINARY_SIZE_KB=$((BINARY_SIZE_BYTES / 1024))
-echo "[+] Executable binary size: ${BINARY_SIZE_KB} KB"
-
-if [ "$BINARY_SIZE_BYTES" -lt 51200 ]; then
-    echo "==========================================================="
-    echo "❌ ERROR: Executable binary is under 50KB (${BINARY_SIZE_KB} KB)."
-    echo "   This is a stub/empty binary — compilation almost certainly failed."
-    echo "==========================================================="
-    exit 1
-fi
-
-# 7. IPA total size info (informational only — NOT a pass/fail criterion)
-IPA_SIZE_KB=$(du -sk "$IPA_PATH" 2>/dev/null | cut -f1 || echo "unknown")
-APP_DIR_KB=$(du -sk "$APP_DIR" 2>/dev/null | cut -f1 || echo "unknown")
-echo "[+] Uncompressed .app size: ${APP_DIR_KB} KB"
-echo "[+] Compressed .ipa size:   ${IPA_SIZE_KB} KB"
-echo "    (Note: Since iOS 12.2+, Swift stdlib is pre-installed on device."
-echo "     A valid .app without embedded frameworks may be 100–500 KB. This is correct.)"
-
-echo "==========================================================="
-echo "  SUCCESS! Valid ARM64 .ipa package structure verified."
-echo "==========================================================="
+echo "IPA PASS: bundle=$bundle_id family=iPad architecture=arm64"
