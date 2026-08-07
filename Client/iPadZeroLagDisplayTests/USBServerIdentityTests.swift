@@ -13,6 +13,15 @@ final class USBServerIdentityTests: XCTestCase {
         XCTAssertEqual(fingerprint(first), fingerprint(second))
     }
 
+    func testCertificateInsertionFailureIsNotAccepted() {
+        XCTAssertFalse(USBServerIdentityStore.certificateInsertSucceeded(errSecAuthFailed))
+        XCTAssertFalse(USBServerIdentityStore.certificateInsertSucceeded(errSecDecode))
+    }
+
+    func testDuplicateCertificateIsAcceptedForRecovery() {
+        XCTAssertTrue(USBServerIdentityStore.certificateInsertSucceeded(errSecDuplicateItem))
+    }
+
     private func fingerprint(_ identity: SecIdentity?) -> Data? {
         guard let identity else { return nil }
         var certificate: SecCertificate?

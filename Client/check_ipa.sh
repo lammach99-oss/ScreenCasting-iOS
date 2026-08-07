@@ -99,7 +99,7 @@ if command -v file >/dev/null 2>&1; then
     if echo "$FILE_OUTPUT" | grep -qiE "arm64|arm64e"; then
         echo "✓ Architecture Check Passed: Binary is ARM64 (real device build)."
     elif echo "$FILE_OUTPUT" | grep -qi "x86_64"; then
-        echo "❌ ERROR: Binary is x86_64 (Simulator build)! Must build for iphoneos SDK."
+        echo "❌ ERROR: Binary is x86_64 (Simulator build)! Must build for the iPad device SDK."
         exit 1
     elif echo "$FILE_OUTPUT" | grep -qi "Mach-O"; then
         echo "✓ Architecture Check Passed: Binary is a valid Mach-O executable."

@@ -26,8 +26,20 @@ enum USBServerIdentityStore {
             kSecValueRef as String: certificate,
         ]
         let status = SecItemAdd(certificateAttributes as CFDictionary, nil)
-        guard status == errSecSuccess || status == errSecDuplicateItem else { return nil }
+        guard certificateInsertSucceeded(status) else {
+            // The RSA key is permanent. Remove it when certificate persistence
+            // fails, otherwise the next launch is wedged on duplicate-key
+            // recovery with no usable identity.
+            delete()
+            return nil
+        }
         return identity
+    }
+
+    /// Kept internal so XCTest can lock down the Keychain recovery contract
+    /// without manufacturing Security.framework objects or writing secrets.
+    static func certificateInsertSucceeded(_ status: OSStatus) -> Bool {
+        status == errSecSuccess || status == errSecDuplicateItem
     }
 
     static func copy() -> SecIdentity? {

@@ -40,6 +40,7 @@
 		500111111111111111111004 /* OpusBridge.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 500211111111111111111004 /* OpusBridge.cpp */; };
 		500111111111111111111005 /* libsrtp2.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 500211111111111111111005 /* libsrtp2.xcframework */; };
 		500111111111111111111006 /* libopus.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 500211111111111111111006 /* libopus.xcframework */; };
+		500111111111111111111008 /* OpenSSLCrypto.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 500211111111111111111008 /* OpenSSLCrypto.xcframework */; };
 		500111111111111111111007 /* RealtimeNativeWrapperTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 500211111111111111111007 /* RealtimeNativeWrapperTests.swift */; };
 		A001111111111111111111102 /* USBServerIdentityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A002111111111111111111102 /* USBServerIdentityTests.swift */; };
 		600111111111111111111001 /* WifiMediaReceiver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 600211111111111111111001 /* WifiMediaReceiver.swift */; };
@@ -98,6 +99,7 @@
 		500211111111111111111004 /* OpusBridge.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = ../NativeTransport/OpusBridge.cpp; sourceTree = "<group>"; };
 		500211111111111111111005 /* libsrtp2.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = ../ThirdPartyBuild/xcframeworks/libsrtp2.xcframework; sourceTree = "<group>"; };
 		500211111111111111111006 /* libopus.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = ../ThirdPartyBuild/xcframeworks/libopus.xcframework; sourceTree = "<group>"; };
+		500211111111111111111008 /* OpenSSLCrypto.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = ../ThirdPartyBuild/xcframeworks/OpenSSLCrypto.xcframework; sourceTree = "<group>"; };
 		500211111111111111111007 /* RealtimeNativeWrapperTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeNativeWrapperTests.swift; sourceTree = "<group>"; };
 		A002111111111111111111102 /* USBServerIdentityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = USBServerIdentityTests.swift; sourceTree = "<group>"; };
 		600211111111111111111001 /* WifiMediaReceiver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeTransport/WifiMediaReceiver.swift; sourceTree = "<group>"; };
@@ -115,6 +117,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				500111111111111111111005 /* libsrtp2.xcframework in Frameworks */,
+				500111111111111111111008 /* OpenSSLCrypto.xcframework in Frameworks */,
 				500111111111111111111006 /* libopus.xcframework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -162,6 +165,7 @@
 				500211111111111111111003 /* SrtpBridge.cpp */,
 				500211111111111111111004 /* OpusBridge.cpp */,
 				500211111111111111111005 /* libsrtp2.xcframework */,
+				500211111111111111111008 /* OpenSSLCrypto.xcframework */,
 				500211111111111111111006 /* libopus.xcframework */,
 				800211111111111111111001 /* THIRD-PARTY-NOTICES.txt */,
 				200811111111111111111108 /* Info.plist */,

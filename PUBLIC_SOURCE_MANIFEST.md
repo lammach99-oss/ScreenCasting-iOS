@@ -12,3 +12,8 @@ Generated dependencies:
 
 - libsrtp `24b3bf8f19b6f5ab4cd2bcceb4f4064efca86fd5`
 - Opus `ddbe48383984d56acd9e1ab6a090c54ca6b735a6`
+- OpenSSL `98b3bf1433f8f4a29e64ca8b9bd42c58d3d1b98a` (OpenSSL 3.3.2 release commit from `https://github.com/openssl/openssl.git`)
+
+The required CI slice is iPad Simulator x86_64 on `macos-15-intel`; the
+device slice is iPad arm64. Apple SDK identifiers `iphonesimulator` and
+`iphoneos` are used only by the toolchain.
