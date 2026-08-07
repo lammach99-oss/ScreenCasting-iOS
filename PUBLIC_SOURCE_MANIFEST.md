@@ -1,6 +1,6 @@
 # Public source manifest
 
-Private source commit: `10175a050082932ce5553e9d16d8a080b3a99862`.
+Private source commit: `4837afd02085121fc69370a807aa50fdfbdaae56` (`ios/public-split`).
 
 Exported: `Client/**`
 
