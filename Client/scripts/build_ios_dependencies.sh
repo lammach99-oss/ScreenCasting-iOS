@@ -44,7 +44,7 @@ openssl_target() {
     target="$OPENSSL_IPAD_SIMULATOR_TARGET"
   fi
   targets="$(cd "$CACHE_ROOT/src/openssl" && ./Configure LIST 2>&1 || true)"
-  grep -Fx "$target" < <(printf '%s\n' "$targets" | tr ' ' '\n') || {
+  grep -Fxq "$target" < <(printf '%s\n' "$targets" | tr ' ' '\n') || {
     echo "pinned OpenSSL source does not expose the required $kind target: $target" >&2
     exit 1
   }
