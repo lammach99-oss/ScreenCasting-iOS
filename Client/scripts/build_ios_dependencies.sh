@@ -94,6 +94,14 @@ build_srtp() {
   cmake --build "$build" --config Release --target srtp2
 }
 
+stage_slice_owned_headers() {
+  local headers="$CACHE_ROOT/build/source-headers"
+  rm -rf "$headers"
+  mkdir -p "$headers"
+  cp -R "$CACHE_ROOT/src/libsrtp/include" "$headers/libsrtp"
+  cp -R "$CACHE_ROOT/src/opus/include" "$headers/opus"
+}
+
 package_xcframework() {
   local name="$1" device="$2" simulator="$3" device_headers="$4" simulator_headers="$5"
   rm -rf "$OUTPUT/xcframeworks/$name.xcframework"
@@ -113,6 +121,7 @@ build_srtp iphoneos arm64 device
 build_srtp iphonesimulator x86_64 simulator
 build_opus iphoneos arm64 device
 build_opus iphonesimulator x86_64 simulator
+stage_slice_owned_headers
 
 package_xcframework OpenSSLCrypto \
   "$CACHE_ROOT/build/openssl-device/install/lib/libcrypto.a" \

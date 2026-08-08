@@ -94,8 +94,8 @@ verify_archive_platform "$BUILD_ROOT/opus-simulator/Release-iphonesimulator/libo
 
 verify_headers "$BUILD_ROOT/openssl-device/install/include"
 verify_headers "$BUILD_ROOT/openssl-simulator/install/include"
-verify_headers "$BUILD_ROOT/../src/libsrtp/include"
-verify_headers "$BUILD_ROOT/../src/opus/include"
+verify_headers "$BUILD_ROOT/source-headers/libsrtp"
+verify_headers "$BUILD_ROOT/source-headers/opus"
 
 verify_xcframework OpenSSLCrypto arm64 x86_64
 verify_xcframework libsrtp2 arm64 x86_64
