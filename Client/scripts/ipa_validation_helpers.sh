@@ -38,12 +38,12 @@ ipa_require_entitlement_profile_match() {
     expected_bundle="$6"
     expected_app_id="$expected_team.$expected_bundle"
 
-    ipa_require_exact_value 'signed application-identifier' "$signed_app_id" "$expected_app_id"
-    ipa_require_exact_value 'signed team entitlement' "$signed_team_id" "$expected_team"
-    ipa_require_exact_value 'profile application-identifier' "$profile_app_id" "$expected_app_id"
-    ipa_require_exact_value 'profile team identifier' "$profile_team_id" "$expected_team"
-    ipa_require_exact_value 'signed/profile application-identifier' "$signed_app_id" "$profile_app_id"
-    ipa_require_exact_value 'signed/profile team identifier' "$signed_team_id" "$profile_team_id"
+    ipa_require_exact_value 'signed application-identifier' "$signed_app_id" "$expected_app_id" || return 1
+    ipa_require_exact_value 'signed team entitlement' "$signed_team_id" "$expected_team" || return 1
+    ipa_require_exact_value 'profile application-identifier' "$profile_app_id" "$expected_app_id" || return 1
+    ipa_require_exact_value 'profile team identifier' "$profile_team_id" "$expected_team" || return 1
+    ipa_require_exact_value 'signed/profile application-identifier' "$signed_app_id" "$profile_app_id" || return 1
+    ipa_require_exact_value 'signed/profile team identifier' "$signed_team_id" "$profile_team_id" || return 1
 }
 
 ipa_method_requires_provisioning() {
