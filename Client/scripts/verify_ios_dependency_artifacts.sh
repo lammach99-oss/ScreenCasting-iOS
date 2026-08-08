@@ -57,7 +57,8 @@ plist_array() {
 }
 
 verify_xcframework() {
-  local name="$1" device_arch="$2" simulator_arch="$3" framework="$XCFRAMEWORK_ROOT/$name.xcframework"
+  local name="$1" device_arch="$2" simulator_arch="$3" framework
+  framework="$XCFRAMEWORK_ROOT/$name.xcframework"
   local plist index identifier platform variant architectures device_count=0 simulator_count=0 total=0
   require_dir "$framework"
   plist="$framework/Info.plist"
