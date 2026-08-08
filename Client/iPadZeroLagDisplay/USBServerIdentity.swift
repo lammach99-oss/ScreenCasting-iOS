@@ -22,8 +22,13 @@ enum USBServerIdentityStore {
         for _ in 0..<2 {
             delete()
             guard let key = createKey(),
-                  let certificate = createCertificate(for: key),
-                  let identity = SecIdentityCreate(nil, certificate, key) else {
+                  let certificate = createCertificate(for: key) else {
+                delete()
+                continue
+            }
+            var identity: SecIdentity?
+            guard SecIdentityCreateWithCertificate(nil, certificate, &identity) == errSecSuccess,
+                  let identity else {
                 delete()
                 continue
             }
@@ -62,8 +67,9 @@ enum USBServerIdentityStore {
         ]
         var value: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &value) == errSecSuccess,
-              let value else { return nil }
-        return value as? SecIdentity
+              let value,
+              CFGetTypeID(value) == SecIdentityGetTypeID() else { return nil }
+        return value as! SecIdentity
     }
 
     static func delete() {
@@ -125,7 +131,7 @@ enum USBServerIdentityStore {
         let validity = derSequence(derGeneralizedTime(Date().addingTimeInterval(-60)),
                                    derGeneralizedTime(Date().addingTimeInterval(31536000)))
         let tbs = derSequence(
-            derExplicit(0, derInteger(2)),
+            derExplicit(0, derInteger(Data([2]))),
             derInteger(Data([1])),
             algorithm,
             name,
