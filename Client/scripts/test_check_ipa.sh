@@ -58,14 +58,14 @@ make_ipa "$wrong_bundle" 'com.example.wrong' '2' "$TEMP_DIR/arm64.o"
 make_ipa "$iphone_family" 'com.iPadZeroLagDisplay.client' '1 2' "$TEMP_DIR/arm64.o"
 make_ipa "$fat_architecture" 'com.iPadZeroLagDisplay.client' '2' "$TEMP_DIR/fat.o"
 
-CHECK_IPA_MODE=unsigned EXPORT_METHOD=none "$CHECK_IPA" "$positive" >/dev/null
+CHECK_IPA_TEST_MODE=1 CHECK_IPA_MODE=unsigned EXPORT_METHOD=none "$CHECK_IPA" "$positive" >/dev/null
 
 expect_unsigned_failure() {
     local label path method
     label="$1"
     path="$2"
     method="${3:-none}"
-    if CHECK_IPA_MODE=unsigned EXPORT_METHOD="$method" "$CHECK_IPA" "$path" >/dev/null 2>&1; then
+    if CHECK_IPA_TEST_MODE=1 CHECK_IPA_MODE=unsigned EXPORT_METHOD="$method" "$CHECK_IPA" "$path" >/dev/null 2>&1; then
         ipa_fail "$label unexpectedly passed"
     fi
 }

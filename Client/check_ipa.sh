@@ -11,6 +11,7 @@ EXPECTED_APP_NAME="${EXPECTED_APP_NAME:-iPadCasting.app}"
 EXPECTED_TEAM_ID="${EXPECTED_TEAM_ID:-}"
 EXPORT_METHOD="${EXPORT_METHOD:-app-store}"
 CHECK_IPA_MODE="${CHECK_IPA_MODE:-signed}"
+CHECK_IPA_TEST_MODE="${CHECK_IPA_TEST_MODE:-0}"
 
 [[ -f "$IPA_PATH" ]] || ipa_fail "missing IPA: $IPA_PATH"
 case "$CHECK_IPA_MODE" in
@@ -20,6 +21,9 @@ case "$CHECK_IPA_MODE" in
         ipa_fail "CHECK_IPA_MODE must be signed or unsigned, got $CHECK_IPA_MODE"
         ;;
 esac
+if [[ "$CHECK_IPA_MODE" == unsigned ]]; then
+    [[ "$CHECK_IPA_TEST_MODE" == 1 ]] || ipa_fail 'unsigned mode is restricted to explicit deterministic fixtures'
+fi
 
 for tool in unzip plutil lipo; do
     command -v "$tool" >/dev/null || ipa_fail "missing required tool: $tool"
