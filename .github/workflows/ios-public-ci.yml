@@ -94,7 +94,8 @@ jobs:
       - name: Verify device dependency search paths
         run: |
           settings="$(xcodebuild -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj \
-            -scheme iPadCasting -configuration Release -sdk iphoneos -showBuildSettings)"
+            -scheme iPadCasting -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' -showBuildSettings)"
           grep -Fq 'ThirdPartyBuild/xcframeworks' <<<"$settings"
           if grep -Eiq 'iphonesimulator|MacOSX|/opt/homebrew|/usr/local/opt|HostService|SessionAgent|MediaWorker|DriverBroker|MttVDD' <<<"$settings"; then
             echo 'simulator, macOS, or private Host dependency path selected' >&2
