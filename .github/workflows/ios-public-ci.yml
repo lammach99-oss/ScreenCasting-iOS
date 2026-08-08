@@ -31,6 +31,19 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode.app
       - name: Verify iPad-only target
         run: ./Client/scripts/verify_ipad_target.sh
+      - name: Verify identity persistence boundary
+        run: |
+          if grep -En 'UserDefaults|FileManager|NSKeyedArchiver|write\(to:' Client/iPadZeroLagDisplay/USBServerIdentity.swift; then
+            echo 'USB identity must remain Security/Keychain-backed' >&2
+            exit 1
+          fi
+          grep -q 'SystemKeychainBackend' Client/iPadZeroLagDisplay/USBServerIdentity.swift
+          if grep -En 'testRecover\(|TestRecoveryState|testCertificateInsertStatus' Client/iPadZeroLagDisplay/USBServerIdentity.swift Client/iPadZeroLagDisplayTests/USBServerIdentityTests.swift; then
+            echo 'disconnected recovery test seam remains' >&2
+            exit 1
+          fi
+      - name: Run deterministic IPA validator fixtures
+        run: ./Client/scripts/test_check_ipa.sh
       - name: Build pinned native dependencies
         run: ./Client/scripts/build_ios_dependencies.sh
       - name: Verify dependency artifacts
@@ -105,9 +118,9 @@ jobs:
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/export"
           export_method="app-store"
           if [[ "$export_method" == "app-store" || "$export_method" == "ad-hoc" || "$export_method" == "development" ]]; then
-            REQUIRE_EMBEDDED_PROVISIONING=1 EXPECTED_TEAM_ID="$IOS_TEAM_ID" ./Client/check_ipa.sh "$RUNNER_TEMP/export/iPadCasting.ipa"
+            CHECK_IPA_MODE=signed EXPORT_METHOD="$export_method" EXPECTED_TEAM_ID="$IOS_TEAM_ID" ./Client/check_ipa.sh "$RUNNER_TEMP/export/iPadCasting.ipa"
           else
-            REQUIRE_EMBEDDED_PROVISIONING=0 EXPECTED_TEAM_ID="$IOS_TEAM_ID" ./Client/check_ipa.sh "$RUNNER_TEMP/export/iPadCasting.ipa"
+            CHECK_IPA_MODE=signed EXPORT_METHOD="$export_method" EXPECTED_TEAM_ID="$IOS_TEAM_ID" ./Client/check_ipa.sh "$RUNNER_TEMP/export/iPadCasting.ipa"
           fi
       - uses: actions/upload-artifact@v4
         with:

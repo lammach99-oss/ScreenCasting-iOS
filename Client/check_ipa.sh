@@ -1,66 +1,103 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IPA_PATH="${1:?usage: $0 <path-to-ipa-file>}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=Client/scripts/ipa_validation_helpers.sh
+source "$SCRIPT_DIR/scripts/ipa_validation_helpers.sh"
+
+IPA_PATH="${1:?usage: EXPORT_METHOD=<method> $0 <path-to-ipa-file>}"
 EXPECTED_BUNDLE_IDENTIFIER="${EXPECTED_BUNDLE_IDENTIFIER:-com.iPadZeroLagDisplay.client}"
 EXPECTED_APP_NAME="${EXPECTED_APP_NAME:-iPadCasting.app}"
-REQUIRE_EMBEDDED_PROVISIONING="${REQUIRE_EMBEDDED_PROVISIONING:-1}"
 EXPECTED_TEAM_ID="${EXPECTED_TEAM_ID:-}"
+EXPORT_METHOD="${EXPORT_METHOD:-app-store}"
+CHECK_IPA_MODE="${CHECK_IPA_MODE:-signed}"
 
-[[ -f "$IPA_PATH" ]] || { echo "missing IPA: $IPA_PATH" >&2; exit 1; }
-for tool in unzip plutil lipo codesign; do command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }; done
-command -v /usr/libexec/PlistBuddy >/dev/null || { echo 'missing required tool: PlistBuddy' >&2; exit 1; }
-if [[ "$REQUIRE_EMBEDDED_PROVISIONING" == 1 ]]; then command -v security >/dev/null || { echo 'missing required tool: security' >&2; exit 1; }; fi
+[[ -f "$IPA_PATH" ]] || ipa_fail "missing IPA: $IPA_PATH"
+case "$CHECK_IPA_MODE" in
+    signed|unsigned)
+        ;;
+    *)
+        ipa_fail "CHECK_IPA_MODE must be signed or unsigned, got $CHECK_IPA_MODE"
+        ;;
+esac
+
+for tool in unzip plutil lipo; do
+    command -v "$tool" >/dev/null || ipa_fail "missing required tool: $tool"
+done
+command -v /usr/libexec/PlistBuddy >/dev/null || ipa_fail 'missing required tool: PlistBuddy'
+
+if [[ "$CHECK_IPA_MODE" == signed ]]; then
+    [[ -n "$EXPECTED_TEAM_ID" ]] || ipa_fail 'EXPECTED_TEAM_ID is required in signed mode'
+    command -v codesign >/dev/null || ipa_fail 'missing required tool: codesign'
+    command -v security >/dev/null || ipa_fail 'missing required tool: security'
+fi
 
 TEMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEMP_DIR"' EXIT
 unzip -q "$IPA_PATH" -d "$TEMP_DIR"
 
 PAYLOAD="$TEMP_DIR/Payload"
-[[ -d "$PAYLOAD" ]] || { echo 'missing Payload directory' >&2; exit 1; }
+[[ -d "$PAYLOAD" ]] || ipa_fail 'missing Payload directory'
 shopt -s nullglob
 APP_BUNDLES=("$PAYLOAD"/*.app)
 shopt -u nullglob
-[[ "${#APP_BUNDLES[@]}" == 1 ]] || { echo 'IPA must contain exactly one app bundle' >&2; exit 1; }
+[[ "${#APP_BUNDLES[@]}" == 1 ]] || ipa_fail 'IPA must contain exactly one app bundle'
 APP_DIR="${APP_BUNDLES[0]}"
-[[ "$(basename "$APP_DIR")" == "$EXPECTED_APP_NAME" ]] || { echo "unexpected app bundle: $(basename "$APP_DIR")" >&2; exit 1; }
+[[ "$(basename "$APP_DIR")" == "$EXPECTED_APP_NAME" ]] || ipa_fail "unexpected app bundle: $(basename "$APP_DIR")"
 
 PLIST="$APP_DIR/Info.plist"
-[[ -f "$PLIST" ]] || { echo 'missing app Info.plist' >&2; exit 1; }
-bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$PLIST")"
-[[ "$bundle_id" == "$EXPECTED_BUNDLE_IDENTIFIER" ]] || { echo "bundle identifier mismatch: $bundle_id" >&2; exit 1; }
+[[ -f "$PLIST" ]] || ipa_fail 'missing app Info.plist'
+bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$PLIST")" || ipa_fail 'missing CFBundleIdentifier'
+ipa_require_exact_value 'bundle identifier' "$bundle_id" "$EXPECTED_BUNDLE_IDENTIFIER"
 
 family="$(/usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily' "$PLIST" 2>/dev/null || true)"
-[[ "$family" == *' = 2'* && "$family" != *' = 1'* ]] || { echo "IPA is not iPad-only: $family" >&2; exit 1; }
+ipa_require_ipad_only_family "$family"
 
-executable="$(plutil -extract CFBundleExecutable raw -o - "$PLIST")"
+executable="$(plutil -extract CFBundleExecutable raw -o - "$PLIST")" || ipa_fail 'missing CFBundleExecutable'
 EXEC_PATH="$APP_DIR/$executable"
-[[ -f "$EXEC_PATH" ]] || { echo "missing declared executable: $EXEC_PATH" >&2; exit 1; }
-architecture="$(lipo -archs "$EXEC_PATH" | tr ' ' '\n' | sed '/^$/d' | sort -u | paste -sd, -)"
-[[ "$architecture" == 'arm64' ]] || {
-  echo "IPA executable is not an exact arm64 device binary: {$architecture}" >&2
-  exit 1
-}
+[[ -f "$EXEC_PATH" ]] || ipa_fail "missing declared executable: $EXEC_PATH"
+architecture="$(lipo -archs "$EXEC_PATH" 2>/dev/null)" || ipa_fail 'unable to inspect executable architectures'
+ipa_require_exact_architecture "$architecture" 'arm64'
 
-codesign --verify --deep --strict --verbose=2 "$APP_DIR"
-signing_metadata="$(codesign -dvvv "$APP_DIR" 2>&1)" || { echo 'unable to inspect code signature' >&2; exit 1; }
-grep -q "Identifier=$EXPECTED_BUNDLE_IDENTIFIER" <<<"$signing_metadata" || { echo 'code signature identifier mismatch' >&2; exit 1; }
-if [[ -n "$EXPECTED_TEAM_ID" ]]; then
-  grep -Eq "TeamIdentifier=$EXPECTED_TEAM_ID|TeamIdentifier=.+$EXPECTED_TEAM_ID" <<<"$signing_metadata" || { echo 'code signature team identifier mismatch' >&2; exit 1; }
+SIGNED_APP_ID=""
+SIGNED_TEAM_ID=""
+if [[ "$CHECK_IPA_MODE" == signed ]]; then
+    codesign --verify --deep --strict --verbose=2 "$APP_DIR" || ipa_fail 'strict code-signature verification failed'
+    signing_metadata="$(codesign -dvvv "$APP_DIR" 2>&1)" || ipa_fail 'unable to inspect code signature'
+    signed_identifier="$(printf '%s\n' "$signing_metadata" | awk -F= '$1 == "Identifier" { print substr($0, index($0, "=") + 1); exit }')"
+    signed_team="$(printf '%s\n' "$signing_metadata" | awk -F= '$1 == "TeamIdentifier" { print substr($0, index($0, "=") + 1); exit }')"
+    ipa_require_exact_value 'code-signature identifier' "$signed_identifier" "$EXPECTED_BUNDLE_IDENTIFIER"
+    ipa_require_exact_value 'code-signature team identifier' "$signed_team" "$EXPECTED_TEAM_ID"
+
+    signed_entitlements="$TEMP_DIR/signed-entitlements.plist"
+    codesign -d --entitlements :- "$APP_DIR" > "$signed_entitlements" 2>/dev/null || ipa_fail 'unable to extract signed entitlements'
+    SIGNED_APP_ID="$(plutil -extract 'application-identifier' raw -o - "$signed_entitlements")" || ipa_fail 'signed entitlements missing application-identifier'
+    SIGNED_TEAM_ID="$(plutil -extract 'com.apple.developer.team-identifier' raw -o - "$signed_entitlements")" || ipa_fail 'signed entitlements missing team identifier'
+fi
+
+requires_profile=0
+if ipa_method_requires_provisioning "$EXPORT_METHOD"; then
+    requires_profile=1
+else
+    method_status=$?
+    [[ "$method_status" == 1 ]] || ipa_fail "unsupported export method: $EXPORT_METHOD"
 fi
 
 profile="$APP_DIR/embedded.mobileprovision"
 if [[ -f "$profile" ]]; then
-  security cms -D -i "$profile" -o "$TEMP_DIR/profile.plist"
-  profile_app_id="$(plutil -extract Entitlements:application-identifier raw -o - "$TEMP_DIR/profile.plist")" || { echo 'provisioning profile is missing application-identifier' >&2; exit 1; }
-  [[ "$profile_app_id" == *"$EXPECTED_BUNDLE_IDENTIFIER" ]] || { echo 'provisioning application identifier mismatch' >&2; exit 1; }
-  if [[ -n "$EXPECTED_TEAM_ID" ]]; then
-    profile_team_id="$(plutil -extract TeamIdentifier.0 raw -o - "$TEMP_DIR/profile.plist")" || { echo 'provisioning profile is missing TeamIdentifier' >&2; exit 1; }
-    [[ "$profile_team_id" == "$EXPECTED_TEAM_ID" ]] || { echo 'provisioning team identifier mismatch' >&2; exit 1; }
-  fi
-elif [[ "$REQUIRE_EMBEDDED_PROVISIONING" == 1 ]]; then
-  echo 'missing embedded.mobileprovision' >&2
-  exit 1
+    [[ "$CHECK_IPA_MODE" == signed ]] || ipa_fail 'embedded provisioning requires signed validation mode'
+    security cms -D -i "$profile" -o "$TEMP_DIR/profile.plist" || ipa_fail 'unable to decode embedded provisioning profile'
+    profile_app_id="$(plutil -extract 'Entitlements:application-identifier' raw -o - "$TEMP_DIR/profile.plist")" || ipa_fail 'profile missing application-identifier'
+    profile_team_id="$(plutil -extract 'Entitlements:com.apple.developer.team-identifier' raw -o - "$TEMP_DIR/profile.plist")" || ipa_fail 'profile missing team entitlement'
+    profile_team_identifier="$(plutil -extract 'TeamIdentifier.0' raw -o - "$TEMP_DIR/profile.plist")" || ipa_fail 'profile missing TeamIdentifier'
+    ipa_require_exact_value 'profile TeamIdentifier' "$profile_team_identifier" "$EXPECTED_TEAM_ID"
+    ipa_require_entitlement_profile_match "$SIGNED_APP_ID" "$SIGNED_TEAM_ID" "$profile_app_id" "$profile_team_id" "$EXPECTED_TEAM_ID" "$EXPECTED_BUNDLE_IDENTIFIER"
+elif [[ "$requires_profile" == 1 ]]; then
+    ipa_fail "export method $EXPORT_METHOD requires embedded.mobileprovision"
 fi
 
-echo "IPA PASS: bundle=$bundle_id family=iPad architecture=arm64"
+if [[ "$CHECK_IPA_MODE" == signed && ! -f "$profile" ]]; then
+    ipa_require_entitlement_profile_match "$SIGNED_APP_ID" "$SIGNED_TEAM_ID" "$SIGNED_APP_ID" "$SIGNED_TEAM_ID" "$EXPECTED_TEAM_ID" "$EXPECTED_BUNDLE_IDENTIFIER"
+fi
+
+echo "IPA PASS: bundle=$bundle_id family=iPad architecture=arm64 mode=$CHECK_IPA_MODE method=$EXPORT_METHOD"
