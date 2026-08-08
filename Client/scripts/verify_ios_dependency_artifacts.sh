@@ -53,7 +53,7 @@ plist_value() {
 }
 
 plist_array() {
-  sed -n '/Array[[:space:]]*{/,$p' | sed -n '/}/q; /Array[[:space:]]*{/d; /^[[:space:]]*}/d; s/^[[:space:]]*//; /^[[:space:]]*$/d'
+  sed -n '/Array[[:space:]]*{/,$p' | sed -n '/}/q; /Array[[:space:]]*{/d; /^[[:space:]]*}/d; s/^[[:space:]]*//; /^[[:space:]]*$/d; p'
 }
 
 verify_xcframework() {
