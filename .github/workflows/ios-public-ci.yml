@@ -122,10 +122,6 @@ jobs:
           started_epoch=$(date +%s)
           ./Client/scripts/verify_ios_dependency_artifacts.sh \
             "$DEP_ROOT/xcframeworks" "$DEP_ROOT/build"
-          [[ ! -d "$DEP_ROOT/src" ]] || {
-            echo 'native dependency source clones must not be cached' >&2
-            exit 1
-          }
           echo "NATIVE_DEPENDENCY_VERIFY_SECONDS=$(( $(date +%s) - started_epoch ))"
           echo 'NATIVE_DEPENDENCY_VERIFY=PASS'
       - name: Remove source clones before cache save and artifact staging
@@ -135,6 +131,17 @@ jobs:
           set -euo pipefail
           rm -rf "$DEP_ROOT/src"
           [[ ! -e "$DEP_ROOT/src" ]]
+      - name: Re-verify cache-safe dependency tree after source cleanup
+        env:
+          DEP_ROOT: ${{ github.workspace }}/Client/ThirdPartyBuild
+        run: |
+          set -euo pipefail
+          started_epoch=$(date +%s)
+          [[ ! -e "$DEP_ROOT/src" ]]
+          ./Client/scripts/verify_ios_dependency_artifacts.sh \
+            "$DEP_ROOT/xcframeworks" "$DEP_ROOT/build"
+          echo "NATIVE_DEPENDENCY_CACHE_VERIFY_SECONDS=$(( $(date +%s) - started_epoch ))"
+          echo 'NATIVE_DEPENDENCY_CACHE_CONTENTS=PASS'
       - name: Save verified native dependency cache
         if: ${{ steps.native-cache-restore.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
         uses: actions/cache/save@v6

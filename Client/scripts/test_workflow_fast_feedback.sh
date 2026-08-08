@@ -14,6 +14,14 @@ job_block() {
     in_job { print }
   ' "$WORKFLOW"
 }
+step_block() {
+  local step="$1"
+  awk -v step="$step" '
+    $0 == "      - name: " step { in_step = 1; next }
+    in_step && $0 ~ /^      - name:/ { exit }
+    in_step { print }
+  ' "$WORKFLOW"
+}
 
 for job in prepare-native-deps build-and-test build-unsigned-ipad-app package-unsigned-ipa revalidate-uploaded-ipa; do
   require_text "  $job:"
@@ -28,6 +36,18 @@ require_text 'cancel-in-progress: ${{ github.event_name != '\''workflow_dispatch
 if grep -Fq 'restore-keys:' "$WORKFLOW"; then fail 'broad cache restore keys are present'; fi
 if grep -Fq 'pull_request_target' "$WORKFLOW"; then fail 'pull_request_target is present'; fi
 if grep -Eq 'mapfile|readarray' "$WORKFLOW"; then fail 'workflow requires Bash 4-only array helpers'; fi
+
+strict_native_step="$(step_block 'Strictly verify restored or built native dependencies')"
+cleanup_native_step="$(step_block 'Remove source clones before cache save and artifact staging')"
+post_cleanup_native_step="$(step_block 'Re-verify cache-safe dependency tree after source cleanup')"
+if grep -Fq 'DEP_ROOT/src' <<<"$strict_native_step"; then
+  fail 'strict native verification checks source absence before cleanup'
+fi
+grep -Fq 'rm -rf "$DEP_ROOT/src"' <<<"$cleanup_native_step" || fail 'source cleanup is missing'
+grep -Fq '[[ ! -e "$DEP_ROOT/src" ]]' <<<"$cleanup_native_step" || fail 'source cleanup does not assert absence'
+[[ -n "$post_cleanup_native_step" ]] || fail 'post-cleanup native verification step is missing'
+grep -Fq './Client/scripts/verify_ios_dependency_artifacts.sh' <<<"$post_cleanup_native_step" ||
+  fail 'post-cleanup native verification is missing strict artifact validation'
 
 package="$(job_block package-unsigned-ipa)"
 [[ -n "$package" ]] || fail 'package job block is empty'
