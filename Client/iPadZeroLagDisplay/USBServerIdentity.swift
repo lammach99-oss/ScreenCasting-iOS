@@ -13,98 +13,107 @@ enum USBIdentityResource {
 /// Creates and persists the iPad-side USB TLS identity without shipping a
 /// private key. The host pins the certificate fingerprint after first-use
 /// pairing, so a device-local self-signed certificate is sufficient.
+protocol USBServerIdentityKeychainBackend {
+    associatedtype Identity
+
+    mutating func loadIdentity() -> Identity?
+    mutating func createIdentity() -> Identity?
+    mutating func deleteIdentityRecords()
+}
+
 enum USBServerIdentityStore {
     static let keychainLabel = "ScreenCasting USB Server Identity"
     private static let applicationTag = Data("com.screencasting.usb-server-identity".utf8)
 
-    static var testCertificateInsertStatus: OSStatus?
-
-    enum TestRecoveryState {
-        case empty, valid, orphanKey, orphanCertificate, corruptCertificate
-        case insertionFailure, duplicateItem
-    }
-    static var testRecoveryState: TestRecoveryState?
-
     static func loadOrCreate() -> SecIdentity? {
-        if let existing = copy() { return existing }
+        var backend = SystemKeychainBackend()
+        return loadOrCreate(using: &backend)
+    }
+
+    /// The recovery algorithm used by the production entry point. XCTest
+    /// injects an in-memory backend here, while production supplies the
+    /// Security.framework-backed implementation below.
+    @discardableResult
+    static func loadOrCreate<Backend: USBServerIdentityKeychainBackend>(using backend: inout Backend) -> Backend.Identity? {
+        if let existing = backend.loadIdentity() { return existing }
 
         // A missing identity can mean an orphaned key, a stale certificate,
-        // or a corrupt keychain record. Purge all identity records before
-        // regenerating so recovery completes in this public call and never
-        // leaves duplicate-key state for the next launch.
+        // a corrupt certificate, or a duplicate-item race. Purge all records
+        // before each bounded regeneration attempt so recovery completes in
+        // this public call and never leaves duplicate-key state behind.
         for _ in 0..<2 {
-            delete()
-            guard let key = createKey(),
-                  let certificate = createCertificate(for: key) else {
-                delete()
-                continue
+            backend.deleteIdentityRecords()
+            if backend.createIdentity() != nil,
+               let persisted = backend.loadIdentity() {
+                return persisted
             }
-
-            let certificateAttributes: [String: Any] = [
-                kSecClass as String: kSecClassCertificate,
-                kSecAttrLabel as String: keychainLabel,
-                kSecValueRef as String: certificate,
-            ]
-            let status = testCertificateInsertStatus ?? SecItemAdd(certificateAttributes as CFDictionary, nil)
-            if status == errSecSuccess, let identity = copy() { return identity }
-            // The RSA key is permanent. Remove it when certificate persistence
-            // fails, including duplicate-item races, then perform one bounded
-            // regeneration attempt in this call.
-            delete()
+            // createIdentity may have persisted a permanent key before a
+            // certificate insertion or reload failure. Always roll it back.
+            backend.deleteIdentityRecords()
         }
         return nil
     }
 
-    /// Kept internal so XCTest can lock down the Keychain recovery contract
-    /// without manufacturing Security.framework objects or writing secrets.
-    static func certificateInsertSucceeded(_ status: OSStatus) -> Bool {
-        status == errSecSuccess
-    }
-
-    static func testRecover() -> Bool {
-        guard let state = testRecoveryState else { return false }
-        switch state {
-        case .empty, .valid, .orphanKey, .orphanCertificate, .corruptCertificate:
-            testRecoveryState = .valid
-            return true
-        case .insertionFailure, .duplicateItem:
-            testRecoveryState = .empty
-            return false
-        }
-    }
-
     static func copy() -> SecIdentity? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassIdentity,
-            kSecAttrLabel as String: keychainLabel,
-            kSecReturnRef as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var value: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &value) == errSecSuccess,
-              let value,
-              CFGetTypeID(value) == SecIdentityGetTypeID() else { return nil }
-        return unsafeBitCast(value, to: SecIdentity.self)
+        var backend = SystemKeychainBackend()
+        return backend.loadIdentity()
     }
 
     static func delete() {
-        for type in [kSecClassIdentity, kSecClassCertificate, kSecClassKey] {
+        var backend = SystemKeychainBackend()
+        backend.deleteIdentityRecords()
+    }
+
+    static func delete<Backend: USBServerIdentityKeychainBackend>(using backend: inout Backend) {
+        backend.deleteIdentityRecords()
+    }
+
+    private struct SystemKeychainBackend: USBServerIdentityKeychainBackend {
+        typealias Identity = SecIdentity
+
+        mutating func loadIdentity() -> SecIdentity? {
             let query: [String: Any] = [
-                kSecClass as String: type,
-                kSecAttrLabel as String: keychainLabel,
+                kSecClass as String: kSecClassIdentity,
+                kSecAttrLabel as String: USBServerIdentityStore.keychainLabel,
+                kSecReturnRef as String: true,
+                kSecMatchLimit as String: kSecMatchLimitOne,
             ]
-            SecItemDelete(query as CFDictionary)
+            var value: CFTypeRef?
+            guard SecItemCopyMatching(query as CFDictionary, &value) == errSecSuccess,
+                  let value,
+                  CFGetTypeID(value) == SecIdentityGetTypeID() else { return nil }
+            return unsafeBitCast(value, to: SecIdentity.self)
         }
-    }
 
-    static func testCreateOrphanKey() { testRecoveryState = .orphanKey }
+        mutating func createIdentity() -> SecIdentity? {
+            guard let key = USBServerIdentityStore.createKey(),
+                  let certificate = USBServerIdentityStore.createCertificate(for: key) else {
+                deleteIdentityRecords()
+                return nil
+            }
 
-    static func testCreateOrphanCertificate() {
-        testRecoveryState = .orphanCertificate
-    }
+            let certificateAttributes: [String: Any] = [
+                kSecClass as String: kSecClassCertificate,
+                kSecAttrLabel as String: USBServerIdentityStore.keychainLabel,
+                kSecValueRef as String: certificate,
+            ]
+            guard SecItemAdd(certificateAttributes as CFDictionary, nil) == errSecSuccess,
+                  let identity = loadIdentity() else {
+                deleteIdentityRecords()
+                return nil
+            }
+            return identity
+        }
 
-    static func testCreateCorruptCertificate() {
-        testRecoveryState = .corruptCertificate
+        mutating func deleteIdentityRecords() {
+            for type in [kSecClassIdentity, kSecClassCertificate, kSecClassKey] {
+                let query: [String: Any] = [
+                    kSecClass as String: type,
+                    kSecAttrLabel as String: USBServerIdentityStore.keychainLabel,
+                ]
+                SecItemDelete(query as CFDictionary)
+            }
+        }
     }
 
     private static func createKey() -> SecKey? {
