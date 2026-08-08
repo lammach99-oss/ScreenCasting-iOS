@@ -658,7 +658,7 @@ final class WireProtocolTests: XCTestCase {
         XCTAssertEqual(WireProtocol.realtimeNegotiationSupportedFlag, 0x8000)
     }
 
-    func testUSBIdentityResourceDecodesWhitespaceWrappedPKCS12() {
+    func testUSBIdentityResourceDecodesWhitespaceWrappedData() {
         let decoded = USBIdentityResource.decode("AQID\nBA==")
         XCTAssertEqual(decoded, Data([1, 2, 3, 4]))
     }

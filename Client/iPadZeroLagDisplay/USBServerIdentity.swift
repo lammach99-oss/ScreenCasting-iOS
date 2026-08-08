@@ -1,6 +1,15 @@
 import Foundation
 import Security
 
+/// Testable decoder for externally supplied identity resource data.
+/// No identity material or fallback resource is embedded in the app.
+enum USBIdentityResource {
+    static func decode(_ encoded: String) -> Data? {
+        let normalized = encoded.filter { !$0.isWhitespace }
+        return Data(base64Encoded: String(normalized))
+    }
+}
+
 /// Creates and persists the iPad-side USB TLS identity without shipping a
 /// private key. The host pins the certificate fingerprint after first-use
 /// pairing, so a device-local self-signed certificate is sufficient.
