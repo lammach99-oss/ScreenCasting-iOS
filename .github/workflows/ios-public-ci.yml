@@ -101,7 +101,12 @@ jobs:
           EOF
           xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/iPadCasting.xcarchive" \
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/export"
-          REQUIRE_EMBEDDED_PROVISIONING=1 ./Client/check_ipa.sh "$RUNNER_TEMP/export/iPadCasting.ipa"
+          export_method="app-store"
+          if [[ "$export_method" == "app-store" || "$export_method" == "ad-hoc" || "$export_method" == "development" ]]; then
+            REQUIRE_EMBEDDED_PROVISIONING=1 EXPECTED_TEAM_ID="$IOS_TEAM_ID" ./Client/check_ipa.sh "$RUNNER_TEMP/export/iPadCasting.ipa"
+          else
+            REQUIRE_EMBEDDED_PROVISIONING=0 EXPECTED_TEAM_ID="$IOS_TEAM_ID" ./Client/check_ipa.sh "$RUNNER_TEMP/export/iPadCasting.ipa"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: iPadCasting-ipa
