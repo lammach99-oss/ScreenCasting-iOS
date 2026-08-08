@@ -7,7 +7,7 @@ CHECK_IPA="$CLIENT_DIR/check_ipa.sh"
 # shellcheck source=Client/scripts/ipa_validation_helpers.sh
 source "$SCRIPT_DIR/ipa_validation_helpers.sh"
 
-if grep -q 'Entitlements:' "$CHECK_IPA" || ! grep -q 'Entitlements.application-identifier' "$CHECK_IPA" || ! grep -q 'Entitlements.com.apple.developer.team-identifier' "$CHECK_IPA" || ! grep -q 'Print :com.apple.developer.team-identifier' "$CHECK_IPA"; then
+if grep -q 'Entitlements:' "$CHECK_IPA" || ! grep -Fq 'Entitlements.application-identifier' "$CHECK_IPA" || ! grep -Fq 'Entitlements.com\.apple\.developer\.team-identifier' "$CHECK_IPA" || ! grep -Fq 'com\.apple\.developer\.team-identifier' "$CHECK_IPA"; then
     ipa_fail 'check_ipa profile paths are not dot-delimited'
 fi
 

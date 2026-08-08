@@ -76,8 +76,8 @@ if [[ "$CHECK_IPA_MODE" == signed ]]; then
     signed_entitlements="$TEMP_DIR/signed-entitlements.plist"
     codesign -d --entitlements :- "$APP_DIR" > "$signed_entitlements" 2>/dev/null || ipa_fail 'unable to extract signed entitlements'
     SIGNED_APP_ID="$(plutil -extract 'application-identifier' raw -o - "$signed_entitlements")" || ipa_fail 'signed entitlements missing application-identifier'
-    # This entitlement name contains literal dots; PlistBuddy addresses the literal key.
-    SIGNED_TEAM_ID="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' "$signed_entitlements" 2>/dev/null)" || ipa_fail 'signed entitlements missing team identifier'
+    # Escape literal dots so plutil treats the entitlement name as one key.
+    SIGNED_TEAM_ID="$(plutil -extract 'com\.apple\.developer\.team-identifier' raw -o - "$signed_entitlements")" || ipa_fail 'signed entitlements missing team identifier'
 fi
 
 requires_profile=0
@@ -93,7 +93,7 @@ if [[ -f "$profile" ]]; then
     [[ "$CHECK_IPA_MODE" == signed ]] || ipa_fail 'embedded provisioning requires signed validation mode'
     security cms -D -i "$profile" -o "$TEMP_DIR/profile.plist" || ipa_fail 'unable to decode embedded provisioning profile'
     profile_app_id="$(plutil -extract 'Entitlements.application-identifier' raw -o - "$TEMP_DIR/profile.plist")" || ipa_fail 'profile missing application-identifier'
-    profile_team_id="$(plutil -extract 'Entitlements.com.apple.developer.team-identifier' raw -o - "$TEMP_DIR/profile.plist")" || ipa_fail 'profile missing team entitlement'
+    profile_team_id="$(plutil -extract 'Entitlements.com\.apple\.developer\.team-identifier' raw -o - "$TEMP_DIR/profile.plist")" || ipa_fail 'profile missing team entitlement'
     profile_team_identifier="$(plutil -extract 'TeamIdentifier.0' raw -o - "$TEMP_DIR/profile.plist")" || ipa_fail 'profile missing TeamIdentifier'
     ipa_require_exact_value 'profile TeamIdentifier' "$profile_team_identifier" "$EXPECTED_TEAM_ID"
     ipa_require_entitlement_profile_match "$SIGNED_APP_ID" "$SIGNED_TEAM_ID" "$profile_app_id" "$profile_team_id" "$EXPECTED_TEAM_ID" "$EXPECTED_BUNDLE_IDENTIFIER"
