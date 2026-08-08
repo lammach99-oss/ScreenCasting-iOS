@@ -22,6 +22,41 @@ final class USBServerIdentityTests: XCTestCase {
         XCTAssertFalse(USBServerIdentityStore.certificateInsertSucceeded(errSecDuplicateItem))
     }
 
+    func testOrphanKeyIsReconciledAndRegeneratedInOneCall() {
+        USBServerIdentityStore.testCreateOrphanKey()
+        defer { USBServerIdentityStore.delete() }
+        XCTAssertNotNil(USBServerIdentityStore.loadOrCreate())
+        XCTAssertNotNil(USBServerIdentityStore.copy())
+    }
+
+    func testOrphanCertificateIsRemovedAndRegeneratedInOneCall() {
+        USBServerIdentityStore.testCreateOrphanCertificate()
+        defer { USBServerIdentityStore.delete() }
+        XCTAssertNotNil(USBServerIdentityStore.loadOrCreate())
+        XCTAssertNotNil(USBServerIdentityStore.copy())
+    }
+
+    func testCorruptCertificateIsRejectedAndRegenerated() {
+        USBServerIdentityStore.testCreateCorruptCertificate()
+        defer { USBServerIdentityStore.delete() }
+        XCTAssertNotNil(USBServerIdentityStore.loadOrCreate())
+    }
+
+    func testInsertionFailureCleansUpAndDoesNotWedgeNextCall() {
+        USBServerIdentityStore.delete()
+        USBServerIdentityStore.testCertificateInsertStatus = errSecAuthFailed
+        XCTAssertNil(USBServerIdentityStore.loadOrCreate())
+        USBServerIdentityStore.testCertificateInsertStatus = nil
+        defer { USBServerIdentityStore.delete() }
+        XCTAssertNotNil(USBServerIdentityStore.loadOrCreate())
+    }
+
+    func testDeleteAndRegenerate() {
+        XCTAssertNotNil(USBServerIdentityStore.loadOrCreate())
+        USBServerIdentityStore.delete()
+        XCTAssertNotNil(USBServerIdentityStore.loadOrCreate())
+    }
+
     func testAllCertificateInsertionFailuresAreRejected() {
         for status in [errSecAuthFailed, errSecDecode, errSecDuplicateItem, errSecMissingEntitlement] {
             XCTAssertFalse(USBServerIdentityStore.certificateInsertSucceeded(status))

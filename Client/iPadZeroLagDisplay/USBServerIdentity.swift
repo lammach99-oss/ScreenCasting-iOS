@@ -8,6 +8,10 @@ enum USBServerIdentityStore {
     static let keychainLabel = "ScreenCasting USB Server Identity"
     private static let applicationTag = Data("com.screencasting.usb-server-identity".utf8)
 
+    #if DEBUG
+    static var testCertificateInsertStatus: OSStatus?
+    #endif
+
     static func loadOrCreate() -> SecIdentity? {
         if let existing = copy() { return existing }
 
@@ -15,31 +19,32 @@ enum USBServerIdentityStore {
         // or a corrupt keychain record. Purge all identity records before
         // regenerating so recovery completes in this public call and never
         // leaves duplicate-key state for the next launch.
-        delete()
-        guard let key = createKey(),
-              let certificate = createCertificate(for: key) else {
+        for _ in 0..<2 {
             delete()
-            return nil
-        }
-        guard let identity = SecIdentityCreate(nil, certificate, key) else {
-            delete()
-            return nil
-        }
+            guard let key = createKey(),
+                  let certificate = createCertificate(for: key),
+                  let identity = SecIdentityCreate(nil, certificate, key) else {
+                delete()
+                continue
+            }
 
-        let certificateAttributes: [String: Any] = [
-            kSecClass as String: kSecClassCertificate,
-            kSecAttrLabel as String: keychainLabel,
-            kSecValueRef as String: certificate,
-        ]
-        let status = SecItemAdd(certificateAttributes as CFDictionary, nil)
-        guard status == errSecSuccess else {
+            let certificateAttributes: [String: Any] = [
+                kSecClass as String: kSecClassCertificate,
+                kSecAttrLabel as String: keychainLabel,
+                kSecValueRef as String: certificate,
+            ]
+            #if DEBUG
+            let status = testCertificateInsertStatus ?? SecItemAdd(certificateAttributes as CFDictionary, nil)
+            #else
+            let status = SecItemAdd(certificateAttributes as CFDictionary, nil)
+            #endif
+            if status == errSecSuccess { return identity }
             // The RSA key is permanent. Remove it when certificate persistence
-            // fails, including duplicate-item races. A subsequent public call
-            // can then regenerate a complete identity deterministically.
+            // fails, including duplicate-item races, then perform one bounded
+            // regeneration attempt in this call.
             delete()
-            return nil
         }
-        return identity
+        return nil
     }
 
     /// Kept internal so XCTest can lock down the Keychain recovery contract
@@ -58,7 +63,7 @@ enum USBServerIdentityStore {
         var value: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &value) == errSecSuccess,
               let value else { return nil }
-        return (value as! SecIdentity)
+        return value as? SecIdentity
     }
 
     static func delete() {
@@ -70,6 +75,30 @@ enum USBServerIdentityStore {
             SecItemDelete(query as CFDictionary)
         }
     }
+
+    #if DEBUG
+    static func testCreateOrphanKey() { delete(); _ = createKey() }
+
+    static func testCreateOrphanCertificate() {
+        delete()
+        guard let key = createKey(), let certificate = createCertificate(for: key) else { return }
+        SecItemDelete([kSecClass as String: kSecClassKey, kSecAttrLabel as String: keychainLabel] as CFDictionary)
+        _ = SecItemAdd([
+            kSecClass as String: kSecClassCertificate,
+            kSecAttrLabel as String: keychainLabel,
+            kSecValueRef as String: certificate,
+        ] as CFDictionary, nil)
+    }
+
+    static func testCreateCorruptCertificate() {
+        delete()
+        _ = SecItemAdd([
+            kSecClass as String: kSecClassCertificate,
+            kSecAttrLabel as String: keychainLabel,
+            kSecValueData as String: Data([0x01, 0x02, 0x03]),
+        ] as CFDictionary, nil)
+    }
+    #endif
 
     private static func createKey() -> SecKey? {
         let attributes: [String: Any] = [
