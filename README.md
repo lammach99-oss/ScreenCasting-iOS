@@ -29,4 +29,8 @@ NOT RUN / DEFERRED.
 Wave 6 code closeout: PASS.
 Physical iPad: NOT RUN / DEFERRED.
 
+The cache, verified native-dependency artifact, app/IPA job split, retry
+semantics, and timing telemetry are documented in
+[`docs/CI_FAST_FEEDBACK.md`](docs/CI_FAST_FEEDBACK.md).
+
 Project license: NOT SPECIFIED.
