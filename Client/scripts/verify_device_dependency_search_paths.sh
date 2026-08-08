@@ -17,7 +17,7 @@ require_setting() {
   grep -Eq "$pattern" <<<"$selected_settings" || fail "missing device setting: $description"
 }
 
-require_setting '^SDKROOT=iphoneos[[:space:]]*$' 'SDKROOT=iphoneos'
+require_setting '^SDKROOT=iphoneos([0-9]+([.][0-9]+)*)?[[:space:]]*$' 'SDKROOT=iphoneos'
 require_setting '^PLATFORM_NAME=iphoneos[[:space:]]*$' 'PLATFORM_NAME=iphoneos'
 require_setting '^CONFIGURATION_BUILD_DIR=.*iphoneos' 'device CONFIGURATION_BUILD_DIR'
 grep -Fq 'ThirdPartyBuild/xcframeworks' <<<"$selected_settings" || fail 'public ThirdPartyBuild/xcframeworks path missing'

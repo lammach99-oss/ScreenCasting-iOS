@@ -10,7 +10,7 @@ positive_settings() {
   cat <<'EOF'
 Build settings for action build and target iPadCasting:
     EXCLUDED_ARCHS[sdk=iphonesimulator*] = arm64
-    SDKROOT = iphoneos
+    SDKROOT = iphoneos17.5
     PLATFORM_NAME = iphoneos
     CONFIGURATION_BUILD_DIR = /tmp/derived-data/Build/Products/Release-iphoneos
     FRAMEWORK_SEARCH_PATHS = $(inherited) /workspace/Client/ThirdPartyBuild/xcframeworks
@@ -35,6 +35,7 @@ expect_fail() {
 
 positive="$(positive_settings)"
 expect_pass
+expect_fail 'selected simulator SDKROOT' "$(sed 's/SDKROOT = iphoneos17.5/SDKROOT = iphonesimulator17.5/' <<<"$positive")"
 expect_fail 'selected simulator search path' "$(sed 's#FRAMEWORK_SEARCH_PATHS = .*#FRAMEWORK_SEARCH_PATHS = /tmp/iphonesimulator/Selected/ThirdPartyBuild/xcframeworks#' <<<"$positive")"
 expect_fail 'selected private Host path' "$(sed 's#FRAMEWORK_SEARCH_PATHS = .*#FRAMEWORK_SEARCH_PATHS = /tmp/HostService/ThirdPartyBuild/xcframeworks#' <<<"$positive")"
 expect_fail 'missing device SDKROOT' "$(sed '/SDKROOT = iphoneos/d' <<<"$positive")"
