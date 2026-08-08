@@ -3,7 +3,7 @@ import Security
 @testable import iPadCasting
 
 final class USBServerIdentityTests: XCTestCase {
-    func testFirstLoadCreatesKeychainIdentity() {
+    func testFirstLoadCreatesKeychainIdentity() throws {
         USBServerIdentityStore.delete()
         defer { USBServerIdentityStore.delete() }
         let first = USBServerIdentityStore.loadOrCreate()
