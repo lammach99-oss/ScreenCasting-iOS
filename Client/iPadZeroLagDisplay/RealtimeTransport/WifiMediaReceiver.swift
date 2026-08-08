@@ -778,6 +778,7 @@ final class WifiMediaReceiver {
     private let audioConsumer: AudioConsumer
     private let onProbeAuthenticated: (UInt64, SessionID) -> Void
     private let onCommittedFailure: (UInt64, Error) -> Void
+    private let securityDropObserver: ((WifiSecurityDropCounters) -> Void)?
     private let telemetryProvider: () -> WifiFeedbackTelemetry
     private let framePacketObserver: FramePacketObserver?
     private let timedOutcomeObserver: TimedOutcomeObserver?
@@ -862,6 +863,7 @@ final class WifiMediaReceiver {
         onCommittedFailure: @escaping (UInt64, Error) -> Void,
         framePacketObserver: FramePacketObserver? = nil,
         timedOutcomeObserver: TimedOutcomeObserver? = nil,
+        securityDropObserver: ((WifiSecurityDropCounters) -> Void)? = nil,
         telemetryProvider: @escaping () -> WifiFeedbackTelemetry = {
             .zero
         }
@@ -871,6 +873,7 @@ final class WifiMediaReceiver {
         self.audioConsumer = audioConsumer
         self.onProbeAuthenticated = onProbeAuthenticated
         self.onCommittedFailure = onCommittedFailure
+        self.securityDropObserver = securityDropObserver
         self.framePacketObserver = framePacketObserver
         self.timedOutcomeObserver = timedOutcomeObserver
         self.telemetryProvider = telemetryProvider
@@ -1353,6 +1356,7 @@ final class WifiMediaReceiver {
               let feedbackSrtp,
               let sessionID else { return }
         let ssrc = WifiMediaContract.feedbackSsrc(sessionID)
+        securityDropObserver?(securityDropCounters)
         let sourceTelemetry = telemetryProvider()
         let jitterMs = UInt16(clamping: Int(jitter90k / 90))
         let measuredRtt = rttP95Ms()

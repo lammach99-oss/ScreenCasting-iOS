@@ -614,10 +614,11 @@ public class NetworkManager: ObservableObject {
                 observedAt: observedAt,
                 generation: generation)
         },
+        securityDropObserver: { [weak self] counters in
+            self?.transportTelemetry.recordWifiSecurityDrops(counters)
+        },
         telemetryProvider: { [weak self] in
             guard let self else { return .zero }
-            self.transportTelemetry.recordWifiSecurityDrops(
-                self.wifiMediaReceiver.securityDropCounters)
             let feedback = self.transportTelemetry.makeFeedback()
             return WifiFeedbackTelemetry(
                 lastDecoded: feedback.1,
