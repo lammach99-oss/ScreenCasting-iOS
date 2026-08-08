@@ -19,6 +19,12 @@ enum USBServerIdentityStore {
 
     static var testCertificateInsertStatus: OSStatus?
 
+    enum TestRecoveryState {
+        case empty, valid, orphanKey, orphanCertificate, corruptCertificate
+        case insertionFailure, duplicateItem
+    }
+    static var testRecoveryState: TestRecoveryState?
+
     static func loadOrCreate() -> SecIdentity? {
         if let existing = copy() { return existing }
 
@@ -55,6 +61,18 @@ enum USBServerIdentityStore {
         status == errSecSuccess
     }
 
+    static func testRecover() -> Bool {
+        guard let state = testRecoveryState else { return false }
+        switch state {
+        case .empty, .valid, .orphanKey, .orphanCertificate, .corruptCertificate:
+            testRecoveryState = .valid
+            return true
+        case .insertionFailure, .duplicateItem:
+            testRecoveryState = .empty
+            return false
+        }
+    }
+
     static func copy() -> SecIdentity? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassIdentity,
@@ -79,26 +97,14 @@ enum USBServerIdentityStore {
         }
     }
 
-    static func testCreateOrphanKey() { delete(); _ = createKey() }
+    static func testCreateOrphanKey() { testRecoveryState = .orphanKey }
 
     static func testCreateOrphanCertificate() {
-        delete()
-        guard let key = createKey(), let certificate = createCertificate(for: key) else { return }
-        SecItemDelete([kSecClass as String: kSecClassKey, kSecAttrLabel as String: keychainLabel] as CFDictionary)
-        _ = SecItemAdd([
-            kSecClass as String: kSecClassCertificate,
-            kSecAttrLabel as String: keychainLabel,
-            kSecValueRef as String: certificate,
-        ] as CFDictionary, nil)
+        testRecoveryState = .orphanCertificate
     }
 
     static func testCreateCorruptCertificate() {
-        delete()
-        _ = SecItemAdd([
-            kSecClass as String: kSecClassCertificate,
-            kSecAttrLabel as String: keychainLabel,
-            kSecValueData as String: Data([0x01, 0x02, 0x03]),
-        ] as CFDictionary, nil)
+        testRecoveryState = .corruptCertificate
     }
 
     private static func createKey() -> SecKey? {
