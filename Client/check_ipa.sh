@@ -76,7 +76,8 @@ if [[ "$CHECK_IPA_MODE" == signed ]]; then
     signed_entitlements="$TEMP_DIR/signed-entitlements.plist"
     codesign -d --entitlements :- "$APP_DIR" > "$signed_entitlements" 2>/dev/null || ipa_fail 'unable to extract signed entitlements'
     SIGNED_APP_ID="$(plutil -extract 'application-identifier' raw -o - "$signed_entitlements")" || ipa_fail 'signed entitlements missing application-identifier'
-    SIGNED_TEAM_ID="$(plutil -extract 'com.apple.developer.team-identifier' raw -o - "$signed_entitlements")" || ipa_fail 'signed entitlements missing team identifier'
+    # This entitlement name contains literal dots; PlistBuddy addresses the literal key.
+    SIGNED_TEAM_ID="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' "$signed_entitlements" 2>/dev/null)" || ipa_fail 'signed entitlements missing team identifier'
 fi
 
 requires_profile=0
