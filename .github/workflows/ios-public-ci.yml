@@ -44,6 +44,8 @@ jobs:
           fi
       - name: Run deterministic IPA validator fixtures
         run: ./Client/scripts/test_check_ipa.sh
+      - name: Run deterministic device dependency search fixtures
+        run: ./Client/scripts/test_verify_device_dependency_search_paths.sh
       - name: Build pinned native dependencies
         run: ./Client/scripts/build_ios_dependencies.sh
       - name: Verify dependency artifacts
@@ -93,15 +95,11 @@ jobs:
           echo 'SIMULATOR_DEPENDENCY_VARIANTS=OpenSSLCrypto:x86_64,libsrtp2:x86_64,libopus:x86_64'
       - name: Verify device dependency search paths
         run: |
-          settings="$(xcodebuild -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj \
+          set -euo pipefail
+          xcodebuild -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj \
             -scheme iPadCasting -configuration Release -sdk iphoneos \
-            -destination 'generic/platform=iOS' -showBuildSettings)"
-          grep -Fq 'ThirdPartyBuild/xcframeworks' <<<"$settings"
-          if grep -Eiq 'iphonesimulator|MacOSX|/opt/homebrew|/usr/local/opt|HostService|SessionAgent|MediaWorker|DriverBroker|MttVDD' <<<"$settings"; then
-            echo 'simulator, macOS, or private Host dependency path selected' >&2
-            exit 1
-          fi
-          echo 'DEVICE_DEPENDENCY_SEARCH_PATH=PASS'
+            -destination 'generic/platform=iOS' -showBuildSettings |
+            ./Client/scripts/verify_device_dependency_search_paths.sh
       - name: Build unsigned iPad device app
         env:
           DERIVED_DATA: ${{ runner.temp }}/r3-device-derived-data

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+settings="$(cat)"
+selected_settings="$(grep -E '^[[:space:]]*(CONFIGURATION_BUILD_DIR|FRAMEWORK_SEARCH_PATHS|HEADER_SEARCH_PATHS|LIBRARY_SEARCH_PATHS|OTHER_LDFLAGS|PLATFORM_NAME|SDKROOT)[[:space:]]*=' <<<"$settings" || true)"
+
+fail() { echo "$*" >&2; exit 1; }
+require_setting() {
+  local pattern="$1" description="$2"
+  grep -Eq "$pattern" <<<"$selected_settings" || fail "missing device setting: $description"
+}
+
+require_setting '^[[:space:]]*SDKROOT[[:space:]]*=[[:space:]]*iphoneos[[:space:]]*$' 'SDKROOT=iphoneos'
+require_setting '^[[:space:]]*PLATFORM_NAME[[:space:]]*=[[:space:]]*iphoneos[[:space:]]*$' 'PLATFORM_NAME=iphoneos'
+require_setting '^[[:space:]]*CONFIGURATION_BUILD_DIR[[:space:]]*=.*iphoneos' 'device CONFIGURATION_BUILD_DIR'
+grep -Fq 'ThirdPartyBuild/xcframeworks' <<<"$selected_settings" || fail 'public ThirdPartyBuild/xcframeworks path missing'
+
+if grep -Eiq 'iphonesimulator|MacOSX|/opt/homebrew|/usr/local/opt|HostService|SessionAgent|MediaWorker|DriverBroker|MttVDD' <<<"$selected_settings"; then
+  fail 'simulator, macOS, or private Host dependency path selected'
+fi
+
+echo 'DEVICE_DEPENDENCY_SEARCH_PATH=PASS'
