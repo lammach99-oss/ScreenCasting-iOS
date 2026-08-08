@@ -8,9 +8,7 @@ enum USBServerIdentityStore {
     static let keychainLabel = "ScreenCasting USB Server Identity"
     private static let applicationTag = Data("com.screencasting.usb-server-identity".utf8)
 
-    #if DEBUG
     static var testCertificateInsertStatus: OSStatus?
-    #endif
 
     static func loadOrCreate() -> SecIdentity? {
         if let existing = copy() { return existing }
@@ -32,11 +30,7 @@ enum USBServerIdentityStore {
                 kSecAttrLabel as String: keychainLabel,
                 kSecValueRef as String: certificate,
             ]
-            #if DEBUG
             let status = testCertificateInsertStatus ?? SecItemAdd(certificateAttributes as CFDictionary, nil)
-            #else
-            let status = SecItemAdd(certificateAttributes as CFDictionary, nil)
-            #endif
             if status == errSecSuccess, let identity = copy() { return identity }
             // The RSA key is permanent. Remove it when certificate persistence
             // fails, including duplicate-item races, then perform one bounded
@@ -76,7 +70,6 @@ enum USBServerIdentityStore {
         }
     }
 
-    #if DEBUG
     static func testCreateOrphanKey() { delete(); _ = createKey() }
 
     static func testCreateOrphanCertificate() {
@@ -98,7 +91,6 @@ enum USBServerIdentityStore {
             kSecValueData as String: Data([0x01, 0x02, 0x03]),
         ] as CFDictionary, nil)
     }
-    #endif
 
     private static func createKey() -> SecKey? {
         let attributes: [String: Any] = [
