@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPUTE="$SCRIPT_DIR/compute_native_dependency_manifest.sh"
 VERIFY="$SCRIPT_DIR/verify_native_dependency_provenance.sh"
+ARTIFACT_HELPER="$SCRIPT_DIR/verify_native_dependency_artifact.sh"
 # shellcheck source=Client/scripts/native_dependency_helpers.sh
 source "$SCRIPT_DIR/native_dependency_helpers.sh"
 TEMP_ROOT="$(mktemp -d)"
@@ -39,6 +40,15 @@ bash "$COMPUTE" "$dependency_root" "$manifest"
 manifest_sha256="$(native_dependency_sha256 "$manifest" | awk '{print $1}')"
 EXPECTED_PUBLIC_SHA="$PUBLIC_SHA" EXPECTED_CACHE_KEY="$CACHE_KEY" EXPECTED_MANIFEST_SHA256="$manifest_sha256" \
   bash "$VERIFY" "$dependency_root" "$manifest"
+
+download_root="$TEMP_ROOT/download"
+destination_root="$TEMP_ROOT/consumer/Client/ThirdPartyBuild"
+mkdir -p "$download_root/Client"
+cp -R "$dependency_root" "$download_root/Client/ThirdPartyBuild"
+cp "$manifest" "$download_root/native-deps.manifest.txt"
+EXPECTED_PUBLIC_SHA="$PUBLIC_SHA" EXPECTED_CACHE_KEY="$CACHE_KEY" EXPECTED_MANIFEST_SHA256="$manifest_sha256" \
+  bash "$ARTIFACT_HELPER" "$download_root" "$destination_root"
+cmp "$dependency_root/build/libcrypto.a" "$destination_root/build/libcrypto.a"
 
 printf 'changed output\n' >> "$dependency_root/build/libcrypto.a"
 expect_fail 'changed generated output' env EXPECTED_PUBLIC_SHA="$PUBLIC_SHA" EXPECTED_CACHE_KEY="$CACHE_KEY" EXPECTED_MANIFEST_SHA256="$manifest_sha256" bash "$VERIFY" "$dependency_root" "$manifest"

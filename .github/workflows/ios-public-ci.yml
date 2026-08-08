@@ -17,16 +17,170 @@ permissions:
   contents: read
 
 concurrency:
-  group: ios-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ios-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || 'ci' }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+env:
+  NATIVE_CACHE_SCHEMA: v1
+  OPENSSL_PIN: openssl-3.3.2-98b3bf1433f8f4a29e64ca8b9bd42c58d3d1b98a
+  LIBSRTP_PIN: 24b3bf8f19b6f5ab4cd2bcceb4f4064efca86fd5
+  OPUS_PIN: ddbe48383984d56acd9e1ab6a090c54ca6b735a6
+  IOS_DEPLOYMENT_TARGET: '17.0'
+  NATIVE_DEVICE_ARCH: arm64
+  NATIVE_SIMULATOR_ARCH: x86_64
 
 jobs:
-  test:
+  prepare-native-deps:
+    name: Prepare verified native dependencies
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    outputs:
+      cache_key: ${{ steps.native-key.outputs.cache_key }}
+      xcode_fingerprint: ${{ steps.native-key.outputs.xcode_fingerprint }}
+      native_manifest_sha256: ${{ steps.native-manifest.outputs.manifest_sha256 }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+      - name: Compute exact native dependency cache key
+        id: native-key
+        run: |
+          set -euo pipefail
+          xcode_fingerprint="$({ xcodebuild -version; xcode-select -p; } | shasum -a 256 | awk '{print substr($1, 1, 16)}')"
+          build_config_hash="$({
+            shasum -a 256 Client/scripts/build_ios_dependencies.sh
+            shasum -a 256 Client/scripts/verify_ios_dependency_artifacts.sh
+            shasum -a 256 Client/scripts/native_dependency_helpers.sh
+            shasum -a 256 Client/iPadZeroLagDisplay/iPadCasting.xcodeproj/project.pbxproj
+            printf '%s\n' \
+              "IPHONEOS_DEPLOYMENT_TARGET=$IOS_DEPLOYMENT_TARGET" \
+              "DEVICE_ARCH=$NATIVE_DEVICE_ARCH" \
+              "SIMULATOR_ARCH=$NATIVE_SIMULATOR_ARCH" \
+              'OPENSSL_DEVICE_TARGET=ios64-xcrun' \
+              'OPENSSL_SIMULATOR_TARGET=iossimulator-x86_64-xcrun' \
+              'CMAKE_SYSTEM_NAME=iOS' \
+              'CODE_SIGNING_ALLOWED=NO' \
+              'CODE_SIGNING_REQUIRED=NO'
+          } | shasum -a 256 | awk '{print substr($1, 1, 16)}')"
+          cache_key="native-ios-${NATIVE_CACHE_SCHEMA}-${RUNNER_OS}-${RUNNER_ARCH}-${xcode_fingerprint}-${OPENSSL_PIN}-${LIBSRTP_PIN}-${OPUS_PIN}-${build_config_hash}"
+          echo "cache_key=$cache_key" >> "$GITHUB_OUTPUT"
+          echo "xcode_fingerprint=$xcode_fingerprint" >> "$GITHUB_OUTPUT"
+          echo "NATIVE_CACHE_SCHEMA=$NATIVE_CACHE_SCHEMA"
+          echo "XCODE_FINGERPRINT=$xcode_fingerprint"
+          echo "NATIVE_CACHE_KEY=$cache_key"
+      - name: Start native dependency cache restore timer
+        id: cache-restore-start
+        run: echo "started_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - name: Restore exact native dependency cache
+        id: native-cache-restore
+        uses: actions/cache/restore@v6
+        with:
+          path: Client/ThirdPartyBuild
+          key: ${{ steps.native-key.outputs.cache_key }}
+      - name: Report native dependency cache result
+        env:
+          CACHE_HIT: ${{ steps.native-cache-restore.outputs.cache-hit }}
+          STARTED_EPOCH: ${{ steps.cache-restore-start.outputs.started_epoch }}
+        run: |
+          set -euo pipefail
+          echo "CACHE_RESTORE_SECONDS=$(( $(date +%s) - STARTED_EPOCH ))"
+          if [[ "$CACHE_HIT" == true ]]; then
+            echo 'Native dependency cache: HIT'
+          else
+            echo 'Native dependency cache: MISS'
+          fi
+      - name: Clear generated dependency root on cache miss
+        if: steps.native-cache-restore.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          rm -rf "$GITHUB_WORKSPACE/Client/ThirdPartyBuild"
+          mkdir -p "$GITHUB_WORKSPACE/Client/ThirdPartyBuild"
+      - name: Build pinned native dependencies on cache miss
+        if: steps.native-cache-restore.outputs.cache-hit != 'true'
+        env:
+          SCREENCASTING_DEP_CACHE: ${{ github.workspace }}/Client/ThirdPartyBuild
+        run: |
+          set -euo pipefail
+          started_epoch=$(date +%s)
+          ./Client/scripts/build_ios_dependencies.sh
+          echo "NATIVE_DEPENDENCY_BUILD_SECONDS=$(( $(date +%s) - started_epoch ))"
+          echo 'OpenSSL build: EXECUTED'
+          echo 'libsrtp build: EXECUTED'
+          echo 'Opus build: EXECUTED'
+      - name: Report native dependency cache-hit compilation skip
+        if: steps.native-cache-restore.outputs.cache-hit == 'true'
+        run: |
+          echo 'OpenSSL build: SKIPPED'
+          echo 'libsrtp build: SKIPPED'
+          echo 'Opus build: SKIPPED'
+      - name: Strictly verify restored or built native dependencies
+        id: native-verify
+        env:
+          DEP_ROOT: ${{ github.workspace }}/Client/ThirdPartyBuild
+        run: |
+          set -euo pipefail
+          started_epoch=$(date +%s)
+          ./Client/scripts/verify_ios_dependency_artifacts.sh \
+            "$DEP_ROOT/xcframeworks" "$DEP_ROOT/build"
+          [[ ! -d "$DEP_ROOT/src" ]] || {
+            echo 'native dependency source clones must not be cached' >&2
+            exit 1
+          }
+          echo "NATIVE_DEPENDENCY_VERIFY_SECONDS=$(( $(date +%s) - started_epoch ))"
+          echo 'NATIVE_DEPENDENCY_VERIFY=PASS'
+      - name: Remove source clones before cache save and artifact staging
+        env:
+          DEP_ROOT: ${{ github.workspace }}/Client/ThirdPartyBuild
+        run: |
+          set -euo pipefail
+          rm -rf "$DEP_ROOT/src"
+          [[ ! -e "$DEP_ROOT/src" ]]
+      - name: Save verified native dependency cache
+        if: ${{ steps.native-cache-restore.outputs.cache-hit != 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@v6
+        with:
+          path: Client/ThirdPartyBuild
+          key: ${{ steps.native-key.outputs.cache_key }}
+      - name: Stage verified native dependency artifact and manifest
+        id: native-manifest
+        env:
+          DEP_ROOT: ${{ github.workspace }}/Client/ThirdPartyBuild
+          PUBLIC_SHA: ${{ github.sha }}
+          CACHE_SCHEMA: ${{ env.NATIVE_CACHE_SCHEMA }}
+          CACHE_KEY: ${{ steps.native-key.outputs.cache_key }}
+          XCODE_FINGERPRINT: ${{ steps.native-key.outputs.xcode_fingerprint }}
+          OPENSSL_PIN: ${{ env.OPENSSL_PIN }}
+          LIBSRTP_PIN: ${{ env.LIBSRTP_PIN }}
+          OPUS_PIN: ${{ env.OPUS_PIN }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/native-deps-artifact"
+          rm -rf "$stage"
+          mkdir -p "$stage/Client"
+          cp -R "$DEP_ROOT" "$stage/Client/ThirdPartyBuild"
+          bash ./Client/scripts/compute_native_dependency_manifest.sh \
+            "$stage/Client/ThirdPartyBuild" "$stage/native-deps.manifest.txt"
+          source ./Client/scripts/native_dependency_helpers.sh
+          manifest_sha256="$(native_dependency_sha256 "$stage/native-deps.manifest.txt" | awk '{print $1}')"
+          echo "manifest_sha256=$manifest_sha256" >> "$GITHUB_OUTPUT"
+          echo "NATIVE_DEPENDENCY_MANIFEST_SHA256=$manifest_sha256"
+      - name: Upload verified native dependency artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ScreenCasting-native-deps
+          path: |
+            ${{ runner.temp }}/native-deps-artifact/Client/ThirdPartyBuild
+            ${{ runner.temp }}/native-deps-artifact/native-deps.manifest.txt
+          if-no-files-found: error
+          retention-days: 3
+
+  build-and-test:
     name: Build and XCTest
+    needs: prepare-native-deps
     runs-on: macos-15-intel
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
       - name: Verify iPad-only target
@@ -42,57 +196,88 @@ jobs:
             echo 'disconnected recovery test seam remains' >&2
             exit 1
           fi
+      - name: Run fast feedback workflow fixtures
+        run: ./Client/scripts/test_workflow_fast_feedback.sh
       - name: Run deterministic IPA validator fixtures
         run: ./Client/scripts/test_check_ipa.sh
       - name: Run deterministic device dependency search fixtures
         run: ./Client/scripts/test_verify_device_dependency_search_paths.sh
-      - name: Build pinned native dependencies
-        run: ./Client/scripts/build_ios_dependencies.sh
-      - name: Verify dependency artifacts
+      - name: Download verified native dependency artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ScreenCasting-native-deps
+          path: ${{ runner.temp }}/native-deps-download
+      - name: Verify and install native dependency artifact
+        env:
+          EXPECTED_PUBLIC_SHA: ${{ github.sha }}
+          EXPECTED_CACHE_KEY: ${{ needs.prepare-native-deps.outputs.cache_key }}
+          EXPECTED_MANIFEST_SHA256: ${{ needs.prepare-native-deps.outputs.native_manifest_sha256 }}
         run: |
-          cache_root="${SCREENCASTING_DEP_CACHE:-${TMPDIR:-/tmp}/screencasting-ios-deps}"
+          set -euo pipefail
+          started_epoch=$(date +%s)
+          bash ./Client/scripts/verify_native_dependency_artifact.sh \
+            "$RUNNER_TEMP/native-deps-download" "$GITHUB_WORKSPACE/Client/ThirdPartyBuild"
           ./Client/scripts/verify_ios_dependency_artifacts.sh \
             "$GITHUB_WORKSPACE/Client/ThirdPartyBuild/xcframeworks" \
-            "$cache_root/build"
+            "$GITHUB_WORKSPACE/Client/ThirdPartyBuild/build"
+          echo "NATIVE_DEPENDENCY_ARTIFACT_VERIFY_SECONDS=$(( $(date +%s) - started_epoch ))"
+          echo 'NATIVE_DEPENDENCY_CONSUMER_VERIFY=PASS'
       - name: Build unsigned iOS Simulator app
-        run: >-
-          xcodebuild -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj
-          -scheme iPadCasting -destination 'generic/platform=iOS Simulator'
-          ARCHS=x86_64 ONLY_ACTIVE_ARCH=YES
-          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+        run: |
+          set -euo pipefail
+          started_epoch=$(date +%s)
+          xcodebuild -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj \
+            -scheme iPadCasting -destination 'generic/platform=iOS Simulator' \
+            ARCHS=x86_64 ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+          echo "SIMULATOR_BUILD_SECONDS=$(( $(date +%s) - started_epoch ))"
       - name: Run XCTest
         run: |
+          set -euo pipefail
+          started_epoch=$(date +%s)
           destination=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(("platform=iOS Simulator,id="+device["udid"]+",arch=x86_64" for devices in data.get("devices", {}).values() for device in devices if device.get("isAvailable") and "iPad" in device.get("name", "")), ""))')
           test -n "$destination"
           xcodebuild test -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj \
             -scheme iPadCasting -destination "$destination" \
             ARCHS=x86_64 ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          echo "XCTEST_SECONDS=$(( $(date +%s) - started_epoch ))"
 
-  unsigned-ipad-ipa:
-    name: Unsigned iPad IPA
-    needs: test
-    if: github.event_name == 'workflow_dispatch' && inputs.build_unsigned_ipa == true && needs.test.result == 'success'
+  build-unsigned-ipad-app:
+    name: Build unsigned iPad app
+    needs: [prepare-native-deps, build-and-test]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_unsigned_ipa == true && needs.prepare-native-deps.result == 'success' && needs.build-and-test.result == 'success' }}
     runs-on: macos-15-intel
     timeout-minutes: 45
-    permissions:
-      contents: read
+    outputs:
+      app_manifest_sha256: ${{ steps.app-manifest.outputs.manifest_sha256 }}
+      native_manifest_sha256: ${{ needs.prepare-native-deps.outputs.native_manifest_sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
       - name: Verify iPad-only target
         run: ./Client/scripts/verify_ipad_target.sh
-      - name: Build pinned native dependencies for device
-        run: ./Client/scripts/build_ios_dependencies.sh
-      - name: Verify device and simulator dependency slices
+      - name: Download verified native dependency artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ScreenCasting-native-deps
+          path: ${{ runner.temp }}/native-deps-download
+      - name: Verify and install native dependency artifact
+        env:
+          EXPECTED_PUBLIC_SHA: ${{ github.sha }}
+          EXPECTED_CACHE_KEY: ${{ needs.prepare-native-deps.outputs.cache_key }}
+          EXPECTED_MANIFEST_SHA256: ${{ needs.prepare-native-deps.outputs.native_manifest_sha256 }}
         run: |
-          cache_root="${SCREENCASTING_DEP_CACHE:-${TMPDIR:-/tmp}/screencasting-ios-deps}"
+          set -euo pipefail
+          started_epoch=$(date +%s)
+          bash ./Client/scripts/verify_native_dependency_artifact.sh \
+            "$RUNNER_TEMP/native-deps-download" "$GITHUB_WORKSPACE/Client/ThirdPartyBuild"
           ./Client/scripts/verify_ios_dependency_artifacts.sh \
             "$GITHUB_WORKSPACE/Client/ThirdPartyBuild/xcframeworks" \
-            "$cache_root/build"
-          echo 'DEVICE_DEPENDENCY_VARIANTS=OpenSSLCrypto:arm64,libsrtp2:arm64,libopus:arm64'
-          echo 'SIMULATOR_DEPENDENCY_VARIANTS=OpenSSLCrypto:x86_64,libsrtp2:x86_64,libopus:x86_64'
+            "$GITHUB_WORKSPACE/Client/ThirdPartyBuild/build"
+          echo "NATIVE_DEPENDENCY_ARTIFACT_VERIFY_SECONDS=$(( $(date +%s) - started_epoch ))"
+          echo 'NATIVE_DEPENDENCY_CONSUMER_VERIFY=PASS'
       - name: Verify device dependency search paths
         run: |
           set -euo pipefail
@@ -105,59 +290,154 @@ jobs:
           DERIVED_DATA: ${{ runner.temp }}/r3-device-derived-data
         run: |
           set -euo pipefail
+          started_epoch=$(date +%s)
           rm -rf "$DERIVED_DATA"
           xcodebuild -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj \
             -scheme iPadCasting -configuration Release \
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$DERIVED_DATA" \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            TARGETED_DEVICE_FAMILY=2 \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' build \
             2>&1 | tee "$RUNNER_TEMP/r3-device-build.log"
+          echo "DEVICE_APP_BUILD_SECONDS=$(( $(date +%s) - started_epoch ))"
           mapfile -t apps < <(find "$DERIVED_DATA/Build/Products/Release-iphoneos" \
             -maxdepth 1 -type d -name '*.app' -print)
           [[ "${#apps[@]}" == 1 ]]
           [[ "$(basename "${apps[0]}")" == 'iPadCasting.app' ]]
           printf 'DEVICE_APP=%s\n' "${apps[0]}"
-      - name: Validate unsigned iPad app before packaging
+          echo "APP_PATH=${apps[0]}" >> "$GITHUB_ENV"
+      - name: Validate unsigned iPad app
         env:
-          DERIVED_DATA: ${{ runner.temp }}/r3-device-derived-data
+          EXPECTED_BUNDLE_IDENTIFIER: com.iPadZeroLagDisplay.client
         run: |
+          set -euo pipefail
           shopt -s nullglob
-          apps=("$DERIVED_DATA/Build/Products/Release-iphoneos"/*.app)
-          [[ "${#apps[@]}" == 1 ]]
-          EXPECTED_BUNDLE_IDENTIFIER=com.iPadZeroLagDisplay.client \
+          apps=("$APP_PATH")
+          [[ "${#apps[@]}" == 1 && -d "${apps[0]}" ]]
+          started_epoch=$(date +%s)
+          EXPECTED_BUNDLE_IDENTIFIER="$EXPECTED_BUNDLE_IDENTIFIER" \
             ./Client/scripts/validate_unsigned_app.sh "${apps[0]}"
-      - name: Package unsigned iPad IPA
+          echo "UNSIGNED_APP_VALIDATION_SECONDS=$(( $(date +%s) - started_epoch ))"
+          echo 'UNSIGNED_APP_VALIDATION=PASS'
+      - name: Create unsigned app provenance manifest
+        id: app-manifest
         env:
-          DERIVED_DATA: ${{ runner.temp }}/r3-device-derived-data
+          APP_ARTIFACT_ROOT: ${{ runner.temp }}/unsigned-app-artifact
+          NATIVE_MANIFEST_SHA256: ${{ needs.prepare-native-deps.outputs.native_manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          rm -rf "$APP_ARTIFACT_ROOT"
+          mkdir -p "$APP_ARTIFACT_ROOT"
+          executable="$(plutil -extract CFBundleExecutable raw -o - "$APP_PATH/Info.plist")"
+          bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$APP_PATH/Info.plist")"
+          bundle_version="$(plutil -extract CFBundleVersion raw -o - "$APP_PATH/Info.plist")"
+          short_version="$(plutil -extract CFBundleShortVersionString raw -o - "$APP_PATH/Info.plist")"
+          [[ "$bundle_id" == 'com.iPadZeroLagDisplay.client' ]]
+          [[ "$(lipo -archs "$APP_PATH/$executable")" == 'arm64' ]]
+          cp -R "$APP_PATH" "$APP_ARTIFACT_ROOT/iPadCasting.app"
+          manifest="$APP_ARTIFACT_ROOT/ScreenCasting-iPad-unsigned-app.manifest.txt"
+          cat > "$manifest" <<EOF
+          Manifest-Version: 1
+          Product: ScreenCasting iPad Client
+          Public SHA: $GITHUB_SHA
+          CFBundleIdentifier: $bundle_id
+          CFBundleVersion: $bundle_version
+          CFBundleShortVersionString: $short_version
+          Targeted Device Family: 2
+          Architecture: arm64
+          Signing: unsigned
+          Native Dependencies Manifest SHA-256: $NATIVE_MANIFEST_SHA256
+          Validation: PASS
+          EOF
+          grep -Fq "Public SHA: $GITHUB_SHA" "$manifest"
+          manifest_sha256="$(shasum -a 256 "$manifest" | awk '{print $1}')"
+          echo "manifest_sha256=$manifest_sha256" >> "$GITHUB_OUTPUT"
+          echo "APP_MANIFEST_SHA256=$manifest_sha256"
+      - name: Upload unsigned iPad app artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ScreenCasting-iPad-unsigned-app
+          path: ${{ runner.temp }}/unsigned-app-artifact
+          if-no-files-found: error
+          retention-days: 3
+
+  package-unsigned-ipa:
+    name: Package unsigned iPad IPA
+    needs: build-unsigned-ipad-app
+    if: ${{ needs.build-unsigned-ipad-app.result == 'success' }}
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    outputs:
+      final_manifest_sha256: ${{ steps.final-manifest.outputs.manifest_sha256 }}
+      app_manifest_sha256: ${{ needs.build-unsigned-ipad-app.outputs.app_manifest_sha256 }}
+      native_manifest_sha256: ${{ needs.build-unsigned-ipad-app.outputs.native_manifest_sha256 }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download unsigned iPad app artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ScreenCasting-iPad-unsigned-app
+          path: ${{ runner.temp }}/unsigned-app-download
+      - name: Verify unsigned app provenance
+        env:
+          EXPECTED_APP_MANIFEST_SHA256: ${{ needs.build-unsigned-ipad-app.outputs.app_manifest_sha256 }}
+          EXPECTED_NATIVE_MANIFEST_SHA256: ${{ needs.build-unsigned-ipad-app.outputs.native_manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          download_root="$RUNNER_TEMP/unsigned-app-download"
+          mapfile -t apps < <(find "$download_root" -type d -name '*.app' -print)
+          mapfile -t manifests < <(find "$download_root" -type f -name '*-app.manifest.txt' -print)
+          [[ "${#apps[@]}" == 1 && "${#manifests[@]}" == 1 ]]
+          app_path="${apps[0]}"
+          manifest_path="${manifests[0]}"
+          manifest_sha256="$(shasum -a 256 "$manifest_path" | awk '{print $1}')"
+          [[ "$manifest_sha256" == "$EXPECTED_APP_MANIFEST_SHA256" ]]
+          field() { awk -F': ' -v key="$1" '$1 == key { print substr($0, length($1) + 3); exit }' "$manifest_path"; }
+          [[ "$(field 'Public SHA')" == "$GITHUB_SHA" ]]
+          [[ "$(field 'Targeted Device Family')" == '2' ]]
+          [[ "$(field 'Architecture')" == 'arm64' ]]
+          [[ "$(field 'Native Dependencies Manifest SHA-256')" == "$EXPECTED_NATIVE_MANIFEST_SHA256" ]]
+          EXPECTED_BUNDLE_IDENTIFIER=com.iPadZeroLagDisplay.client \
+            ./Client/scripts/validate_unsigned_app.sh "$app_path"
+          echo 'UNSIGNED_APP_ARTIFACT_PROVENANCE=PASS'
+      - name: Package unsigned IPA
+        env:
           IPA_PATH: ${{ runner.temp }}/ScreenCasting-iPad-unsigned.ipa
           PACKAGE_ROOT: ${{ runner.temp }}/r3-ipa-root
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          apps=("$DERIVED_DATA/Build/Products/Release-iphoneos"/*.app)
-          [[ "${#apps[@]}" == 1 ]]
+          started_epoch=$(date +%s)
+          app_path="$(find "$RUNNER_TEMP/unsigned-app-download" -type d -name '*.app' -print -quit)"
           rm -rf "$PACKAGE_ROOT" "$IPA_PATH"
           mkdir -p "$PACKAGE_ROOT/Payload"
-          cp -R "${apps[0]}" "$PACKAGE_ROOT/Payload/iPadCasting.app"
+          cp -R "$app_path" "$PACKAGE_ROOT/Payload/iPadCasting.app"
           (cd "$PACKAGE_ROOT" && zip -qry "$IPA_PATH" Payload)
           test -f "$IPA_PATH"
+          echo "IPA_PACKAGE_SECONDS=$(( $(date +%s) - started_epoch ))"
           echo 'UNSIGNED_IPA_PACKAGING=PASS'
       - name: Validate packaged unsigned IPA
         env:
           IPA_PATH: ${{ runner.temp }}/ScreenCasting-iPad-unsigned.ipa
         run: |
+          set -euo pipefail
+          started_epoch=$(date +%s)
           EXPECTED_BUNDLE_IDENTIFIER=com.iPadZeroLagDisplay.client \
             ./Client/check_ipa.sh --unsigned "$IPA_PATH" | tee "$RUNNER_TEMP/r3-unsigned-validator.log"
+          echo "IPA_VALIDATION_SECONDS=$(( $(date +%s) - started_epoch ))"
           echo 'UNSIGNED_IPA_VALIDATION=PASS'
       - name: Create unsigned IPA provenance manifest
+        id: final-manifest
         env:
           IPA_PATH: ${{ runner.temp }}/ScreenCasting-iPad-unsigned.ipa
+          APP_MANIFEST_SHA256: ${{ needs.build-unsigned-ipad-app.outputs.app_manifest_sha256 }}
+          NATIVE_MANIFEST_SHA256: ${{ needs.build-unsigned-ipad-app.outputs.native_manifest_sha256 }}
           MANIFEST_PATH: ${{ runner.temp }}/ScreenCasting-iPad-unsigned.manifest.txt
         run: |
           set -euo pipefail
           ipa_sha256="$(shasum -a 256 "$IPA_PATH" | awk '{print $1}')"
           cat > "$MANIFEST_PATH" <<EOF
+          Manifest-Version: 1
           Product: ScreenCasting iPad Client
           Public SHA: $GITHUB_SHA
           Workflow Run: $GITHUB_RUN_ID
@@ -167,18 +447,20 @@ jobs:
           Targeted Device Family: 2
           Signing: unsigned
           Validator: PASS
-          OpenSSL pin: openssl-3.3.2 (tag object 98b3bf1433f8f4a29e64ca8b9bd42c58d3d1b98a)
-          libsrtp pin: 24b3bf8f19b6f5ab4cd2bcceb4f4064efca86fd5
-          Opus pin: ddbe48383984d56acd9e1ab6a090c54ca6b735a6
+          App Manifest SHA-256: $APP_MANIFEST_SHA256
+          Native Dependencies Manifest SHA-256: $NATIVE_MANIFEST_SHA256
           IPA filename: ScreenCasting-iPad-unsigned.ipa
           IPA SHA-256: $ipa_sha256
           EOF
           grep -Fq "Public SHA: $GITHUB_SHA" "$MANIFEST_PATH"
           grep -Fq "IPA SHA-256: $ipa_sha256" "$MANIFEST_PATH"
+          manifest_sha256="$(shasum -a 256 "$MANIFEST_PATH" | awk '{print $1}')"
+          echo "manifest_sha256=$manifest_sha256" >> "$GITHUB_OUTPUT"
           echo "IPA_SHA256=$ipa_sha256"
+          echo "FINAL_MANIFEST_SHA256=$manifest_sha256"
           echo 'SHA256_MANIFEST=PASS'
       - name: Upload unsigned iPad IPA artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ScreenCasting-iPad-unsigned
           path: |
@@ -187,37 +469,48 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  revalidate-unsigned-artifact:
+  revalidate-uploaded-ipa:
     name: Revalidate uploaded unsigned IPA
-    needs: unsigned-ipad-ipa
-    if: needs.unsigned-ipad-ipa.result == 'success'
+    needs: package-unsigned-ipa
+    if: ${{ needs.package-unsigned-ipa.result == 'success' }}
     runs-on: macos-15-intel
     timeout-minutes: 15
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Download uploaded unsigned IPA artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ScreenCasting-iPad-unsigned
           path: ${{ runner.temp }}/r3-downloaded
       - name: Revalidate downloaded unsigned IPA and SHA-256
+        env:
+          EXPECTED_FINAL_MANIFEST_SHA256: ${{ needs.package-unsigned-ipa.outputs.final_manifest_sha256 }}
+          EXPECTED_APP_MANIFEST_SHA256: ${{ needs.package-unsigned-ipa.outputs.app_manifest_sha256 }}
+          EXPECTED_NATIVE_MANIFEST_SHA256: ${{ needs.package-unsigned-ipa.outputs.native_manifest_sha256 }}
         run: |
           set -euo pipefail
-          download_root="${{ runner.temp }}/r3-downloaded"
+          started_epoch=$(date +%s)
+          download_root="$RUNNER_TEMP/r3-downloaded"
           mapfile -t ipas < <(find "$download_root" -type f -name '*.ipa' -print)
           mapfile -t manifests < <(find "$download_root" -type f -name '*.manifest.txt' -print)
           [[ "${#ipas[@]}" == 1 && "${#manifests[@]}" == 1 ]]
           ipa_path="${ipas[0]}"
           manifest_path="${manifests[0]}"
-          expected_sha256="$(awk -F': ' '$1 == "IPA SHA-256" {print $2; exit}' "$manifest_path")"
+          actual_manifest_sha256="$(shasum -a 256 "$manifest_path" | awk '{print $1}')"
+          [[ "$actual_manifest_sha256" == "$EXPECTED_FINAL_MANIFEST_SHA256" ]]
+          field() { awk -F': ' -v key="$1" '$1 == key { print substr($0, length($1) + 3); exit }' "$manifest_path"; }
+          expected_sha256="$(field 'IPA SHA-256')"
           actual_sha256="$(shasum -a 256 "$ipa_path" | awk '{print $1}')"
           [[ -n "$expected_sha256" && "$actual_sha256" == "$expected_sha256" ]]
-          expected_public_sha="$(awk -F': ' '$1 == "Public SHA" {print $2; exit}' "$manifest_path")"
-          [[ "$expected_public_sha" == "$GITHUB_SHA" ]]
-          output="$(./Client/check_ipa.sh --unsigned "$ipa_path")"
-          grep -Fq 'CODE_SIGNATURE=NOT_REQUIRED_UNSIGNED_MODE' <<<"$output"
-          grep -Fq 'PROVISIONING_PROFILE=NOT_REQUIRED_UNSIGNED_MODE' <<<"$output"
+          [[ "$(field 'Public SHA')" == "$GITHUB_SHA" ]]
+          [[ "$(field 'Architecture')" == 'arm64' ]]
+          [[ "$(field 'Targeted Device Family')" == '2' ]]
+          [[ "$(field 'App Manifest SHA-256')" == "$EXPECTED_APP_MANIFEST_SHA256" ]]
+          [[ "$(field 'Native Dependencies Manifest SHA-256')" == "$EXPECTED_NATIVE_MANIFEST_SHA256" ]]
+          EXPECTED_BUNDLE_IDENTIFIER=com.iPadZeroLagDisplay.client \
+            ./Client/check_ipa.sh --unsigned "$ipa_path"
           echo "DOWNLOADED_IPA_SHA256=$actual_sha256"
+          echo "DOWNLOADED_ARTIFACT_REVALIDATION_SECONDS=$(( $(date +%s) - started_epoch ))"
           echo 'DOWNLOADED_ARTIFACT_REVALIDATION=PASS'
