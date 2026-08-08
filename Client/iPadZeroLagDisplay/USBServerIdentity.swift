@@ -26,12 +26,6 @@ enum USBServerIdentityStore {
                 delete()
                 continue
             }
-            var identity: SecIdentity?
-            guard SecIdentityCreateWithCertificate(nil, certificate, &identity) == errSecSuccess,
-                  let identity else {
-                delete()
-                continue
-            }
 
             let certificateAttributes: [String: Any] = [
                 kSecClass as String: kSecClassCertificate,
@@ -43,7 +37,7 @@ enum USBServerIdentityStore {
             #else
             let status = SecItemAdd(certificateAttributes as CFDictionary, nil)
             #endif
-            if status == errSecSuccess { return identity }
+            if status == errSecSuccess, let identity = copy() { return identity }
             // The RSA key is permanent. Remove it when certificate persistence
             // fails, including duplicate-item races, then perform one bounded
             // regeneration attempt in this call.
@@ -69,7 +63,7 @@ enum USBServerIdentityStore {
         guard SecItemCopyMatching(query as CFDictionary, &value) == errSecSuccess,
               let value,
               CFGetTypeID(value) == SecIdentityGetTypeID() else { return nil }
-        return value as! SecIdentity
+        return unsafeBitCast(value, to: SecIdentity.self)
     }
 
     static func delete() {
