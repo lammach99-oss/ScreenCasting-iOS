@@ -2,6 +2,20 @@
 
 This guide walks you through compiling and sideloading the **iPadCasting** Swift/Metal client application onto your physical iPad using Xcode on macOS.
 
+## R3 public CI artifact and local Windows signing
+
+The public workflow can be dispatched with `build_unsigned_ipa=true` to build
+and validate an unsigned physical-iPad IPA. Download the
+`ScreenCasting-iPad-unsigned` artifact from the completed GitHub Actions run
+and move the IPA to the Windows PC used for local signing.
+
+Use the user's local 3uTools workflow with their own Apple ID/free provisioning
+and intended iPad, then install the resulting locally signed IPA. Free
+provisioning may require periodic re-signing. Do not put Apple ID, iCloud, or
+3uTools credentials in this repository or GitHub Actions; 3uTools is external
+local tooling and is not run by CI. The GitHub artifact is unsigned, and
+physical iPad qualification remains NOT RUN / DEFERRED.
+
 ---
 
 ## 📋 Prerequisites
