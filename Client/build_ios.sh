@@ -59,5 +59,5 @@ echo "==========================================================="
 CHECK_SCRIPT="$REPO_ROOT/Client/check_ipa.sh"
 if [ -f "$CHECK_SCRIPT" ]; then
     chmod +x "$CHECK_SCRIPT"
-    "$CHECK_SCRIPT" "$IPA_PATH"
+    "$CHECK_SCRIPT" --unsigned "$IPA_PATH"
 fi

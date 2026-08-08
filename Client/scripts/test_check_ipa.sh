@@ -7,7 +7,7 @@ CHECK_IPA="$CLIENT_DIR/check_ipa.sh"
 # shellcheck source=Client/scripts/ipa_validation_helpers.sh
 source "$SCRIPT_DIR/ipa_validation_helpers.sh"
 
-if grep -q 'Entitlements:' "$CHECK_IPA" || ! grep -Fq 'Entitlements.application-identifier' "$CHECK_IPA" || ! grep -Fq 'Entitlements.com\.apple\.developer\.team-identifier' "$CHECK_IPA" || ! grep -Fq 'com\.apple\.developer\.team-identifier' "$CHECK_IPA"; then
+if grep -q 'Entitlements:' "$CHECK_IPA" || ! grep -Fq 'Entitlements.application-identifier' "$CHECK_IPA" || ! grep -Fq 'Entitlements.com\.apple\.developer\.team-identifier' "$CHECK_IPA" || ! grep -Fq 'com\.apple\.developer\.team-identifier' "$CHECK_IPA" || ! grep -Fq -- '--signed|--unsigned' "$CHECK_IPA"; then
     ipa_fail 'check_ipa profile paths are not dot-delimited'
 fi
 
@@ -18,6 +18,16 @@ command -v /usr/libexec/PlistBuddy >/dev/null || ipa_fail 'missing fixture tool:
 
 TEMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEMP_DIR"' EXIT
+MOCK_BIN="$TEMP_DIR/mock-bin"
+mkdir -p "$MOCK_BIN"
+
+cat > "$MOCK_BIN/otool" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${1:-}" == -L && -n "${2:-}" ]] || exit 1
+printf '%s:\n' "$2"
+EOF
+chmod +x "$MOCK_BIN/otool"
 
 cat > "$TEMP_DIR/fixture.c" <<'EOF'
 int screencasting_fixture(void) {
@@ -26,6 +36,7 @@ int screencasting_fixture(void) {
 EOF
 clang -target arm64-apple-ios17.0 -c "$TEMP_DIR/fixture.c" -o "$TEMP_DIR/arm64.o"
 clang -target x86_64-apple-ios17.0 -c "$TEMP_DIR/fixture.c" -o "$TEMP_DIR/x86_64.o"
+clang -target arm64e-apple-ios17.0 -c "$TEMP_DIR/fixture.c" -o "$TEMP_DIR/arm64e.o"
 lipo -create "$TEMP_DIR/arm64.o" "$TEMP_DIR/x86_64.o" -output "$TEMP_DIR/fat.o"
 
 make_ipa() {
@@ -64,30 +75,46 @@ EOF
 positive="$TEMP_DIR/positive.ipa"
 wrong_bundle="$TEMP_DIR/wrong-bundle.ipa"
 iphone_family="$TEMP_DIR/iphone-family.ipa"
+missing_ipad_family="$TEMP_DIR/missing-ipad-family.ipa"
 fat_architecture="$TEMP_DIR/fat-architecture.ipa"
+unknown_architecture="$TEMP_DIR/unknown-architecture.ipa"
+ambiguous_payload="$TEMP_DIR/ambiguous-payload.ipa"
 make_ipa "$positive" 'com.iPadZeroLagDisplay.client' '2' "$TEMP_DIR/arm64.o"
 make_ipa "$wrong_bundle" 'com.example.wrong' '2' "$TEMP_DIR/arm64.o"
 make_ipa "$iphone_family" 'com.iPadZeroLagDisplay.client' '1 2' "$TEMP_DIR/arm64.o"
+make_ipa "$missing_ipad_family" 'com.iPadZeroLagDisplay.client' '1' "$TEMP_DIR/arm64.o"
 make_ipa "$fat_architecture" 'com.iPadZeroLagDisplay.client' '2' "$TEMP_DIR/fat.o"
+make_ipa "$unknown_architecture" 'com.iPadZeroLagDisplay.client' '2' "$TEMP_DIR/arm64e.o"
 
-CHECK_IPA_TEST_MODE=1 CHECK_IPA_MODE=unsigned EXPORT_METHOD=none "$CHECK_IPA" "$positive" >/dev/null
+ambiguous_stage="$TEMP_DIR/ambiguous-stage"
+mkdir -p "$ambiguous_stage"
+unzip -q "$positive" -d "$ambiguous_stage"
+cp -R "$ambiguous_stage/Payload/iPadCasting.app" "$ambiguous_stage/Payload/Unexpected.app"
+(cd "$ambiguous_stage" && zip -q -r "$ambiguous_payload" Payload)
+
+unsigned_output="$(PATH="$MOCK_BIN:$PATH" "$CHECK_IPA" --unsigned "$positive")"
+grep -Fqx 'CODE_SIGNATURE=NOT_REQUIRED_UNSIGNED_MODE' <<<"$unsigned_output"
+grep -Fqx 'PROVISIONING_PROFILE=NOT_REQUIRED_UNSIGNED_MODE' <<<"$unsigned_output"
 
 expect_unsigned_failure() {
     local label path method
     label="$1"
     path="$2"
     method="${3:-none}"
-    if CHECK_IPA_TEST_MODE=1 CHECK_IPA_MODE=unsigned EXPORT_METHOD="$method" "$CHECK_IPA" "$path" >/dev/null 2>&1; then
+    if PATH="$MOCK_BIN:$PATH" EXPORT_METHOD="$method" "$CHECK_IPA" --unsigned "$path" >/dev/null 2>&1; then
         ipa_fail "$label unexpectedly passed"
     fi
 }
 
 expect_unsigned_failure 'wrong bundle fixture' "$wrong_bundle"
 expect_unsigned_failure 'iPhone-family fixture' "$iphone_family"
+expect_unsigned_failure 'missing iPad-family fixture' "$missing_ipad_family"
 expect_unsigned_failure 'fat-architecture fixture' "$fat_architecture"
+expect_unsigned_failure 'unknown-architecture fixture' "$unknown_architecture"
+expect_unsigned_failure 'ambiguous Payload fixture' "$ambiguous_payload"
 expect_unsigned_failure 'missing provisioning fixture' "$positive" app-store
 
-if CHECK_IPA_MODE=signed EXPORT_METHOD=app-store EXPECTED_TEAM_ID=ABCDE12345 "$CHECK_IPA" "$positive" >/dev/null 2>&1; then
+if EXPORT_METHOD=app-store EXPECTED_TEAM_ID=ABCDE12345 "$CHECK_IPA" --signed "$positive" >/dev/null 2>&1; then
     ipa_fail 'unsigned fixture unexpectedly passed signed validation'
 fi
 
@@ -121,8 +148,6 @@ fi
 
 TEAM_ID='ABCDE12345'
 BUNDLE_ID='com.iPadZeroLagDisplay.client'
-MOCK_BIN="$TEMP_DIR/mock-bin"
-mkdir -p "$MOCK_BIN"
 
 cat > "$TEMP_DIR/entitlements.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -157,6 +182,7 @@ cat > "$MOCK_BIN/codesign" <<'EOF'
 set -euo pipefail
 case "${1:-}" in
     --verify)
+        [[ "${2:-}" == --deep && "${3:-}" == --strict && "${4:-}" == --verbose=2 && -n "${5:-}" ]] || exit 1
         exit 0
         ;;
     -dvvv)
@@ -211,8 +237,8 @@ run_mock_signed_validation() {
         MOCK_PROFILE_SOURCE="$profile_source" \
         MOCK_TEAM_ID="$TEAM_ID" \
         MOCK_BUNDLE_ID="$BUNDLE_ID" \
-        CHECK_IPA_MODE=signed EXPORT_METHOD=app-store EXPECTED_TEAM_ID="$TEAM_ID" \
-        "$CHECK_IPA" "$ipa_path"
+        EXPORT_METHOD=app-store EXPECTED_TEAM_ID="$TEAM_ID" \
+        "$CHECK_IPA" --signed "$ipa_path"
 }
 
 run_mock_signed_validation "$valid_profile" "$signed_ipa" >/dev/null

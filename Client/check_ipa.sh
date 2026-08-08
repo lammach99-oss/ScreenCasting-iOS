@@ -5,13 +5,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=Client/scripts/ipa_validation_helpers.sh
 source "$SCRIPT_DIR/scripts/ipa_validation_helpers.sh"
 
-IPA_PATH="${1:?usage: EXPORT_METHOD=<method> $0 <path-to-ipa-file>}"
 EXPECTED_BUNDLE_IDENTIFIER="${EXPECTED_BUNDLE_IDENTIFIER:-com.iPadZeroLagDisplay.client}"
 EXPECTED_APP_NAME="${EXPECTED_APP_NAME:-iPadCasting.app}"
 EXPECTED_TEAM_ID="${EXPECTED_TEAM_ID:-}"
-EXPORT_METHOD="${EXPORT_METHOD:-app-store}"
-CHECK_IPA_MODE="${CHECK_IPA_MODE:-signed}"
-CHECK_IPA_TEST_MODE="${CHECK_IPA_TEST_MODE:-0}"
+
+usage() {
+    printf 'usage: %s --signed|--unsigned <path-to-ipa-file>\n' "$0" >&2
+}
+
+[[ "$#" == 2 ]] || { usage; exit 2; }
+case "$1" in
+    --signed)
+        CHECK_IPA_MODE=signed
+        EXPORT_METHOD="${EXPORT_METHOD:-app-store}"
+        ;;
+    --unsigned)
+        CHECK_IPA_MODE=unsigned
+        EXPORT_METHOD="${EXPORT_METHOD:-none}"
+        ;;
+    *)
+        usage
+        exit 2
+        ;;
+esac
+IPA_PATH="$2"
 
 [[ -f "$IPA_PATH" ]] || ipa_fail "missing IPA: $IPA_PATH"
 case "$CHECK_IPA_MODE" in
@@ -21,10 +38,6 @@ case "$CHECK_IPA_MODE" in
         ipa_fail "CHECK_IPA_MODE must be signed or unsigned, got $CHECK_IPA_MODE"
         ;;
 esac
-if [[ "$CHECK_IPA_MODE" == unsigned ]]; then
-    [[ "$CHECK_IPA_TEST_MODE" == 1 ]] || ipa_fail 'unsigned mode is restricted to explicit deterministic fixtures'
-fi
-
 for tool in unzip plutil lipo; do
     command -v "$tool" >/dev/null || ipa_fail "missing required tool: $tool"
 done
@@ -62,6 +75,12 @@ EXEC_PATH="$APP_DIR/$executable"
 [[ -f "$EXEC_PATH" ]] || ipa_fail "missing declared executable: $EXEC_PATH"
 architecture="$(lipo -archs "$EXEC_PATH" 2>/dev/null)" || ipa_fail 'unable to inspect executable architectures'
 ipa_require_exact_architecture "$architecture" 'arm64'
+
+if [[ "$CHECK_IPA_MODE" == unsigned ]]; then
+    ipa_require_unsigned_material_absent "$APP_DIR"
+    ipa_require_public_content_boundary "$APP_DIR"
+    ipa_require_no_simulator_linkage "$EXEC_PATH"
+fi
 
 SIGNED_APP_ID=""
 SIGNED_TEAM_ID=""
@@ -105,4 +124,7 @@ if [[ "$CHECK_IPA_MODE" == signed && ! -f "$profile" ]]; then
     ipa_require_entitlement_profile_match "$SIGNED_APP_ID" "$SIGNED_TEAM_ID" "$SIGNED_APP_ID" "$SIGNED_TEAM_ID" "$EXPECTED_TEAM_ID" "$EXPECTED_BUNDLE_IDENTIFIER"
 fi
 
+if [[ "$CHECK_IPA_MODE" == unsigned ]]; then
+    printf '%s\n' 'CODE_SIGNATURE=NOT_REQUIRED_UNSIGNED_MODE' 'PROVISIONING_PROFILE=NOT_REQUIRED_UNSIGNED_MODE'
+fi
 echo "IPA PASS: bundle=$bundle_id family=iPad architecture=arm64 mode=$CHECK_IPA_MODE method=$EXPORT_METHOD"
