@@ -7,10 +7,10 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      build_ipa:
-        description: Build signed IPA
+      build_unsigned_ipa:
+        description: Build and upload unsigned iPad IPA
         required: true
-        default: false
+        default: true
         type: boolean
 
 permissions:
@@ -67,63 +67,158 @@ jobs:
             ARCHS=x86_64 ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
 
-  signed-ipa:
-    name: Signed IPA (manual only)
+  unsigned-ipad-ipa:
+    name: Unsigned iPad IPA
     needs: test
-    if: github.event_name == 'workflow_dispatch' && inputs.build_ipa == true && needs.test.result == 'success'
+    if: github.event_name == 'workflow_dispatch' && inputs.build_unsigned_ipa == true && needs.test.result == 'success'
     runs-on: macos-15-intel
-    environment: ios-release
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - name: Install signing certificate and profile
-        env:
-          IOS_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
-          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
-          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+      - name: Verify iPad-only target
+        run: ./Client/scripts/verify_ipad_target.sh
+      - name: Build pinned native dependencies for device
+        run: ./Client/scripts/build_ios_dependencies.sh
+      - name: Verify device and simulator dependency slices
         run: |
-          test -n "$IOS_CERTIFICATE_BASE64" -a -n "$IOS_PROVISIONING_PROFILE_BASE64" -a -n "$KEYCHAIN_PASSWORD"
-          keychain="$RUNNER_TEMP/build.keychain-db"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          echo "$IOS_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/signing.p12"
-          security import "$RUNNER_TEMP/signing.p12" -P "$IOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
-          echo "$IOS_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
-          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
-          cp "$RUNNER_TEMP/profile.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$(uuidgen).mobileprovision"
-          security list-keychains -d user -s "$keychain"
-      - name: Build dependencies and archive
+          cache_root="${SCREENCASTING_DEP_CACHE:-${TMPDIR:-/tmp}/screencasting-ios-deps}"
+          ./Client/scripts/verify_ios_dependency_artifacts.sh \
+            "$GITHUB_WORKSPACE/Client/ThirdPartyBuild/xcframeworks" \
+            "$cache_root/build"
+          echo 'DEVICE_DEPENDENCY_VARIANTS=OpenSSLCrypto:arm64,libsrtp2:arm64,libopus:arm64'
+          echo 'SIMULATOR_DEPENDENCY_VARIANTS=OpenSSLCrypto:x86_64,libsrtp2:x86_64,libopus:x86_64'
+      - name: Verify device dependency search paths
         run: |
-          ./Client/scripts/verify_ipad_target.sh
-          ./Client/scripts/build_ios_dependencies.sh
-          xcodebuild archive -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj \
-            -scheme iPadCasting -configuration Release -destination generic/platform=iOS \
-            -archivePath "$RUNNER_TEMP/iPadCasting.xcarchive" \
-            CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=YES
-      - name: Export and validate IPA
-        env:
-          IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
-        run: |
-          test -n "$IOS_TEAM_ID"
-          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict><key>method</key><string>app-store</string><key>teamID</key><string>$IOS_TEAM_ID</string></dict></plist>
-          EOF
-          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/iPadCasting.xcarchive" \
-            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/export"
-          export_method="app-store"
-          if [[ "$export_method" == "app-store" || "$export_method" == "ad-hoc" || "$export_method" == "development" ]]; then
-            CHECK_IPA_MODE=signed EXPORT_METHOD="$export_method" EXPECTED_TEAM_ID="$IOS_TEAM_ID" ./Client/check_ipa.sh "$RUNNER_TEMP/export/iPadCasting.ipa"
-          else
-            CHECK_IPA_MODE=signed EXPORT_METHOD="$export_method" EXPECTED_TEAM_ID="$IOS_TEAM_ID" ./Client/check_ipa.sh "$RUNNER_TEMP/export/iPadCasting.ipa"
+          settings="$(xcodebuild -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj \
+            -scheme iPadCasting -configuration Release -sdk iphoneos -showBuildSettings)"
+          grep -Fq 'ThirdPartyBuild/xcframeworks' <<<"$settings"
+          if grep -Eiq 'iphonesimulator|MacOSX|/opt/homebrew|/usr/local/opt|HostService|SessionAgent|MediaWorker|DriverBroker|MttVDD' <<<"$settings"; then
+            echo 'simulator, macOS, or private Host dependency path selected' >&2
+            exit 1
           fi
-      - uses: actions/upload-artifact@v4
+          echo 'DEVICE_DEPENDENCY_SEARCH_PATH=PASS'
+      - name: Build unsigned iPad device app
+        env:
+          DERIVED_DATA: ${{ runner.temp }}/r3-device-derived-data
+        run: |
+          set -euo pipefail
+          rm -rf "$DERIVED_DATA"
+          xcodebuild -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj \
+            -scheme iPadCasting -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$DERIVED_DATA" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' build \
+            2>&1 | tee "$RUNNER_TEMP/r3-device-build.log"
+          mapfile -t apps < <(find "$DERIVED_DATA/Build/Products/Release-iphoneos" \
+            -maxdepth 1 -type d -name '*.app' -print)
+          [[ "${#apps[@]}" == 1 ]]
+          [[ "$(basename "${apps[0]}")" == 'iPadCasting.app' ]]
+          printf 'DEVICE_APP=%s\n' "${apps[0]}"
+      - name: Validate unsigned iPad app before packaging
+        env:
+          DERIVED_DATA: ${{ runner.temp }}/r3-device-derived-data
+        run: |
+          shopt -s nullglob
+          apps=("$DERIVED_DATA/Build/Products/Release-iphoneos"/*.app)
+          [[ "${#apps[@]}" == 1 ]]
+          EXPECTED_BUNDLE_IDENTIFIER=com.iPadZeroLagDisplay.client \
+            ./Client/scripts/validate_unsigned_app.sh "${apps[0]}"
+      - name: Package unsigned iPad IPA
+        env:
+          DERIVED_DATA: ${{ runner.temp }}/r3-device-derived-data
+          IPA_PATH: ${{ runner.temp }}/ScreenCasting-iPad-unsigned.ipa
+          PACKAGE_ROOT: ${{ runner.temp }}/r3-ipa-root
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apps=("$DERIVED_DATA/Build/Products/Release-iphoneos"/*.app)
+          [[ "${#apps[@]}" == 1 ]]
+          rm -rf "$PACKAGE_ROOT" "$IPA_PATH"
+          mkdir -p "$PACKAGE_ROOT/Payload"
+          cp -R "${apps[0]}" "$PACKAGE_ROOT/Payload/iPadCasting.app"
+          (cd "$PACKAGE_ROOT" && zip -qry "$IPA_PATH" Payload)
+          test -f "$IPA_PATH"
+          echo 'UNSIGNED_IPA_PACKAGING=PASS'
+      - name: Validate packaged unsigned IPA
+        env:
+          IPA_PATH: ${{ runner.temp }}/ScreenCasting-iPad-unsigned.ipa
+        run: |
+          EXPECTED_BUNDLE_IDENTIFIER=com.iPadZeroLagDisplay.client \
+            ./Client/check_ipa.sh --unsigned "$IPA_PATH" | tee "$RUNNER_TEMP/r3-unsigned-validator.log"
+          echo 'UNSIGNED_IPA_VALIDATION=PASS'
+      - name: Create unsigned IPA provenance manifest
+        env:
+          IPA_PATH: ${{ runner.temp }}/ScreenCasting-iPad-unsigned.ipa
+          MANIFEST_PATH: ${{ runner.temp }}/ScreenCasting-iPad-unsigned.manifest.txt
+        run: |
+          set -euo pipefail
+          ipa_sha256="$(shasum -a 256 "$IPA_PATH" | awk '{print $1}')"
+          cat > "$MANIFEST_PATH" <<EOF
+          Product: ScreenCasting iPad Client
+          Public SHA: $GITHUB_SHA
+          Workflow Run: $GITHUB_RUN_ID
+          Configuration: Release
+          Platform: iOS device
+          Architecture: arm64
+          Targeted Device Family: 2
+          Signing: unsigned
+          Validator: PASS
+          OpenSSL pin: openssl-3.3.2 (tag object 98b3bf1433f8f4a29e64ca8b9bd42c58d3d1b98a)
+          libsrtp pin: 24b3bf8f19b6f5ab4cd2bcceb4f4064efca86fd5
+          Opus pin: ddbe48383984d56acd9e1ab6a090c54ca6b735a6
+          IPA filename: ScreenCasting-iPad-unsigned.ipa
+          IPA SHA-256: $ipa_sha256
+          EOF
+          grep -Fq "Public SHA: $GITHUB_SHA" "$MANIFEST_PATH"
+          grep -Fq "IPA SHA-256: $ipa_sha256" "$MANIFEST_PATH"
+          echo "IPA_SHA256=$ipa_sha256"
+          echo 'SHA256_MANIFEST=PASS'
+      - name: Upload unsigned iPad IPA artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: iPadCasting-ipa
-          path: ${{ runner.temp }}/export/*.ipa
+          name: ScreenCasting-iPad-unsigned
+          path: |
+            ${{ runner.temp }}/ScreenCasting-iPad-unsigned.ipa
+            ${{ runner.temp }}/ScreenCasting-iPad-unsigned.manifest.txt
+          if-no-files-found: error
           retention-days: 7
+
+  revalidate-unsigned-artifact:
+    name: Revalidate uploaded unsigned IPA
+    needs: unsigned-ipad-ipa
+    if: needs.unsigned-ipad-ipa.result == 'success'
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download uploaded unsigned IPA artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ScreenCasting-iPad-unsigned
+          path: ${{ runner.temp }}/r3-downloaded
+      - name: Revalidate downloaded unsigned IPA and SHA-256
+        run: |
+          set -euo pipefail
+          download_root="${{ runner.temp }}/r3-downloaded"
+          mapfile -t ipas < <(find "$download_root" -type f -name '*.ipa' -print)
+          mapfile -t manifests < <(find "$download_root" -type f -name '*.manifest.txt' -print)
+          [[ "${#ipas[@]}" == 1 && "${#manifests[@]}" == 1 ]]
+          ipa_path="${ipas[0]}"
+          manifest_path="${manifests[0]}"
+          expected_sha256="$(awk -F': ' '$1 == "IPA SHA-256" {print $2; exit}' "$manifest_path")"
+          actual_sha256="$(shasum -a 256 "$ipa_path" | awk '{print $1}')"
+          [[ -n "$expected_sha256" && "$actual_sha256" == "$expected_sha256" ]]
+          expected_public_sha="$(awk -F': ' '$1 == "Public SHA" {print $2; exit}' "$manifest_path")"
+          [[ "$expected_public_sha" == "$GITHUB_SHA" ]]
+          output="$(./Client/check_ipa.sh --unsigned "$ipa_path")"
+          grep -Fq 'CODE_SIGNATURE=NOT_REQUIRED_UNSIGNED_MODE' <<<"$output"
+          grep -Fq 'PROVISIONING_PROFILE=NOT_REQUIRED_UNSIGNED_MODE' <<<"$output"
+          echo "DOWNLOADED_IPA_SHA256=$actual_sha256"
+          echo 'DOWNLOADED_ARTIFACT_REVALIDATION=PASS'
