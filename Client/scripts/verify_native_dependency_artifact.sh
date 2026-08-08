@@ -9,13 +9,15 @@ DESTINATION_ROOT="${2:?usage: $0 <download-root> <destination-root>}"
 : "${EXPECTED_CACHE_KEY:?EXPECTED_CACHE_KEY is required}"
 : "${EXPECTED_MANIFEST_SHA256:?EXPECTED_MANIFEST_SHA256 is required}"
 
-mapfile -t manifests < <(find "$DOWNLOAD_ROOT" -type f -name 'native-deps.manifest.txt' -print)
+manifests=()
+while IFS= read -r path; do manifests[${#manifests[@]}]="$path"; done < <(find "$DOWNLOAD_ROOT" -type f -name 'native-deps.manifest.txt' -print)
 [[ "${#manifests[@]}" == 1 ]] || { echo 'expected exactly one native dependency manifest' >&2; exit 1; }
 manifest="${manifests[0]}"
 artifact_root="$(dirname "$manifest")"
 source_root="$artifact_root/Client/ThirdPartyBuild"
 if [[ ! -d "$source_root" ]]; then
-  mapfile -t roots < <(find "$artifact_root" -type d -name ThirdPartyBuild -print)
+  roots=()
+  while IFS= read -r path; do roots[${#roots[@]}]="$path"; done < <(find "$artifact_root" -type d -name ThirdPartyBuild -print)
   [[ "${#roots[@]}" == 1 ]] || { echo 'native dependency artifact root layout is ambiguous' >&2; exit 1; }
   source_root="${roots[0]}"
 fi

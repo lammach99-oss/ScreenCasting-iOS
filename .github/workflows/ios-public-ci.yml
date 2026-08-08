@@ -301,7 +301,8 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' build \
             2>&1 | tee "$RUNNER_TEMP/r3-device-build.log"
           echo "DEVICE_APP_BUILD_SECONDS=$(( $(date +%s) - started_epoch ))"
-          mapfile -t apps < <(find "$DERIVED_DATA/Build/Products/Release-iphoneos" \
+          apps=()
+          while IFS= read -r app; do apps[${#apps[@]}]="$app"; done < <(find "$DERIVED_DATA/Build/Products/Release-iphoneos" \
             -maxdepth 1 -type d -name '*.app' -print)
           [[ "${#apps[@]}" == 1 ]]
           [[ "$(basename "${apps[0]}")" == 'iPadCasting.app' ]]
@@ -386,8 +387,10 @@ jobs:
         run: |
           set -euo pipefail
           download_root="$RUNNER_TEMP/unsigned-app-download"
-          mapfile -t apps < <(find "$download_root" -type d -name '*.app' -print)
-          mapfile -t manifests < <(find "$download_root" -type f -name '*-app.manifest.txt' -print)
+          apps=()
+          while IFS= read -r app; do apps[${#apps[@]}]="$app"; done < <(find "$download_root" -type d -name '*.app' -print)
+          manifests=()
+          while IFS= read -r manifest; do manifests[${#manifests[@]}]="$manifest"; done < <(find "$download_root" -type f -name '*-app.manifest.txt' -print)
           [[ "${#apps[@]}" == 1 && "${#manifests[@]}" == 1 ]]
           app_path="${apps[0]}"
           manifest_path="${manifests[0]}"
@@ -493,8 +496,10 @@ jobs:
           set -euo pipefail
           started_epoch=$(date +%s)
           download_root="$RUNNER_TEMP/r3-downloaded"
-          mapfile -t ipas < <(find "$download_root" -type f -name '*.ipa' -print)
-          mapfile -t manifests < <(find "$download_root" -type f -name '*.manifest.txt' -print)
+          ipas=()
+          while IFS= read -r ipa; do ipas[${#ipas[@]}]="$ipa"; done < <(find "$download_root" -type f -name '*.ipa' -print)
+          manifests=()
+          while IFS= read -r manifest; do manifests[${#manifests[@]}]="$manifest"; done < <(find "$download_root" -type f -name '*.manifest.txt' -print)
           [[ "${#ipas[@]}" == 1 && "${#manifests[@]}" == 1 ]]
           ipa_path="${ipas[0]}"
           manifest_path="${manifests[0]}"

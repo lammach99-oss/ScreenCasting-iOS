@@ -27,6 +27,7 @@ require_text 'cancel-in-progress: ${{ github.event_name != '\''workflow_dispatch
 
 if grep -Fq 'restore-keys:' "$WORKFLOW"; then fail 'broad cache restore keys are present'; fi
 if grep -Fq 'pull_request_target' "$WORKFLOW"; then fail 'pull_request_target is present'; fi
+if grep -Eq 'mapfile|readarray' "$WORKFLOW"; then fail 'workflow requires Bash 4-only array helpers'; fi
 
 package="$(job_block package-unsigned-ipa)"
 [[ -n "$package" ]] || fail 'package job block is empty'
