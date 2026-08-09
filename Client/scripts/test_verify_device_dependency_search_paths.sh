@@ -3,8 +3,24 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPER="$SCRIPT_DIR/verify_device_dependency_search_paths.sh"
+PROJECT_FILE="$SCRIPT_DIR/../iPadZeroLagDisplay/iPadCasting.xcodeproj/project.pbxproj"
 
 fail() { echo "$*" >&2; exit 1; }
+[[ -f "$PROJECT_FILE" ]] || fail "iPad project file missing: $PROJECT_FILE"
+
+require_target_framework_search_path() {
+  local marker="$1" block
+  block="$(awk -v marker="$marker" '
+    index($0, marker) { in_block = 1 }
+    in_block { print }
+    in_block && /^[[:space:]]*};$/ { exit }
+  ' "$PROJECT_FILE")"
+  [[ -n "$block" ]] || fail "iPad target configuration missing: $marker"
+  grep -Fq 'FRAMEWORK_SEARCH_PATHS = (' <<<"$block" ||
+    fail "iPad target configuration lacks framework search paths: $marker"
+  grep -Fq '$(PROJECT_DIR)/../ThirdPartyBuild/xcframeworks' <<<"$block" ||
+    fail "iPad target configuration lacks public XCFramework path: $marker"
+}
 
 positive_settings() {
   cat <<'EOF'
@@ -40,6 +56,8 @@ expect_fail() {
 }
 
 positive="$(positive_settings)"
+require_target_framework_search_path '11111111111111111111110B /* Debug */ ='
+require_target_framework_search_path '11111111111111111111110C /* Release */ ='
 expect_pass
 expect_fail 'selected simulator SDKROOT' "$(sed 's/SDKROOT = iphoneos17.5/SDKROOT = iphonesimulator17.5/' <<<"$positive")"
 expect_fail 'selected simulator search path' "$(sed 's#/workspace/Client/ThirdPartyBuild/xcframeworks#/tmp/iphonesimulator/Selected/ThirdPartyBuild/xcframeworks#g' <<<"$positive")"
