@@ -3,11 +3,27 @@ set -euo pipefail
 
 settings="$(cat)"
 selected_settings="$(awk '
-  /^[[:space:]]*(CONFIGURATION_BUILD_DIR|FRAMEWORK_SEARCH_PATHS|HEADER_SEARCH_PATHS|LIBRARY_SEARCH_PATHS|OTHER_LDFLAGS|PLATFORM_NAME|SDKROOT)[[:space:]]*=/ {
-    line = $0
+  function selected_key(line) {
+    return line ~ /^[[:space:]]*(CONFIGURATION_BUILD_DIR|FRAMEWORK_SEARCH_PATHS|HEADER_SEARCH_PATHS|LIBRARY_SEARCH_PATHS|OTHER_LDFLAGS|PLATFORM_NAME|SDKROOT)[[:space:]]*=/
+  }
+  function normalized(line) {
     sub(/^[[:space:]]*/, "", line)
-    gsub(/[[:space:]]*=[[:space:]]*/, "=", line)
-    print line
+    sub(/[[:space:]]*=[[:space:]]*/, "=", line)
+    return line
+  }
+  {
+    if (selected_key($0)) {
+      line = normalized($0)
+      print line
+      in_multiline = line ~ /=[[:space:]]*\([[:space:]]*$/
+      next
+    }
+    if (in_multiline) {
+      print $0
+      if ($0 ~ /^[[:space:]]*\)[[:space:]]*;?[[:space:]]*$/) {
+        in_multiline = 0
+      }
+    }
   }
 ' <<<"$settings")"
 
