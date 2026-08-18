@@ -589,10 +589,14 @@ public final class DecoderManager {
                         return
                     }
 
+                    let decoderSpec: [String: Any] = [
+                        kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String: true
+                    ]
                     let attributes: [String: Any] = [
                         kCVPixelBufferPixelFormatTypeKey as String:
                             kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                        kCVPixelBufferMetalCompatibilityKey as String: true
+                        kCVPixelBufferMetalCompatibilityKey as String: true,
+                        kCVPixelBufferIOSurfacePropertiesKey as String: [:] as CFDictionary
                     ]
                     var callback = VTDecompressionOutputCallbackRecord(
                         decompressionOutputCallback: {
@@ -626,7 +630,7 @@ public final class DecoderManager {
                     let sessionStatus = VTDecompressionSessionCreate(
                         allocator: kCFAllocatorDefault,
                         formatDescription: description,
-                        decoderSpecification: nil,
+                        decoderSpecification: decoderSpec as CFDictionary,
                         imageBufferAttributes: attributes as CFDictionary,
                         outputCallback: &callback,
                         decompressionSessionOut: &candidateSession)
@@ -683,10 +687,14 @@ public final class DecoderManager {
             print("[DecoderManager] H264 format rejected: \(formatStatus)")
             return false
         }
+        let decoderSpec: [String: Any] = [
+            kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String: true
+        ]
         let attributes: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String:
                 kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-            kCVPixelBufferMetalCompatibilityKey as String: true
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as CFDictionary
         ]
         var callback = VTDecompressionOutputCallbackRecord(
             decompressionOutputCallback: { outputRefCon, sourceFrameRefCon, status, _, imageBuffer, _, _ in
@@ -704,7 +712,7 @@ public final class DecoderManager {
         var session: VTDecompressionSession?
         let sessionStatus = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault, formatDescription: description,
-            decoderSpecification: nil, imageBufferAttributes: attributes as CFDictionary,
+            decoderSpecification: decoderSpec as CFDictionary, imageBufferAttributes: attributes as CFDictionary,
             outputCallback: &callback, decompressionSessionOut: &session)
         guard sessionStatus == noErr, let session else {
             print("[DecoderManager] H264 session rejected: \(sessionStatus)")
@@ -714,6 +722,7 @@ public final class DecoderManager {
         formatDescription = description
         decompressionSession = session
         setPropertyIfSupported(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue, name: "real-time")
+        setPropertyIfSupported(session, key: kVTDecompressionPropertyKey_MaximizePowerEfficiency, value: kCFBooleanFalse, name: "disable-power-saving")
         if let previous {
             VTDecompressionSessionWaitForAsynchronousFrames(previous)
             VTDecompressionSessionInvalidate(previous)

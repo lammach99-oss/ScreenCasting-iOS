@@ -303,7 +303,9 @@ public struct ContentView: View {
 
             PencilTouchView(
                 onPencilInput: { _ in },
-                onNetworkSend: { data in networkManager.sendData(data) }
+                onSendTouchEvent: { [weak networkManager] type, x, y, pressure in
+                    networkManager?.sendTouchEvent(type: type, x: x, y: y, pressure: pressure)
+                }
             )
             .ignoresSafeArea()
             .allowsHitTesting(true)

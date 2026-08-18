@@ -42,7 +42,7 @@ public final class AudioManager {
         qos: .userInteractive)
     private var engineStarted = false
     private var queuedFrames = 0
-    private let maxQueuedFrames = 9_600
+    private let maxQueuedFrames = 1_440 // 30ms max audio queue threshold to prevent audio lag
     private var opusDecoder: RealtimeOpusDecoder?
     private var jitterBuffer = AudioJitterBuffer(profile: .wifi)
     private var realtimeGeneration: UInt64?
@@ -92,7 +92,9 @@ public final class AudioManager {
     private func configureAudioSession() {
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try session.setCategory(.playback, mode: .measurement, options: [.mixWithOthers])
+            try session.setPreferredIOBufferDuration(0.005) // 5ms low-latency hardware buffer
+            try session.setPreferredSampleRate(sampleRate)
             try session.setActive(true)
         } catch {
             print("[AudioManager] ⚠️ AVAudioSession setup failed: \(error)")

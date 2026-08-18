@@ -95,7 +95,6 @@ public class Renderer: NSObject, MTKViewDelegate {
     private let commandQueue: MTLCommandQueue
     private var pipelineState: MTLRenderPipelineState?
     private var textureCache: CVMetalTextureCache?
-    private var aspectRatioBuffer: MTLBuffer?
     private var currentPixelBuffer: CVPixelBuffer?
     private var freshness = RenderFreshnessTracker()
     private let lock = NSLock()
@@ -135,9 +134,6 @@ public class Renderer: NSObject, MTKViewDelegate {
         descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
         do {
             pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
-            aspectRatioBuffer = device.makeBuffer(
-                length: MemoryLayout<SIMD2<Float>>.size,
-                options: .storageModeShared)
         } catch {
             print("[Renderer] Failed to create render pipeline: \(error)")
         }
@@ -222,9 +218,8 @@ public class Renderer: NSObject, MTKViewDelegate {
         } else {
             scale.x = videoAspect / viewAspect
         }
-        aspectRatioBuffer?.contents().storeBytes(of: scale, as: SIMD2<Float>.self)
         encoder.setRenderPipelineState(pipelineState)
-        encoder.setVertexBuffer(aspectRatioBuffer, offset: 0, index: 0)
+        encoder.setVertexBytes(&scale, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
         encoder.setFragmentTexture(yTexture, index: 0)
         encoder.setFragmentTexture(uvTexture, index: 1)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)

@@ -253,7 +253,7 @@ jobs:
   build-unsigned-ipad-app:
     name: Build unsigned iPad app
     needs: [prepare-native-deps, build-and-test]
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_unsigned_ipa == true && needs.prepare-native-deps.result == 'success' && needs.build-and-test.result == 'success' }}
+    if: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.build_unsigned_ipa == true)) && needs.prepare-native-deps.result == 'success' && needs.build-and-test.result == 'success' }}
     runs-on: macos-15-intel
     timeout-minutes: 45
     outputs:
