@@ -303,10 +303,31 @@ public struct ContentView: View {
 
             PencilTouchView(
                 onPencilInput: { _ in },
-                onNetworkSend: { data in networkManager.sendData(data) }
+                onSendTouchEvent: { type, x, y, pressure in
+                    networkManager.sendTouchEvent(
+                        type: type,
+                        x: x,
+                        y: y,
+                        pressure: pressure)
+                }
             )
             .ignoresSafeArea()
             .allowsHitTesting(true)
+            // Keep the existing HUD gestures without placing a hit-test view
+            // above the remote-input surface. The touch view remains the
+            // recipient of the UIKit touch sequence.
+            .simultaneousGesture(
+                TapGesture(count: 2)
+                    .onEnded {
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
+                            isHudVisible.toggle()
+                        }
+                    })
+            .simultaneousGesture(
+                TapGesture(count: 1)
+                    .onEnded {
+                        showDisconnectButtonTemporary()
+                    })
         } else {
             // Premium Disconnected Background
             RadialGradient(
@@ -650,18 +671,6 @@ public struct ContentView: View {
 
     private var streamingHUD: some View {
         ZStack {
-            // Tap gesture intercepts
-            Color.clear
-                .contentShape(Rectangle())
-                .onTapGesture(count: 2) {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
-                        isHudVisible.toggle()
-                    }
-                }
-                .onTapGesture(count: 1) {
-                    showDisconnectButtonTemporary()
-                }
-
             // Stats HUD (Top-Right)
             if isHudVisible {
                 VStack {
