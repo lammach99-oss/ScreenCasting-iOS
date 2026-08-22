@@ -192,6 +192,16 @@ public class Renderer: NSObject, MTKViewDelegate {
 
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
+        guard CVPixelBufferGetIOSurface(pixelBuffer) != nil else {
+            print("[Renderer] Metal presentation rejected: IOSurface unavailable for \(width)x\(height)")
+            abandon(identity)
+            return
+        }
+        guard CVPixelBufferGetPixelFormatType(pixelBuffer) == DecoderOutputBufferAttributes.pixelFormat else {
+            print("[Renderer] Metal presentation rejected: pixelFormat=\(CVPixelBufferGetPixelFormatType(pixelBuffer)) expected=\(DecoderOutputBufferAttributes.pixelFormat)")
+            abandon(identity)
+            return
+        }
         var yTextureRef: CVMetalTexture?
         let yStatus = CVMetalTextureCacheCreateTextureFromImage(
             kCFAllocatorDefault, textureCache, pixelBuffer, nil,
@@ -206,8 +216,12 @@ public class Renderer: NSObject, MTKViewDelegate {
               let yTextureRef,
               let uvTextureRef,
               let yTexture = CVMetalTextureGetTexture(yTextureRef),
-              let uvTexture = CVMetalTextureGetTexture(uvTextureRef),
-              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let uvTexture = CVMetalTextureGetTexture(uvTextureRef) else {
+            print("[Renderer] CVMetalTextureCacheCreateTextureFromImage failed: yStatus=\(yStatus) uvStatus=\(uvStatus) size=\(width)x\(height) pixelFormat=\(CVPixelBufferGetPixelFormatType(pixelBuffer))")
+            abandon(identity)
+            return
+        }
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeRenderCommandEncoder(
                 descriptor: renderPassDescriptor) else {
             abandon(identity)

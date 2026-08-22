@@ -1,8 +1,54 @@
 import XCTest
 import CoreMedia
+import CoreVideo
+import Metal
 @testable import iPadCasting
 
 final class DecoderParameterSetTests: XCTestCase {
+    func testHEVCDecodeOutputAttributesAllocateIOSurfaceBackedMetalCompatibleNV12() throws {
+        var pixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            32,
+            18,
+            DecoderOutputBufferAttributes.pixelFormat,
+            DecoderOutputBufferAttributes.make() as CFDictionary,
+            &pixelBuffer)
+
+        XCTAssertEqual(status, kCVReturnSuccess)
+        let buffer = try XCTUnwrap(pixelBuffer)
+        XCTAssertEqual(
+            CVPixelBufferGetPixelFormatType(buffer),
+            DecoderOutputBufferAttributes.pixelFormat)
+        XCTAssertNotNil(CVPixelBufferGetIOSurface(buffer))
+        XCTAssertNil(
+            DecoderOutputBufferAttributes.invalidReason(
+                for: buffer,
+                expectedWidth: 32,
+                expectedHeight: 18))
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("Metal is unavailable on this test runner")
+        }
+        var textureCache: CVMetalTextureCache?
+        XCTAssertEqual(
+            CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &textureCache),
+            kCVReturnSuccess)
+        let cache = try XCTUnwrap(textureCache)
+        var yTexture: CVMetalTexture?
+        XCTAssertEqual(
+            CVMetalTextureCacheCreateTextureFromImage(
+                kCFAllocatorDefault, cache, buffer, nil, .r8Unorm, 32, 18, 0, &yTexture),
+            kCVReturnSuccess)
+        XCTAssertNotNil(CVMetalTextureGetTexture(try XCTUnwrap(yTexture)))
+        var uvTexture: CVMetalTexture?
+        XCTAssertEqual(
+            CVMetalTextureCacheCreateTextureFromImage(
+                kCFAllocatorDefault, cache, buffer, nil, .rg8Unorm, 16, 9, 1, &uvTexture),
+            kCVReturnSuccess)
+        XCTAssertNotNil(CVMetalTextureGetTexture(try XCTUnwrap(uvTexture)))
+    }
+
     func testIdenticalParameterSetsCreateOneDecoderSession() {
         let vps = Data([0x40, 0x01])
         let sps = Data([0x42, 0x01, 0x0a])
