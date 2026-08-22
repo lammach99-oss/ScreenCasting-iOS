@@ -4,14 +4,22 @@ import MetalKit
 public struct MetalView: UIViewRepresentable {
     @ObservedObject var networkManager: NetworkManager
     public var onFrameRendered: (() -> Void)?
+    public var onContentViewportChanged: ((VideoContentViewport?) -> Void)?
 
-    public init(networkManager: NetworkManager, onFrameRendered: (() -> Void)? = nil) {
+    public init(
+        networkManager: NetworkManager,
+        onFrameRendered: (() -> Void)? = nil,
+        onContentViewportChanged: ((VideoContentViewport?) -> Void)? = nil
+    ) {
         self.networkManager = networkManager
         self.onFrameRendered = onFrameRendered
+        self.onContentViewportChanged = onContentViewportChanged
     }
 
     public func makeCoordinator() -> Coordinator {
-        Coordinator(onFrameRendered: onFrameRendered)
+        Coordinator(
+            onFrameRendered: onFrameRendered,
+            onContentViewportChanged: onContentViewportChanged)
     }
 
     public func makeUIView(context: Context) -> MTKView {
@@ -38,6 +46,9 @@ public struct MetalView: UIViewRepresentable {
                     sequence: sequence,
                     generation: generation)
             }
+            renderer.onContentViewportChanged = { [weak coordinator = context.coordinator] viewport in
+                coordinator?.onContentViewportChanged?(viewport)
+            }
 
             // Connect VideoToolbox Decoded PixelBuffers directly into Metal Renderer
             networkManager.decoder.onSessionBegan = { [weak renderer] generation in
@@ -57,14 +68,20 @@ public struct MetalView: UIViewRepresentable {
 
     public func updateUIView(_ uiView: MTKView, context: Context) {
         context.coordinator.onFrameRendered = onFrameRendered
+        context.coordinator.onContentViewportChanged = onContentViewportChanged
     }
 
     public class Coordinator {
         var renderer: Renderer?
         var onFrameRendered: (() -> Void)?
+        var onContentViewportChanged: ((VideoContentViewport?) -> Void)?
 
-        init(onFrameRendered: (() -> Void)?) {
+        init(
+            onFrameRendered: (() -> Void)?,
+            onContentViewportChanged: ((VideoContentViewport?) -> Void)?
+        ) {
             self.onFrameRendered = onFrameRendered
+            self.onContentViewportChanged = onContentViewportChanged
         }
     }
 }
@@ -73,13 +90,22 @@ public struct MetalView: UIViewRepresentable {
 public struct MetalVideoView: View {
     @ObservedObject var networkManager: NetworkManager
     public var onFrameRendered: (() -> Void)?
+    public var onContentViewportChanged: ((VideoContentViewport?) -> Void)?
 
-    public init(networkManager: NetworkManager, onFrameRendered: (() -> Void)? = nil) {
+    public init(
+        networkManager: NetworkManager,
+        onFrameRendered: (() -> Void)? = nil,
+        onContentViewportChanged: ((VideoContentViewport?) -> Void)? = nil
+    ) {
         self.networkManager = networkManager
         self.onFrameRendered = onFrameRendered
+        self.onContentViewportChanged = onContentViewportChanged
     }
 
     public var body: some View {
-        MetalView(networkManager: networkManager, onFrameRendered: onFrameRendered)
+        MetalView(
+            networkManager: networkManager,
+            onFrameRendered: onFrameRendered,
+            onContentViewportChanged: onContentViewportChanged)
     }
 }

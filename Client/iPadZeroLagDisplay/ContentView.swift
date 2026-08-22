@@ -195,6 +195,7 @@ public struct ContentView: View {
     @State private var isHudVisible: Bool = true
     @State private var isDisconnectButtonVisible: Bool = false
     @State private var dismissTimer: Timer? = nil
+    @State private var renderedContentViewport: VideoContentViewport?
 
     public init() {
         let netManager = NetworkManager()
@@ -296,12 +297,18 @@ public struct ContentView: View {
     @ViewBuilder
     private var backgroundLayer: some View {
         if streamManager.isConnected {
-            MetalVideoView(networkManager: networkManager) {
-                streamManager.registerFrameRendered()
-            }
+            MetalVideoView(
+                networkManager: networkManager,
+                onFrameRendered: {
+                    streamManager.registerFrameRendered()
+                },
+                onContentViewportChanged: { viewport in
+                    renderedContentViewport = viewport
+                })
             .ignoresSafeArea()
 
             PencilTouchView(
+                contentViewport: renderedContentViewport,
                 onPencilInput: { _ in },
                 onSendTouchEvent: { type, x, y, pressure in
                     networkManager.sendTouchEvent(

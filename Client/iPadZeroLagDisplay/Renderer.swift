@@ -87,10 +87,85 @@ struct RenderFreshnessTracker {
 }
 
 /// High-performance zero-copy Metal renderer for a 120 Hz iPad display.
+public struct VideoContentViewport: Equatable {
+    let rect: CGRect
+
+    static func aspectFit(
+        containerSize: CGSize,
+        videoSize: CGSize
+    ) -> VideoContentViewport? {
+        guard containerSize.width > 0,
+              containerSize.height > 0,
+              videoSize.width > 0,
+              videoSize.height > 0 else {
+            return nil
+        }
+
+        let scale = min(
+            containerSize.width / videoSize.width,
+            containerSize.height / videoSize.height)
+        let renderedSize = CGSize(
+            width: videoSize.width * scale,
+            height: videoSize.height * scale)
+        return VideoContentViewport(
+            rect: CGRect(
+                x: (containerSize.width - renderedSize.width) /
+                    (2 * containerSize.width),
+                y: (containerSize.height - renderedSize.height) /
+                    (2 * containerSize.height),
+                width: renderedSize.width / containerSize.width,
+                height: renderedSize.height / containerSize.height))
+    }
+
+    func normalizedPoint(
+        for location: CGPoint,
+        in container: CGRect
+    ) -> CGPoint? {
+        guard let point = normalizedContainerPoint(for: location, in: container),
+              point.x >= rect.minX,
+              point.x <= rect.maxX,
+              point.y >= rect.minY,
+              point.y <= rect.maxY else {
+            return nil
+        }
+        return CGPoint(
+            x: (point.x - rect.minX) / rect.width,
+            y: (point.y - rect.minY) / rect.height)
+    }
+
+    func clampedNormalizedPoint(
+        for location: CGPoint,
+        in container: CGRect
+    ) -> CGPoint? {
+        guard let point = normalizedContainerPoint(for: location, in: container) else {
+            return nil
+        }
+        return CGPoint(
+            x: min(max((point.x - rect.minX) / rect.width, 0), 1),
+            y: min(max((point.y - rect.minY) / rect.height, 0), 1))
+    }
+
+    private func normalizedContainerPoint(
+        for location: CGPoint,
+        in container: CGRect
+    ) -> CGPoint? {
+        guard container.width > 0,
+              container.height > 0,
+              rect.width > 0,
+              rect.height > 0 else {
+            return nil
+        }
+        return CGPoint(
+            x: (location.x - container.minX) / container.width,
+            y: (location.y - container.minY) / container.height)
+    }
+}
+
 public class Renderer: NSObject, MTKViewDelegate {
     public var onFrameRendered: ((UInt32, UInt64) -> Void)?
     public var onDrawableCommitted: ((UInt32, UInt64) -> Void)?
     public var onFrameDropped: ((UInt32, UInt64) -> Void)?
+    var onContentViewportChanged: ((VideoContentViewport?) -> Void)?
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private var pipelineState: MTLRenderPipelineState?
@@ -98,6 +173,7 @@ public class Renderer: NSObject, MTKViewDelegate {
     private var aspectRatioBuffer: MTLBuffer?
     private var currentPixelBuffer: CVPixelBuffer?
     private var freshness = RenderFreshnessTracker()
+    private var publishedContentViewport: VideoContentViewport?
     private let lock = NSLock()
 
     public init?(metalView: MTKView) {
@@ -147,7 +223,14 @@ public class Renderer: NSObject, MTKViewDelegate {
         lock.lock()
         currentPixelBuffer = nil
         freshness.beginSession(generation: generation)
+        let shouldResetContentViewport = publishedContentViewport != nil
+        publishedContentViewport = nil
         lock.unlock()
+        if shouldResetContentViewport {
+            DispatchQueue.main.async { [weak self] in
+                self?.onContentViewportChanged?(nil)
+            }
+        }
     }
 
     public func updateFrame(
@@ -228,14 +311,16 @@ public class Renderer: NSObject, MTKViewDelegate {
             return
         }
 
-        let viewAspect = Float(view.drawableSize.width / view.drawableSize.height)
-        let videoAspect = Float(width) / Float(height)
-        var scale = SIMD2<Float>(1, 1)
-        if videoAspect > viewAspect {
-            scale.y = viewAspect / videoAspect
-        } else {
-            scale.x = videoAspect / viewAspect
+        guard let contentViewport = VideoContentViewport.aspectFit(
+            containerSize: view.drawableSize,
+            videoSize: CGSize(width: width, height: height)) else {
+            abandon(identity)
+            return
         }
+        publishContentViewport(contentViewport)
+        let scale = SIMD2<Float>(
+            Float(contentViewport.rect.width),
+            Float(contentViewport.rect.height))
         aspectRatioBuffer?.contents().storeBytes(of: scale, as: SIMD2<Float>.self)
         encoder.setRenderPipelineState(pipelineState)
         encoder.setVertexBuffer(aspectRatioBuffer, offset: 0, index: 0)
@@ -271,6 +356,18 @@ public class Renderer: NSObject, MTKViewDelegate {
         }
         commandBuffer.commit()
         onDrawableCommitted?(identity.sequence, identity.generation)
+    }
+
+    private func publishContentViewport(_ contentViewport: VideoContentViewport) {
+        lock.lock()
+        let changed = publishedContentViewport != contentViewport
+        publishedContentViewport = contentViewport
+        lock.unlock()
+        guard changed else { return }
+
+        DispatchQueue.main.async { [weak self] in
+            self?.onContentViewportChanged?(contentViewport)
+        }
     }
 
     private func abandon(_ identity: RenderFrameIdentity) {

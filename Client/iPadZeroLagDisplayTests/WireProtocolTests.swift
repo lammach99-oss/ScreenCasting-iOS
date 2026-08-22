@@ -1,5 +1,6 @@
 import XCTest
 import Network
+import CoreGraphics
 @testable import iPadCasting
 
 final class UsbSplitCommitGateTests: XCTestCase {
@@ -192,6 +193,55 @@ final class UsbSplitCommitGateTests: XCTestCase {
                 videoLaneBound: false,
                 audioLaneBound: true),
             .reject)
+    }
+}
+
+final class VideoContentViewportTests: XCTestCase {
+    func testAspectFitMapsOnlyTheVisibleVideoContent() throws {
+        let viewport = try XCTUnwrap(VideoContentViewport.aspectFit(
+            containerSize: CGSize(width: 4, height: 3),
+            videoSize: CGSize(width: 16, height: 9)))
+        let container = CGRect(x: 0, y: 0, width: 4, height: 3)
+
+        XCTAssertEqual(viewport.rect.origin.x, 0, accuracy: 0.0001)
+        XCTAssertEqual(viewport.rect.origin.y, 0.125, accuracy: 0.0001)
+        XCTAssertEqual(viewport.rect.width, 1, accuracy: 0.0001)
+        XCTAssertEqual(viewport.rect.height, 0.75, accuracy: 0.0001)
+        XCTAssertEqual(
+            viewport.normalizedPoint(
+                for: CGPoint(x: 2, y: 0.375),
+                in: container),
+            CGPoint(x: 0.5, y: 0))
+        XCTAssertEqual(
+            viewport.normalizedPoint(
+                for: CGPoint(x: 2, y: 2.625),
+                in: container),
+            CGPoint(x: 0.5, y: 1))
+    }
+
+    func testLetterboxTouchIsRejectedInsteadOfMappingToRemoteFrameEdge() throws {
+        let viewport = try XCTUnwrap(VideoContentViewport.aspectFit(
+            containerSize: CGSize(width: 4, height: 3),
+            videoSize: CGSize(width: 16, height: 9)))
+        let container = CGRect(x: 0, y: 0, width: 4, height: 3)
+
+        XCTAssertNil(
+            viewport.normalizedPoint(
+                for: CGPoint(x: 2, y: 0),
+                in: container))
+    }
+
+    func testActiveDragClampsOnlyAfterItHasStartedInsideVisibleContent() throws {
+        let viewport = try XCTUnwrap(VideoContentViewport.aspectFit(
+            containerSize: CGSize(width: 4, height: 3),
+            videoSize: CGSize(width: 16, height: 9)))
+        let container = CGRect(x: 0, y: 0, width: 4, height: 3)
+
+        XCTAssertEqual(
+            viewport.clampedNormalizedPoint(
+                for: CGPoint(x: 2, y: 0),
+                in: container),
+            CGPoint(x: 0.5, y: 0))
     }
 }
 
