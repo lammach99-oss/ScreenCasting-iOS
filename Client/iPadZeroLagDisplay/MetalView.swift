@@ -145,12 +145,22 @@ public final class ConnectedPresentationContainer: UIView {
         clipsToBounds = true
 
         // The container owns the one runtime rectangle used by both surfaces.
-        // Autoresizing plus layoutSubviews avoids a representable/constraint
-        // timing gap during fullscreen and rotation layout.
-        metalView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        touchView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        // Explicit edge constraints prevent UIKit from retaining a provisional
+        // UIViewRepresentable size during fullscreen and rotation layout.
+        metalView.translatesAutoresizingMaskIntoConstraints = false
+        touchView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(metalView)
         addSubview(touchView)
+        NSLayoutConstraint.activate([
+            metalView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            metalView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            metalView.topAnchor.constraint(equalTo: topAnchor),
+            metalView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            touchView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            touchView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            touchView.topAnchor.constraint(equalTo: topAnchor),
+            touchView.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
     }
 
     required init?(coder: NSCoder) {
@@ -165,17 +175,13 @@ public final class ConnectedPresentationContainer: UIView {
     override public func layoutSubviews() {
         super.layoutSubviews()
 
-        let sharedBounds = bounds
-        metalView.frame = sharedBounds
-        touchView.frame = sharedBounds
-
         let scale = window?.screen.scale ?? traitCollection.displayScale
         guard scale > 0 else { return }
 
         metalView.contentScaleFactor = scale
         metalView.drawableSize = CGSize(
-            width: sharedBounds.width * scale,
-            height: sharedBounds.height * scale)
+            width: metalView.bounds.width * scale,
+            height: metalView.bounds.height * scale)
     }
 }
 

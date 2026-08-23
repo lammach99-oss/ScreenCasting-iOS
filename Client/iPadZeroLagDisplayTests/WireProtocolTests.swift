@@ -270,6 +270,14 @@ final class FullscreenSurfaceLayoutTests: XCTestCase {
         XCTAssertEqual(surface.touchView.bounds, surface.bounds)
     }
 
+    func testCommonUIKitContainerPinsBothSurfacesToItsEdges() {
+        let surface = ConnectedPresentationContainer(frame: .zero)
+
+        XCTAssertFalse(surface.metalView.translatesAutoresizingMaskIntoConstraints)
+        XCTAssertFalse(surface.touchView.translatesAutoresizingMaskIntoConstraints)
+        XCTAssertEqual(surface.constraints.count, 8)
+    }
+
     func testContainerReappliesTheSharedRectangleAfterResize() {
         let surface = ConnectedPresentationContainer(frame: .zero)
         surface.frame = CGRect(x: 10, y: 20, width: 1194, height: 834)
