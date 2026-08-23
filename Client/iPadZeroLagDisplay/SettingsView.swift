@@ -113,6 +113,32 @@ public struct SettingsView: View {
 
                         // ── Adaptive Bitrate Card ─────────────────────────────
                         settingsCard {
+                            VStack(alignment: .leading, spacing: 14) {
+                                Label("Stream Connection", systemImage: "network")
+                                    .font(.system(size: 15, weight: .bold))
+                                    .foregroundColor(.white)
+
+                                Divider().background(Color.white.opacity(0.12))
+
+                                Text("Disconnect only when you are finished with this remote session.")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(.white.opacity(0.55))
+
+                                Button(role: .destructive) {
+                                    networkManager.stop()
+                                    dismiss()
+                                } label: {
+                                    Label("Disconnect Stream", systemImage: "xmark.circle.fill")
+                                        .font(.system(size: 14, weight: .semibold))
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 11)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.red)
+                            }
+                        }
+
+                        settingsCard {
                             VStack(alignment: .leading, spacing: 16) {
                                 Label("Bitrate Control", systemImage: "gauge.medium")
                                     .font(.system(size: 15, weight: .bold))

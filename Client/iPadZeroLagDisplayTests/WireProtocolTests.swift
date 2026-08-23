@@ -293,6 +293,26 @@ final class FullscreenSurfaceLayoutTests: XCTestCase {
     }
 }
 
+final class StreamingControlGestureTests: XCTestCase {
+    func testDisconnectIsOnlyAvailableFromDoubleTapSettings() throws {
+        let sourceRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let contentSource = try String(
+            contentsOf: sourceRoot.appendingPathComponent("iPadZeroLagDisplay/ContentView.swift"),
+            encoding: .utf8)
+        let settingsSource = try String(
+            contentsOf: sourceRoot.appendingPathComponent("iPadZeroLagDisplay/SettingsView.swift"),
+            encoding: .utf8)
+
+        XCTAssertTrue(contentSource.contains("TapGesture(count: 2)"))
+        XCTAssertTrue(contentSource.contains("isSettingsPresented = true"))
+        XCTAssertFalse(contentSource.contains("TapGesture(count: 1)"))
+        XCTAssertFalse(contentSource.contains("Disconnect Stream"))
+        XCTAssertTrue(settingsSource.contains("Disconnect Stream"))
+    }
+}
+
 final class ClientRuntimeManifestTests: XCTestCase {
     func testSourceInfoPlistDeclaresExactBonjourServiceAndFullscreenRuntime() throws {
         let sourceURL = URL(fileURLWithPath: #filePath)

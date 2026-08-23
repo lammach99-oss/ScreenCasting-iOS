@@ -199,8 +199,6 @@ public struct ContentView: View {
 
     // UI States
     @State private var isHudVisible: Bool = true
-    @State private var isDisconnectButtonVisible: Bool = false
-    @State private var dismissTimer: Timer? = nil
     @State private var renderedContentViewport: VideoContentViewport?
     @State private var rendererGeometrySnapshot: RendererGeometrySnapshot?
     @State private var pencilTouchBounds = CGRect.zero
@@ -390,20 +388,13 @@ public struct ContentView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .ignoresSafeArea(.container, edges: .all)
             .allowsHitTesting(true)
-            // Keep the existing HUD gestures without placing a hit-test view
-            // above the remote-input surface. The UIKit touch view remains
-            // the recipient of the touch sequence.
+            // Keep the settings gesture without placing a hit-test view above
+            // the remote-input surface. A single touch remains remote input;
+            // only a deliberate double tap presents stream controls.
             .simultaneousGesture(
                 TapGesture(count: 2)
                     .onEnded {
-                        withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
-                            isHudVisible.toggle()
-                        }
-                    })
-            .simultaneousGesture(
-                TapGesture(count: 1)
-                    .onEnded {
-                        showDisconnectButtonTemporary()
+                        isSettingsPresented = true
                     })
     }
 
@@ -795,14 +786,6 @@ public struct ContentView: View {
                                 }
                                     .font(.system(size: 13, weight: .bold, design: .monospaced))
                             }
-                            Button {
-                                isSettingsPresented = true
-                            } label: {
-                                Image(systemName: "gearshape.fill")
-                                    .font(.system(size: 14, weight: .semibold))
-                                    .frame(width: 24, height: 24)
-                            }
-                            .accessibilityLabel("Display and streaming settings")
                         }
                         .foregroundColor(.white)
                         .padding(.horizontal, 16).padding(.vertical, 10)
@@ -817,43 +800,6 @@ public struct ContentView: View {
                     insertion: .move(edge: .top).combined(with: .opacity),
                     removal: .opacity
                 ))
-            }
-
-            // Disconnect Button (Bottom Center, tap-to-reveal)
-            if isDisconnectButtonVisible {
-                VStack {
-                    Spacer()
-                    Button(action: {
-                        withAnimation { networkManager.stop() }
-                    }) {
-                        HStack(spacing: 8) {
-                            Image(systemName: "xmark.circle.fill").font(.system(size: 18))
-                            Text("Disconnect Stream")
-                                .font(.system(size: 14, weight: .semibold, design: .rounded))
-                        }
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 24).padding(.vertical, 12)
-                        .background(Color.red.opacity(0.85)).cornerRadius(24)
-                        .overlay(RoundedRectangle(cornerRadius: 24).stroke(Color.white.opacity(0.2), lineWidth: 1))
-                        .shadow(color: .red.opacity(0.3), radius: 10, x: 0, y: 5)
-                    }
-                    .padding(.bottom, 24)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-            }
-        }
-    }
-
-    // MARK: - Helpers
-
-    private func showDisconnectButtonTemporary() {
-        dismissTimer?.invalidate()
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-            isDisconnectButtonVisible = true
-        }
-        dismissTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { _ in
-            withAnimation(.easeOut(duration: 0.25)) {
-                isDisconnectButtonVisible = false
             }
         }
     }
