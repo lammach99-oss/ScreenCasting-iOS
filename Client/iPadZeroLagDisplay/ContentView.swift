@@ -297,44 +297,7 @@ public struct ContentView: View {
     @ViewBuilder
     private var backgroundLayer: some View {
         if streamManager.isConnected {
-            MetalVideoView(
-                networkManager: networkManager,
-                onFrameRendered: {
-                    streamManager.registerFrameRendered()
-                },
-                onContentViewportChanged: { viewport in
-                    renderedContentViewport = viewport
-                })
-            .ignoresSafeArea()
-
-            PencilTouchView(
-                onPencilInput: { _ in },
-                onSendTouchEvent: { type, x, y, pressure in
-                    networkManager.sendTouchEvent(
-                        type: type,
-                        x: x,
-                        y: y,
-                        pressure: pressure)
-                },
-                contentViewport: renderedContentViewport
-            )
-            .ignoresSafeArea()
-            .allowsHitTesting(true)
-            // Keep the existing HUD gestures without placing a hit-test view
-            // above the remote-input surface. The touch view remains the
-            // recipient of the UIKit touch sequence.
-            .simultaneousGesture(
-                TapGesture(count: 2)
-                    .onEnded {
-                        withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
-                            isHudVisible.toggle()
-                        }
-                    })
-            .simultaneousGesture(
-                TapGesture(count: 1)
-                    .onEnded {
-                        showDisconnectButtonTemporary()
-                    })
+            connectedVideoSurface
         } else {
             // Premium Disconnected Background
             RadialGradient(
@@ -348,6 +311,55 @@ public struct ContentView: View {
             )
             .ignoresSafeArea()
         }
+    }
+
+    // The decoder/renderer owns the viewport it actually draws. Keep the
+    // Metal and UIKit touch surfaces in one full-window container so that the
+    // same normalized viewport describes both surfaces.
+    @ViewBuilder
+    private var connectedVideoSurface: some View {
+        ZStack {
+            MetalVideoView(
+                networkManager: networkManager,
+                onFrameRendered: {
+                    streamManager.registerFrameRendered()
+                },
+                onContentViewportChanged: { viewport in
+                    renderedContentViewport = viewport
+                })
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            PencilTouchView(
+                onPencilInput: { _ in },
+                onSendTouchEvent: { type, x, y, pressure in
+                    networkManager.sendTouchEvent(
+                        type: type,
+                        x: x,
+                        y: y,
+                        pressure: pressure)
+                },
+                contentViewport: renderedContentViewport
+            )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(true)
+                // Keep the existing HUD gestures without placing a hit-test view
+                // above the remote-input surface. The touch view remains the
+                // recipient of the UIKit touch sequence.
+                .simultaneousGesture(
+                    TapGesture(count: 2)
+                        .onEnded {
+                            withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
+                                isHudVisible.toggle()
+                            }
+                        })
+                .simultaneousGesture(
+                    TapGesture(count: 1)
+                        .onEnded {
+                            showDisconnectButtonTemporary()
+                        })
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .ignoresSafeArea()
     }
 
     @ViewBuilder
