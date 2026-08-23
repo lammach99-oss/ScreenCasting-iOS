@@ -28,6 +28,7 @@ public struct MetalView: UIViewRepresentable {
 
     public func makeUIView(context: Context) -> MTKView {
         let metalView = MTKView()
+        metalView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
 
         if let renderer = Renderer(metalView: metalView) {
             context.coordinator.renderer = renderer
@@ -71,6 +72,14 @@ public struct MetalView: UIViewRepresentable {
         }
 
         return metalView
+    }
+
+    public func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        uiView: MTKView,
+        context: Context
+    ) -> CGSize? {
+        proposal.replacingUnspecifiedDimensions()
     }
 
     public func updateUIView(_ uiView: MTKView, context: Context) {

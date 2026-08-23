@@ -53,8 +53,17 @@ public struct PencilTouchView: UIViewRepresentable {
 
     public func makeUIView(context: Context) -> PencilUIKitView {
         let view = PencilUIKitView()
+        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         updateUIView(view, context: context)
         return view
+    }
+
+    public func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        uiView: PencilUIKitView,
+        context: Context
+    ) -> CGSize? {
+        proposal.replacingUnspecifiedDimensions()
     }
 
     public func updateUIView(_ uiView: PencilUIKitView, context: Context) {

@@ -1,5 +1,6 @@
 import SwiftUI
 import Foundation
+import os
 
 // MARK: - PIN Shake Modifier
 
@@ -181,6 +182,9 @@ struct PINEntryView: View {
 // MARK: - ContentView
 
 public struct ContentView: View {
+    private static let geometryLogger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.iPadZeroLagDisplay.client",
+        category: "presentation")
 
     @StateObject private var networkManager: NetworkManager
     @StateObject private var streamManager: StreamManager
@@ -218,6 +222,7 @@ public struct ContentView: View {
             // LAYER 2: Foreground UI
             foregroundLayer
         }
+        .ignoresSafeArea()
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .onAppear {
@@ -322,62 +327,64 @@ public struct ContentView: View {
     // same normalized viewport describes both surfaces.
     @ViewBuilder
     private var connectedVideoSurface: some View {
-        ZStack {
-            MetalVideoView(
-                networkManager: networkManager,
-                onFrameRendered: {
-                    streamManager.registerFrameRendered()
-                },
-                onContentViewportChanged: { viewport in
-                    renderedContentViewport = viewport
-                },
-                onGeometrySnapshotChanged: { snapshot in
-                    rendererGeometrySnapshot = snapshot
-                    emitGeometrySnapshot(
-                        snapshot,
-                        touchBounds: pencilTouchBounds)
-                })
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            PencilTouchView(
-                onPencilInput: { _ in },
-                onSendTouchEvent: { type, x, y, pressure in
-                    networkManager.sendTouchEvent(
-                        type: type,
-                        x: x,
-                        y: y,
-                        pressure: pressure)
-                },
-                contentViewport: renderedContentViewport,
-                onBoundsChanged: { bounds in
-                    pencilTouchBounds = bounds
-                    if let rendererGeometrySnapshot {
+        GeometryReader { geometry in
+            let surfaceSize = geometry.size
+            ZStack {
+                MetalVideoView(
+                    networkManager: networkManager,
+                    onFrameRendered: {
+                        streamManager.registerFrameRendered()
+                    },
+                    onContentViewportChanged: { viewport in
+                        renderedContentViewport = viewport
+                    },
+                    onGeometrySnapshotChanged: { snapshot in
+                        rendererGeometrySnapshot = snapshot
                         emitGeometrySnapshot(
-                            rendererGeometrySnapshot,
-                            touchBounds: bounds)
+                            snapshot,
+                            touchBounds: pencilTouchBounds)
+                    })
+                    .frame(width: surfaceSize.width, height: surfaceSize.height)
+
+                PencilTouchView(
+                    onPencilInput: { _ in },
+                    onSendTouchEvent: { type, x, y, pressure in
+                        networkManager.sendTouchEvent(
+                            type: type,
+                            x: x,
+                            y: y,
+                            pressure: pressure)
+                    },
+                    contentViewport: renderedContentViewport,
+                    onBoundsChanged: { bounds in
+                        pencilTouchBounds = bounds
+                        if let rendererGeometrySnapshot {
+                            emitGeometrySnapshot(
+                                rendererGeometrySnapshot,
+                                touchBounds: bounds)
+                        }
                     }
-                }
-            )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .allowsHitTesting(true)
-                // Keep the existing HUD gestures without placing a hit-test view
-                // above the remote-input surface. The touch view remains the
-                // recipient of the UIKit touch sequence.
-                .simultaneousGesture(
-                    TapGesture(count: 2)
-                        .onEnded {
-                            withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
-                                isHudVisible.toggle()
-                            }
-                        })
-                .simultaneousGesture(
-                    TapGesture(count: 1)
-                        .onEnded {
-                            showDisconnectButtonTemporary()
-                        })
+                )
+                    .frame(width: surfaceSize.width, height: surfaceSize.height)
+                    .allowsHitTesting(true)
+                    // Keep the existing HUD gestures without placing a hit-test view
+                    // above the remote-input surface. The touch view remains the
+                    // recipient of the UIKit touch sequence.
+                    .simultaneousGesture(
+                        TapGesture(count: 2)
+                            .onEnded {
+                                withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
+                                    isHudVisible.toggle()
+                                }
+                            })
+                    .simultaneousGesture(
+                        TapGesture(count: 1)
+                            .onEnded {
+                                showDisconnectButtonTemporary()
+                            })
+            }
+            .frame(width: surfaceSize.width, height: surfaceSize.height)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .ignoresSafeArea()
     }
 
     private func emitGeometrySnapshot(
@@ -395,7 +402,7 @@ public struct ContentView: View {
             "touchBoundsPt=\(format(rect: touchBounds))"
         guard line != lastGeometrySnapshotLine else { return }
         lastGeometrySnapshotLine = line
-        print(line)
+        Self.geometryLogger.notice("\(line, privacy: .public)")
     }
 
     private func format(rect: CGRect) -> String {
