@@ -269,6 +269,19 @@ final class FullscreenSurfaceLayoutTests: XCTestCase {
         XCTAssertEqual(surface.metalView.bounds, surface.bounds)
         XCTAssertEqual(surface.touchView.bounds, surface.bounds)
     }
+
+    func testContainerReappliesTheSharedRectangleAfterResize() {
+        let surface = ConnectedPresentationContainer(frame: .zero)
+        surface.frame = CGRect(x: 10, y: 20, width: 1194, height: 834)
+        surface.layoutIfNeeded()
+
+        surface.frame = CGRect(x: 10, y: 20, width: 834, height: 1194)
+        surface.layoutIfNeeded()
+
+        XCTAssertEqual(surface.metalView.frame, surface.bounds)
+        XCTAssertEqual(surface.touchView.frame, surface.bounds)
+        XCTAssertEqual(surface.metalView.bounds, surface.touchView.bounds)
+    }
 }
 
 final class ControlChannelWriterTests: XCTestCase {

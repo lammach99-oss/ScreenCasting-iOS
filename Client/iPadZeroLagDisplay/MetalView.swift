@@ -144,24 +144,38 @@ public final class ConnectedPresentationContainer: UIView {
         isOpaque = true
         clipsToBounds = true
 
-        metalView.translatesAutoresizingMaskIntoConstraints = false
-        touchView.translatesAutoresizingMaskIntoConstraints = false
+        // The container owns the one runtime rectangle used by both surfaces.
+        // Autoresizing plus layoutSubviews avoids a representable/constraint
+        // timing gap during fullscreen and rotation layout.
+        metalView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        touchView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         addSubview(metalView)
         addSubview(touchView)
-        NSLayoutConstraint.activate([
-            metalView.leadingAnchor.constraint(equalTo: leadingAnchor),
-            metalView.trailingAnchor.constraint(equalTo: trailingAnchor),
-            metalView.topAnchor.constraint(equalTo: topAnchor),
-            metalView.bottomAnchor.constraint(equalTo: bottomAnchor),
-            touchView.leadingAnchor.constraint(equalTo: leadingAnchor),
-            touchView.trailingAnchor.constraint(equalTo: trailingAnchor),
-            touchView.topAnchor.constraint(equalTo: topAnchor),
-            touchView.bottomAnchor.constraint(equalTo: bottomAnchor)
-        ])
     }
 
     required init?(coder: NSCoder) {
         nil
+    }
+
+    override public func didMoveToWindow() {
+        super.didMoveToWindow()
+        setNeedsLayout()
+    }
+
+    override public func layoutSubviews() {
+        super.layoutSubviews()
+
+        let sharedBounds = bounds
+        metalView.frame = sharedBounds
+        touchView.frame = sharedBounds
+
+        let scale = window?.screen.scale ?? traitCollection.displayScale
+        guard scale > 0 else { return }
+
+        metalView.contentScaleFactor = scale
+        metalView.drawableSize = CGSize(
+            width: sharedBounds.width * scale,
+            height: sharedBounds.height * scale)
     }
 }
 
@@ -243,7 +257,9 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         }
 
         let metalView = container.metalView
-        metalView.autoResizeDrawable = true
+        // ConnectedPresentationContainer owns drawable sizing from its shared
+        // bounds so the Metal surface and the touch surface cannot diverge.
+        metalView.autoResizeDrawable = false
         if let screen = metalView.window?.screen {
             metalView.contentScaleFactor = screen.scale
         }
