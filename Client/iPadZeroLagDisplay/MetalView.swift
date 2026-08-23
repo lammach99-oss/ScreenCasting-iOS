@@ -5,21 +5,25 @@ public struct MetalView: UIViewRepresentable {
     @ObservedObject var networkManager: NetworkManager
     public var onFrameRendered: (() -> Void)?
     public var onContentViewportChanged: ((VideoContentViewport?) -> Void)?
+    var onGeometrySnapshotChanged: ((RendererGeometrySnapshot) -> Void)?
 
     public init(
         networkManager: NetworkManager,
         onFrameRendered: (() -> Void)? = nil,
-        onContentViewportChanged: ((VideoContentViewport?) -> Void)? = nil
+        onContentViewportChanged: ((VideoContentViewport?) -> Void)? = nil,
+        onGeometrySnapshotChanged: ((RendererGeometrySnapshot) -> Void)? = nil
     ) {
         self.networkManager = networkManager
         self.onFrameRendered = onFrameRendered
         self.onContentViewportChanged = onContentViewportChanged
+        self.onGeometrySnapshotChanged = onGeometrySnapshotChanged
     }
 
     public func makeCoordinator() -> Coordinator {
         Coordinator(
             onFrameRendered: onFrameRendered,
-            onContentViewportChanged: onContentViewportChanged)
+            onContentViewportChanged: onContentViewportChanged,
+            onGeometrySnapshotChanged: onGeometrySnapshotChanged)
     }
 
     public func makeUIView(context: Context) -> MTKView {
@@ -49,6 +53,9 @@ public struct MetalView: UIViewRepresentable {
             renderer.onContentViewportChanged = { [weak coordinator = context.coordinator] viewport in
                 coordinator?.onContentViewportChanged?(viewport)
             }
+            renderer.onGeometrySnapshotChanged = { [weak coordinator = context.coordinator] snapshot in
+                coordinator?.onGeometrySnapshotChanged?(snapshot)
+            }
 
             // Connect VideoToolbox Decoded PixelBuffers directly into Metal Renderer
             networkManager.decoder.onSessionBegan = { [weak renderer] generation in
@@ -69,19 +76,23 @@ public struct MetalView: UIViewRepresentable {
     public func updateUIView(_ uiView: MTKView, context: Context) {
         context.coordinator.onFrameRendered = onFrameRendered
         context.coordinator.onContentViewportChanged = onContentViewportChanged
+        context.coordinator.onGeometrySnapshotChanged = onGeometrySnapshotChanged
     }
 
     public class Coordinator {
         var renderer: Renderer?
         var onFrameRendered: (() -> Void)?
         var onContentViewportChanged: ((VideoContentViewport?) -> Void)?
+        var onGeometrySnapshotChanged: ((RendererGeometrySnapshot) -> Void)?
 
         init(
             onFrameRendered: (() -> Void)?,
-            onContentViewportChanged: ((VideoContentViewport?) -> Void)?
+            onContentViewportChanged: ((VideoContentViewport?) -> Void)?,
+            onGeometrySnapshotChanged: ((RendererGeometrySnapshot) -> Void)?
         ) {
             self.onFrameRendered = onFrameRendered
             self.onContentViewportChanged = onContentViewportChanged
+            self.onGeometrySnapshotChanged = onGeometrySnapshotChanged
         }
     }
 }
@@ -91,21 +102,25 @@ public struct MetalVideoView: View {
     @ObservedObject var networkManager: NetworkManager
     public var onFrameRendered: (() -> Void)?
     public var onContentViewportChanged: ((VideoContentViewport?) -> Void)?
+    var onGeometrySnapshotChanged: ((RendererGeometrySnapshot) -> Void)?
 
     public init(
         networkManager: NetworkManager,
         onFrameRendered: (() -> Void)? = nil,
-        onContentViewportChanged: ((VideoContentViewport?) -> Void)? = nil
+        onContentViewportChanged: ((VideoContentViewport?) -> Void)? = nil,
+        onGeometrySnapshotChanged: ((RendererGeometrySnapshot) -> Void)? = nil
     ) {
         self.networkManager = networkManager
         self.onFrameRendered = onFrameRendered
         self.onContentViewportChanged = onContentViewportChanged
+        self.onGeometrySnapshotChanged = onGeometrySnapshotChanged
     }
 
     public var body: some View {
         MetalView(
             networkManager: networkManager,
             onFrameRendered: onFrameRendered,
-            onContentViewportChanged: onContentViewportChanged)
+            onContentViewportChanged: onContentViewportChanged,
+            onGeometrySnapshotChanged: onGeometrySnapshotChanged)
     }
 }

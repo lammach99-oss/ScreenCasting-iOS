@@ -2,6 +2,7 @@ import Foundation
 import Metal
 import MetalKit
 import CoreVideo
+import UIKit
 
 enum RenderOfferDecision: Equatable {
     case accepted(replaced: UInt32?)
@@ -161,11 +162,22 @@ public struct VideoContentViewport: Equatable {
     }
 }
 
+public struct RendererGeometrySnapshot: Equatable {
+    let decodedFrameSize: CGSize
+    let windowBounds: CGRect
+    let safeAreaInsets: UIEdgeInsets
+    let metalBounds: CGRect
+    let drawableSize: CGSize
+    let contentScaleFactor: CGFloat
+    let contentViewport: VideoContentViewport
+}
+
 public class Renderer: NSObject, MTKViewDelegate {
     public var onFrameRendered: ((UInt32, UInt64) -> Void)?
     public var onDrawableCommitted: ((UInt32, UInt64) -> Void)?
     public var onFrameDropped: ((UInt32, UInt64) -> Void)?
     var onContentViewportChanged: ((VideoContentViewport?) -> Void)?
+    var onGeometrySnapshotChanged: ((RendererGeometrySnapshot) -> Void)?
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private var pipelineState: MTLRenderPipelineState?
@@ -174,6 +186,8 @@ public class Renderer: NSObject, MTKViewDelegate {
     private var currentPixelBuffer: CVPixelBuffer?
     private var freshness = RenderFreshnessTracker()
     private var publishedContentViewport: VideoContentViewport?
+    private var publishedGeometrySnapshot: RendererGeometrySnapshot?
+    private var lastDecodedFrameSize: CGSize?
     private let lock = NSLock()
 
     public init?(metalView: MTKView) {
@@ -225,6 +239,8 @@ public class Renderer: NSObject, MTKViewDelegate {
         freshness.beginSession(generation: generation)
         let shouldResetContentViewport = publishedContentViewport != nil
         publishedContentViewport = nil
+        publishedGeometrySnapshot = nil
+        lastDecodedFrameSize = nil
         lock.unlock()
         if shouldResetContentViewport {
             DispatchQueue.main.async { [weak self] in
@@ -253,7 +269,16 @@ public class Renderer: NSObject, MTKViewDelegate {
         if let dropped { onFrameDropped?(dropped, generation) }
     }
 
-    public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+    public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        lock.lock()
+        let decodedFrameSize = lastDecodedFrameSize
+        lock.unlock()
+        if let decodedFrameSize {
+            publishGeometrySnapshot(
+                for: view,
+                decodedFrameSize: decodedFrameSize)
+        }
+    }
 
     public func draw(in view: MTKView) {
         lock.lock()
@@ -275,6 +300,10 @@ public class Renderer: NSObject, MTKViewDelegate {
 
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
+        let decodedFrameSize = CGSize(width: width, height: height)
+        lock.lock()
+        lastDecodedFrameSize = decodedFrameSize
+        lock.unlock()
         guard CVPixelBufferGetIOSurface(pixelBuffer) != nil else {
             print("[Renderer] Metal presentation rejected: IOSurface unavailable for \(width)x\(height)")
             abandon(identity)
@@ -318,6 +347,9 @@ public class Renderer: NSObject, MTKViewDelegate {
             return
         }
         publishContentViewport(contentViewport)
+        publishGeometrySnapshot(
+            for: view,
+            decodedFrameSize: decodedFrameSize)
         let scale = SIMD2<Float>(
             Float(contentViewport.rect.width),
             Float(contentViewport.rect.height))
@@ -367,6 +399,36 @@ public class Renderer: NSObject, MTKViewDelegate {
 
         DispatchQueue.main.async { [weak self] in
             self?.onContentViewportChanged?(contentViewport)
+        }
+    }
+
+    private func publishGeometrySnapshot(
+        for view: MTKView,
+        decodedFrameSize: CGSize
+    ) {
+        DispatchQueue.main.async { [weak self, weak view] in
+            guard let self,
+                  let view,
+                  let contentViewport = VideoContentViewport.aspectFit(
+                    containerSize: view.drawableSize,
+                    videoSize: decodedFrameSize) else {
+                return
+            }
+
+            let snapshot = RendererGeometrySnapshot(
+                decodedFrameSize: decodedFrameSize,
+                windowBounds: view.window?.bounds ?? .zero,
+                safeAreaInsets: view.window?.safeAreaInsets ?? view.safeAreaInsets,
+                metalBounds: view.bounds,
+                drawableSize: view.drawableSize,
+                contentScaleFactor: view.contentScaleFactor,
+                contentViewport: contentViewport)
+            self.lock.lock()
+            let changed = self.publishedGeometrySnapshot != snapshot
+            self.publishedGeometrySnapshot = snapshot
+            self.lock.unlock()
+            guard changed else { return }
+            self.onGeometrySnapshotChanged?(snapshot)
         }
     }
 

@@ -1,4 +1,5 @@
 import SwiftUI
+import Foundation
 
 // MARK: - PIN Shake Modifier
 
@@ -196,6 +197,9 @@ public struct ContentView: View {
     @State private var isDisconnectButtonVisible: Bool = false
     @State private var dismissTimer: Timer? = nil
     @State private var renderedContentViewport: VideoContentViewport?
+    @State private var rendererGeometrySnapshot: RendererGeometrySnapshot?
+    @State private var pencilTouchBounds = CGRect.zero
+    @State private var lastGeometrySnapshotLine = ""
 
     public init() {
         let netManager = NetworkManager()
@@ -326,6 +330,12 @@ public struct ContentView: View {
                 },
                 onContentViewportChanged: { viewport in
                     renderedContentViewport = viewport
+                },
+                onGeometrySnapshotChanged: { snapshot in
+                    rendererGeometrySnapshot = snapshot
+                    emitGeometrySnapshot(
+                        snapshot,
+                        touchBounds: pencilTouchBounds)
                 })
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -338,7 +348,15 @@ public struct ContentView: View {
                         y: y,
                         pressure: pressure)
                 },
-                contentViewport: renderedContentViewport
+                contentViewport: renderedContentViewport,
+                onBoundsChanged: { bounds in
+                    pencilTouchBounds = bounds
+                    if let rendererGeometrySnapshot {
+                        emitGeometrySnapshot(
+                            rendererGeometrySnapshot,
+                            touchBounds: bounds)
+                    }
+                }
             )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .allowsHitTesting(true)
@@ -360,6 +378,40 @@ public struct ContentView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .ignoresSafeArea()
+    }
+
+    private func emitGeometrySnapshot(
+        _ snapshot: RendererGeometrySnapshot,
+        touchBounds: CGRect
+    ) {
+        let line = "[ScreenCasting][VIEW_GEOMETRY] " +
+            "framePx=\(Int(snapshot.decodedFrameSize.width))x\(Int(snapshot.decodedFrameSize.height)) " +
+            "windowPt=\(format(rect: snapshot.windowBounds)) " +
+            "safeAreaPt=\(format(insets: snapshot.safeAreaInsets)) " +
+            "mtkBoundsPt=\(format(rect: snapshot.metalBounds)) " +
+            "drawablePx=\(format(size: snapshot.drawableSize)) " +
+            "scale=\(format(value: snapshot.contentScaleFactor)) " +
+            "contentRectNorm=\(format(rect: snapshot.contentViewport.rect)) " +
+            "touchBoundsPt=\(format(rect: touchBounds))"
+        guard line != lastGeometrySnapshotLine else { return }
+        lastGeometrySnapshotLine = line
+        print(line)
+    }
+
+    private func format(rect: CGRect) -> String {
+        "(x=\(format(value: rect.origin.x)),y=\(format(value: rect.origin.y)),w=\(format(value: rect.width)),h=\(format(value: rect.height)))"
+    }
+
+    private func format(insets: UIEdgeInsets) -> String {
+        "(t=\(format(value: insets.top)),l=\(format(value: insets.left)),b=\(format(value: insets.bottom)),r=\(format(value: insets.right)))"
+    }
+
+    private func format(size: CGSize) -> String {
+        "\(format(value: size.width))x\(format(value: size.height))"
+    }
+
+    private func format(value: CGFloat) -> String {
+        String(format: "%.2f", Double(value))
     }
 
     @ViewBuilder

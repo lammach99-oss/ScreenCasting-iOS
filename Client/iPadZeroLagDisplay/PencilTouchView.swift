@@ -33,6 +33,7 @@ public struct PencilTouchView: UIViewRepresentable {
     /// Normalized aspect-fit rectangle occupied by the remote video in this view.
     /// The Metal renderer is the source of truth for this displayed geometry.
     public var contentViewport: VideoContentViewport?
+    var onBoundsChanged: ((CGRect) -> Void)?
 
     // MARK: Init
 
@@ -40,12 +41,14 @@ public struct PencilTouchView: UIViewRepresentable {
         onPencilInput:    ((PencilPacket) -> Void)?                        = nil,
         onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)? = nil,
         onNetworkSend:    ((Data) -> Void)?                                = nil,
-        contentViewport:  VideoContentViewport?                             = nil
+        contentViewport:  VideoContentViewport?                             = nil,
+        onBoundsChanged:  ((CGRect) -> Void)?                               = nil
     ) {
         self.onPencilInput    = onPencilInput
         self.onSendTouchEvent = onSendTouchEvent
         self.onNetworkSend    = onNetworkSend
         self.contentViewport  = contentViewport
+        self.onBoundsChanged  = onBoundsChanged
     }
 
     public func makeUIView(context: Context) -> PencilUIKitView {
@@ -59,6 +62,7 @@ public struct PencilTouchView: UIViewRepresentable {
         uiView.onSendTouchEvent = onSendTouchEvent
         uiView.onNetworkSend    = onNetworkSend
         uiView.contentViewport  = contentViewport
+        uiView.onBoundsChanged  = onBoundsChanged
     }
 }
 
@@ -99,9 +103,11 @@ public class PencilUIKitView: UIView {
     public var onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)?
     public var onNetworkSend:    ((Data) -> Void)?
     public var contentViewport: VideoContentViewport?
+    public var onBoundsChanged: ((CGRect) -> Void)?
 
     private var activeTouchIdentifier: ObjectIdentifier?
     private var lastNormalizedPoint: CGPoint?
+    private var lastReportedBounds: CGRect?
 
     override public init(frame: CGRect) {
         super.init(frame: frame)
@@ -111,6 +117,13 @@ public class PencilUIKitView: UIView {
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
+    }
+
+    override public func layoutSubviews() {
+        super.layoutSubviews()
+        guard bounds != lastReportedBounds else { return }
+        lastReportedBounds = bounds
+        onBoundsChanged?(bounds)
     }
 
     // MARK: - UIKit touch overrides (pass event for coalesced touch access)
