@@ -260,6 +260,15 @@ final class FullscreenSurfaceLayoutTests: XCTestCase {
                 height: 834),
             CGSize(width: 1194, height: 834))
     }
+
+    func testCommonUIKitContainerPinsMetalAndTouchToIdenticalBounds() {
+        let surface = ConnectedPresentationContainer()
+        surface.frame = CGRect(x: 0, y: 0, width: 1194, height: 834)
+        surface.layoutIfNeeded()
+
+        XCTAssertEqual(surface.metalView.bounds, surface.bounds)
+        XCTAssertEqual(surface.touchView.bounds, surface.bounds)
+    }
 }
 
 final class ControlChannelWriterTests: XCTestCase {

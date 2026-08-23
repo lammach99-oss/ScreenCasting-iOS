@@ -329,61 +329,53 @@ public struct ContentView: View {
     private var connectedVideoSurface: some View {
         GeometryReader { geometry in
             let surfaceSize = geometry.size
-            ZStack {
-                MetalVideoView(
-                    networkManager: networkManager,
-                    onFrameRendered: {
-                        streamManager.registerFrameRendered()
-                    },
-                    onContentViewportChanged: { viewport in
-                        renderedContentViewport = viewport
-                    },
-                    onGeometrySnapshotChanged: { snapshot in
-                        rendererGeometrySnapshot = snapshot
+            ConnectedPresentationSurface(
+                networkManager: networkManager,
+                onFrameRendered: {
+                    streamManager.registerFrameRendered()
+                },
+                onContentViewportChanged: { viewport in
+                    renderedContentViewport = viewport
+                },
+                onGeometrySnapshotChanged: { snapshot in
+                    rendererGeometrySnapshot = snapshot
+                    emitGeometrySnapshot(
+                        snapshot,
+                        touchBounds: pencilTouchBounds)
+                },
+                onTouchBoundsChanged: { bounds in
+                    pencilTouchBounds = bounds
+                    if let rendererGeometrySnapshot {
                         emitGeometrySnapshot(
-                            snapshot,
-                            touchBounds: pencilTouchBounds)
-                    })
-                    .frame(width: surfaceSize.width, height: surfaceSize.height)
-
-                PencilTouchView(
-                    onPencilInput: { _ in },
-                    onSendTouchEvent: { type, x, y, pressure in
-                        networkManager.sendTouchEvent(
-                            type: type,
-                            x: x,
-                            y: y,
-                            pressure: pressure)
-                    },
-                    contentViewport: renderedContentViewport,
-                    onBoundsChanged: { bounds in
-                        pencilTouchBounds = bounds
-                        if let rendererGeometrySnapshot {
-                            emitGeometrySnapshot(
-                                rendererGeometrySnapshot,
-                                touchBounds: bounds)
-                        }
+                            rendererGeometrySnapshot,
+                            touchBounds: bounds)
                     }
-                )
-                    .frame(width: surfaceSize.width, height: surfaceSize.height)
-                    .allowsHitTesting(true)
-                    // Keep the existing HUD gestures without placing a hit-test view
-                    // above the remote-input surface. The touch view remains the
-                    // recipient of the UIKit touch sequence.
-                    .simultaneousGesture(
-                        TapGesture(count: 2)
-                            .onEnded {
-                                withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
-                                    isHudVisible.toggle()
-                                }
-                            })
-                    .simultaneousGesture(
-                        TapGesture(count: 1)
-                            .onEnded {
-                                showDisconnectButtonTemporary()
-                            })
-            }
-            .frame(width: surfaceSize.width, height: surfaceSize.height)
+                },
+                onPencilInput: { _ in },
+                onSendTouchEvent: { type, x, y, pressure in
+                    networkManager.sendTouchEvent(
+                        type: type,
+                        x: x,
+                        y: y,
+                        pressure: pressure)
+                })
+                .frame(width: surfaceSize.width, height: surfaceSize.height)
+                .allowsHitTesting(true)
+                // Keep the existing HUD gestures without placing a hit-test view
+                // above the remote-input surface. The UIKit touch view remains
+                // the recipient of the touch sequence.
+                .simultaneousGesture(
+                    TapGesture(count: 2)
+                        .onEnded {
+                            withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
+                                isHudVisible.toggle()
+                            }
+                        })
+                .simultaneousGesture(
+                    TapGesture(count: 1)
+                        .onEnded {
+                            showDisconnectButtonTemporary()
+                        })
         }
         // This is the common runtime rectangle for the MTKView and the UIKit
         // touch view. The renderer still decides the visible video viewport
