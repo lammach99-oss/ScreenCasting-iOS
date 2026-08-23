@@ -408,6 +408,40 @@ final class DisplayConfigurationProtocolTests: XCTestCase {
         XCTAssertFalse(gate.isInputSuppressed)
         XCTAssertNil(gate.begin(configuration))
     }
+
+    func testRejectedReconfigurationKeepsTheEffectiveModeAndResumesTouch() throws {
+        var gate = DisplayRequestGate()
+        let native = DisplayConfigurationRequest(
+            width: 2388,
+            height: 1668,
+            refreshHz: 60,
+            orientation: .landscape,
+            requestId: 0)
+        let firstRequest = try XCTUnwrap(gate.begin(native))
+        let activeMode = DisplayReady(
+            width: firstRequest.width,
+            height: firstRequest.height,
+            refreshHz: firstRequest.refreshHz,
+            orientation: firstRequest.orientation,
+            requestId: firstRequest.requestId,
+            generation: 4)
+        XCTAssertTrue(gate.accept(activeMode))
+
+        let alternate = DisplayConfigurationRequest(
+            width: 1920,
+            height: 1080,
+            refreshHz: 60,
+            orientation: .landscape,
+            requestId: 0)
+        let rejectedRequest = try XCTUnwrap(gate.begin(alternate))
+        XCTAssertTrue(gate.isInputSuppressed)
+
+        XCTAssertTrue(gate.reject(DisplayConfigurationFailed(
+            requestId: rejectedRequest.requestId,
+            reason: .applyFailed)))
+        XCTAssertFalse(gate.isInputSuppressed)
+        XCTAssertEqual(gate.effective, activeMode)
+    }
 }
 
 final class ControlChannelWriterTests: XCTestCase {
