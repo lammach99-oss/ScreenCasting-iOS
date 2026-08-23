@@ -63,7 +63,9 @@ public struct PencilTouchView: UIViewRepresentable {
         uiView: PencilUIKitView,
         context: Context
     ) -> CGSize? {
-        proposal.replacingUnspecifiedDimensions()
+        FullscreenSurfaceLayout.exactSize(
+            width: proposal.width,
+            height: proposal.height)
     }
 
     public func updateUIView(_ uiView: PencilUIKitView, context: Context) {

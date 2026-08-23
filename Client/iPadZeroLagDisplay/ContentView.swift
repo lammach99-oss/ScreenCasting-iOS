@@ -385,6 +385,10 @@ public struct ContentView: View {
             }
             .frame(width: surfaceSize.width, height: surfaceSize.height)
         }
+        // This is the common runtime rectangle for the MTKView and the UIKit
+        // touch view. The renderer still decides the visible video viewport
+        // inside it; this only removes safe-area layout from the surfaces.
+        .ignoresSafeArea(.container, edges: .all)
     }
 
     private func emitGeometrySnapshot(

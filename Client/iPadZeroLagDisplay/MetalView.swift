@@ -1,5 +1,19 @@
 import SwiftUI
 import MetalKit
+import UIKit
+
+/// Resolves the size that both UIKit presentation surfaces receive from their
+/// shared SwiftUI container. An incomplete proposal must stay incomplete: the
+/// old 10-point fallback from `replacingUnspecifiedDimensions()` could shrink a
+/// representable before the fullscreen container finished its layout.
+enum FullscreenSurfaceLayout {
+    static func exactSize(width: CGFloat?, height: CGFloat?) -> CGSize? {
+        guard let width, let height, width >= 0, height >= 0 else {
+            return nil
+        }
+        return CGSize(width: width, height: height)
+    }
+}
 
 public struct MetalView: UIViewRepresentable {
     @ObservedObject var networkManager: NetworkManager
@@ -79,13 +93,23 @@ public struct MetalView: UIViewRepresentable {
         uiView: MTKView,
         context: Context
     ) -> CGSize? {
-        proposal.replacingUnspecifiedDimensions()
+        FullscreenSurfaceLayout.exactSize(
+            width: proposal.width,
+            height: proposal.height)
     }
 
     public func updateUIView(_ uiView: MTKView, context: Context) {
         context.coordinator.onFrameRendered = onFrameRendered
         context.coordinator.onContentViewportChanged = onContentViewportChanged
         context.coordinator.onGeometrySnapshotChanged = onGeometrySnapshotChanged
+
+        // MTKView owns its drawable lifetime. Keep automatic resizing enabled
+        // and give it the screen scale once it has a window; this keeps its
+        // bounds and drawable size aligned with the shared fullscreen rect.
+        uiView.autoResizeDrawable = true
+        if let screen = uiView.window?.screen {
+            uiView.contentScaleFactor = screen.scale
+        }
     }
 
     public class Coordinator {

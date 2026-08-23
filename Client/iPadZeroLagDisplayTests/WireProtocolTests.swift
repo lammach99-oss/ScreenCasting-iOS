@@ -245,6 +245,23 @@ final class VideoContentViewportTests: XCTestCase {
     }
 }
 
+final class FullscreenSurfaceLayoutTests: XCTestCase {
+    func testUnspecifiedDimensionDoesNotCreateAnArbitrarySmallSurface() {
+        XCTAssertNil(
+            FullscreenSurfaceLayout.exactSize(
+                width: nil,
+                height: 834))
+    }
+
+    func testExplicitContainerSizeIsSharedWithoutAspectAdjustment() {
+        XCTAssertEqual(
+            FullscreenSurfaceLayout.exactSize(
+                width: 1194,
+                height: 834),
+            CGSize(width: 1194, height: 834))
+    }
+}
+
 final class ControlChannelWriterTests: XCTestCase {
     func testSenderNeverHasMoreThanOneInFlightSend() {
         let queue = DispatchQueue(label: "control.writer.test")
