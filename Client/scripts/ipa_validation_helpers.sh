@@ -28,6 +28,26 @@ ipa_require_exact_value() {
     [[ -n "$actual" && "$actual" == "$expected" ]] || ipa_fail "$label mismatch: expected $expected, got ${actual:-<empty>}"
 }
 
+ipa_require_screencasting_runtime_configuration() {
+    local plist full_screen status_bar bonjour_service local_network multiple_scenes
+    plist="$1"
+
+    full_screen="$(plutil -extract UIRequiresFullScreen raw -o - "$plist" 2>/dev/null || true)"
+    ipa_require_exact_value 'UIRequiresFullScreen' "$full_screen" true || return 1
+
+    status_bar="$(plutil -extract UIStatusBarHidden raw -o - "$plist" 2>/dev/null || true)"
+    ipa_require_exact_value 'UIStatusBarHidden' "$status_bar" true || return 1
+
+    bonjour_service="$(plutil -extract NSBonjourServices.0 raw -o - "$plist" 2>/dev/null || true)"
+    ipa_require_exact_value 'NSBonjourServices[0]' "$bonjour_service" '_screencasting._tcp' || return 1
+
+    local_network="$(plutil -extract NSLocalNetworkUsageDescription raw -o - "$plist" 2>/dev/null || true)"
+    [[ -n "$local_network" ]] || { ipa_fail 'NSLocalNetworkUsageDescription must be non-empty'; return 1; }
+
+    multiple_scenes="$(plutil -extract 'UIApplicationSceneManifest.UIApplicationSupportsMultipleScenes' raw -o - "$plist" 2>/dev/null || true)"
+    ipa_require_exact_value 'UIApplicationSupportsMultipleScenes' "$multiple_scenes" false || return 1
+}
+
 ipa_require_unsigned_material_absent() {
     local app_dir="$1" forbidden
     if [[ -e "$app_dir/_CodeSignature" || -e "$app_dir/embedded.mobileprovision" ]]; then
@@ -69,6 +89,7 @@ ipa_validate_unsigned_app() {
     [[ -f "$plist" ]] || { ipa_fail 'unsigned app missing Info.plist'; return 1; }
     bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$plist")" || { ipa_fail 'unsigned app missing CFBundleIdentifier'; return 1; }
     ipa_require_exact_value 'unsigned app bundle identifier' "$bundle_id" "$expected_bundle_id" || return 1
+    ipa_require_screencasting_runtime_configuration "$plist" || return 1
     family="$(/usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily' "$plist" 2>/dev/null || true)"
     ipa_require_ipad_only_family "$family" || return 1
     executable="$(plutil -extract CFBundleExecutable raw -o - "$plist")" || { ipa_fail 'unsigned app missing CFBundleExecutable'; return 1; }

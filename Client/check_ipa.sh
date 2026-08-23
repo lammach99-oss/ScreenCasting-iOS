@@ -66,6 +66,7 @@ PLIST="$APP_DIR/Info.plist"
 [[ -f "$PLIST" ]] || ipa_fail 'missing app Info.plist'
 bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$PLIST")" || ipa_fail 'missing CFBundleIdentifier'
 ipa_require_exact_value 'bundle identifier' "$bundle_id" "$EXPECTED_BUNDLE_IDENTIFIER"
+ipa_require_screencasting_runtime_configuration "$PLIST"
 
 family="$(/usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily' "$PLIST" 2>/dev/null || true)"
 ipa_require_ipad_only_family "$family"

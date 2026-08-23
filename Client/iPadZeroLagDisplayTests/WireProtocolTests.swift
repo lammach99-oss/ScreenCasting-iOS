@@ -1,4 +1,5 @@
 import XCTest
+import Foundation
 import Network
 import CoreGraphics
 @testable import iPadCasting
@@ -289,6 +290,33 @@ final class FullscreenSurfaceLayoutTests: XCTestCase {
         XCTAssertEqual(surface.metalView.frame, surface.bounds)
         XCTAssertEqual(surface.touchView.frame, surface.bounds)
         XCTAssertEqual(surface.metalView.bounds, surface.touchView.bounds)
+    }
+}
+
+final class ClientRuntimeManifestTests: XCTestCase {
+    func testSourceInfoPlistDeclaresExactBonjourServiceAndFullscreenRuntime() throws {
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("iPadZeroLagDisplay/Info.plist")
+        let data = try Data(contentsOf: sourceURL)
+        let values = try XCTUnwrap(
+            PropertyListSerialization.propertyList(
+                from: data,
+                format: nil) as? [String: Any])
+
+        XCTAssertEqual(
+            values["NSBonjourServices"] as? [String],
+            ["_screencasting._tcp"])
+        XCTAssertEqual(values["UIRequiresFullScreen"] as? Bool, true)
+        XCTAssertEqual(values["UIStatusBarHidden"] as? Bool, true)
+        XCTAssertEqual(
+            values["UIApplicationSupportsMultipleScenes"] as? Bool,
+            nil,
+            "The setting belongs only inside UIApplicationSceneManifest.")
+        XCTAssertEqual(
+            (values["UIApplicationSceneManifest"] as? [String: Any])?["UIApplicationSupportsMultipleScenes"] as? Bool,
+            false)
     }
 }
 

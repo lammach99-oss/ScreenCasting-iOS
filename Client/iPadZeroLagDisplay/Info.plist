@@ -30,7 +30,7 @@
 	<string>ScreenCasting requires local network access to discover and connect to your Windows PC secondary monitor host.</string>
 	<key>NSBonjourServices</key>
 	<array>
-		<string>_screencasting._tcp.</string>
+		<string>_screencasting._tcp</string>
 	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>

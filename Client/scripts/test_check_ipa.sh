@@ -40,12 +40,14 @@ clang -target arm64e-apple-ios17.0 -c "$TEMP_DIR/fixture.c" -o "$TEMP_DIR/arm64e
 lipo -create "$TEMP_DIR/arm64.o" "$TEMP_DIR/x86_64.o" -output "$TEMP_DIR/fat.o"
 
 make_ipa() {
-    local output bundle_id family binary profile_source stage app plist index value
+    local output bundle_id family binary profile_source bonjour_service include_fullscreen stage app plist index value
     output="$1"
     bundle_id="$2"
     family="$3"
     binary="$4"
     profile_source="${5:-}"
+    bonjour_service="${6:-_screencasting._tcp}"
+    include_fullscreen="${7:-true}"
     stage="$TEMP_DIR/$(basename "$output" .ipa)-stage"
     app="$stage/Payload/iPadCasting.app"
     plist="$app/Info.plist"
@@ -59,6 +61,15 @@ EOF
     /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $bundle_id" "$plist"
     /usr/libexec/PlistBuddy -c 'Add :CFBundleExecutable string iPadCasting' "$plist"
     /usr/libexec/PlistBuddy -c 'Add :CFBundlePackageType string APPL' "$plist"
+    /usr/libexec/PlistBuddy -c 'Add :NSLocalNetworkUsageDescription string ScreenCasting local network access' "$plist"
+    /usr/libexec/PlistBuddy -c 'Add :NSBonjourServices array' "$plist"
+    /usr/libexec/PlistBuddy -c "Add :NSBonjourServices:0 string $bonjour_service" "$plist"
+    /usr/libexec/PlistBuddy -c 'Add :UIApplicationSceneManifest dict' "$plist"
+    /usr/libexec/PlistBuddy -c 'Add :UIApplicationSceneManifest:UIApplicationSupportsMultipleScenes bool false' "$plist"
+    if [[ "$include_fullscreen" == true ]]; then
+        /usr/libexec/PlistBuddy -c 'Add :UIRequiresFullScreen bool true' "$plist"
+        /usr/libexec/PlistBuddy -c 'Add :UIStatusBarHidden bool true' "$plist"
+    fi
     /usr/libexec/PlistBuddy -c 'Add :UIDeviceFamily array' "$plist"
     index=0
     for value in $family; do
@@ -78,6 +89,8 @@ iphone_family="$TEMP_DIR/iphone-family.ipa"
 missing_ipad_family="$TEMP_DIR/missing-ipad-family.ipa"
 fat_architecture="$TEMP_DIR/fat-architecture.ipa"
 unknown_architecture="$TEMP_DIR/unknown-architecture.ipa"
+invalid_bonjour="$TEMP_DIR/invalid-bonjour.ipa"
+missing_fullscreen="$TEMP_DIR/missing-fullscreen.ipa"
 ambiguous_payload="$TEMP_DIR/ambiguous-payload.ipa"
 make_ipa "$positive" 'com.iPadZeroLagDisplay.client' '2' "$TEMP_DIR/arm64.o"
 make_ipa "$wrong_bundle" 'com.example.wrong' '2' "$TEMP_DIR/arm64.o"
@@ -85,6 +98,8 @@ make_ipa "$iphone_family" 'com.iPadZeroLagDisplay.client' '1 2' "$TEMP_DIR/arm64
 make_ipa "$missing_ipad_family" 'com.iPadZeroLagDisplay.client' '1' "$TEMP_DIR/arm64.o"
 make_ipa "$fat_architecture" 'com.iPadZeroLagDisplay.client' '2' "$TEMP_DIR/fat.o"
 make_ipa "$unknown_architecture" 'com.iPadZeroLagDisplay.client' '2' "$TEMP_DIR/arm64e.o"
+make_ipa "$invalid_bonjour" 'com.iPadZeroLagDisplay.client' '2' "$TEMP_DIR/arm64.o" '' '_screencasting._tcp.'
+make_ipa "$missing_fullscreen" 'com.iPadZeroLagDisplay.client' '2' "$TEMP_DIR/arm64.o" '' '_screencasting._tcp' false
 
 ambiguous_stage="$TEMP_DIR/ambiguous-stage"
 mkdir -p "$ambiguous_stage"
@@ -111,6 +126,8 @@ expect_unsigned_failure 'iPhone-family fixture' "$iphone_family"
 expect_unsigned_failure 'missing iPad-family fixture' "$missing_ipad_family"
 expect_unsigned_failure 'fat-architecture fixture' "$fat_architecture"
 expect_unsigned_failure 'unknown-architecture fixture' "$unknown_architecture"
+expect_unsigned_failure 'invalid Bonjour fixture' "$invalid_bonjour"
+expect_unsigned_failure 'missing fullscreen fixture' "$missing_fullscreen"
 expect_unsigned_failure 'ambiguous Payload fixture' "$ambiguous_payload"
 expect_unsigned_failure 'missing provisioning fixture' "$positive" app-store
 
