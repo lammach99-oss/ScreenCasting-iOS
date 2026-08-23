@@ -230,7 +230,7 @@ struct DisplayReady: Equatable {
     }
 }
 
-enum DisplayConfigurationFailureReason: UInt8 {
+enum DisplayConfigurationFailureReason: UInt8, Equatable {
     case unsupportedMode = 1
     case applyFailed = 2
 }
