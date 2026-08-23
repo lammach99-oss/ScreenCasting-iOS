@@ -262,7 +262,7 @@ final class FullscreenSurfaceLayoutTests: XCTestCase {
     }
 
     func testCommonUIKitContainerPinsMetalAndTouchToIdenticalBounds() {
-        let surface = ConnectedPresentationContainer()
+        let surface = ConnectedPresentationContainer(frame: .zero)
         surface.frame = CGRect(x: 0, y: 0, width: 1194, height: 834)
         surface.layoutIfNeeded()
 

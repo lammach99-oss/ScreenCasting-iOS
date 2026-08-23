@@ -197,7 +197,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     }
 
     public func makeUIView(context: Context) -> ConnectedPresentationContainer {
-        let container = ConnectedPresentationContainer()
+        let container = ConnectedPresentationContainer(frame: .zero)
         configure(
             container,
             coordinator: context.coordinator,
