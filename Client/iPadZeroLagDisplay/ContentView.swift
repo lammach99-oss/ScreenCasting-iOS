@@ -1,6 +1,7 @@
 import SwiftUI
 import Foundation
 import os
+import UIKit
 
 // MARK: - PIN Shake Modifier
 
@@ -204,6 +205,7 @@ public struct ContentView: View {
     @State private var rendererGeometrySnapshot: RendererGeometrySnapshot?
     @State private var pencilTouchBounds = CGRect.zero
     @State private var lastGeometrySnapshotLine = ""
+    @State private var isSettingsPresented = false
 
     public init() {
         let netManager = NetworkManager()
@@ -227,10 +229,13 @@ public struct ContentView: View {
         .persistentSystemOverlays(.hidden)
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
+            UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+            networkManager.updateInterfaceOrientation(currentInterfaceOrientation())
             discoveryManager.startBrowsing()
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
+            UIDevice.current.endGeneratingDeviceOrientationNotifications()
             discoveryManager.stopBrowsing()
             networkManager.stop()
         }
@@ -259,6 +264,18 @@ public struct ContentView: View {
                 networkManager.sendAuthPIN(enteredPIN)
             }
         }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIDevice.orientationDidChangeNotification)
+        ) { _ in
+            DispatchQueue.main.async {
+                networkManager.updateInterfaceOrientation(
+                    currentInterfaceOrientation())
+            }
+        }
+        .sheet(isPresented: $isSettingsPresented) {
+            SettingsView(networkManager: networkManager)
+        }
     }
 
     // MARK: - Computed Helpers
@@ -282,6 +299,15 @@ public struct ContentView: View {
 
     private var normalizedManualHost: String {
         hostIP.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func currentInterfaceOrientation() -> ClientDisplayOrientation {
+        let activeScene = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+        return activeScene?.interfaceOrientation.isPortrait == true
+            ? .portrait
+            : .landscape
     }
 
     private var isValidManualIPv4: Bool {
@@ -769,6 +795,14 @@ public struct ContentView: View {
                                 }
                                     .font(.system(size: 13, weight: .bold, design: .monospaced))
                             }
+                            Button {
+                                isSettingsPresented = true
+                            } label: {
+                                Image(systemName: "gearshape.fill")
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .frame(width: 24, height: 24)
+                            }
+                            .accessibilityLabel("Display and streaming settings")
                         }
                         .foregroundColor(.white)
                         .padding(.horizontal, 16).padding(.vertical, 10)

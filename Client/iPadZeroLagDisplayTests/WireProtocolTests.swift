@@ -292,6 +292,124 @@ final class FullscreenSurfaceLayoutTests: XCTestCase {
     }
 }
 
+final class DisplayConfigurationProtocolTests: XCTestCase {
+    func testCapabilitiesDecodeTheHostCuratedModesAndPreferredDefault() throws {
+        var payload = Data(count: 52)
+        payload[0] = 1
+        payload[1] = 4
+        let modes: [(UInt32, UInt32, UInt16, UInt16)] = [
+            (2388, 1668, 60, 0),
+            (2388, 1668, 120, 1),
+            (1920, 1080, 60, 0),
+            (1920, 1080, 120, 1)
+        ]
+        for (index, mode) in modes.enumerated() {
+            let offset = 4 + (index * 12)
+            payload.storeLittleEndian(mode.0, at: offset)
+            payload.storeLittleEndian(mode.1, at: offset + 4)
+            payload.storeLittleEndian(mode.2, at: offset + 8)
+            payload.storeLittleEndian(mode.3, at: offset + 10)
+        }
+
+        let capabilities = try XCTUnwrap(DisplayCapabilities.decode(payload))
+
+        XCTAssertEqual(capabilities.modes.count, 4)
+        XCTAssertEqual(capabilities.preferred.width, 2388)
+        XCTAssertEqual(capabilities.preferred.height, 1668)
+        XCTAssertEqual(capabilities.preferred.refreshHz, 60)
+        XCTAssertTrue(capabilities.modes[1].isExperimental)
+        XCTAssertTrue(capabilities.modes[3].isExperimental)
+    }
+
+    func testPreferenceSwapsOnlyTheRequestedDimensionsForPortrait() {
+        let preference = DisplayPreference(
+            width: 2388,
+            height: 1668,
+            refreshHz: 60,
+            orientationMode: .automatic)
+
+        XCTAssertEqual(
+            preference.makeRequest(
+                interfaceOrientation: .portrait,
+                requestId: 7),
+            DisplayConfigurationRequest(
+                width: 1668,
+                height: 2388,
+                refreshHz: 60,
+                orientation: .portrait,
+                requestId: 7))
+    }
+
+    func testDisplayRequestReadyAndFailureUseTheHostV1PayloadLayout() throws {
+        let request = DisplayConfigurationRequest(
+            width: 2388,
+            height: 1668,
+            refreshHz: 60,
+            orientation: .landscape,
+            requestId: 12)
+        let requestPayload = request.encode()
+        XCTAssertEqual(requestPayload.count, 20)
+        XCTAssertEqual(requestPayload[0], 1)
+        XCTAssertEqual(requestPayload[1], ClientDisplayOrientation.landscape.rawValue)
+        XCTAssertEqual(requestPayload.loadLittleEndian(UInt32.self, at: 4), 2388)
+        XCTAssertEqual(requestPayload.loadLittleEndian(UInt32.self, at: 8), 1668)
+        XCTAssertEqual(requestPayload.loadLittleEndian(UInt32.self, at: 12), 60)
+        XCTAssertEqual(requestPayload.loadLittleEndian(UInt32.self, at: 16), 12)
+
+        var readyPayload = Data(count: 24)
+        readyPayload[0] = 1
+        readyPayload[1] = ClientDisplayOrientation.landscape.rawValue
+        readyPayload.storeLittleEndian(UInt32(2388), at: 4)
+        readyPayload.storeLittleEndian(UInt32(1668), at: 8)
+        readyPayload.storeLittleEndian(UInt32(60), at: 12)
+        readyPayload.storeLittleEndian(UInt32(12), at: 16)
+        readyPayload.storeLittleEndian(UInt32(3), at: 20)
+        XCTAssertEqual(
+            DisplayReady.decode(readyPayload),
+            DisplayReady(
+                width: 2388,
+                height: 1668,
+                refreshHz: 60,
+                orientation: .landscape,
+                requestId: 12,
+                generation: 3))
+
+        var failedPayload = Data(count: 8)
+        failedPayload[0] = 1
+        failedPayload[1] = DisplayConfigurationFailureReason.applyFailed.rawValue
+        failedPayload.storeLittleEndian(UInt32(12), at: 4)
+        XCTAssertEqual(
+            DisplayConfigurationFailed.decode(failedPayload),
+            DisplayConfigurationFailed(
+                requestId: 12,
+                reason: .applyFailed))
+    }
+
+    func testRequestGateSuppressesTouchUntilMatchingReadyAndDoesNotResend() throws {
+        var gate = DisplayRequestGate()
+        let configuration = DisplayConfigurationRequest(
+            width: 2388,
+            height: 1668,
+            refreshHz: 60,
+            orientation: .landscape,
+            requestId: 0)
+
+        let request = try XCTUnwrap(gate.begin(configuration))
+        XCTAssertTrue(gate.isInputSuppressed)
+        XCTAssertNil(gate.begin(configuration))
+
+        XCTAssertTrue(gate.accept(DisplayReady(
+            width: request.width,
+            height: request.height,
+            refreshHz: request.refreshHz,
+            orientation: request.orientation,
+            requestId: request.requestId,
+            generation: 3)))
+        XCTAssertFalse(gate.isInputSuppressed)
+        XCTAssertNil(gate.begin(configuration))
+    }
+}
+
 final class ControlChannelWriterTests: XCTestCase {
     func testSenderNeverHasMoreThanOneInFlightSend() {
         let queue = DispatchQueue(label: "control.writer.test")

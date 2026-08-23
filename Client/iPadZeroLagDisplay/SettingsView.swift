@@ -30,6 +30,9 @@ public struct SettingsView: View {
     /// Prevent a feedback loop when the server pushes a BC packet that updates
     /// `networkManager.targetBitrateMbps` — we don't want to echo it back.
     @State private var suppressSend = false
+    @State private var draftResolution = DisplayPreference.defaultValue.resolution
+    @State private var draftRefreshHz: UInt32 = DisplayPreference.defaultValue.refreshHz
+    @State private var draftOrientationMode: DisplayOrientationMode = .automatic
 
     // MARK: Body
 
@@ -41,6 +44,72 @@ public struct SettingsView: View {
 
                 ScrollView {
                     VStack(spacing: 20) {
+                        settingsCard {
+                            VStack(alignment: .leading, spacing: 14) {
+                                Label("Virtual Display", systemImage: "rectangle.on.rectangle")
+                                    .font(.system(size: 15, weight: .bold))
+                                    .foregroundColor(.white)
+
+                                Divider().background(Color.white.opacity(0.12))
+
+                                if let capabilities = networkManager.displayCapabilities {
+                                    Picker("Resolution", selection: $draftResolution) {
+                                        ForEach(capabilities.resolutions) { resolution in
+                                            Text(resolution.title).tag(resolution)
+                                        }
+                                    }
+                                    .pickerStyle(.menu)
+
+                                    Picker("Refresh Rate", selection: $draftRefreshHz) {
+                                        ForEach(
+                                            capabilities.refreshRates(for: draftResolution),
+                                            id: \.self
+                                        ) { refreshHz in
+                                            Text(refreshTitle(
+                                                refreshHz,
+                                                capabilities: capabilities))
+                                                .tag(refreshHz)
+                                        }
+                                    }
+                                    .pickerStyle(.menu)
+
+                                    Picker("Orientation", selection: $draftOrientationMode) {
+                                        ForEach(DisplayOrientationMode.allCases, id: \.self) { mode in
+                                            Text(mode.title).tag(mode)
+                                        }
+                                    }
+                                    .pickerStyle(.menu)
+
+                                    Button(action: applyDisplaySettings) {
+                                        Text(networkManager.isDisplayConfigurationPending
+                                             ? "Applying…"
+                                             : "Apply Display Settings")
+                                            .font(.system(size: 14, weight: .semibold))
+                                            .foregroundColor(.white)
+                                            .frame(maxWidth: .infinity)
+                                            .padding(.vertical, 11)
+                                            .background(Color(hex: "#0EA5E9"))
+                                            .cornerRadius(10)
+                                    }
+                                    .disabled(networkManager.isDisplayConfigurationPending)
+
+                                    if let effective = networkManager.effectiveDisplayState {
+                                        Text("Active: \(effective.width) × \(effective.height) @ \(effective.refreshHz) Hz, \(effective.orientation == .portrait ? "Portrait" : "Landscape")")
+                                            .font(.system(size: 11, weight: .medium))
+                                            .foregroundColor(.white.opacity(0.65))
+                                    }
+                                    if let failure = networkManager.displayConfigurationFailureMessage {
+                                        Text(failure)
+                                            .font(.system(size: 11, weight: .medium))
+                                            .foregroundColor(.orange)
+                                    }
+                                } else {
+                                    Text("Connect to the Host to load supported display modes.")
+                                        .font(.system(size: 12))
+                                        .foregroundColor(.white.opacity(0.55))
+                                }
+                            }
+                        }
 
                         // ── Adaptive Bitrate Card ─────────────────────────────
                         settingsCard {
@@ -197,12 +266,55 @@ public struct SettingsView: View {
                 draftBitrate = newMbps
             }
         }
+        .onReceive(networkManager.$displayCapabilities) { _ in
+            synchronizeDisplayDraft()
+        }
+        .onReceive(networkManager.$displayPreference) { _ in
+            synchronizeDisplayDraft()
+        }
+        .onChange(of: draftResolution) { _, resolution in
+            guard let capabilities = networkManager.displayCapabilities else { return }
+            let rates = capabilities.refreshRates(for: resolution)
+            if !rates.contains(draftRefreshHz) {
+                draftRefreshHz = rates.first ?? DisplayPreference.defaultValue.refreshHz
+            }
+        }
         .onAppear {
             draftBitrate = networkManager.targetBitrateMbps
+            synchronizeDisplayDraft()
         }
     }
 
     // MARK: - Private Helpers
+
+    private func synchronizeDisplayDraft() {
+        guard let capabilities = networkManager.displayCapabilities else { return }
+        let preference = networkManager.displayPreference.reconciled(with: capabilities)
+        draftResolution = preference.resolution
+        draftRefreshHz = preference.refreshHz
+        draftOrientationMode = preference.orientationMode
+    }
+
+    private func applyDisplaySettings() {
+        networkManager.applyDisplayPreference(DisplayPreference(
+            width: draftResolution.width,
+            height: draftResolution.height,
+            refreshHz: draftRefreshHz,
+            orientationMode: draftOrientationMode))
+    }
+
+    private func refreshTitle(
+        _ refreshHz: UInt32,
+        capabilities: DisplayCapabilities
+    ) -> String {
+        let experimental = capabilities.modes.contains {
+            $0.width == draftResolution.width &&
+            $0.height == draftResolution.height &&
+            $0.refreshHz == refreshHz &&
+            $0.isExperimental
+        }
+        return experimental ? "\(refreshHz) Hz (Experimental)" : "\(refreshHz) Hz"
+    }
 
     /// Constructs and sends a BC packet with the current NetworkManager state.
     private func sendBitrateControl() {

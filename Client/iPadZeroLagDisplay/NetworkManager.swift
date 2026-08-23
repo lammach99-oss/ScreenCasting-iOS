@@ -59,6 +59,10 @@ enum WireMessageType: UInt8 {
     case usbLaneBindResult = 14
     case videoConfiguration = 15
     case videoConfigurationAck = 16
+    case displayCapabilities = 17
+    case displayConfigurationRequest = 18
+    case displayReady = 19
+    case displayConfigurationFailed = 20
 }
 
 enum WireProtocol {
@@ -73,6 +77,332 @@ enum WireProtocol {
     static let audioFlagOpus: UInt16 = 0x0001
     static let maximumOpusPayloadLength = 1_275
     static let realtimeNegotiationSupportedFlag: UInt16 = 0x8000
+}
+
+enum ClientDisplayOrientation: UInt8, Equatable {
+    case landscape = 0
+    case portrait = 1
+}
+
+enum DisplayOrientationMode: String, CaseIterable, Hashable {
+    case automatic
+    case landscape
+    case portrait
+
+    var title: String {
+        switch self {
+        case .automatic: return "Automatic"
+        case .landscape: return "Landscape"
+        case .portrait: return "Portrait"
+        }
+    }
+
+    func resolved(using interfaceOrientation: ClientDisplayOrientation) -> ClientDisplayOrientation {
+        switch self {
+        case .automatic: return interfaceOrientation
+        case .landscape: return .landscape
+        case .portrait: return .portrait
+        }
+    }
+}
+
+struct DisplayResolution: Hashable, Identifiable {
+    let width: UInt32
+    let height: UInt32
+
+    var id: String { "\(width)x\(height)" }
+    var title: String { "\(width) × \(height)" }
+}
+
+struct DisplayMode: Hashable {
+    let width: UInt32
+    let height: UInt32
+    let refreshHz: UInt32
+    let isExperimental: Bool
+
+    var resolution: DisplayResolution {
+        DisplayResolution(width: width, height: height)
+    }
+}
+
+struct DisplayCapabilities: Equatable {
+    static let encodedSize = 52
+
+    let modes: [DisplayMode]
+    let preferred: DisplayMode
+
+    var resolutions: [DisplayResolution] {
+        var seen = Set<DisplayResolution>()
+        return modes.compactMap { mode in
+            let resolution = mode.resolution
+            return seen.insert(resolution).inserted ? resolution : nil
+        }
+    }
+
+    func refreshRates(for resolution: DisplayResolution) -> [UInt32] {
+        modes.compactMap { mode in
+            mode.resolution == resolution ? mode.refreshHz : nil
+        }
+    }
+
+    func supports(_ preference: DisplayPreference) -> Bool {
+        modes.contains {
+            $0.width == preference.width &&
+            $0.height == preference.height &&
+            $0.refreshHz == preference.refreshHz
+        }
+    }
+
+    static func decode(_ data: Data) -> DisplayCapabilities? {
+        guard data.count == encodedSize, data[0] == 1, data[1] == 4 else {
+            return nil
+        }
+
+        var decodedModes: [DisplayMode] = []
+        decodedModes.reserveCapacity(4)
+        for index in 0..<4 {
+            let offset = 4 + (index * 12)
+            let width = data.loadLittleEndian(UInt32.self, at: offset)
+            let height = data.loadLittleEndian(UInt32.self, at: offset + 4)
+            let refreshHz = UInt32(data.loadLittleEndian(UInt16.self, at: offset + 8))
+            let flags = data.loadLittleEndian(UInt16.self, at: offset + 10)
+            guard width > 0,
+                  height > 0,
+                  refreshHz > 0,
+                  (flags & ~UInt16(1)) == 0 else {
+                return nil
+            }
+            decodedModes.append(DisplayMode(
+                width: width,
+                height: height,
+                refreshHz: refreshHz,
+                isExperimental: (flags & 1) != 0))
+        }
+        guard let preferred = decodedModes.first else { return nil }
+        return DisplayCapabilities(modes: decodedModes, preferred: preferred)
+    }
+}
+
+struct DisplayConfigurationRequest: Equatable {
+    let width: UInt32
+    let height: UInt32
+    let refreshHz: UInt32
+    let orientation: ClientDisplayOrientation
+    let requestId: UInt32
+
+    func encode() -> Data {
+        var data = Data(count: 20)
+        data[0] = 1
+        data[1] = orientation.rawValue
+        data.storeLittleEndian(width, at: 4)
+        data.storeLittleEndian(height, at: 8)
+        data.storeLittleEndian(refreshHz, at: 12)
+        data.storeLittleEndian(requestId, at: 16)
+        return data
+    }
+}
+
+struct DisplayReady: Equatable {
+    let width: UInt32
+    let height: UInt32
+    let refreshHz: UInt32
+    let orientation: ClientDisplayOrientation
+    let requestId: UInt32
+    let generation: UInt32
+
+    static func decode(_ data: Data) -> DisplayReady? {
+        guard data.count == 24,
+              data[0] == 1,
+              let orientation = ClientDisplayOrientation(rawValue: data[1]) else {
+            return nil
+        }
+        let width = data.loadLittleEndian(UInt32.self, at: 4)
+        let height = data.loadLittleEndian(UInt32.self, at: 8)
+        let refreshHz = data.loadLittleEndian(UInt32.self, at: 12)
+        guard width > 0, height > 0, refreshHz > 0 else { return nil }
+        return DisplayReady(
+            width: width,
+            height: height,
+            refreshHz: refreshHz,
+            orientation: orientation,
+            requestId: data.loadLittleEndian(UInt32.self, at: 16),
+            generation: data.loadLittleEndian(UInt32.self, at: 20))
+    }
+}
+
+enum DisplayConfigurationFailureReason: UInt8 {
+    case unsupportedMode = 1
+    case applyFailed = 2
+}
+
+struct DisplayConfigurationFailed: Equatable {
+    let requestId: UInt32
+    let reason: DisplayConfigurationFailureReason
+
+    static func decode(_ data: Data) -> DisplayConfigurationFailed? {
+        guard data.count == 8,
+              data[0] == 1,
+              let reason = DisplayConfigurationFailureReason(rawValue: data[1]) else {
+            return nil
+        }
+        return DisplayConfigurationFailed(
+            requestId: data.loadLittleEndian(UInt32.self, at: 4),
+            reason: reason)
+    }
+}
+
+struct DisplayPreference: Equatable {
+    static let defaultValue = DisplayPreference(
+        width: 2388,
+        height: 1668,
+        refreshHz: 60,
+        orientationMode: .automatic)
+
+    let width: UInt32
+    let height: UInt32
+    let refreshHz: UInt32
+    let orientationMode: DisplayOrientationMode
+
+    var resolution: DisplayResolution {
+        DisplayResolution(width: width, height: height)
+    }
+
+    func makeRequest(
+        interfaceOrientation: ClientDisplayOrientation,
+        requestId: UInt32
+    ) -> DisplayConfigurationRequest {
+        let orientation = orientationMode.resolved(using: interfaceOrientation)
+        return DisplayConfigurationRequest(
+            width: orientation == .portrait ? height : width,
+            height: orientation == .portrait ? width : height,
+            refreshHz: refreshHz,
+            orientation: orientation,
+            requestId: requestId)
+    }
+
+    func reconciled(with capabilities: DisplayCapabilities) -> DisplayPreference {
+        guard capabilities.supports(self) else {
+            return DisplayPreference(
+                width: capabilities.preferred.width,
+                height: capabilities.preferred.height,
+                refreshHz: capabilities.preferred.refreshHz,
+                orientationMode: orientationMode)
+        }
+        return self
+    }
+}
+
+struct DisplayRequestGate {
+    private var nextRequestId: UInt32 = 0
+    private(set) var pending: DisplayConfigurationRequest?
+    private(set) var effective: DisplayReady?
+
+    var isInputSuppressed: Bool { pending != nil }
+
+    mutating func begin(_ requested: DisplayConfigurationRequest) -> DisplayConfigurationRequest? {
+        let candidate = DisplayConfigurationRequest(
+            width: requested.width,
+            height: requested.height,
+            refreshHz: requested.refreshHz,
+            orientation: requested.orientation,
+            requestId: 0)
+        if let pending, sameConfiguration(pending, candidate) {
+            return nil
+        }
+        if let effective,
+           effective.width == candidate.width,
+           effective.height == candidate.height,
+           effective.refreshHz == candidate.refreshHz,
+           effective.orientation == candidate.orientation {
+            return nil
+        }
+
+        nextRequestId &+= 1
+        if nextRequestId == 0 { nextRequestId = 1 }
+        let issued = DisplayConfigurationRequest(
+            width: candidate.width,
+            height: candidate.height,
+            refreshHz: candidate.refreshHz,
+            orientation: candidate.orientation,
+            requestId: nextRequestId)
+        pending = issued
+        return issued
+    }
+
+    mutating func accept(_ ready: DisplayReady) -> Bool {
+        guard let pending,
+              pending.requestId == ready.requestId,
+              sameConfiguration(pending, ready) else {
+            return false
+        }
+        effective = ready
+        self.pending = nil
+        return true
+    }
+
+    mutating func reject(_ failed: DisplayConfigurationFailed) -> Bool {
+        guard pending?.requestId == failed.requestId else { return false }
+        pending = nil
+        return true
+    }
+
+    mutating func reset() {
+        pending = nil
+        effective = nil
+    }
+
+    private func sameConfiguration(
+        _ request: DisplayConfigurationRequest,
+        _ candidate: DisplayConfigurationRequest
+    ) -> Bool {
+        request.width == candidate.width &&
+        request.height == candidate.height &&
+        request.refreshHz == candidate.refreshHz &&
+        request.orientation == candidate.orientation
+    }
+
+    private func sameConfiguration(
+        _ request: DisplayConfigurationRequest,
+        _ ready: DisplayReady
+    ) -> Bool {
+        request.width == ready.width &&
+        request.height == ready.height &&
+        request.refreshHz == ready.refreshHz &&
+        request.orientation == ready.orientation
+    }
+}
+
+private enum DisplayPreferenceStore {
+    private static let widthKey = "ScreenCasting.display.preferredWidth"
+    private static let heightKey = "ScreenCasting.display.preferredHeight"
+    private static let refreshKey = "ScreenCasting.display.preferredRefreshHz"
+    private static let orientationKey = "ScreenCasting.display.orientationMode"
+
+    static func load() -> DisplayPreference {
+        let defaults = UserDefaults.standard
+        let width = (defaults.object(forKey: widthKey) as? NSNumber)?.uint32Value
+        let height = (defaults.object(forKey: heightKey) as? NSNumber)?.uint32Value
+        let refreshHz = (defaults.object(forKey: refreshKey) as? NSNumber)?.uint32Value
+        let orientationMode = defaults.string(forKey: orientationKey)
+            .flatMap(DisplayOrientationMode.init(rawValue:)) ?? .automatic
+        guard let width, let height, let refreshHz,
+              width > 0, height > 0, refreshHz > 0 else {
+            return DisplayPreference.defaultValue
+        }
+        return DisplayPreference(
+            width: width,
+            height: height,
+            refreshHz: refreshHz,
+            orientationMode: orientationMode)
+    }
+
+    static func save(_ preference: DisplayPreference) {
+        let defaults = UserDefaults.standard
+        defaults.set(preference.width, forKey: widthKey)
+        defaults.set(preference.height, forKey: heightKey)
+        defaults.set(preference.refreshHz, forKey: refreshKey)
+        defaults.set(preference.orientationMode.rawValue, forKey: orientationKey)
+    }
 }
 
 enum RealtimeAudioNegotiationPolicy {
@@ -320,6 +650,14 @@ final class WireStreamParser {
         switch type {
         case .ping, .pong, .videoFeedback:
             fixedLength = 16
+        case .displayCapabilities:
+            fixedLength = DisplayCapabilities.encodedSize
+        case .displayConfigurationRequest:
+            fixedLength = 20
+        case .displayReady:
+            fixedLength = 24
+        case .displayConfigurationFailed:
+            fixedLength = 8
         case .clientCapabilities:
             fixedLength = ClientCapabilities.encodedSize
         case .transportOffer:
@@ -525,6 +863,14 @@ public class NetworkManager: ObservableObject {
     @Published public private(set) var hostFingerprint: String?
     @Published public private(set) var usbServerFingerprint: String?
 
+    // The Host is the authority for selectable modes. These values only mirror
+    // authenticated control responses for the connected settings surface.
+    @Published public private(set) var displayCapabilities: DisplayCapabilities?
+    @Published public private(set) var displayPreference = DisplayPreference.defaultValue
+    @Published public private(set) var effectiveDisplayState: DisplayReady?
+    @Published public private(set) var displayConfigurationFailureMessage: String?
+    @Published public private(set) var isDisplayConfigurationPending = false
+
     // MARK: Published Bitrate Control State
     /// Whether the host is in Adaptive Bitrate mode.
     @Published public var isAdaptiveBitrate: Bool   = false
@@ -661,8 +1007,17 @@ public class NetworkManager: ObservableObject {
     private var lastClientPingSentAt: TimeInterval = 0
     private var nextClientPingNonce: UInt64 = 1
     private var pendingClientPings: [UInt64: TimeInterval] = [:]
+    private var activeDisplayCapabilities: DisplayCapabilities?
+    private var activeDisplayPreference = DisplayPreference.defaultValue
+    private var displayRequestGate = DisplayRequestGate()
+    private var pendingDisplayPreference: DisplayPreference?
+    private var observedInterfaceOrientation: ClientDisplayOrientation = .landscape
+    private var orientationDebounceWorkItem: DispatchWorkItem?
 
     public init() {
+        let savedDisplayPreference = DisplayPreferenceStore.load()
+        displayPreference = savedDisplayPreference
+        activeDisplayPreference = savedDisplayPreference
         decoder.onDecodeLatency = {
             [weak self] sequence, generation, decodeStartedAt, latencyMs in
             self?.transportTelemetry.recordDecodeCallback(
@@ -711,6 +1066,9 @@ public class NetworkManager: ObservableObject {
         guard connectionState == .idle || isDisconnected else { return }
 
         _ = connectionGenerationClock.advance()
+        networkQueue.async { [weak self] in
+            self?.resetDisplaySession()
+        }
         let parameters = buildTLSParameters(for: endpoint)
         connection = NWConnection(to: endpoint, using: parameters)
 
@@ -826,7 +1184,8 @@ public class NetworkManager: ObservableObject {
         networkQueue.async { [weak self] in
             guard let self,
                   generation == self.connectionGeneration,
-                  self.committedTransportGeneration == generation else {
+                  self.committedTransportGeneration == generation,
+                  !self.displayRequestGate.isInputSuppressed else {
                 return
             }
             let delivery = InputDeliveryPolicy.forEvent(type)
@@ -936,12 +1295,58 @@ public class NetworkManager: ObservableObject {
             self.wireAuthenticatedGeneration = nil
             self.committedTransportGeneration = nil
             self.advertisedClientCapabilities = nil
+            self.resetDisplaySession()
             self.clearPendingTransportOffer()
             self.wireParser.reset(generation: stoppedGeneration)
             self.controlChannelWriter.cancel()
             self.stopTelemetryTimer()
         }
         setState(.idle)
+    }
+
+    public func applyDisplayPreference(
+        _ preference: DisplayPreference,
+        interfaceOrientation: ClientDisplayOrientation
+    ) {
+        networkQueue.async { [weak self] in
+            self?.requestDisplayConfiguration(
+                preference: preference,
+                interfaceOrientation: interfaceOrientation)
+        }
+    }
+
+    public func applyDisplayPreference(_ preference: DisplayPreference) {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.requestDisplayConfiguration(
+                preference: preference,
+                interfaceOrientation: self.observedInterfaceOrientation)
+        }
+    }
+
+    public func updateInterfaceOrientation(_ orientation: ClientDisplayOrientation) {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.observedInterfaceOrientation = orientation
+            guard self.activeDisplayCapabilities != nil,
+                  self.activeDisplayPreference.orientationMode == .automatic else {
+                return
+            }
+            self.orientationDebounceWorkItem?.cancel()
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self,
+                      self.activeDisplayPreference.orientationMode == .automatic else {
+                    return
+                }
+                self.requestDisplayConfiguration(
+                    preference: self.activeDisplayPreference,
+                    interfaceOrientation: self.observedInterfaceOrientation)
+            }
+            self.orientationDebounceWorkItem = workItem
+            self.networkQueue.asyncAfter(
+                deadline: .now() + .milliseconds(250),
+                execute: workItem)
+        }
     }
 
     /// Stops the USB listener/session before deleting the imported Keychain
@@ -1517,6 +1922,27 @@ public class NetworkManager: ObservableObject {
         }
 
         switch header.type {
+        case .displayCapabilities:
+            guard let capabilities = DisplayCapabilities.decode(payload) else {
+                handleStreamError("Malformed display capabilities.")
+                return
+            }
+            receiveDisplayCapabilities(capabilities)
+
+        case .displayReady:
+            guard let ready = DisplayReady.decode(payload) else {
+                handleStreamError("Malformed display readiness response.")
+                return
+            }
+            receiveDisplayReady(ready)
+
+        case .displayConfigurationFailed:
+            guard let failure = DisplayConfigurationFailed.decode(payload) else {
+                handleStreamError("Malformed display configuration failure.")
+                return
+            }
+            receiveDisplayConfigurationFailure(failure)
+
         case .video:
             guard committedTransportGeneration == generation else { return }
             if committedRealtimeMode == RealtimeTransportMode.wifiRTP {
@@ -1803,7 +2229,8 @@ public class NetworkManager: ObservableObject {
             }
 
         case .clientCapabilities, .transportReady, .usbLaneBind,
-             .usbLaneBindResult, .videoConfigurationAck:
+             .usbLaneBindResult, .videoConfigurationAck,
+             .displayConfigurationRequest:
             handleStreamError("Unexpected client-direction negotiation message.")
         }
     }
@@ -1854,6 +2281,91 @@ public class NetworkManager: ObservableObject {
             payload: capabilities.encode(),
             sequence: 0)
         scheduleLegacyFallback(generation: connectionGeneration)
+    }
+
+    private func receiveDisplayCapabilities(_ capabilities: DisplayCapabilities) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        activeDisplayCapabilities = capabilities
+        let reconciledPreference = activeDisplayPreference.reconciled(
+            with: capabilities)
+        DispatchQueue.main.async { [weak self] in
+            self?.displayCapabilities = capabilities
+            self?.displayConfigurationFailureMessage = nil
+        }
+        requestDisplayConfiguration(
+            preference: reconciledPreference,
+            interfaceOrientation: observedInterfaceOrientation)
+    }
+
+    private func requestDisplayConfiguration(
+        preference: DisplayPreference,
+        interfaceOrientation: ClientDisplayOrientation
+    ) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard wireAuthenticatedGeneration == connectionGeneration,
+              let capabilities = activeDisplayCapabilities else {
+            return
+        }
+
+        let reconciledPreference = preference.reconciled(with: capabilities)
+        let proposed = reconciledPreference.makeRequest(
+            interfaceOrientation: interfaceOrientation,
+            requestId: 0)
+        guard let request = displayRequestGate.begin(proposed) else { return }
+        pendingDisplayPreference = reconciledPreference
+        DispatchQueue.main.async { [weak self] in
+            self?.isDisplayConfigurationPending = true
+            self?.displayConfigurationFailureMessage = nil
+        }
+        sendWireMessage(
+            type: .displayConfigurationRequest,
+            payload: request.encode(),
+            sequence: request.requestId)
+    }
+
+    private func receiveDisplayReady(_ ready: DisplayReady) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard displayRequestGate.accept(ready),
+              let appliedPreference = pendingDisplayPreference else {
+            return
+        }
+        pendingDisplayPreference = nil
+        activeDisplayPreference = appliedPreference
+        DisplayPreferenceStore.save(appliedPreference)
+        DispatchQueue.main.async { [weak self] in
+            self?.displayPreference = appliedPreference
+            self?.effectiveDisplayState = ready
+            self?.isDisplayConfigurationPending = false
+            self?.displayConfigurationFailureMessage = nil
+        }
+    }
+
+    private func receiveDisplayConfigurationFailure(
+        _ failure: DisplayConfigurationFailed
+    ) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard displayRequestGate.reject(failure) else { return }
+        pendingDisplayPreference = nil
+        DispatchQueue.main.async { [weak self] in
+            self?.isDisplayConfigurationPending = false
+            self?.displayConfigurationFailureMessage =
+                "Could not apply this display mode."
+        }
+    }
+
+    private func resetDisplaySession() {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        orientationDebounceWorkItem?.cancel()
+        orientationDebounceWorkItem = nil
+        activeDisplayCapabilities = nil
+        pendingDisplayPreference = nil
+        displayRequestGate.reset()
+        DispatchQueue.main.async { [weak self] in
+            self?.displayCapabilities = nil
+            self?.effectiveDisplayState = nil
+            self?.isDisplayConfigurationPending = false
+            self?.displayConfigurationFailureMessage = nil
+        }
     }
 
     private func commitLegacyTransport(generation: UInt64) {
@@ -2114,6 +2626,7 @@ public class NetworkManager: ObservableObject {
         wifiLegacyFallbackGeneration = nil
         wifiLegacyFallbackRequestGeneration = nil
         advertisedClientCapabilities = nil
+        resetDisplaySession()
         clearPendingTransportOffer()
         wireParser.reset(generation: failedGeneration)
         controlChannelWriter.cancel()
