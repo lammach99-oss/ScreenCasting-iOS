@@ -865,11 +865,11 @@ public class NetworkManager: ObservableObject {
 
     // The Host is the authority for selectable modes. These values only mirror
     // authenticated control responses for the connected settings surface.
-    @Published public private(set) var displayCapabilities: DisplayCapabilities?
-    @Published public private(set) var displayPreference = DisplayPreference.defaultValue
-    @Published public private(set) var effectiveDisplayState: DisplayReady?
-    @Published public private(set) var displayConfigurationFailureMessage: String?
-    @Published public private(set) var isDisplayConfigurationPending = false
+    @Published private(set) var displayCapabilities: DisplayCapabilities?
+    @Published private(set) var displayPreference = DisplayPreference.defaultValue
+    @Published private(set) var effectiveDisplayState: DisplayReady?
+    @Published private(set) var displayConfigurationFailureMessage: String?
+    @Published private(set) var isDisplayConfigurationPending = false
 
     // MARK: Published Bitrate Control State
     /// Whether the host is in Adaptive Bitrate mode.
@@ -1304,7 +1304,7 @@ public class NetworkManager: ObservableObject {
         setState(.idle)
     }
 
-    public func applyDisplayPreference(
+    func applyDisplayPreference(
         _ preference: DisplayPreference,
         interfaceOrientation: ClientDisplayOrientation
     ) {
@@ -1315,7 +1315,7 @@ public class NetworkManager: ObservableObject {
         }
     }
 
-    public func applyDisplayPreference(_ preference: DisplayPreference) {
+    func applyDisplayPreference(_ preference: DisplayPreference) {
         networkQueue.async { [weak self] in
             guard let self else { return }
             self.requestDisplayConfiguration(
@@ -1324,7 +1324,7 @@ public class NetworkManager: ObservableObject {
         }
     }
 
-    public func updateInterfaceOrientation(_ orientation: ClientDisplayOrientation) {
+    func updateInterfaceOrientation(_ orientation: ClientDisplayOrientation) {
         networkQueue.async { [weak self] in
             guard let self else { return }
             self.observedInterfaceOrientation = orientation
