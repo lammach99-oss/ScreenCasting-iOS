@@ -170,6 +170,22 @@ public struct RendererGeometrySnapshot: Equatable {
     let drawableSize: CGSize
     let contentScaleFactor: CGFloat
     let contentViewport: VideoContentViewport
+
+    public static func == (
+        lhs: RendererGeometrySnapshot,
+        rhs: RendererGeometrySnapshot
+    ) -> Bool {
+        lhs.decodedFrameSize == rhs.decodedFrameSize &&
+            lhs.windowBounds == rhs.windowBounds &&
+            lhs.safeAreaInsets.top == rhs.safeAreaInsets.top &&
+            lhs.safeAreaInsets.left == rhs.safeAreaInsets.left &&
+            lhs.safeAreaInsets.bottom == rhs.safeAreaInsets.bottom &&
+            lhs.safeAreaInsets.right == rhs.safeAreaInsets.right &&
+            lhs.metalBounds == rhs.metalBounds &&
+            lhs.drawableSize == rhs.drawableSize &&
+            lhs.contentScaleFactor == rhs.contentScaleFactor &&
+            lhs.contentViewport == rhs.contentViewport
+    }
 }
 
 public class Renderer: NSObject, MTKViewDelegate {
