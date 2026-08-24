@@ -91,6 +91,14 @@ struct RenderFreshnessTracker {
 public struct VideoContentViewport: Equatable {
     let rect: CGRect
 
+    func contentRect(in container: CGRect) -> CGRect {
+        CGRect(
+            x: container.minX + rect.minX * container.width,
+            y: container.minY + rect.minY * container.height,
+            width: rect.width * container.width,
+            height: rect.height * container.height)
+    }
+
     static func aspectFit(
         containerSize: CGSize,
         videoSize: CGSize

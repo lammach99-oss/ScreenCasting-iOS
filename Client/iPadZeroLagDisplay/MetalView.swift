@@ -13,6 +13,27 @@ enum FullscreenSurfaceLayout {
         }
         return CGSize(width: width, height: height)
     }
+
+    static func edgeToEdgeFrame(
+        proposedBounds: CGRect,
+        safeAreaInsets: EdgeInsets
+    ) -> CGRect {
+        CGRect(
+            x: proposedBounds.minX - safeAreaInsets.leading,
+            y: proposedBounds.minY - safeAreaInsets.top,
+            width: proposedBounds.width + safeAreaInsets.leading + safeAreaInsets.trailing,
+            height: proposedBounds.height + safeAreaInsets.top + safeAreaInsets.bottom)
+    }
+}
+
+public struct PresentationSurfaceGeometry: Equatable {
+    let screenBounds: CGRect
+    let windowBounds: CGRect
+    let rootBounds: CGRect
+    let streamContainerBounds: CGRect
+    let metalBounds: CGRect
+    let touchBounds: CGRect
+    let safeAreaInsets: UIEdgeInsets
 }
 
 public struct MetalView: UIViewRepresentable {
@@ -138,6 +159,8 @@ public struct MetalView: UIViewRepresentable {
 public final class ConnectedPresentationContainer: UIView {
     let metalView = MTKView()
     let touchView = PencilUIKitView()
+    var onGeometryChanged: ((PresentationSurfaceGeometry) -> Void)?
+    private var publishedGeometry: PresentationSurfaceGeometry?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -182,6 +205,18 @@ public final class ConnectedPresentationContainer: UIView {
         metalView.drawableSize = CGSize(
             width: metalView.bounds.width * scale,
             height: metalView.bounds.height * scale)
+
+        let geometry = PresentationSurfaceGeometry(
+            screenBounds: window?.screen.bounds ?? .zero,
+            windowBounds: window?.bounds ?? .zero,
+            rootBounds: window?.rootViewController?.view.bounds ?? .zero,
+            streamContainerBounds: bounds,
+            metalBounds: metalView.bounds,
+            touchBounds: touchView.bounds,
+            safeAreaInsets: window?.safeAreaInsets ?? safeAreaInsets)
+        guard geometry != publishedGeometry else { return }
+        publishedGeometry = geometry
+        onGeometryChanged?(geometry)
     }
 }
 
@@ -190,6 +225,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     public var onFrameRendered: (() -> Void)?
     public var onContentViewportChanged: ((VideoContentViewport?) -> Void)?
     var onGeometrySnapshotChanged: ((RendererGeometrySnapshot) -> Void)?
+    var onPresentationGeometryChanged: ((PresentationSurfaceGeometry) -> Void)?
     var onTouchBoundsChanged: ((CGRect) -> Void)?
     var onPencilInput: ((PencilPacket) -> Void)?
     var onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)?
@@ -199,6 +235,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         onFrameRendered: (() -> Void)? = nil,
         onContentViewportChanged: ((VideoContentViewport?) -> Void)? = nil,
         onGeometrySnapshotChanged: ((RendererGeometrySnapshot) -> Void)? = nil,
+        onPresentationGeometryChanged: ((PresentationSurfaceGeometry) -> Void)? = nil,
         onTouchBoundsChanged: ((CGRect) -> Void)? = nil,
         onPencilInput: ((PencilPacket) -> Void)? = nil,
         onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)? = nil
@@ -207,6 +244,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         self.onFrameRendered = onFrameRendered
         self.onContentViewportChanged = onContentViewportChanged
         self.onGeometrySnapshotChanged = onGeometrySnapshotChanged
+        self.onPresentationGeometryChanged = onPresentationGeometryChanged
         self.onTouchBoundsChanged = onTouchBoundsChanged
         self.onPencilInput = onPencilInput
         self.onSendTouchEvent = onSendTouchEvent
@@ -253,7 +291,13 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         coordinator.onFrameRendered = onFrameRendered
         coordinator.onContentViewportChanged = onContentViewportChanged
         coordinator.onGeometrySnapshotChanged = onGeometrySnapshotChanged
+        coordinator.onPresentationGeometryChanged = onPresentationGeometryChanged
         coordinator.onTouchBoundsChanged = onTouchBoundsChanged
+
+        container.onGeometryChanged = { [weak coordinator] geometry in
+            coordinator?.onPresentationGeometryChanged?(geometry)
+        }
+        container.setNeedsLayout()
 
         let touchView = container.touchView
         touchView.onPencilInput = onPencilInput
@@ -318,6 +362,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         var onFrameRendered: (() -> Void)?
         var onContentViewportChanged: ((VideoContentViewport?) -> Void)?
         var onGeometrySnapshotChanged: ((RendererGeometrySnapshot) -> Void)?
+        var onPresentationGeometryChanged: ((PresentationSurfaceGeometry) -> Void)?
         var onTouchBoundsChanged: ((CGRect) -> Void)?
     }
 }

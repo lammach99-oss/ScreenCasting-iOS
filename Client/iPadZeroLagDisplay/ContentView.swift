@@ -201,7 +201,7 @@ public struct ContentView: View {
     @State private var isHudVisible: Bool = true
     @State private var renderedContentViewport: VideoContentViewport?
     @State private var rendererGeometrySnapshot: RendererGeometrySnapshot?
-    @State private var pencilTouchBounds = CGRect.zero
+    @State private var presentationGeometry: PresentationSurfaceGeometry?
     @State private var lastGeometrySnapshotLine = ""
     @State private var isSettingsPresented = false
 
@@ -351,66 +351,71 @@ public struct ContentView: View {
     // same normalized viewport describes both surfaces.
     @ViewBuilder
     private var connectedVideoSurface: some View {
-        ConnectedPresentationSurface(
-            networkManager: networkManager,
-            onFrameRendered: {
-                streamManager.registerFrameRendered()
-            },
-            onContentViewportChanged: { viewport in
-                renderedContentViewport = viewport
-            },
-            onGeometrySnapshotChanged: { snapshot in
-                rendererGeometrySnapshot = snapshot
-                emitGeometrySnapshot(
-                    snapshot,
-                    touchBounds: pencilTouchBounds)
-            },
-            onTouchBoundsChanged: { bounds in
-                pencilTouchBounds = bounds
-                if let rendererGeometrySnapshot {
-                    emitGeometrySnapshot(
-                        rendererGeometrySnapshot,
-                        touchBounds: bounds)
-                }
-            },
-            onPencilInput: { _ in },
-            onSendTouchEvent: { type, x, y, pressure in
-                networkManager.sendTouchEvent(
-                    type: type,
-                    x: x,
-                    y: y,
-                    pressure: pressure)
-            })
-            // Give the one UIKit container the connected window proposal
-            // directly. A GeometryReader-sized child can retain its
-            // background-layer safe-area proposal even while the outer ZStack
-            // ignores the safe area, leaving the Metal and touch views short.
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .ignoresSafeArea(.container, edges: .all)
-            .allowsHitTesting(true)
-            // Keep the settings gesture without placing a hit-test view above
-            // the remote-input surface. A single touch remains remote input;
-            // only a deliberate double tap presents stream controls.
-            .simultaneousGesture(
-                TapGesture(count: 2)
-                    .onEnded {
-                        isSettingsPresented = true
-                    })
+        GeometryReader { proxy in
+            let frame = FullscreenSurfaceLayout.edgeToEdgeFrame(
+                proposedBounds: proxy.frame(in: .local),
+                safeAreaInsets: proxy.safeAreaInsets)
+
+            ConnectedPresentationSurface(
+                networkManager: networkManager,
+                onFrameRendered: {
+                    streamManager.registerFrameRendered()
+                },
+                onContentViewportChanged: { viewport in
+                    renderedContentViewport = viewport
+                },
+                onGeometrySnapshotChanged: { snapshot in
+                    rendererGeometrySnapshot = snapshot
+                    if let presentationGeometry {
+                        emitGeometrySnapshot(snapshot, presentationGeometry)
+                    }
+                },
+                onPresentationGeometryChanged: { geometry in
+                    presentationGeometry = geometry
+                    if let rendererGeometrySnapshot {
+                        emitGeometrySnapshot(rendererGeometrySnapshot, geometry)
+                    }
+                },
+                onTouchBoundsChanged: { _ in },
+                onPencilInput: { _ in },
+                onSendTouchEvent: { type, x, y, pressure in
+                    networkManager.sendTouchEvent(
+                        type: type,
+                        x: x,
+                        y: y,
+                        pressure: pressure)
+                })
+                .frame(width: frame.width, height: frame.height)
+                .offset(x: frame.minX, y: frame.minY)
+                .allowsHitTesting(true)
+                // A single touch remains remote input. Only a deliberate
+                // double tap presents local stream controls.
+                .simultaneousGesture(
+                    TapGesture(count: 2)
+                        .onEnded {
+                            isSettingsPresented = true
+                        })
+        }
+        .ignoresSafeArea(.container, edges: .all)
     }
 
     private func emitGeometrySnapshot(
         _ snapshot: RendererGeometrySnapshot,
-        touchBounds: CGRect
+        _ geometry: PresentationSurfaceGeometry
     ) {
         let line = "[ScreenCasting][VIEW_GEOMETRY] " +
             "framePx=\(Int(snapshot.decodedFrameSize.width))x\(Int(snapshot.decodedFrameSize.height)) " +
-            "windowPt=\(format(rect: snapshot.windowBounds)) " +
-            "safeAreaPt=\(format(insets: snapshot.safeAreaInsets)) " +
-            "mtkBoundsPt=\(format(rect: snapshot.metalBounds)) " +
-            "drawablePx=\(format(size: snapshot.drawableSize)) " +
+            "screenBounds=\(format(rect: geometry.screenBounds)) " +
+            "windowBounds=\(format(rect: geometry.windowBounds)) " +
+            "rootBounds=\(format(rect: geometry.rootBounds)) " +
+            "streamContainerBounds=\(format(rect: geometry.streamContainerBounds)) " +
+            "metalBounds=\(format(rect: geometry.metalBounds)) " +
+            "touchBounds=\(format(rect: geometry.touchBounds)) " +
+            "drawableSize=\(format(size: snapshot.drawableSize)) " +
             "scale=\(format(value: snapshot.contentScaleFactor)) " +
+            "contentRect=\(format(rect: snapshot.contentViewport.contentRect(in: geometry.metalBounds))) " +
             "contentRectNorm=\(format(rect: snapshot.contentViewport.rect)) " +
-            "touchBoundsPt=\(format(rect: touchBounds))"
+            "safeAreaInsets=\(format(insets: geometry.safeAreaInsets))"
         guard line != lastGeometrySnapshotLine else { return }
         lastGeometrySnapshotLine = line
         Self.geometryLogger.notice("\(line, privacy: .public)")

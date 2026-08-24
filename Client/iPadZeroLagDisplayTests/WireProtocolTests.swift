@@ -244,9 +244,43 @@ final class VideoContentViewportTests: XCTestCase {
                 in: container),
             CGPoint(x: 0.5, y: 0))
     }
+
+    func testSmallControlMapsThroughTheExactContentRectangle() throws {
+        let viewport = try XCTUnwrap(VideoContentViewport.aspectFit(
+            containerSize: CGSize(width: 1194, height: 834),
+            videoSize: CGSize(width: 2388, height: 1668)))
+        let container = CGRect(x: 0, y: 0, width: 1194, height: 834)
+
+        let mapped = try XCTUnwrap(viewport.normalizedPoint(
+            for: CGPoint(x: 1175.5, y: 23.25),
+            in: container))
+        XCTAssertEqual(viewport.contentRect(in: container), container)
+        XCTAssertEqual(mapped.x, 1175.5 / 1194.0, accuracy: 0.000_001)
+        XCTAssertEqual(mapped.y, 23.25 / 834.0, accuracy: 0.000_001)
+    }
 }
 
 final class FullscreenSurfaceLayoutTests: XCTestCase {
+    func testSafeAreaSizedProposalExpandsToTheFullWindow() {
+        XCTAssertEqual(
+            FullscreenSurfaceLayout.edgeToEdgeFrame(
+                proposedBounds: CGRect(x: 0, y: 0, width: 1130, height: 780),
+                safeAreaInsets: EdgeInsets(
+                    top: 24,
+                    leading: 32,
+                    bottom: 30,
+                    trailing: 32)),
+            CGRect(x: -32, y: -24, width: 1194, height: 834))
+    }
+
+    func testAlreadyFullscreenProposalIsNotExpandedAgain() {
+        XCTAssertEqual(
+            FullscreenSurfaceLayout.edgeToEdgeFrame(
+                proposedBounds: CGRect(x: 0, y: 0, width: 1194, height: 834),
+                safeAreaInsets: EdgeInsets()),
+            CGRect(x: 0, y: 0, width: 1194, height: 834))
+    }
+
     func testUnspecifiedDimensionDoesNotCreateAnArbitrarySmallSurface() {
         XCTAssertNil(
             FullscreenSurfaceLayout.exactSize(
