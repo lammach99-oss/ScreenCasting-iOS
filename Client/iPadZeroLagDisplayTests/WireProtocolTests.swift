@@ -379,12 +379,9 @@ final class DisplayConfigurationProtocolTests: XCTestCase {
     func testCapabilitiesDecodeTheHostCuratedModesAndPreferredDefault() throws {
         var payload = Data(count: 52)
         payload[0] = 1
-        payload[1] = 4
+        payload[1] = 1
         let modes: [(UInt32, UInt32, UInt16, UInt16)] = [
-            (2388, 1668, 60, 0),
-            (2388, 1668, 120, 1),
-            (1920, 1080, 60, 0),
-            (1920, 1080, 120, 1)
+            (2388, 1668, 60, 0)
         ]
         for (index, mode) in modes.enumerated() {
             let offset = 4 + (index * 12)
@@ -396,12 +393,11 @@ final class DisplayConfigurationProtocolTests: XCTestCase {
 
         let capabilities = try XCTUnwrap(DisplayCapabilities.decode(payload))
 
-        XCTAssertEqual(capabilities.modes.count, 4)
+        XCTAssertEqual(capabilities.modes.count, 1)
         XCTAssertEqual(capabilities.preferred.width, 2388)
         XCTAssertEqual(capabilities.preferred.height, 1668)
         XCTAssertEqual(capabilities.preferred.refreshHz, 60)
-        XCTAssertTrue(capabilities.modes[1].isExperimental)
-        XCTAssertTrue(capabilities.modes[3].isExperimental)
+        XCTAssertFalse(capabilities.modes[0].isExperimental)
     }
 
     func testPreferenceSwapsOnlyTheRequestedDimensionsForPortrait() {
@@ -421,6 +417,41 @@ final class DisplayConfigurationProtocolTests: XCTestCase {
                 refreshHz: 60,
                 orientation: .portrait,
                 requestId: 7))
+    }
+
+    func testPersistedLegacyPreferenceCannotRequestANonNativeMode() {
+        let legacyPreference = DisplayPreference(
+            width: 1920,
+            height: 1080,
+            refreshHz: 120,
+            orientationMode: .landscape)
+
+        XCTAssertEqual(
+            legacyPreference.makeRequest(
+                interfaceOrientation: .landscape,
+                requestId: 8),
+            DisplayConfigurationRequest(
+                width: 2388,
+                height: 1668,
+                refreshHz: 60,
+                orientation: .landscape,
+                requestId: 8))
+    }
+
+    func testCapabilitiesRejectLegacyAdvertisedModes() {
+        var payload = Data(count: 52)
+        payload[0] = 1
+        payload[1] = 2
+        payload.storeLittleEndian(UInt32(2388), at: 4)
+        payload.storeLittleEndian(UInt32(1668), at: 8)
+        payload.storeLittleEndian(UInt16(60), at: 12)
+        payload.storeLittleEndian(UInt16(0), at: 14)
+        payload.storeLittleEndian(UInt32(1920), at: 16)
+        payload.storeLittleEndian(UInt32(1080), at: 20)
+        payload.storeLittleEndian(UInt16(60), at: 24)
+        payload.storeLittleEndian(UInt16(0), at: 26)
+
+        XCTAssertNil(DisplayCapabilities.decode(payload))
     }
 
     func testDisplayRequestReadyAndFailureUseTheHostV1PayloadLayout() throws {
@@ -492,7 +523,7 @@ final class DisplayConfigurationProtocolTests: XCTestCase {
         XCTAssertNil(gate.begin(configuration))
     }
 
-    func testRejectedReconfigurationKeepsTheEffectiveModeAndResumesTouch() throws {
+    func testRejectedNonNativeReconfigurationKeepsEffectiveModeAndResumesTouch() throws {
         var gate = DisplayRequestGate()
         let native = DisplayConfigurationRequest(
             width: 2388,
@@ -511,8 +542,8 @@ final class DisplayConfigurationProtocolTests: XCTestCase {
         XCTAssertTrue(gate.accept(activeMode))
 
         let alternate = DisplayConfigurationRequest(
-            width: 1920,
-            height: 1080,
+            width: 1111,
+            height: 999,
             refreshHz: 60,
             orientation: .landscape,
             requestId: 0)

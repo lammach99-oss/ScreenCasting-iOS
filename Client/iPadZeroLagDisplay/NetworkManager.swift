@@ -154,13 +154,16 @@ struct DisplayCapabilities: Equatable {
     }
 
     static func decode(_ data: Data) -> DisplayCapabilities? {
-        guard data.count == encodedSize, data[0] == 1, data[1] == 4 else {
+        guard data.count == encodedSize,
+              data[0] == 1,
+              (1...4).contains(Int(data[1])) else {
             return nil
         }
 
+        let modeCount = Int(data[1])
         var decodedModes: [DisplayMode] = []
-        decodedModes.reserveCapacity(4)
-        for index in 0..<4 {
+        decodedModes.reserveCapacity(modeCount)
+        for index in 0..<modeCount {
             let offset = 4 + (index * 12)
             let width = data.loadLittleEndian(UInt32.self, at: offset)
             let height = data.loadLittleEndian(UInt32.self, at: offset + 4)
@@ -178,8 +181,16 @@ struct DisplayCapabilities: Equatable {
                 refreshHz: refreshHz,
                 isExperimental: (flags & 1) != 0))
         }
-        guard let preferred = decodedModes.first else { return nil }
-        return DisplayCapabilities(modes: decodedModes, preferred: preferred)
+        let nativeModes = decodedModes.filter {
+            $0.width == 2388 &&
+            $0.height == 1668 &&
+            $0.refreshHz == 60 &&
+            !$0.isExperimental
+        }
+        guard decodedModes.count == 1,
+              nativeModes.count == 1,
+              let preferred = nativeModes.first else { return nil }
+        return DisplayCapabilities(modes: nativeModes, preferred: preferred)
     }
 }
 
@@ -252,10 +263,13 @@ struct DisplayConfigurationFailed: Equatable {
 }
 
 struct DisplayPreference: Equatable {
+    static let nativeLandscapeWidth: UInt32 = 2388
+    static let nativeLandscapeHeight: UInt32 = 1668
+    static let nativeRefreshHz: UInt32 = 60
     static let defaultValue = DisplayPreference(
-        width: 2388,
-        height: 1668,
-        refreshHz: 60,
+        width: nativeLandscapeWidth,
+        height: nativeLandscapeHeight,
+        refreshHz: nativeRefreshHz,
         orientationMode: .automatic)
 
     let width: UInt32
@@ -273,9 +287,13 @@ struct DisplayPreference: Equatable {
     ) -> DisplayConfigurationRequest {
         let orientation = orientationMode.resolved(using: interfaceOrientation)
         return DisplayConfigurationRequest(
-            width: orientation == .portrait ? height : width,
-            height: orientation == .portrait ? width : height,
-            refreshHz: refreshHz,
+            width: orientation == .portrait
+                ? Self.nativeLandscapeHeight
+                : Self.nativeLandscapeWidth,
+            height: orientation == .portrait
+                ? Self.nativeLandscapeWidth
+                : Self.nativeLandscapeHeight,
+            refreshHz: Self.nativeRefreshHz,
             orientation: orientation,
             requestId: requestId)
     }

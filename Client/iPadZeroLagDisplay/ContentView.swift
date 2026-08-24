@@ -468,7 +468,7 @@ public struct ContentView: View {
                     .font(.system(size: 32, weight: .bold, design: .rounded))
                     .foregroundColor(.white)
 
-                Text("Zero-Lag 120Hz iPad Receiver")
+                Text("Native 60Hz iPad Receiver")
                     .font(.system(size: 16, weight: .medium))
                     .foregroundColor(.gray)
             }

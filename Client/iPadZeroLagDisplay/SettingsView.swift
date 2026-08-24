@@ -53,25 +53,9 @@ public struct SettingsView: View {
                                 Divider().background(Color.white.opacity(0.12))
 
                                 if let capabilities = networkManager.displayCapabilities {
-                                    Picker("Resolution", selection: $draftResolution) {
-                                        ForEach(capabilities.resolutions) { resolution in
-                                            Text(resolution.title).tag(resolution)
-                                        }
-                                    }
-                                    .pickerStyle(.menu)
-
-                                    Picker("Refresh Rate", selection: $draftRefreshHz) {
-                                        ForEach(
-                                            capabilities.refreshRates(for: draftResolution),
-                                            id: \.self
-                                        ) { refreshHz in
-                                            Text(refreshTitle(
-                                                refreshHz,
-                                                capabilities: capabilities))
-                                                .tag(refreshHz)
-                                        }
-                                    }
-                                    .pickerStyle(.menu)
+                                    Text("Native 2388 x 1668 @ 60 Hz")
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .foregroundColor(.white.opacity(0.85))
 
                                     Picker("Orientation", selection: $draftOrientationMode) {
                                         ForEach(DisplayOrientationMode.allCases, id: \.self) { mode in
@@ -298,13 +282,6 @@ public struct SettingsView: View {
         .onReceive(networkManager.$displayPreference) { _ in
             synchronizeDisplayDraft()
         }
-        .onChange(of: draftResolution) { _, resolution in
-            guard let capabilities = networkManager.displayCapabilities else { return }
-            let rates = capabilities.refreshRates(for: resolution)
-            if !rates.contains(draftRefreshHz) {
-                draftRefreshHz = rates.first ?? DisplayPreference.defaultValue.refreshHz
-            }
-        }
         .onAppear {
             draftBitrate = networkManager.targetBitrateMbps
             synchronizeDisplayDraft()
@@ -327,19 +304,6 @@ public struct SettingsView: View {
             height: draftResolution.height,
             refreshHz: draftRefreshHz,
             orientationMode: draftOrientationMode))
-    }
-
-    private func refreshTitle(
-        _ refreshHz: UInt32,
-        capabilities: DisplayCapabilities
-    ) -> String {
-        let experimental = capabilities.modes.contains {
-            $0.width == draftResolution.width &&
-            $0.height == draftResolution.height &&
-            $0.refreshHz == refreshHz &&
-            $0.isExperimental
-        }
-        return experimental ? "\(refreshHz) Hz (Experimental)" : "\(refreshHz) Hz"
     }
 
     /// Constructs and sends a BC packet with the current NetworkManager state.
