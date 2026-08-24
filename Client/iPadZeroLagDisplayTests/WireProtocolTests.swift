@@ -2,6 +2,7 @@ import XCTest
 import Foundation
 import Network
 import CoreGraphics
+import SwiftUI
 @testable import iPadCasting
 
 final class UsbSplitCommitGateTests: XCTestCase {
