@@ -194,6 +194,15 @@ enum TrustedReconnectPolicy {
     static func delay(forAttempt attempt: Int) -> TimeInterval {
         delays[min(max(attempt, 0), delays.count - 1)]
     }
+
+    static func shouldSchedule(
+        isForegroundActive: Bool,
+        reconnectEnabled: Bool,
+        lastKnownHost: String?
+    ) -> Bool {
+        isForegroundActive && reconnectEnabled &&
+            !(lastKnownHost?.isEmpty ?? true)
+    }
 }
 
 struct TrustedSettingsState: Equatable {
@@ -1802,8 +1811,11 @@ public class NetworkManager: ObservableObject {
                 print("[IPAD][NW_STATE] preparing")
             case .waiting(let error):
                 print("[IPAD][NW_STATE] waiting error=\(error)")
-                self.setState(.disconnected(reason: "Waiting for Windows host: \(error.localizedDescription)"))
-                self.scheduleAutoReconnect(reset: false)
+                // NWConnection remains non-nil while it is waiting. Route the
+                // transition through the normal generation-safe teardown so
+                // the bounded reconnect attempt can create a fresh socket.
+                self.handleStreamError(
+                    "Waiting for Windows host: \(error.localizedDescription)")
             case .ready:
                 self.connectionTimeoutWorkItem?.cancel()
                 print("[IPAD][NW_STATE] ready TLS_VERIFY_COMPLETE accepted")
@@ -1883,10 +1895,13 @@ public class NetworkManager: ObservableObject {
 
     private func scheduleAutoReconnect(reset: Bool) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
-        guard isForegroundActive, reconnectEnabled,
-              let host = UserDefaults.standard.string(
-                forKey: Self.lastKnownHostKey),
-              !host.isEmpty else { return }
+        let lastKnownHost = UserDefaults.standard.string(
+            forKey: Self.lastKnownHostKey)
+        guard TrustedReconnectPolicy.shouldSchedule(
+                isForegroundActive: isForegroundActive,
+                reconnectEnabled: reconnectEnabled,
+                lastKnownHost: lastKnownHost),
+              let host = lastKnownHost else { return }
         if reset { reconnectAttempt = 0 }
         reconnectWorkItem?.cancel()
         let delay = TrustedReconnectPolicy.delay(forAttempt: reconnectAttempt)

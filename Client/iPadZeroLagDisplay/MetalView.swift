@@ -16,13 +16,13 @@ enum FullscreenSurfaceLayout {
 
     static func edgeToEdgeFrame(
         proposedBounds: CGRect,
-        safeAreaInsets: EdgeInsets
+        safeAreaInsets _: EdgeInsets
     ) -> CGRect {
-        CGRect(
-            x: proposedBounds.minX - safeAreaInsets.leading,
-            y: proposedBounds.minY - safeAreaInsets.top,
-            width: proposedBounds.width + safeAreaInsets.leading + safeAreaInsets.trailing,
-            height: proposedBounds.height + safeAreaInsets.top + safeAreaInsets.bottom)
+        // The GeometryReader is already outside the safe area. UIKit may
+        // continue reporting non-zero insets for system gestures; adding
+        // those values again enlarges the Metal/touch container beyond the
+        // actual window and changes its aspect ratio.
+        proposedBounds
     }
 }
 

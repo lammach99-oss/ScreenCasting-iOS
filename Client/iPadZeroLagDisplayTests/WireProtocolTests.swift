@@ -49,6 +49,89 @@ final class TrustedSessionAndSettingsTests: XCTestCase {
         XCTAssertEqual(TrustedReconnectPolicy.delay(forAttempt: 99), 5)
     }
 
+    func testReconnectSchedulingRequiresForegroundIntentAndLastKnownHost() {
+        XCTAssertTrue(TrustedReconnectPolicy.shouldSchedule(
+            isForegroundActive: true,
+            reconnectEnabled: true,
+            lastKnownHost: "192.168.1.3"))
+        XCTAssertFalse(TrustedReconnectPolicy.shouldSchedule(
+            isForegroundActive: false,
+            reconnectEnabled: true,
+            lastKnownHost: "192.168.1.3"))
+        XCTAssertFalse(TrustedReconnectPolicy.shouldSchedule(
+            isForegroundActive: true,
+            reconnectEnabled: false,
+            lastKnownHost: "192.168.1.3"))
+        XCTAssertFalse(TrustedReconnectPolicy.shouldSchedule(
+            isForegroundActive: true,
+            reconnectEnabled: true,
+            lastKnownHost: nil))
+    }
+
+    func testNetworkWaitingReleasesTheStalledConnectionBeforeRetry() throws {
+        let sourceRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: sourceRoot.appendingPathComponent(
+                "iPadZeroLagDisplay/NetworkManager.swift"),
+            encoding: .utf8)
+        let waitingStart = try XCTUnwrap(
+            source.range(of: "case .waiting(let error):"))
+        let readyStart = try XCTUnwrap(
+            source.range(
+                of: "case .ready:",
+                range: waitingStart.upperBound..<source.endIndex))
+        let waitingBranch = String(
+            source[waitingStart.lowerBound..<readyStart.lowerBound])
+
+        XCTAssertTrue(waitingBranch.contains("handleStreamError("))
+        XCTAssertFalse(waitingBranch.contains("scheduleAutoReconnect("))
+        XCTAssertFalse(waitingBranch.contains("setState(.disconnected"))
+    }
+
+    func testLifecycleAndExplicitActionsPreserveReconnectIntentBoundaries() throws {
+        let sourceRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let networkSource = try String(
+            contentsOf: sourceRoot.appendingPathComponent(
+                "iPadZeroLagDisplay/NetworkManager.swift"),
+            encoding: .utf8)
+        let contentSource = try String(
+            contentsOf: sourceRoot.appendingPathComponent(
+                "iPadZeroLagDisplay/ContentView.swift"),
+            encoding: .utf8)
+
+        XCTAssertTrue(networkSource.contains(
+            "applicationDidBecomeActive()"))
+        XCTAssertTrue(networkSource.contains(
+            "self.scheduleAutoReconnect(reset: true)"))
+        XCTAssertTrue(networkSource.contains(
+            "self.reconnectWorkItem?.cancel()"))
+        XCTAssertTrue(networkSource.contains("Self.lastKnownHostKey"))
+        XCTAssertTrue(contentSource.contains(
+            "connectDiscoveredHostIfNeeded(host.endpoint)"))
+
+        let stopStart = try XCTUnwrap(networkSource.range(of: "public func stop()"))
+        let stopEnd = try XCTUnwrap(networkSource.range(
+            of: "func applyDisplayPreference(",
+            range: stopStart.upperBound..<networkSource.endIndex))
+        let stopBody = String(networkSource[stopStart.lowerBound..<stopEnd.lowerBound])
+        XCTAssertTrue(stopBody.contains("reconnectEnabled = false"))
+        XCTAssertFalse(stopBody.contains("trustedCredentialStore.delete"))
+
+        let forgetStart = try XCTUnwrap(networkSource.range(
+            of: "case .forgetDeviceResult:"))
+        let forgetEnd = try XCTUnwrap(networkSource.range(
+            of: "case .displayCapabilities:",
+            range: forgetStart.upperBound..<networkSource.endIndex))
+        let forgetBody = String(
+            networkSource[forgetStart.lowerBound..<forgetEnd.lowerBound])
+        XCTAssertTrue(forgetBody.contains("trustedCredentialStore.delete"))
+        XCTAssertTrue(forgetBody.contains("removeObject(forKey: Self.lastKnownHostKey)"))
+    }
+
     func testSettingsWireTypesAndHostStateDecode() throws {
         XCTAssertEqual(WireMessageType.clientHello.rawValue, 21)
         XCTAssertEqual(WireMessageType.sessionResumeResult.rawValue, 27)
@@ -344,16 +427,16 @@ final class VideoContentViewportTests: XCTestCase {
 }
 
 final class FullscreenSurfaceLayoutTests: XCTestCase {
-    func testSafeAreaSizedProposalExpandsToTheFullWindow() {
+    func testFullscreenProposalIsNotExpandedWhenSafeAreaInsetsRemainReported() {
         XCTAssertEqual(
             FullscreenSurfaceLayout.edgeToEdgeFrame(
-                proposedBounds: CGRect(x: 0, y: 0, width: 1130, height: 780),
+                proposedBounds: CGRect(x: 0, y: 0, width: 1194, height: 834),
                 safeAreaInsets: EdgeInsets(
                     top: 24,
                     leading: 32,
                     bottom: 30,
                     trailing: 32)),
-            CGRect(x: -32, y: -24, width: 1194, height: 834))
+            CGRect(x: 0, y: 0, width: 1194, height: 834))
     }
 
     func testAlreadyFullscreenProposalIsNotExpandedAgain() {
