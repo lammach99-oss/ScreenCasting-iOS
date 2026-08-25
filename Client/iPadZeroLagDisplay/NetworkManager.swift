@@ -102,10 +102,16 @@ struct TrustedHostCredential: Codable, Equatable {
     var sessionID: Data
 }
 
-enum TrustedHostCredentialStore {
-    private static let service = "com.screencasting.trusted-host.v1"
+protocol TrustedHostCredentialBacking {
+    func load(fingerprint: String) -> Data?
+    func save(_ data: Data, fingerprint: String) -> Bool
+    func delete(fingerprint: String)
+}
 
-    static func load(fingerprint: String) -> TrustedHostCredential? {
+struct SecurityTrustedHostCredentialBacking: TrustedHostCredentialBacking {
+    private let service = "com.screencasting.trusted-host.v1"
+
+    func load(fingerprint: String) -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -116,19 +122,14 @@ enum TrustedHostCredentialStore {
         var result: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
               let data = result as? Data else { return nil }
-        return try? JSONDecoder().decode(TrustedHostCredential.self, from: data)
+        return data
     }
 
-    static func save(_ credential: TrustedHostCredential) -> Bool {
-        guard credential.hostID.count == 16,
-              credential.deviceID.count == 16,
-              credential.secret.count == 32,
-              credential.sessionID.count == 16,
-              let data = try? JSONEncoder().encode(credential) else { return false }
+    func save(_ data: Data, fingerprint: String) -> Bool {
         let key: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: credential.fingerprint,
+            kSecAttrAccount as String: fingerprint,
         ]
         let values: [String: Any] = [
             kSecValueData as String: data,
@@ -142,12 +143,48 @@ enum TrustedHostCredentialStore {
         return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
     }
 
-    static func delete(fingerprint: String) {
+    func delete(fingerprint: String) {
         SecItemDelete([
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: fingerprint,
         ] as CFDictionary)
+    }
+}
+
+struct TrustedHostCredentialStore {
+    private let backing: any TrustedHostCredentialBacking
+
+    init(backing: any TrustedHostCredentialBacking = SecurityTrustedHostCredentialBacking()) {
+        self.backing = backing
+    }
+
+    func load(fingerprint: String) -> TrustedHostCredential? {
+        guard !fingerprint.isEmpty,
+              let data = backing.load(fingerprint: fingerprint),
+              let credential = try? JSONDecoder().decode(
+                  TrustedHostCredential.self,
+                  from: data),
+              credential.fingerprint == fingerprint,
+              credential.hostID.count == 16,
+              credential.deviceID.count == 16,
+              credential.secret.count == 32,
+              credential.sessionID.count == 16 else { return nil }
+        return credential
+    }
+
+    func save(_ credential: TrustedHostCredential) -> Bool {
+        guard !credential.fingerprint.isEmpty,
+              credential.hostID.count == 16,
+              credential.deviceID.count == 16,
+              credential.secret.count == 32,
+              credential.sessionID.count == 16,
+              let data = try? JSONEncoder().encode(credential) else { return false }
+        return backing.save(data, fingerprint: credential.fingerprint)
+    }
+
+    func delete(fingerprint: String) {
+        backing.delete(fingerprint: fingerprint)
     }
 }
 
@@ -1046,6 +1083,7 @@ public class NetworkManager: ObservableObject {
     private var connection: NWConnection?
     private var verifiedHostFingerprint: String?
     private var trustedCredential: TrustedHostCredential?
+    private let trustedCredentialStore = TrustedHostCredentialStore()
     private let trustedDeviceID = TrustedDeviceIdentity.loadOrCreate()
     private var isForegroundActive = true
     private var reconnectEnabled = true
@@ -1823,7 +1861,7 @@ public class NetworkManager: ObservableObject {
             handleStreamError("TLS host identity was unavailable after verification.")
             return
         }
-        let stored = TrustedHostCredentialStore.load(fingerprint: fingerprint)
+        let stored = trustedCredentialStore.load(fingerprint: fingerprint)
         trustedCredential = stored
         let deviceID = stored?.deviceID ?? trustedDeviceID
         let sessionID = stored?.sessionID ?? Data(repeating: 0, count: 16)
@@ -1901,7 +1939,7 @@ public class NetworkManager: ObservableObject {
             deviceID: payload.subdata(in: 16..<32),
             secret: payload.subdata(in: 48..<80),
             sessionID: payload.subdata(in: 32..<48))
-        guard TrustedHostCredentialStore.save(credential) else {
+        guard trustedCredentialStore.save(credential) else {
             handleStreamError("Unable to save the trusted Host credential in Keychain.")
             return
         }
@@ -1912,7 +1950,7 @@ public class NetworkManager: ObservableObject {
     private func updateResumedSession(_ payload: Data) {
         guard payload.count == 17, var credential = trustedCredential else { return }
         credential.sessionID = payload.subdata(in: 1..<17)
-        if TrustedHostCredentialStore.save(credential) {
+        if trustedCredentialStore.save(credential) {
             trustedCredential = credential
             print(payload[0] == 1
                 ? "[IPAD][SESSION_RESUMED] result=resumed"
@@ -2310,7 +2348,7 @@ public class NetworkManager: ObservableObject {
         case .forgetDeviceResult:
             guard payload.count == 2, payload[0] == 1 else { return }
             if payload[1] == 1, let fingerprint = verifiedHostFingerprint {
-                TrustedHostCredentialStore.delete(fingerprint: fingerprint)
+                trustedCredentialStore.delete(fingerprint: fingerprint)
                 trustedCredential = nil
                 UserDefaults.standard.removeObject(forKey: Self.lastKnownHostKey)
                 reconnectEnabled = false

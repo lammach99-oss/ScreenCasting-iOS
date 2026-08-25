@@ -6,9 +6,27 @@ import SwiftUI
 @testable import iPadCasting
 
 final class TrustedSessionAndSettingsTests: XCTestCase {
-    func testTrustedCredentialRoundTripsThroughDeviceKeychain() throws {
+    private final class InMemoryTrustedHostCredentialBacking: TrustedHostCredentialBacking {
+        private var values: [String: Data] = [:]
+
+        func load(fingerprint: String) -> Data? {
+            values[fingerprint]
+        }
+
+        func save(_ data: Data, fingerprint: String) -> Bool {
+            values[fingerprint] = data
+            return true
+        }
+
+        func delete(fingerprint: String) {
+            values.removeValue(forKey: fingerprint)
+        }
+    }
+
+    func testTrustedCredentialRoundTripsThroughKeychainAbstraction() throws {
+        let store = TrustedHostCredentialStore(
+            backing: InMemoryTrustedHostCredentialBacking())
         let fingerprint = "test-" + UUID().uuidString
-        defer { TrustedHostCredentialStore.delete(fingerprint: fingerprint) }
         let credential = TrustedHostCredential(
             fingerprint: fingerprint,
             hostID: Data(repeating: 0x11, count: 16),
@@ -16,10 +34,10 @@ final class TrustedSessionAndSettingsTests: XCTestCase {
             secret: Data(repeating: 0x33, count: 32),
             sessionID: Data(repeating: 0x44, count: 16))
 
-        XCTAssertTrue(TrustedHostCredentialStore.save(credential))
-        XCTAssertEqual(TrustedHostCredentialStore.load(fingerprint: fingerprint), credential)
-        TrustedHostCredentialStore.delete(fingerprint: fingerprint)
-        XCTAssertNil(TrustedHostCredentialStore.load(fingerprint: fingerprint))
+        XCTAssertTrue(store.save(credential))
+        XCTAssertEqual(store.load(fingerprint: fingerprint), credential)
+        store.delete(fingerprint: fingerprint)
+        XCTAssertNil(store.load(fingerprint: fingerprint))
     }
 
     func testReconnectBackoffIsImmediateThenBoundedAtFiveSeconds() {
