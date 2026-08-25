@@ -9,7 +9,7 @@ final class SettingsFoundationContractTests: XCTestCase {
 
         expect(model.requested.quality == .balanced, "default quality")
         expect(model.effective.quality == .balanced, "default effective quality")
-        expect(model.requested.resolution == .fullHD, "default resolution")
+        expect(model.requested.resolution == .native, "default resolution")
         expect(model.rows.first(where: { $0.id == "quality" })?.accessibilityLabel == "Quality and performance", "quality accessibility label")
         expect(model.rows.first(where: { $0.id == "quality" })?.accessibilityValue == "Balanced", "quality accessibility value")
     }
@@ -17,18 +17,18 @@ final class SettingsFoundationContractTests: XCTestCase {
     func testRequestedAndEffectiveValuesDifferWhenUnsupported() {
         let capabilities = IpadSettingsCapabilities(
             supportedQualities: [.quality],
-            supportedResolutions: [.hd],
+            supportedResolutions: [.native],
             supportedRotations: [.landscape],
             maximumFrameRate: 30,
             supportsUSB: false,
             availableInputDevices: [.touch]
         )!
         let model = IpadSettingsModel(store: InMemorySettingsStore(), capabilities: capabilities)
-        model.update { $0.quality = .performance; $0.resolution = .ultraHD; $0.frameRate = 120; $0.connection = .usb; $0.inputDevice = .pencil }
+        model.update { $0.quality = .performance; $0.frameRate = 120; $0.connection = .usb; $0.inputDevice = .pencil }
 
         expect(model.requested.quality == .performance, "requested quality remains user choice")
         expect(model.effective.quality == .quality, "effective quality is capability constrained")
-        expect(model.effective.resolution == .hd, "effective resolution is capability constrained")
+        expect(model.effective.resolution == .native, "effective resolution remains native")
         expect(model.effective.frameRate == 30, "effective framerate is capability constrained")
         expect(model.effective.connection == .wifi, "effective connection falls back")
         expect(model.effective.inputDevice == .touch, "effective input falls back")
@@ -36,7 +36,7 @@ final class SettingsFoundationContractTests: XCTestCase {
 
     func testCapabilityFilteringAndInvalidBounds() {
         let model = IpadSettingsModel(store: InMemorySettingsStore(), capabilities: .mockDefault)
-        expect(model.options(for: .resolution) == ["hd", "fullHD"], "resolution options are capability filtered")
+        expect(model.options(for: .resolution) == ["native"], "only the native resolution is available")
         model.update { $0.frameRate = 999; $0.pointerSensitivity = -4 }
         expect(model.requested.frameRate == 120, "requested framerate clamps to valid bounds")
         expect(model.requested.pointerSensitivity == 0, "requested sensitivity clamps to valid bounds")
@@ -44,7 +44,7 @@ final class SettingsFoundationContractTests: XCTestCase {
 
     func testCapabilityInvariantRejectsEmptySnapshot() {
         let invalid = IpadSettingsCapabilities(
-            supportedQualities: [], supportedResolutions: [.hd],
+            supportedQualities: [], supportedResolutions: [.native],
             supportedRotations: [.landscape], maximumFrameRate: 60,
             supportsUSB: false, availableInputDevices: [.touch])
         expect(invalid == nil, "empty quality capability snapshot is rejected")
@@ -52,7 +52,7 @@ final class SettingsFoundationContractTests: XCTestCase {
 
     func testCapabilityInvariantRejectsTooLowFrameRate() {
         let invalid = IpadSettingsCapabilities(
-            supportedQualities: [.balanced], supportedResolutions: [.hd],
+            supportedQualities: [.balanced], supportedResolutions: [.native],
             supportedRotations: [.landscape], maximumFrameRate: 23,
             supportsUSB: false, availableInputDevices: [.touch])
         expect(invalid == nil, "maximum frame rate below 24 is rejected")
@@ -69,6 +69,13 @@ final class SettingsFoundationContractTests: XCTestCase {
         let migrated = IpadSettingsModel(store: legacy, capabilities: .mockDefault)
         expect(migrated.requested.quality == .performance && migrated.requested.frameRate == 60, "legacy settings migrate")
         expect(legacy.string(forKey: "ipad.settings")?.contains("schemaVersion") == true, "migration persists current schema")
+
+        let previousNativeDefault = InMemorySettingsStore(values: [
+            "ipad.settings": "{\"schemaVersion\":1,\"settings\":{\"quality\":\"quality\",\"resolution\":\"fullHD\",\"rotation\":\"automatic\",\"frameRate\":60,\"connection\":\"wifi\",\"inputDevice\":\"touch\",\"showPerformanceOverlay\":true,\"pointerSensitivity\":50}}"
+        ])
+        let nativeMigrated = IpadSettingsModel(store: previousNativeDefault, capabilities: .mockDefault)
+        expect(nativeMigrated.requested.resolution == .native, "legacy full HD resolves to native")
+        expect(nativeMigrated.requested.quality == .quality && nativeMigrated.requested.showPerformanceOverlay, "legacy native migration preserves other settings")
     }
 
     private func expect(_ condition: @autoclosure () -> Bool, _ message: String) {

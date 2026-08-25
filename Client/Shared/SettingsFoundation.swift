@@ -1,7 +1,24 @@
 import Foundation
 
 public enum StreamQuality: String, CaseIterable, Codable { case performance, balanced, quality }
-public enum StreamResolution: String, CaseIterable, Codable { case hd, fullHD, ultraHD }
+public enum StreamResolution: String, CaseIterable, Codable {
+    case native
+
+    public init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        guard value == Self.native.rawValue || ["hd", "fullHD", "ultraHD"].contains(value) else {
+            throw DecodingError.dataCorruptedError(
+                in: try decoder.singleValueContainer(),
+                debugDescription: "Unsupported stream resolution")
+        }
+        self = .native
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+}
 public enum StreamRotation: String, CaseIterable, Codable { case automatic, landscape, portrait }
 public enum ConnectionPreference: String, CaseIterable, Codable { case automatic, wifi, usb }
 public enum InputDevice: String, CaseIterable, Codable { case touch, pencil, trackpad }
@@ -9,7 +26,7 @@ public enum SettingsOption: Hashable { case quality, resolution, rotation, conne
 
 public struct IpadSettings: Equatable, Codable {
     public var quality: StreamQuality = .balanced
-    public var resolution: StreamResolution = .fullHD
+    public var resolution: StreamResolution = .native
     public var rotation: StreamRotation = .automatic
     public var frameRate: Int = 60
     public var connection: ConnectionPreference = .automatic
@@ -54,7 +71,7 @@ public struct IpadSettingsCapabilities: Equatable {
 
     public static let mockDefault = IpadSettingsCapabilities(
         supportedQualities: [.performance, .balanced, .quality],
-        supportedResolutions: [.hd, .fullHD],
+        supportedResolutions: [.native],
         supportedRotations: [.automatic, .landscape, .portrait],
         maximumFrameRate: 120,
         supportsUSB: true,
@@ -152,7 +169,7 @@ public final class IpadSettingsModel {
     private static func effectiveSettings(for requested: IpadSettings, capabilities: IpadSettingsCapabilities) -> IpadSettings {
         var result = requested
         result.quality = supported(requested.quality, in: capabilities.supportedQualities, fallback: .balanced)
-        result.resolution = supported(requested.resolution, in: capabilities.supportedResolutions, fallback: .hd)
+        result.resolution = supported(requested.resolution, in: capabilities.supportedResolutions, fallback: .native)
         result.rotation = supported(requested.rotation, in: capabilities.supportedRotations, fallback: .automatic)
         result.frameRate = min(requested.frameRate, max(24, capabilities.maximumFrameRate))
         if requested.connection == .usb && !capabilities.supportsUSB { result.connection = .wifi }
@@ -165,7 +182,7 @@ public final class IpadSettingsModel {
     }
 
     private func display(_ value: StreamQuality) -> String { value.rawValue.capitalized }
-    private func display(_ value: StreamResolution) -> String { value == .fullHD ? "Full HD" : value == .ultraHD ? "Ultra HD" : "HD" }
+    private func display(_: StreamResolution) -> String { "Native 2388 x 1668" }
     private func display(_ value: StreamRotation) -> String { value.rawValue.capitalized }
     private func display(_ value: ConnectionPreference) -> String { value.rawValue.uppercased() }
     private func display(_ value: InputDevice) -> String { value.rawValue.capitalized }
