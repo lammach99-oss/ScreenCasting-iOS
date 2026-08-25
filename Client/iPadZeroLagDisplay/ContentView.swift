@@ -183,6 +183,7 @@ struct PINEntryView: View {
 // MARK: - ContentView
 
 public struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     private static let geometryLogger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "com.iPadZeroLagDisplay.client",
         category: "presentation")
@@ -235,7 +236,7 @@ public struct ContentView: View {
             UIApplication.shared.isIdleTimerDisabled = false
             UIDevice.current.endGeneratingDeviceOrientationNotifications()
             discoveryManager.stopBrowsing()
-            networkManager.stop()
+            networkManager.applicationDidEnterBackground()
         }
         .animation(.easeInOut(duration: 0.3), value: streamManager.isConnected)
         // PIN entry overlay: shown when awaiting PIN or after auth failure
@@ -261,6 +262,25 @@ public struct ContentView: View {
             if newState == .awaitingPIN, enteredPIN.count == 4 {
                 networkManager.sendAuthPIN(enteredPIN)
             }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .active:
+                networkManager.applicationDidBecomeActive()
+                if let host = discoveryManager.discoveredHosts.first {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                        networkManager.connectDiscoveredHostIfNeeded(host.endpoint)
+                    }
+                }
+            case .inactive, .background:
+                networkManager.applicationDidEnterBackground()
+            @unknown default:
+                break
+            }
+        }
+        .onChange(of: discoveryManager.discoveredHosts) { _, hosts in
+            guard scenePhase == .active, let host = hosts.first else { return }
+            networkManager.connectDiscoveredHostIfNeeded(host.endpoint)
         }
         .onReceive(
             NotificationCenter.default.publisher(

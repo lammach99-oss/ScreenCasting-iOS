@@ -5,6 +5,70 @@ import CoreGraphics
 import SwiftUI
 @testable import iPadCasting
 
+final class TrustedSessionAndSettingsTests: XCTestCase {
+    func testTrustedCredentialRoundTripsThroughDeviceKeychain() throws {
+        let fingerprint = "test-" + UUID().uuidString
+        defer { TrustedHostCredentialStore.delete(fingerprint: fingerprint) }
+        let credential = TrustedHostCredential(
+            fingerprint: fingerprint,
+            hostID: Data(repeating: 0x11, count: 16),
+            deviceID: Data(repeating: 0x22, count: 16),
+            secret: Data(repeating: 0x33, count: 32),
+            sessionID: Data(repeating: 0x44, count: 16))
+
+        XCTAssertTrue(TrustedHostCredentialStore.save(credential))
+        XCTAssertEqual(TrustedHostCredentialStore.load(fingerprint: fingerprint), credential)
+        TrustedHostCredentialStore.delete(fingerprint: fingerprint)
+        XCTAssertNil(TrustedHostCredentialStore.load(fingerprint: fingerprint))
+    }
+
+    func testReconnectBackoffIsImmediateThenBoundedAtFiveSeconds() {
+        XCTAssertEqual(TrustedReconnectPolicy.delay(forAttempt: 0), 0)
+        XCTAssertEqual(TrustedReconnectPolicy.delay(forAttempt: 1), 0.25)
+        XCTAssertEqual(TrustedReconnectPolicy.delay(forAttempt: 2), 1)
+        XCTAssertEqual(TrustedReconnectPolicy.delay(forAttempt: 3), 2)
+        XCTAssertEqual(TrustedReconnectPolicy.delay(forAttempt: 4), 5)
+        XCTAssertEqual(TrustedReconnectPolicy.delay(forAttempt: 99), 5)
+    }
+
+    func testSettingsWireTypesAndHostStateDecode() throws {
+        XCTAssertEqual(WireMessageType.clientHello.rawValue, 21)
+        XCTAssertEqual(WireMessageType.sessionResumeResult.rawValue, 27)
+        XCTAssertEqual(WireMessageType.settingsGet.rawValue, 28)
+        XCTAssertEqual(WireMessageType.settingsRejected.rawValue, 32)
+        XCTAssertEqual(WireMessageType.forgetDevice.rawValue, 33)
+        XCTAssertEqual(WireMessageType.forgetDeviceResult.rawValue, 34)
+
+        var payload = Data(count: 24)
+        payload.withUnsafeMutableBytes { bytes in
+            bytes.storeBytes(of: UInt8(1), toByteOffset: 0, as: UInt8.self)
+            bytes.storeBytes(of: UInt8(0), toByteOffset: 1, as: UInt8.self)
+            bytes.storeBytes(of: UInt8(0), toByteOffset: 2, as: UInt8.self)
+            bytes.storeBytes(of: UInt64(7).littleEndian, toByteOffset: 8, as: UInt64.self)
+            bytes.storeBytes(
+                of: UInt32(30_000_000).littleEndian,
+                toByteOffset: 16,
+                as: UInt32.self)
+        }
+        let state = try XCTUnwrap(TrustedSettingsState.decode(payload))
+        XCTAssertEqual(state.generation, 7)
+        XCTAssertEqual(state.bitrateBps, 30_000_000)
+        XCTAssertFalse(state.audioEnabled)
+        XCTAssertEqual(state.rejectionReason, 0)
+
+        payload[2] = 4
+        XCTAssertNil(TrustedSettingsState.decode(payload))
+        payload[2] = 0
+        payload.withUnsafeMutableBytes { bytes in
+            bytes.storeBytes(
+                of: UInt32(2_000_000).littleEndian,
+                toByteOffset: 16,
+                as: UInt32.self)
+        }
+        XCTAssertNil(TrustedSettingsState.decode(payload))
+    }
+}
+
 final class UsbSplitCommitGateTests: XCTestCase {
     func testFeedbackWindowStartsEmptyAndTracksLossAndReordering() {
         var window = WifiFeedbackWindow()
