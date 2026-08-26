@@ -213,7 +213,7 @@ struct TrustedSettingsState: Equatable {
 
     static func decode(_ payload: Data) -> TrustedSettingsState? {
         guard payload.count == 24, payload[0] == 1, payload[1] <= 1,
-              payload[2] <= 3, payload[3] == 0,
+              payload[2] <= 4, payload[3] == 0,
               payload[20] == 0, payload[21] == 0,
               payload[22] == 0, payload[23] == 0 else { return nil }
         let generation = payload.withUnsafeBytes {

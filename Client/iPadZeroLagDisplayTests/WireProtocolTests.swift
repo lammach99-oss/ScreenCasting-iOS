@@ -158,7 +158,8 @@ final class TrustedSessionAndSettingsTests: XCTestCase {
         XCTAssertEqual(state.rejectionReason, 0)
 
         payload[2] = 4
-        XCTAssertNil(TrustedSettingsState.decode(payload))
+        let invalidRequest = try XCTUnwrap(TrustedSettingsState.decode(payload))
+        XCTAssertEqual(invalidRequest.rejectionReason, 4)
         payload[2] = 0
         payload.withUnsafeMutableBytes { bytes in
             bytes.storeBytes(
