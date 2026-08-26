@@ -1509,9 +1509,9 @@ public class NetworkManager: ObservableObject {
     }
 
     public func sendSettingsUpdate(bitrateMbps: Double, audioEnabled: Bool) {
+        let roundedMbps = round(bitrateMbps)
         guard connectionState == .streaming,
-              bitrateMbps.rounded() == bitrateMbps,
-              bitrateMbps >= 3, bitrateMbps <= 50 else { return }
+              roundedMbps >= 3, roundedMbps <= 50 else { return }
         let requestID = nextSettingsRequestID
         nextSettingsRequestID &+= 1
         var payload = Data(count: 24)
@@ -1522,7 +1522,7 @@ public class NetworkManager: ObservableObject {
             bytes.storeBytes(of: requestID.littleEndian, toByteOffset: 4, as: UInt32.self)
             bytes.storeBytes(of: settingsGeneration.littleEndian, toByteOffset: 8, as: UInt64.self)
             bytes.storeBytes(
-                of: UInt32(bitrateMbps * 1_000_000).littleEndian,
+                of: UInt32(roundedMbps * 1_000_000).littleEndian,
                 toByteOffset: 16,
                 as: UInt32.self)
         }

@@ -165,6 +165,45 @@ struct HevcParameterSetSessionGate {
     }
 }
 
+struct H264ParameterSetSignature: Equatable {
+    let digest: SHA256.Digest
+
+    init(sps: Data, pps: Data) {
+        var bytes = Data()
+        Self.append(sps, to: &bytes)
+        Self.append(pps, to: &bytes)
+        digest = SHA256.hash(data: bytes)
+    }
+
+    private static func append(_ value: Data, to bytes: inout Data) {
+        precondition(value.count <= Int(UInt32.max))
+        var length = UInt32(value.count).bigEndian
+        withUnsafeBytes(of: &length) { bytes.append(contentsOf: $0) }
+        bytes.append(value)
+    }
+}
+
+struct H264ParameterSetSessionGate {
+    private(set) var activeParameterSetSignature: H264ParameterSetSignature?
+
+    mutating func replaceIfChanged(
+        sps: Data,
+        pps: Data,
+        factory: () -> Bool
+    ) -> Bool {
+        let candidate = H264ParameterSetSignature(sps: sps, pps: pps)
+        guard candidate != activeParameterSetSignature, factory() else {
+            return false
+        }
+        activeParameterSetSignature = candidate
+        return true
+    }
+
+    mutating func reset() {
+        activeParameterSetSignature = nil
+    }
+}
+
 /// Keeps a canonical payload's backing Data and decode lifetime alive until
 /// CoreMedia releases the block. No Annex-B reconstruction is needed.
 final class RetainedDataBlockStorage {
@@ -347,6 +386,10 @@ public final class DecoderManager {
     private var activeParameterSetSignature: HevcParameterSetSignature? {
         parameterSetSessionGate.activeParameterSetSignature
     }
+    private var h264ParameterSetSessionGate = H264ParameterSetSessionGate()
+    private var activeH264ParameterSetSignature: H264ParameterSetSignature? {
+        h264ParameterSetSessionGate.activeParameterSetSignature
+    }
     private let queue = DispatchQueue(
         label: "com.iPadZeroLagDisplay.decoder",
         qos: .userInteractive)
@@ -389,6 +432,7 @@ public final class DecoderManager {
             vpsData = nil
             spsData = sps
             ppsData = pps
+            _ = h264ParameterSetSessionGate.replaceIfChanged(sps: sps, pps: pps) { true }
             return true
         }
     }
@@ -504,6 +548,17 @@ public final class DecoderManager {
                     sps: sps,
                     pps: pps) {
                     decoder.replaceDecompressionSession(vps: vps, sps: sps, pps: pps)
+                }
+            }
+        } else if activeCodec == .h264,
+                  let sps = spsData, let pps = ppsData {
+            let candidate = H264ParameterSetSignature(sps: sps, pps: pps)
+            if candidate != activeH264ParameterSetSignature {
+                let decoder = self
+                _ = h264ParameterSetSessionGate.replaceIfChanged(
+                    sps: sps,
+                    pps: pps) {
+                    decoder.replaceH264DecompressionSession(sps: sps, pps: pps)
                 }
             }
         }
@@ -848,6 +903,7 @@ public final class DecoderManager {
             activeCodec = .hevc
             hasDecodedH264Idr = false
             parameterSetSessionGate.reset()
+            h264ParameterSetSessionGate.reset()
         }
     }
 
