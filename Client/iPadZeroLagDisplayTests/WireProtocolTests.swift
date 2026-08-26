@@ -375,11 +375,11 @@ final class VideoContentViewportTests: XCTestCase {
         let portraitContainer = CGRect(x: 0, y: 0, width: 834, height: 1194)
 
         XCTAssertNotEqual(landscapeViewport, portraitViewport)
-        XCTAssertEqual(
-            portraitViewport.normalizedPoint(
-                for: CGPoint(x: 417, y: 597),
-                in: portraitContainer),
-            CGPoint(x: 0.5, y: 0.5))
+        let portraitCenter = try XCTUnwrap(portraitViewport.normalizedPoint(
+            for: CGPoint(x: 417, y: 597),
+            in: portraitContainer))
+        XCTAssertEqual(portraitCenter.x, 0.5, accuracy: 0.000_001)
+        XCTAssertEqual(portraitCenter.y, 0.5, accuracy: 0.000_001)
     }
 
     func testAspectFitMapsOnlyTheVisibleVideoContent() throws {
