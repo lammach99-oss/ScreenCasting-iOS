@@ -364,6 +364,23 @@ final class UsbSplitCommitGateTests: XCTestCase {
 }
 
 final class VideoContentViewportTests: XCTestCase {
+    func testRendererUsesTheCurrentDrawableSizeAfterAPortraitResize() throws {
+        let landscapeViewport = try XCTUnwrap(Renderer.contentViewport(
+            forDrawableSize: CGSize(width: 1194, height: 834),
+            videoSize: CGSize(width: 2388, height: 1668)))
+        let portraitViewport = try XCTUnwrap(Renderer.contentViewport(
+            forDrawableSize: CGSize(width: 834, height: 1194),
+            videoSize: CGSize(width: 2388, height: 1668)))
+        let portraitContainer = CGRect(x: 0, y: 0, width: 834, height: 1194)
+
+        XCTAssertNotEqual(landscapeViewport, portraitViewport)
+        XCTAssertEqual(
+            portraitViewport.normalizedPoint(
+                for: CGPoint(x: 417, y: 597),
+                in: portraitContainer),
+            CGPoint(x: 0.5, y: 0.5))
+    }
+
     func testAspectFitMapsOnlyTheVisibleVideoContent() throws {
         let viewport = try XCTUnwrap(VideoContentViewport.aspectFit(
             containerSize: CGSize(width: 4, height: 3),

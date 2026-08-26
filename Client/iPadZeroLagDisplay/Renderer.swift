@@ -211,6 +211,16 @@ public class Renderer: NSObject, MTKViewDelegate {
     private var freshness = RenderFreshnessTracker()
     private var publishedContentViewport: VideoContentViewport?
     private var publishedGeometrySnapshot: RendererGeometrySnapshot?
+
+    static func contentViewport(
+        forDrawableSize drawableSize: CGSize,
+        videoSize: CGSize
+    ) -> VideoContentViewport? {
+        VideoContentViewport.aspectFit(
+            containerSize: drawableSize,
+            videoSize: videoSize)
+    }
+
     private var lastDecodedFrameSize: CGSize?
     private let lock = NSLock()
 
@@ -297,11 +307,16 @@ public class Renderer: NSObject, MTKViewDelegate {
         lock.lock()
         let decodedFrameSize = lastDecodedFrameSize
         lock.unlock()
-        if let decodedFrameSize {
-            publishGeometrySnapshot(
-                for: view,
-                decodedFrameSize: decodedFrameSize)
-        }
+        guard let decodedFrameSize,
+              let contentViewport = Self.contentViewport(
+                forDrawableSize: size,
+                videoSize: decodedFrameSize) else { return }
+        publishContentViewport(contentViewport)
+        publishGeometrySnapshot(
+            for: view,
+            decodedFrameSize: decodedFrameSize,
+            drawableSize: size,
+            contentViewport: contentViewport)
     }
 
     public func draw(in view: MTKView) {
@@ -364,16 +379,18 @@ public class Renderer: NSObject, MTKViewDelegate {
             return
         }
 
-        guard let contentViewport = VideoContentViewport.aspectFit(
-            containerSize: view.drawableSize,
-            videoSize: CGSize(width: width, height: height)) else {
+        guard let contentViewport = Self.contentViewport(
+            forDrawableSize: view.drawableSize,
+            videoSize: decodedFrameSize) else {
             abandon(identity)
             return
         }
         publishContentViewport(contentViewport)
         publishGeometrySnapshot(
             for: view,
-            decodedFrameSize: decodedFrameSize)
+            decodedFrameSize: decodedFrameSize,
+            drawableSize: view.drawableSize,
+            contentViewport: contentViewport)
         let scale = SIMD2<Float>(
             Float(contentViewport.rect.width),
             Float(contentViewport.rect.height))
@@ -428,14 +445,13 @@ public class Renderer: NSObject, MTKViewDelegate {
 
     private func publishGeometrySnapshot(
         for view: MTKView,
-        decodedFrameSize: CGSize
+        decodedFrameSize: CGSize,
+        drawableSize: CGSize,
+        contentViewport: VideoContentViewport
     ) {
         DispatchQueue.main.async { [weak self, weak view] in
             guard let self,
-                  let view,
-                  let contentViewport = VideoContentViewport.aspectFit(
-                    containerSize: view.drawableSize,
-                    videoSize: decodedFrameSize) else {
+                  let view else {
                 return
             }
 
@@ -444,7 +460,7 @@ public class Renderer: NSObject, MTKViewDelegate {
                 windowBounds: view.window?.bounds ?? .zero,
                 safeAreaInsets: view.window?.safeAreaInsets ?? view.safeAreaInsets,
                 metalBounds: view.bounds,
-                drawableSize: view.drawableSize,
+                drawableSize: drawableSize,
                 contentScaleFactor: view.contentScaleFactor,
                 contentViewport: contentViewport)
             self.lock.lock()
