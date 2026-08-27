@@ -4,6 +4,7 @@ import CryptoKit
 import QuartzCore
 import AVFoundation
 import Security
+import UIKit
 
 // MARK: - Connection State Machine
 
@@ -12,6 +13,7 @@ public enum ConnectionState: Equatable {
     case idle
     case listening
     case connecting
+    case awaitingHostIdentity
     case awaitingPIN
     case authFailed(reason: String)
     case streaming
@@ -59,6 +61,24 @@ enum WireMessageType: UInt8 {
     case usbLaneBindResult = 14
     case videoConfiguration = 15
     case videoConfigurationAck = 16
+    case displayCapabilities = 17
+    case displayConfigurationRequest = 18
+    case displayReady = 19
+    case displayConfigurationFailed = 20
+    case clientHello = 21
+    case pairingRequired = 22
+    case trustedDeviceChallenge = 23
+    case trustedDeviceProof = 24
+    case pairingSuccess = 25
+    case trustedAuthResult = 26
+    case sessionResumeResult = 27
+    case settingsGet = 28
+    case settingsState = 29
+    case settingsUpdate = 30
+    case settingsApplied = 31
+    case settingsRejected = 32
+    case forgetDevice = 33
+    case forgetDeviceResult = 34
 }
 
 enum WireProtocol {
@@ -73,6 +93,551 @@ enum WireProtocol {
     static let audioFlagOpus: UInt16 = 0x0001
     static let maximumOpusPayloadLength = 1_275
     static let realtimeNegotiationSupportedFlag: UInt16 = 0x8000
+}
+
+struct TrustedHostCredential: Codable, Equatable {
+    let fingerprint: String
+    let hostID: Data
+    let deviceID: Data
+    let secret: Data
+    var sessionID: Data
+}
+
+protocol TrustedHostCredentialBacking {
+    func load(fingerprint: String) -> Data?
+    func save(_ data: Data, fingerprint: String) -> Bool
+    func delete(fingerprint: String)
+}
+
+struct SecurityTrustedHostCredentialBacking: TrustedHostCredentialBacking {
+    private let service = "com.screencasting.trusted-host.v1"
+
+    func load(fingerprint: String) -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: fingerprint,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        return data
+    }
+
+    func save(_ data: Data, fingerprint: String) -> Bool {
+        let key: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: fingerprint,
+        ]
+        let values: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        ]
+        let update = SecItemUpdate(key as CFDictionary, values as CFDictionary)
+        if update == errSecSuccess { return true }
+        guard update == errSecItemNotFound else { return false }
+        var add = key
+        values.forEach { add[$0.key] = $0.value }
+        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
+    }
+
+    func delete(fingerprint: String) {
+        SecItemDelete([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: fingerprint,
+        ] as CFDictionary)
+    }
+}
+
+struct TrustedHostCredentialStore {
+    private let backing: any TrustedHostCredentialBacking
+
+    init(backing: any TrustedHostCredentialBacking = SecurityTrustedHostCredentialBacking()) {
+        self.backing = backing
+    }
+
+    func load(fingerprint: String) -> TrustedHostCredential? {
+        guard !fingerprint.isEmpty,
+              let data = backing.load(fingerprint: fingerprint),
+              let credential = try? JSONDecoder().decode(
+                  TrustedHostCredential.self,
+                  from: data),
+              credential.fingerprint == fingerprint,
+              credential.hostID.count == 16,
+              credential.deviceID.count == 16,
+              credential.secret.count == 32,
+              credential.sessionID.count == 16 else { return nil }
+        return credential
+    }
+
+    func save(_ credential: TrustedHostCredential) -> Bool {
+        guard !credential.fingerprint.isEmpty,
+              credential.hostID.count == 16,
+              credential.deviceID.count == 16,
+              credential.secret.count == 32,
+              credential.sessionID.count == 16,
+              let data = try? JSONEncoder().encode(credential) else { return false }
+        return backing.save(data, fingerprint: credential.fingerprint)
+    }
+
+    func delete(fingerprint: String) {
+        backing.delete(fingerprint: fingerprint)
+    }
+}
+
+struct TrustedHostFingerprintStore {
+    private let service = "com.screencasting.trusted-host-identity.v1"
+    private let account = "selected-host"
+
+    func load() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data,
+              let fingerprint = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return fingerprint
+    }
+
+    func save(_ fingerprint: String) -> Bool {
+        guard !fingerprint.isEmpty,
+              let data = fingerprint.data(using: .utf8) else { return false }
+        let key: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        let values: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        ]
+        let update = SecItemUpdate(key as CFDictionary, values as CFDictionary)
+        if update == errSecSuccess { return true }
+        guard update == errSecItemNotFound else { return false }
+        var add = key
+        values.forEach { add[$0.key] = $0.value }
+        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
+    }
+
+    func delete() {
+        SecItemDelete([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ] as CFDictionary)
+    }
+}
+
+enum TrustedReconnectPolicy {
+    private static let delays: [TimeInterval] = [0, 0.25, 1, 2, 5]
+
+    static func delay(forAttempt attempt: Int) -> TimeInterval {
+        delays[min(max(attempt, 0), delays.count - 1)]
+    }
+
+    static func shouldSchedule(
+        isForegroundActive: Bool,
+        reconnectEnabled: Bool,
+        lastKnownHost: String?
+    ) -> Bool {
+        isForegroundActive && reconnectEnabled &&
+            !(lastKnownHost?.isEmpty ?? true)
+    }
+}
+
+struct TrustedSettingsState: Equatable {
+    let generation: UInt64
+    let bitrateBps: UInt32
+    let audioEnabled: Bool
+    let rejectionReason: UInt8
+
+    static func decode(_ payload: Data) -> TrustedSettingsState? {
+        guard payload.count == 24, payload[0] == 1, payload[1] <= 1,
+              payload[2] <= 4, payload[3] == 0,
+              payload[20] == 0, payload[21] == 0,
+              payload[22] == 0, payload[23] == 0 else { return nil }
+        let generation = payload.withUnsafeBytes {
+            $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self).littleEndian
+        }
+        let bitrateBps = payload.withUnsafeBytes {
+            $0.loadUnaligned(fromByteOffset: 16, as: UInt32.self).littleEndian
+        }
+        guard bitrateBps >= 3_000_000, bitrateBps <= 50_000_000,
+              bitrateBps.isMultiple(of: 1_000_000) else { return nil }
+        return TrustedSettingsState(
+            generation: generation,
+            bitrateBps: bitrateBps,
+            audioEnabled: payload[1] == 1,
+            rejectionReason: payload[2])
+    }
+}
+
+private enum TrustedDeviceIdentity {
+    private static let defaultsKey = "trustedDeviceId.v1"
+
+    static func loadOrCreate() -> Data {
+        if let stored = UserDefaults.standard.data(forKey: defaultsKey),
+           stored.count == 16 { return stored }
+        var uuid = UUID().uuid
+        let data = withUnsafeBytes(of: &uuid) { Data($0) }
+        UserDefaults.standard.set(data, forKey: defaultsKey)
+        return data
+    }
+}
+
+enum ClientDisplayOrientation: UInt8, Equatable {
+    case landscape = 0
+    case portrait = 1
+}
+
+enum DisplayOrientationMode: String, CaseIterable, Hashable {
+    case automatic
+    case landscape
+    case portrait
+
+    var title: String {
+        switch self {
+        case .automatic: return "Automatic"
+        case .landscape: return "Landscape"
+        case .portrait: return "Portrait"
+        }
+    }
+
+    func resolved(using interfaceOrientation: ClientDisplayOrientation) -> ClientDisplayOrientation {
+        switch self {
+        case .automatic: return interfaceOrientation
+        case .landscape: return .landscape
+        case .portrait: return .portrait
+        }
+    }
+}
+
+struct DisplayResolution: Hashable, Identifiable {
+    let width: UInt32
+    let height: UInt32
+
+    var id: String { "\(width)x\(height)" }
+    var title: String { "\(width) × \(height)" }
+}
+
+struct DisplayMode: Hashable {
+    let width: UInt32
+    let height: UInt32
+    let refreshHz: UInt32
+    let isExperimental: Bool
+
+    var resolution: DisplayResolution {
+        DisplayResolution(width: width, height: height)
+    }
+}
+
+struct DisplayCapabilities: Equatable {
+    static let encodedSize = 52
+
+    let modes: [DisplayMode]
+    let preferred: DisplayMode
+
+    var resolutions: [DisplayResolution] {
+        var seen = Set<DisplayResolution>()
+        return modes.compactMap { mode in
+            let resolution = mode.resolution
+            return seen.insert(resolution).inserted ? resolution : nil
+        }
+    }
+
+    func refreshRates(for resolution: DisplayResolution) -> [UInt32] {
+        modes.compactMap { mode in
+            mode.resolution == resolution ? mode.refreshHz : nil
+        }
+    }
+
+    func supports(_ preference: DisplayPreference) -> Bool {
+        modes.contains {
+            $0.width == preference.width &&
+            $0.height == preference.height &&
+            $0.refreshHz == preference.refreshHz
+        }
+    }
+
+    static func decode(_ data: Data) -> DisplayCapabilities? {
+        guard data.count == encodedSize,
+              data[0] == 1,
+              (1...4).contains(Int(data[1])) else {
+            return nil
+        }
+
+        let modeCount = Int(data[1])
+        var decodedModes: [DisplayMode] = []
+        decodedModes.reserveCapacity(modeCount)
+        for index in 0..<modeCount {
+            let offset = 4 + (index * 12)
+            let width = data.loadLittleEndian(UInt32.self, at: offset)
+            let height = data.loadLittleEndian(UInt32.self, at: offset + 4)
+            let refreshHz = UInt32(data.loadLittleEndian(UInt16.self, at: offset + 8))
+            let flags = data.loadLittleEndian(UInt16.self, at: offset + 10)
+            guard width > 0,
+                  height > 0,
+                  refreshHz > 0,
+                  (flags & ~UInt16(1)) == 0 else {
+                return nil
+            }
+            decodedModes.append(DisplayMode(
+                width: width,
+                height: height,
+                refreshHz: refreshHz,
+                isExperimental: (flags & 1) != 0))
+        }
+        let nativeModes = decodedModes.filter {
+            $0.width == 2388 &&
+            $0.height == 1668 &&
+            $0.refreshHz == 60 &&
+            !$0.isExperimental
+        }
+        guard decodedModes.count == 1,
+              nativeModes.count == 1,
+              let preferred = nativeModes.first else { return nil }
+        return DisplayCapabilities(modes: nativeModes, preferred: preferred)
+    }
+}
+
+struct DisplayConfigurationRequest: Equatable {
+    let width: UInt32
+    let height: UInt32
+    let refreshHz: UInt32
+    let orientation: ClientDisplayOrientation
+    let requestId: UInt32
+
+    func encode() -> Data {
+        var data = Data(count: 20)
+        data[0] = 1
+        data[1] = orientation.rawValue
+        data.storeLittleEndian(width, at: 4)
+        data.storeLittleEndian(height, at: 8)
+        data.storeLittleEndian(refreshHz, at: 12)
+        data.storeLittleEndian(requestId, at: 16)
+        return data
+    }
+}
+
+struct DisplayReady: Equatable {
+    let width: UInt32
+    let height: UInt32
+    let refreshHz: UInt32
+    let orientation: ClientDisplayOrientation
+    let requestId: UInt32
+    let generation: UInt32
+
+    static func decode(_ data: Data) -> DisplayReady? {
+        guard data.count == 24,
+              data[0] == 1,
+              let orientation = ClientDisplayOrientation(rawValue: data[1]) else {
+            return nil
+        }
+        let width = data.loadLittleEndian(UInt32.self, at: 4)
+        let height = data.loadLittleEndian(UInt32.self, at: 8)
+        let refreshHz = data.loadLittleEndian(UInt32.self, at: 12)
+        guard width > 0, height > 0, refreshHz > 0 else { return nil }
+        return DisplayReady(
+            width: width,
+            height: height,
+            refreshHz: refreshHz,
+            orientation: orientation,
+            requestId: data.loadLittleEndian(UInt32.self, at: 16),
+            generation: data.loadLittleEndian(UInt32.self, at: 20))
+    }
+}
+
+enum DisplayConfigurationFailureReason: UInt8, Equatable {
+    case unsupportedMode = 1
+    case applyFailed = 2
+}
+
+struct DisplayConfigurationFailed: Equatable {
+    let requestId: UInt32
+    let reason: DisplayConfigurationFailureReason
+
+    static func decode(_ data: Data) -> DisplayConfigurationFailed? {
+        guard data.count == 8,
+              data[0] == 1,
+              let reason = DisplayConfigurationFailureReason(rawValue: data[1]) else {
+            return nil
+        }
+        return DisplayConfigurationFailed(
+            requestId: data.loadLittleEndian(UInt32.self, at: 4),
+            reason: reason)
+    }
+}
+
+struct DisplayPreference: Equatable {
+    static let nativeLandscapeWidth: UInt32 = 2388
+    static let nativeLandscapeHeight: UInt32 = 1668
+    static let nativeRefreshHz: UInt32 = 60
+    static let defaultValue = DisplayPreference(
+        width: nativeLandscapeWidth,
+        height: nativeLandscapeHeight,
+        refreshHz: nativeRefreshHz,
+        orientationMode: .automatic)
+
+    let width: UInt32
+    let height: UInt32
+    let refreshHz: UInt32
+    let orientationMode: DisplayOrientationMode
+
+    var resolution: DisplayResolution {
+        DisplayResolution(width: width, height: height)
+    }
+
+    func makeRequest(
+        interfaceOrientation: ClientDisplayOrientation,
+        requestId: UInt32
+    ) -> DisplayConfigurationRequest {
+        let orientation = orientationMode.resolved(using: interfaceOrientation)
+        return DisplayConfigurationRequest(
+            width: orientation == .portrait
+                ? Self.nativeLandscapeHeight
+                : Self.nativeLandscapeWidth,
+            height: orientation == .portrait
+                ? Self.nativeLandscapeWidth
+                : Self.nativeLandscapeHeight,
+            refreshHz: Self.nativeRefreshHz,
+            orientation: orientation,
+            requestId: requestId)
+    }
+
+    func reconciled(with capabilities: DisplayCapabilities) -> DisplayPreference {
+        guard capabilities.supports(self) else {
+            return DisplayPreference(
+                width: capabilities.preferred.width,
+                height: capabilities.preferred.height,
+                refreshHz: capabilities.preferred.refreshHz,
+                orientationMode: orientationMode)
+        }
+        return self
+    }
+}
+
+struct DisplayRequestGate {
+    private var nextRequestId: UInt32 = 0
+    private(set) var pending: DisplayConfigurationRequest?
+    private(set) var effective: DisplayReady?
+
+    var isInputSuppressed: Bool { pending != nil }
+
+    mutating func begin(_ requested: DisplayConfigurationRequest) -> DisplayConfigurationRequest? {
+        let candidate = DisplayConfigurationRequest(
+            width: requested.width,
+            height: requested.height,
+            refreshHz: requested.refreshHz,
+            orientation: requested.orientation,
+            requestId: 0)
+        if let pending, sameConfiguration(pending, candidate) {
+            return nil
+        }
+        if let effective,
+           effective.width == candidate.width,
+           effective.height == candidate.height,
+           effective.refreshHz == candidate.refreshHz,
+           effective.orientation == candidate.orientation {
+            return nil
+        }
+
+        nextRequestId &+= 1
+        if nextRequestId == 0 { nextRequestId = 1 }
+        let issued = DisplayConfigurationRequest(
+            width: candidate.width,
+            height: candidate.height,
+            refreshHz: candidate.refreshHz,
+            orientation: candidate.orientation,
+            requestId: nextRequestId)
+        pending = issued
+        return issued
+    }
+
+    mutating func accept(_ ready: DisplayReady) -> Bool {
+        guard let pending,
+              pending.requestId == ready.requestId,
+              sameConfiguration(pending, ready) else {
+            return false
+        }
+        effective = ready
+        self.pending = nil
+        return true
+    }
+
+    mutating func reject(_ failed: DisplayConfigurationFailed) -> Bool {
+        guard pending?.requestId == failed.requestId else { return false }
+        pending = nil
+        return true
+    }
+
+    mutating func reset() {
+        pending = nil
+        effective = nil
+    }
+
+    private func sameConfiguration(
+        _ request: DisplayConfigurationRequest,
+        _ candidate: DisplayConfigurationRequest
+    ) -> Bool {
+        request.width == candidate.width &&
+        request.height == candidate.height &&
+        request.refreshHz == candidate.refreshHz &&
+        request.orientation == candidate.orientation
+    }
+
+    private func sameConfiguration(
+        _ request: DisplayConfigurationRequest,
+        _ ready: DisplayReady
+    ) -> Bool {
+        request.width == ready.width &&
+        request.height == ready.height &&
+        request.refreshHz == ready.refreshHz &&
+        request.orientation == ready.orientation
+    }
+}
+
+private enum DisplayPreferenceStore {
+    private static let widthKey = "ScreenCasting.display.preferredWidth"
+    private static let heightKey = "ScreenCasting.display.preferredHeight"
+    private static let refreshKey = "ScreenCasting.display.preferredRefreshHz"
+    private static let orientationKey = "ScreenCasting.display.orientationMode"
+
+    static func load() -> DisplayPreference {
+        let defaults = UserDefaults.standard
+        let width = (defaults.object(forKey: widthKey) as? NSNumber)?.uint32Value
+        let height = (defaults.object(forKey: heightKey) as? NSNumber)?.uint32Value
+        let refreshHz = (defaults.object(forKey: refreshKey) as? NSNumber)?.uint32Value
+        let orientationMode = defaults.string(forKey: orientationKey)
+            .flatMap(DisplayOrientationMode.init(rawValue:)) ?? .automatic
+        guard let width, let height, let refreshHz,
+              width > 0, height > 0, refreshHz > 0 else {
+            return DisplayPreference.defaultValue
+        }
+        return DisplayPreference(
+            width: width,
+            height: height,
+            refreshHz: refreshHz,
+            orientationMode: orientationMode)
+    }
+
+    static func save(_ preference: DisplayPreference) {
+        let defaults = UserDefaults.standard
+        defaults.set(preference.width, forKey: widthKey)
+        defaults.set(preference.height, forKey: heightKey)
+        defaults.set(preference.refreshHz, forKey: refreshKey)
+        defaults.set(preference.orientationMode.rawValue, forKey: orientationKey)
+    }
 }
 
 enum RealtimeAudioNegotiationPolicy {
@@ -93,8 +658,10 @@ enum RealtimeAudioNegotiationPolicy {
         let exactPair =
             (mode == RealtimeTransportMode.legacyTLS &&
              audioCodec == AudioCodecCapabilities.pcm) ||
-            ((mode == RealtimeTransportMode.wifiRTP ||
-              mode == RealtimeTransportMode.usbSplitTLS) &&
+            (mode == RealtimeTransportMode.wifiRTP &&
+             (audioCodec == AudioCodecCapabilities.opus ||
+              audioCodec == AudioCodecCapabilities.none)) ||
+            (mode == RealtimeTransportMode.usbSplitTLS &&
              audioCodec == AudioCodecCapabilities.opus)
         return exactPair &&
             (advertisedModes & mode) != 0 &&
@@ -320,6 +887,29 @@ final class WireStreamParser {
         switch type {
         case .ping, .pong, .videoFeedback:
             fixedLength = 16
+        case .displayCapabilities:
+            fixedLength = DisplayCapabilities.encodedSize
+        case .displayConfigurationRequest:
+            fixedLength = 20
+        case .displayReady:
+            fixedLength = 24
+        case .displayConfigurationFailed:
+            fixedLength = 8
+        case .trustedDeviceChallenge:
+            fixedLength = 112
+        case .trustedDeviceProof:
+            fixedLength = 48
+        case .pairingSuccess:
+            fixedLength = 80
+        case .sessionResumeResult:
+            fixedLength = 17
+        case .settingsGet, .settingsState, .settingsUpdate,
+             .settingsApplied, .settingsRejected:
+            fixedLength = 24
+        case .forgetDevice:
+            fixedLength = 17
+        case .forgetDeviceResult:
+            fixedLength = 2
         case .clientCapabilities:
             fixedLength = ClientCapabilities.encodedSize
         case .transportOffer:
@@ -514,6 +1104,7 @@ private enum AudioWireProtocol {
 ///   2. PIN authentication handshake phase before video payload begins.
 ///   3. Observable ConnectionState for SwiftUI bindings.
 public class NetworkManager: ObservableObject {
+    private static let lastKnownHostKey = "lastKnownScreenCastingHost.v1"
     private enum ActiveTransportKind: Equatable {
         case wifi
         case usb
@@ -523,13 +1114,29 @@ public class NetworkManager: ObservableObject {
     @Published public var connectionState: ConnectionState = .idle
     public private(set) var bytesReceived: UInt64 = 0
     @Published public private(set) var hostFingerprint: String?
+    @Published public private(set) var hostIdentityCode: String?
     @Published public private(set) var usbServerFingerprint: String?
 
-    // MARK: Published Bitrate Control State
-    /// Whether the host is in Adaptive Bitrate mode.
+    // The Host is the authority for selectable modes. These values only mirror
+    // authenticated control responses for the connected settings surface.
+    @Published private(set) var displayCapabilities: DisplayCapabilities?
+    @Published private(set) var displayPreference = DisplayPreference.defaultValue
+    @Published private(set) var effectiveDisplayState: DisplayReady?
+    @Published private(set) var displayConfigurationFailureMessage: String?
+    @Published private(set) var isDisplayConfigurationPending = false
+
+    // MARK: Published Host-authoritative settings
+    /// Retained for compatibility with the existing telemetry surface. The
+    /// persistent client settings contract is manual-only.
     @Published public var isAdaptiveBitrate: Bool   = false
-    /// Current target bitrate in Mbps (3–50). Reflects the latest BC packet from host.
+    /// Current target bitrate in Mbps (3–50). Reflects the latest Host state.
     @Published public var targetBitrateMbps: Double = 20.0
+    @Published public private(set) var audioEnabled: Bool = true
+    @Published public private(set) var settingsApplyStatus: String = ""
+    @Published public private(set) var settingsGeneration: UInt64 = 0
+    private var nextSettingsRequestID: UInt32 = 1
+    private var committedBitrateMbps: Double = 20
+    private var committedAudioEnabled = true
 
     // Convenience computed properties so existing views don't break
     public var isConnected:  Bool { connectionState == .streaming }
@@ -537,6 +1144,18 @@ public class NetworkManager: ObservableObject {
 
     // MARK: Private
     private var connection: NWConnection?
+    private var verifiedHostFingerprint: String?
+    private var verifiedHostIdentityCode: String?
+    private var hostIdentityConfirmationRequired = false
+    private var hostIdentityConfirmed = false
+    private var trustedCredential: TrustedHostCredential?
+    private let trustedCredentialStore = TrustedHostCredentialStore()
+    private let trustedHostFingerprintStore = TrustedHostFingerprintStore()
+    private let trustedDeviceID = TrustedDeviceIdentity.loadOrCreate()
+    private var isForegroundActive = true
+    private var reconnectEnabled = true
+    private var reconnectAttempt = 0
+    private var reconnectWorkItem: DispatchWorkItem?
     private var connectionTimeoutWorkItem: DispatchWorkItem?
     private var usbListener: NWListener?
     private let connectionGenerationClock = ConnectionGenerationClock()
@@ -661,8 +1280,17 @@ public class NetworkManager: ObservableObject {
     private var lastClientPingSentAt: TimeInterval = 0
     private var nextClientPingNonce: UInt64 = 1
     private var pendingClientPings: [UInt64: TimeInterval] = [:]
+    private var activeDisplayCapabilities: DisplayCapabilities?
+    private var activeDisplayPreference = DisplayPreference.defaultValue
+    private var displayRequestGate = DisplayRequestGate()
+    private var pendingDisplayPreference: DisplayPreference?
+    private var observedInterfaceOrientation: ClientDisplayOrientation = .landscape
+    private var orientationDebounceWorkItem: DispatchWorkItem?
 
     public init() {
+        let savedDisplayPreference = DisplayPreferenceStore.load()
+        displayPreference = savedDisplayPreference
+        activeDisplayPreference = savedDisplayPreference
         decoder.onDecodeLatency = {
             [weak self] sequence, generation, decodeStartedAt, latencyMs in
             self?.transportTelemetry.recordDecodeCallback(
@@ -711,6 +1339,15 @@ public class NetworkManager: ObservableObject {
         guard connectionState == .idle || isDisconnected else { return }
 
         _ = connectionGenerationClock.advance()
+        verifiedHostFingerprint = nil
+        verifiedHostIdentityCode = nil
+        hostIdentityCode = nil
+        hostIdentityConfirmationRequired = false
+        hostIdentityConfirmed = false
+        reconnectWorkItem?.cancel()
+        networkQueue.async { [weak self] in
+            self?.resetDisplaySession()
+        }
         let parameters = buildTLSParameters(for: endpoint)
         connection = NWConnection(to: endpoint, using: parameters)
 
@@ -734,6 +1371,8 @@ public class NetworkManager: ObservableObject {
     ///   - host: Host IP or mDNS hostname (e.g. "192.168.1.10" or "LÂM-DESKTOP.local")
     ///   - port: TCP port the Windows NetworkManager listens on (default 27015)
     public func connect(to host: String, port: UInt16 = 27015) {
+        UserDefaults.standard.set(host, forKey: Self.lastKnownHostKey)
+        reconnectEnabled = true
         let endpoint = NWEndpoint.hostPort(
             host: NWEndpoint.Host(host),
             port: NWEndpoint.Port(rawValue: port)!
@@ -741,10 +1380,59 @@ public class NetworkManager: ObservableObject {
         connect(to: endpoint)
     }
 
+    public func applicationDidBecomeActive() {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.isForegroundActive = true
+            print("[IPAD][APP_LIFECYCLE] state=active")
+            self.scheduleAutoReconnect(reset: true)
+        }
+    }
+
+    public func applicationDidEnterBackground() {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.isForegroundActive = false
+            self.reconnectWorkItem?.cancel()
+            self.reconnectWorkItem = nil
+            if self.connection != nil &&
+                self.wireAuthenticatedGeneration != self.connectionGeneration {
+                self.connectionTimeoutWorkItem?.cancel()
+                self.connection?.cancel()
+                self.connection = nil
+                print("[IPAD][AUTO_RECONNECT_CANCELLED] reason=background")
+            }
+            print("[IPAD][APP_LIFECYCLE] state=background")
+        }
+    }
+
+    public func connectDiscoveredHostIfNeeded(_ endpoint: NWEndpoint) {
+        guard isForegroundActive,
+              reconnectEnabled,
+              connectionState == .idle || isDisconnected else { return }
+        connect(to: endpoint)
+    }
+
+    /// Confirms the displayed Wi-Fi Host identity after the user compares it
+    /// with the identity code shown by the Windows Host.
+    public func confirmHostIdentity() {
+        networkQueue.async { [weak self] in
+            guard let self,
+                  self.hostIdentityConfirmationRequired,
+                  self.verifiedHostFingerprint != nil,
+                  self.verifiedHostIdentityCode != nil,
+                  self.connectionState == .awaitingHostIdentity else { return }
+            self.hostIdentityConfirmed = true
+            self.hostIdentityConfirmationRequired = false
+            self.sendTrustedClientHello(generation: self.connectionGeneration)
+        }
+    }
+
     /// Sends the 4-digit PIN to the server as an 8-byte AuthPacketHeader.
     /// Should only be called when state == .awaitingPIN.
     public func sendAuthPIN(_ pin: String) {
-        guard connectionState == .awaitingPIN || isAuthFailed,
+        guard (connectionState == .awaitingPIN || isAuthFailed),
+              activeTransportKind == .usb || hostIdentityConfirmed,
               let pinValue = UInt32(pin), pin.count == 4 else { return }
 
         var packet = Data(count: AuthProtocol.packetSize)
@@ -826,7 +1514,8 @@ public class NetworkManager: ObservableObject {
         networkQueue.async { [weak self] in
             guard let self,
                   generation == self.connectionGeneration,
-                  self.committedTransportGeneration == generation else {
+                  self.committedTransportGeneration == generation,
+                  !self.displayRequestGate.isInputSuppressed else {
                 return
             }
             let delivery = InputDeliveryPolicy.forEvent(type)
@@ -898,26 +1587,43 @@ public class NetworkManager: ObservableObject {
         enqueueControlData(pkt, telemetry: true)
     }
 
-    /// Sends an 8-byte Bitrate Control packet to the host.
-    /// Call this when the user adjusts the slider or toggle in `SettingsView`.
-    public func sendBitrateControlPacket(isAdaptive: Bool, targetMbps: UInt16) {
-        guard connectionState == .streaming else { return }
-
-        transportTelemetry.recordBitrateMbps(Double(targetMbps))
-
-        var pkt = Data(count: BitrateWireProtocol.packetSize)
-        pkt.withUnsafeMutableBytes { buf in
-            buf.storeBytes(of: BitrateWireProtocol.magic.littleEndian,   toByteOffset: 0, as: UInt16.self)
-            buf.storeBytes(of: isAdaptive ? UInt8(1) : UInt8(0),         toByteOffset: 2, as: UInt8.self)
-            buf.storeBytes(of: UInt8(0),                                 toByteOffset: 3, as: UInt8.self) // reserved
-            buf.storeBytes(of: targetMbps.littleEndian,                  toByteOffset: 4, as: UInt16.self)
-            buf.storeBytes(of: UInt16(0),                                toByteOffset: 6, as: UInt16.self) // reserved
+    public func sendSettingsUpdate(bitrateMbps: Double, audioEnabled: Bool) {
+        let roundedMbps = round(bitrateMbps)
+        guard connectionState == .streaming,
+              roundedMbps >= 3, roundedMbps <= 50 else { return }
+        let requestID = nextSettingsRequestID
+        nextSettingsRequestID &+= 1
+        var payload = Data(count: 24)
+        payload.withUnsafeMutableBytes { bytes in
+            bytes.storeBytes(of: UInt8(1), toByteOffset: 0, as: UInt8.self)
+            bytes.storeBytes(of: audioEnabled ? UInt8(1) : UInt8(0), toByteOffset: 1, as: UInt8.self)
+            bytes.storeBytes(of: UInt8(0), toByteOffset: 2, as: UInt8.self)
+            bytes.storeBytes(of: requestID.littleEndian, toByteOffset: 4, as: UInt32.self)
+            bytes.storeBytes(of: settingsGeneration.littleEndian, toByteOffset: 8, as: UInt64.self)
+            bytes.storeBytes(
+                of: UInt32(roundedMbps * 1_000_000).littleEndian,
+                toByteOffset: 16,
+                as: UInt32.self)
         }
-        enqueueControlData(pkt)
+        settingsApplyStatus = "Applying…"
+        sendWireMessage(type: .settingsUpdate, payload: payload, sequence: requestID)
+    }
+
+    public func forgetTrustedHost() {
+        guard connectionState == .streaming,
+              let credential = trustedCredential,
+              credential.deviceID.count == 16 else { return }
+        var payload = Data([1])
+        payload.append(credential.deviceID)
+        settingsApplyStatus = "Forgetting…"
+        sendWireMessage(type: .forgetDevice, payload: payload, sequence: 0)
     }
 
     /// Gracefully tears down the connection and resets to .idle.
     public func stop() {
+        reconnectEnabled = false
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
         let stoppedGeneration = connectionGenerationClock.advance()
         listenerGeneration &+= 1
         decoder.invalidate()
@@ -936,12 +1642,58 @@ public class NetworkManager: ObservableObject {
             self.wireAuthenticatedGeneration = nil
             self.committedTransportGeneration = nil
             self.advertisedClientCapabilities = nil
+            self.resetDisplaySession()
             self.clearPendingTransportOffer()
             self.wireParser.reset(generation: stoppedGeneration)
             self.controlChannelWriter.cancel()
             self.stopTelemetryTimer()
         }
         setState(.idle)
+    }
+
+    func applyDisplayPreference(
+        _ preference: DisplayPreference,
+        interfaceOrientation: ClientDisplayOrientation
+    ) {
+        networkQueue.async { [weak self] in
+            self?.requestDisplayConfiguration(
+                preference: preference,
+                interfaceOrientation: interfaceOrientation)
+        }
+    }
+
+    func applyDisplayPreference(_ preference: DisplayPreference) {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.requestDisplayConfiguration(
+                preference: preference,
+                interfaceOrientation: self.observedInterfaceOrientation)
+        }
+    }
+
+    func updateInterfaceOrientation(_ orientation: ClientDisplayOrientation) {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.observedInterfaceOrientation = orientation
+            guard self.activeDisplayCapabilities != nil,
+                  self.activeDisplayPreference.orientationMode == .automatic else {
+                return
+            }
+            self.orientationDebounceWorkItem?.cancel()
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self,
+                      self.activeDisplayPreference.orientationMode == .automatic else {
+                    return
+                }
+                self.requestDisplayConfiguration(
+                    preference: self.activeDisplayPreference,
+                    interfaceOrientation: self.observedInterfaceOrientation)
+            }
+            self.orientationDebounceWorkItem = workItem
+            self.networkQueue.asyncAfter(
+                deadline: .now() + .milliseconds(250),
+                execute: workItem)
+        }
     }
 
     /// Stops the USB listener/session before deleting the imported Keychain
@@ -1048,12 +1800,13 @@ public class NetworkManager: ObservableObject {
         sec_protocol_options_set_min_tls_protocol_version(
             tlsOptions.securityProtocolOptions, .TLSv12)
 
-        // Preserve the original Wi-Fi behavior: encryption is mandatory, but
-        // the self-signed Windows certificate is accepted. Authentication is
-        // completed by the displayed PIN after the TLS handshake.
         sec_protocol_options_set_verify_block(
             tlsOptions.securityProtocolOptions,
             { [weak self] _, securityTrust, completionHandler in
+                guard let self else {
+                    completionHandler(false)
+                    return
+                }
                 let trust = sec_trust_copy_ref(securityTrust).takeRetainedValue()
                 guard let certificate = SecTrustGetCertificateAtIndex(trust, 0) else {
                     completionHandler(false)
@@ -1064,11 +1817,37 @@ public class NetworkManager: ObservableObject {
                 let fingerprint = SHA256.hash(data: certificateData)
                     .map { String(format: "%02X", $0) }
                     .joined(separator: ":")
-                print("[IPAD][TLS_VERIFY] received_sha256=\(fingerprint) accepted=true")
-                DispatchQueue.main.async {
-                    self?.hostFingerprint = fingerprint
+                let decision = WifiHostIdentityPolicy.decide(
+                    presentedFingerprint: fingerprint,
+                    pinnedFingerprint: self.trustedHostFingerprintStore.load())
+                guard let identityCode = WifiHostIdentityPolicy.identityCode(
+                    for: fingerprint) else {
+                    completionHandler(false)
+                    return
                 }
-                completionHandler(true)
+                self.verifiedHostFingerprint = fingerprint
+                self.verifiedHostIdentityCode = identityCode
+                DispatchQueue.main.async {
+                    self.hostFingerprint = fingerprint
+                    self.hostIdentityCode = identityCode
+                }
+                switch decision {
+                case .trusted:
+                    self.hostIdentityConfirmationRequired = false
+                    self.hostIdentityConfirmed = true
+                    print("[IPAD][TLS_VERIFY] identity=known code=\(identityCode) accepted=true")
+                    completionHandler(true)
+                case .requiresFirstPairingConfirmation:
+                    self.hostIdentityConfirmationRequired = true
+                    self.hostIdentityConfirmed = false
+                    print("[IPAD][TLS_VERIFY] identity=unknown code=\(identityCode) awaiting_confirmation")
+                    completionHandler(true)
+                case .rejected:
+                    self.hostIdentityConfirmationRequired = false
+                    self.hostIdentityConfirmed = false
+                    print("[IPAD][TLS_VERIFY] identity=mismatch code=\(identityCode) accepted=false")
+                    completionHandler(false)
+                }
             },
             networkQueue
         )
@@ -1137,13 +1916,26 @@ public class NetworkManager: ObservableObject {
                 print("[IPAD][NW_STATE] preparing")
             case .waiting(let error):
                 print("[IPAD][NW_STATE] waiting error=\(error)")
-                self.setState(.disconnected(reason: "Waiting for Windows host: \(error.localizedDescription)"))
+                // NWConnection remains non-nil while it is waiting. Route the
+                // transition through the normal generation-safe teardown so
+                // the bounded reconnect attempt can create a fresh socket.
+                self.handleStreamError(
+                    "Waiting for Windows host: \(error.localizedDescription)")
             case .ready:
                 self.connectionTimeoutWorkItem?.cancel()
                 print("[IPAD][NW_STATE] ready TLS_VERIFY_COMPLETE accepted")
-                print("[NetworkManager] TLS handshake complete — awaiting PIN.")
                 self.controlChannelWriter.begin(generation: generation)
-                self.setState(.awaitingPIN)
+                if self.activeTransportKind == .wifi {
+                    self.startWireReceiveLoop(generation: generation)
+                    if self.hostIdentityConfirmationRequired {
+                        print("[IPAD][PAIRING_GATED] reason=host_identity_confirmation")
+                        self.setState(.awaitingHostIdentity)
+                    } else {
+                        self.sendTrustedClientHello(generation: generation)
+                    }
+                } else {
+                    self.setState(.awaitingPIN)
+                }
 
             case .failed(let error):
                 self.connectionTimeoutWorkItem?.cancel()
@@ -1157,6 +1949,7 @@ public class NetworkManager: ObservableObject {
                     self.setState(.listening)
                 } else {
                     self.setState(.disconnected(reason: error.localizedDescription))
+                    self.scheduleAutoReconnect(reset: false)
                 }
 
             case .cancelled:
@@ -1171,6 +1964,7 @@ public class NetworkManager: ObservableObject {
                     self.setState(.listening)
                 } else if self.connectionState != .idle {
                     self.setState(.disconnected(reason: "Connection cancelled."))
+                    self.scheduleAutoReconnect(reset: false)
                 }
 
             default:
@@ -1180,6 +1974,137 @@ public class NetworkManager: ObservableObject {
     }
 
     // MARK: - Private: Auth Handshake
+
+    private func sendTrustedClientHello(generation: UInt64) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard generation == connectionGeneration,
+              let fingerprint = verifiedHostFingerprint else {
+            handleStreamError("TLS host identity was unavailable after verification.")
+            return
+        }
+        let stored = trustedCredentialStore.load(fingerprint: fingerprint)
+        trustedCredential = stored
+        let deviceID = stored?.deviceID ?? trustedDeviceID
+        let sessionID = stored?.sessionID ?? Data(repeating: 0, count: 16)
+        let name = Data(UIDevice.current.name.utf8.prefix(64))
+        guard deviceID.count == 16, sessionID.count == 16, !name.isEmpty else {
+            handleStreamError("Trusted device identity is malformed.")
+            return
+        }
+        var payload = Data([1])
+        payload.append(deviceID)
+        payload.append(sessionID)
+        payload.append(UInt8(name.count))
+        payload.append(name)
+        print(stored == nil
+            ? "[IPAD][PAIRING_REQUIRED] credential=absent"
+            : "[IPAD][TRUSTED_CREDENTIAL_FOUND] credential=present")
+        sendWireMessage(type: .clientHello, payload: payload, sequence: 0)
+    }
+
+    private func scheduleAutoReconnect(reset: Bool) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        let lastKnownHost = UserDefaults.standard.string(
+            forKey: Self.lastKnownHostKey)
+        guard TrustedReconnectPolicy.shouldSchedule(
+                isForegroundActive: isForegroundActive,
+                reconnectEnabled: reconnectEnabled,
+                lastKnownHost: lastKnownHost),
+              let host = lastKnownHost else { return }
+        if reset { reconnectAttempt = 0 }
+        reconnectWorkItem?.cancel()
+        let delay = TrustedReconnectPolicy.delay(forAttempt: reconnectAttempt)
+        reconnectAttempt += 1
+        print("[IPAD][AUTO_RECONNECT_ATTEMPT] attempt=\(reconnectAttempt) delay=\(delay)")
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.isForegroundActive, self.reconnectEnabled else { return }
+            DispatchQueue.main.async {
+                guard self.connection == nil else { return }
+                print("[IPAD][AUTO_RECONNECT_BEGIN] endpoint=last_known")
+                self.connect(to: host)
+            }
+        }
+        reconnectWorkItem = work
+        networkQueue.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func answerTrustedChallenge(_ payload: Data, generation: UInt64) {
+        guard payload.count == 112,
+              let fingerprint = verifiedHostFingerprint,
+              let credential = trustedCredential,
+              credential.fingerprint == fingerprint,
+              credential.deviceID == payload.subdata(in: 16..<32),
+              credential.hostID == payload.subdata(in: 32..<48),
+              credential.secret.count == 32 else {
+            setState(.authFailed(reason: "Trusted Host credential is missing or does not match."))
+            return
+        }
+        var context = Data()
+        context.append(payload.subdata(in: 48..<80))
+        context.append(payload.subdata(in: 80..<112))
+        context.append(payload.subdata(in: 0..<16))
+        context.append(payload.subdata(in: 16..<32))
+        context.append(payload.subdata(in: 32..<48))
+        context.append(WireProtocol.version)
+        let key = SymmetricKey(data: credential.secret)
+        let proof = Data(HMAC<SHA256>.authenticationCode(for: context, using: key))
+        var response = payload.subdata(in: 0..<16)
+        response.append(proof)
+        print("[IPAD][TRUSTED_AUTH_BEGIN] generation=\(generation)")
+        sendWireMessage(type: .trustedDeviceProof, payload: response, sequence: 0)
+    }
+
+    private func storePairingCredential(_ payload: Data) {
+        guard payload.count == 80,
+              let fingerprint = verifiedHostFingerprint else { return }
+        let credential = TrustedHostCredential(
+            fingerprint: fingerprint,
+            hostID: payload.subdata(in: 0..<16),
+            deviceID: payload.subdata(in: 16..<32),
+            secret: payload.subdata(in: 48..<80),
+            sessionID: payload.subdata(in: 32..<48))
+        guard trustedCredentialStore.save(credential) else {
+            handleStreamError("Unable to save the trusted Host credential in Keychain.")
+            return
+        }
+        trustedCredential = credential
+        guard trustedHostFingerprintStore.save(fingerprint) else {
+            trustedCredentialStore.delete(fingerprint: fingerprint)
+            handleStreamError("Unable to save the trusted Host identity in Keychain.")
+            return
+        }
+        print("[IPAD][PAIRING_SUCCESS] credential=keychain")
+    }
+
+    private func updateResumedSession(_ payload: Data) {
+        guard payload.count == 17, var credential = trustedCredential else { return }
+        credential.sessionID = payload.subdata(in: 1..<17)
+        if trustedCredentialStore.save(credential) {
+            trustedCredential = credential
+            print(payload[0] == 1
+                ? "[IPAD][SESSION_RESUMED] result=resumed"
+                : "[IPAD][SESSION_NOT_FOUND] result=new_session")
+        }
+    }
+
+    private func receiveSettingsState(
+        _ payload: Data,
+        rejected: Bool = false
+    ) {
+        guard let state = TrustedSettingsState.decode(payload),
+              state.generation >= settingsGeneration else { return }
+        let bitrateMbps = Double(state.bitrateBps) / 1_000_000
+        settingsGeneration = state.generation
+        committedBitrateMbps = bitrateMbps
+        committedAudioEnabled = state.audioEnabled
+        DispatchQueue.main.async {
+            self.targetBitrateMbps = bitrateMbps
+            self.audioEnabled = state.audioEnabled
+            self.isAdaptiveBitrate = false
+            self.settingsApplyStatus = rejected ? "Failed" : "Applied"
+        }
+        transportTelemetry.recordBitrateMbps(bitrateMbps)
+    }
 
     /// Reads exactly the minimum response bytes for AUTH_SUCCESS or AUTH_FAILED.
     private func receiveAuthResponse(generation: UInt64) {
@@ -1488,6 +2413,15 @@ public class NetworkManager: ObservableObject {
         let payload = message.payload
 
         guard wireAuthenticatedGeneration == generation else {
+            if header.type == .pairingRequired {
+                print("[IPAD][PAIRING_REQUIRED] host=unknown")
+                setState(.awaitingPIN)
+                return
+            }
+            if header.type == .trustedDeviceChallenge {
+                answerTrustedChallenge(payload, generation: generation)
+                return
+            }
             guard header.type == .authResult, !payload.isEmpty else {
                 handleStreamError("Expected a framed authentication response.")
                 return
@@ -1495,6 +2429,10 @@ public class NetworkManager: ObservableObject {
             let accepted = payload[0] != 0
             let reason = String(data: payload.dropFirst(), encoding: .utf8) ?? ""
             if accepted {
+                reconnectAttempt = 0
+                reconnectWorkItem?.cancel()
+                reconnectWorkItem = nil
+                print("[IPAD][AUTO_RECONNECT_SUCCESS] generation=\(generation)")
                 wireAuthenticatedGeneration = generation
                 committedTransportGeneration = nil
                 committedRealtimeSessionID = nil
@@ -1517,6 +2455,62 @@ public class NetworkManager: ObservableObject {
         }
 
         switch header.type {
+        case .pairingSuccess:
+            storePairingCredential(payload)
+
+        case .trustedAuthResult:
+            guard !payload.isEmpty, payload[0] != 0 else {
+                setState(.authFailed(reason: "Trusted device authentication failed."))
+                return
+            }
+            print("[IPAD][TRUSTED_AUTH_SUCCESS] generation=\(generation)")
+
+        case .sessionResumeResult:
+            updateResumedSession(payload)
+
+        case .settingsState, .settingsApplied:
+            receiveSettingsState(payload)
+
+        case .settingsRejected:
+            receiveSettingsState(payload, rejected: true)
+
+        case .forgetDeviceResult:
+            guard payload.count == 2, payload[0] == 1 else { return }
+            if payload[1] == 1, let fingerprint = verifiedHostFingerprint {
+                trustedCredentialStore.delete(fingerprint: fingerprint)
+                trustedHostFingerprintStore.delete()
+                trustedCredential = nil
+                UserDefaults.standard.removeObject(forKey: Self.lastKnownHostKey)
+                reconnectEnabled = false
+                print("[IPAD][TRUSTED_HOST_FORGOTTEN] credential=deleted")
+                stop()
+            } else {
+                DispatchQueue.main.async {
+                    self.settingsApplyStatus = "Forget failed"
+                }
+            }
+
+        case .displayCapabilities:
+            guard let capabilities = DisplayCapabilities.decode(payload) else {
+                handleStreamError("Malformed display capabilities.")
+                return
+            }
+            receiveDisplayCapabilities(capabilities)
+
+        case .displayReady:
+            guard let ready = DisplayReady.decode(payload) else {
+                handleStreamError("Malformed display readiness response.")
+                return
+            }
+            receiveDisplayReady(ready)
+
+        case .displayConfigurationFailed:
+            guard let failure = DisplayConfigurationFailed.decode(payload) else {
+                handleStreamError("Malformed display configuration failure.")
+                return
+            }
+            receiveDisplayConfigurationFailure(failure)
+
         case .video:
             guard committedTransportGeneration == generation else { return }
             if committedRealtimeMode == RealtimeTransportMode.wifiRTP {
@@ -1799,11 +2793,19 @@ public class NetworkManager: ObservableObject {
                         return
                     }
                 }
-                commitRealtimeTransport(generation: generation, mode: offer.mode)
+                commitRealtimeTransport(
+                    generation: generation,
+                    mode: offer.mode,
+                    audioEnabled:
+                        offer.audioCodec != AudioCodecCapabilities.none)
             }
 
         case .clientCapabilities, .transportReady, .usbLaneBind,
-             .usbLaneBindResult, .videoConfigurationAck:
+             .usbLaneBindResult, .videoConfigurationAck,
+             .displayConfigurationRequest, .clientHello,
+             .pairingRequired, .trustedDeviceChallenge,
+             .trustedDeviceProof, .settingsGet, .settingsUpdate,
+             .forgetDevice:
             handleStreamError("Unexpected client-direction negotiation message.")
         }
     }
@@ -1854,6 +2856,91 @@ public class NetworkManager: ObservableObject {
             payload: capabilities.encode(),
             sequence: 0)
         scheduleLegacyFallback(generation: connectionGeneration)
+    }
+
+    private func receiveDisplayCapabilities(_ capabilities: DisplayCapabilities) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        activeDisplayCapabilities = capabilities
+        let reconciledPreference = activeDisplayPreference.reconciled(
+            with: capabilities)
+        DispatchQueue.main.async { [weak self] in
+            self?.displayCapabilities = capabilities
+            self?.displayConfigurationFailureMessage = nil
+        }
+        requestDisplayConfiguration(
+            preference: reconciledPreference,
+            interfaceOrientation: observedInterfaceOrientation)
+    }
+
+    private func requestDisplayConfiguration(
+        preference: DisplayPreference,
+        interfaceOrientation: ClientDisplayOrientation
+    ) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard wireAuthenticatedGeneration == connectionGeneration,
+              let capabilities = activeDisplayCapabilities else {
+            return
+        }
+
+        let reconciledPreference = preference.reconciled(with: capabilities)
+        let proposed = reconciledPreference.makeRequest(
+            interfaceOrientation: interfaceOrientation,
+            requestId: 0)
+        guard let request = displayRequestGate.begin(proposed) else { return }
+        pendingDisplayPreference = reconciledPreference
+        DispatchQueue.main.async { [weak self] in
+            self?.isDisplayConfigurationPending = true
+            self?.displayConfigurationFailureMessage = nil
+        }
+        sendWireMessage(
+            type: .displayConfigurationRequest,
+            payload: request.encode(),
+            sequence: request.requestId)
+    }
+
+    private func receiveDisplayReady(_ ready: DisplayReady) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard displayRequestGate.accept(ready),
+              let appliedPreference = pendingDisplayPreference else {
+            return
+        }
+        pendingDisplayPreference = nil
+        activeDisplayPreference = appliedPreference
+        DisplayPreferenceStore.save(appliedPreference)
+        DispatchQueue.main.async { [weak self] in
+            self?.displayPreference = appliedPreference
+            self?.effectiveDisplayState = ready
+            self?.isDisplayConfigurationPending = false
+            self?.displayConfigurationFailureMessage = nil
+        }
+    }
+
+    private func receiveDisplayConfigurationFailure(
+        _ failure: DisplayConfigurationFailed
+    ) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard displayRequestGate.reject(failure) else { return }
+        pendingDisplayPreference = nil
+        DispatchQueue.main.async { [weak self] in
+            self?.isDisplayConfigurationPending = false
+            self?.displayConfigurationFailureMessage =
+                "Could not apply this display mode."
+        }
+    }
+
+    private func resetDisplaySession() {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        orientationDebounceWorkItem?.cancel()
+        orientationDebounceWorkItem = nil
+        activeDisplayCapabilities = nil
+        pendingDisplayPreference = nil
+        displayRequestGate.reset()
+        DispatchQueue.main.async { [weak self] in
+            self?.displayCapabilities = nil
+            self?.effectiveDisplayState = nil
+            self?.isDisplayConfigurationPending = false
+            self?.displayConfigurationFailureMessage = nil
+        }
     }
 
     private func commitLegacyTransport(generation: UInt64) {
@@ -2114,6 +3201,7 @@ public class NetworkManager: ObservableObject {
         wifiLegacyFallbackGeneration = nil
         wifiLegacyFallbackRequestGeneration = nil
         advertisedClientCapabilities = nil
+        resetDisplaySession()
         clearPendingTransportOffer()
         wireParser.reset(generation: failedGeneration)
         controlChannelWriter.cancel()
@@ -2131,6 +3219,7 @@ public class NetworkManager: ObservableObject {
             setState(.listening)
         } else {
             setState(.disconnected(reason: reason))
+            scheduleAutoReconnect(reset: false)
         }
     }
 

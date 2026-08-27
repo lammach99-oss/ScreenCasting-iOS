@@ -5,6 +5,36 @@ import CoreVideo
 import CryptoKit
 import QuartzCore
 
+enum DecoderOutputBufferAttributes {
+    static let pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+
+    static func make() -> [String: Any] {
+        [
+            kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+            kCVPixelBufferMetalCompatibilityKey as String: true
+        ]
+    }
+
+    static func invalidReason(
+        for pixelBuffer: CVPixelBuffer,
+        expectedWidth: Int,
+        expectedHeight: Int
+    ) -> String? {
+        guard CVPixelBufferGetIOSurface(pixelBuffer) != nil else {
+            return "IOSurface unavailable"
+        }
+        guard CVPixelBufferGetPixelFormatType(pixelBuffer) == pixelFormat else {
+            return "pixelFormat=\(CVPixelBufferGetPixelFormatType(pixelBuffer)) expected=\(pixelFormat)"
+        }
+        guard CVPixelBufferGetWidth(pixelBuffer) == expectedWidth,
+              CVPixelBufferGetHeight(pixelBuffer) == expectedHeight else {
+            return "dimensions=\(CVPixelBufferGetWidth(pixelBuffer))x\(CVPixelBufferGetHeight(pixelBuffer)) expected=\(expectedWidth)x\(expectedHeight)"
+        }
+        return nil
+    }
+}
+
 enum AnnexBNALScanner {
     static func ranges(in data: Data) -> [Range<Data.Index>] {
         var starts: [(offset: Int, length: Int)] = []
@@ -123,6 +153,45 @@ struct HevcParameterSetSessionGate {
         factory: () -> Bool
     ) -> Bool {
         let candidate = HevcParameterSetSignature(vps: vps, sps: sps, pps: pps)
+        guard candidate != activeParameterSetSignature, factory() else {
+            return false
+        }
+        activeParameterSetSignature = candidate
+        return true
+    }
+
+    mutating func reset() {
+        activeParameterSetSignature = nil
+    }
+}
+
+struct H264ParameterSetSignature: Equatable {
+    let digest: SHA256.Digest
+
+    init(sps: Data, pps: Data) {
+        var bytes = Data()
+        Self.append(sps, to: &bytes)
+        Self.append(pps, to: &bytes)
+        digest = SHA256.hash(data: bytes)
+    }
+
+    private static func append(_ value: Data, to bytes: inout Data) {
+        precondition(value.count <= Int(UInt32.max))
+        var length = UInt32(value.count).bigEndian
+        withUnsafeBytes(of: &length) { bytes.append(contentsOf: $0) }
+        bytes.append(value)
+    }
+}
+
+struct H264ParameterSetSessionGate {
+    private(set) var activeParameterSetSignature: H264ParameterSetSignature?
+
+    mutating func replaceIfChanged(
+        sps: Data,
+        pps: Data,
+        factory: () -> Bool
+    ) -> Bool {
+        let candidate = H264ParameterSetSignature(sps: sps, pps: pps)
         guard candidate != activeParameterSetSignature, factory() else {
             return false
         }
@@ -272,15 +341,21 @@ private final class VideoDecodeSubmission {
     let ticket: DecodeTicket
     let lifetime: DecodeSubmissionLifetime
     let decodeStartedAt: TimeInterval
+    let expectedWidth: Int
+    let expectedHeight: Int
 
     init(
         ticket: DecodeTicket,
         lifetime: DecodeSubmissionLifetime,
-        decodeStartedAt: TimeInterval
+        decodeStartedAt: TimeInterval,
+        expectedWidth: Int,
+        expectedHeight: Int
     ) {
         self.ticket = ticket
         self.lifetime = lifetime
         self.decodeStartedAt = decodeStartedAt
+        self.expectedWidth = expectedWidth
+        self.expectedHeight = expectedHeight
     }
 }
 
@@ -310,6 +385,10 @@ public final class DecoderManager {
     private var parameterSetSessionGate = HevcParameterSetSessionGate()
     private var activeParameterSetSignature: HevcParameterSetSignature? {
         parameterSetSessionGate.activeParameterSetSignature
+    }
+    private var h264ParameterSetSessionGate = H264ParameterSetSessionGate()
+    private var activeH264ParameterSetSignature: H264ParameterSetSignature? {
+        h264ParameterSetSessionGate.activeParameterSetSignature
     }
     private let queue = DispatchQueue(
         label: "com.iPadZeroLagDisplay.decoder",
@@ -353,6 +432,7 @@ public final class DecoderManager {
             vpsData = nil
             spsData = sps
             ppsData = pps
+            _ = h264ParameterSetSessionGate.replaceIfChanged(sps: sps, pps: pps) { true }
             return true
         }
     }
@@ -470,6 +550,17 @@ public final class DecoderManager {
                     decoder.replaceDecompressionSession(vps: vps, sps: sps, pps: pps)
                 }
             }
+        } else if activeCodec == .h264,
+                  let sps = spsData, let pps = ppsData {
+            let candidate = H264ParameterSetSignature(sps: sps, pps: pps)
+            if candidate != activeH264ParameterSetSignature {
+                let decoder = self
+                _ = h264ParameterSetSessionGate.replaceIfChanged(
+                    sps: sps,
+                    pps: pps) {
+                    decoder.replaceH264DecompressionSession(sps: sps, pps: pps)
+                }
+            }
         }
 
         guard !frameRanges.isEmpty,
@@ -534,10 +625,19 @@ public final class DecoderManager {
 
         var infoFlags = VTDecodeInfoFlags()
         let decodeStartedAt = CACurrentMediaTime()
+        let dimensions = CMVideoFormatDescriptionGetDimensions(description)
+        let expectedWidth = Int(dimensions.width)
+        let expectedHeight = Int(dimensions.height)
+        guard expectedWidth > 0, expectedHeight > 0 else {
+            finish(ticket, lifetime: lifetime, succeeded: false, decodeStartedAt: decodeStartedAt)
+            return
+        }
         let submission = VideoDecodeSubmission(
             ticket: ticket,
             lifetime: lifetime,
-            decodeStartedAt: decodeStartedAt)
+            decodeStartedAt: decodeStartedAt,
+            expectedWidth: expectedWidth,
+            expectedHeight: expectedHeight)
         let frameRefCon = Unmanaged.passRetained(submission).toOpaque()
         // Async is enabled, while temporal processing is deliberately omitted:
         // VideoToolbox therefore has no permission to delay output for reorder.
@@ -589,15 +689,6 @@ public final class DecoderManager {
                         return
                     }
 
-                    let decoderSpec: [String: Any] = [
-                        kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String: true
-                    ]
-                    let attributes: [String: Any] = [
-                        kCVPixelBufferPixelFormatTypeKey as String:
-                            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                        kCVPixelBufferMetalCompatibilityKey as String: true,
-                        kCVPixelBufferIOSurfacePropertiesKey as String: [:] as CFDictionary
-                    ]
                     var callback = VTDecompressionOutputCallbackRecord(
                         decompressionOutputCallback: {
                             outputRefCon, sourceFrameRefCon, status, _, imageBuffer, _, _ in
@@ -619,19 +710,32 @@ public final class DecoderManager {
                                     decodeStartedAt: submission.decodeStartedAt)
                                 return
                             }
+                            let pixelBuffer = imageBuffer as CVPixelBuffer
+                            if let reason = DecoderOutputBufferAttributes.invalidReason(
+                                for: pixelBuffer,
+                                expectedWidth: submission.expectedWidth,
+                                expectedHeight: submission.expectedHeight) {
+                                print("[DecoderManager] HEVC decoded buffer rejected: \(reason)")
+                                decoder.finish(
+                                    submission.ticket,
+                                    lifetime: lifetime,
+                                    succeeded: false,
+                                    decodeStartedAt: submission.decodeStartedAt)
+                                return
+                            }
                             decoder.finish(
                                 submission.ticket,
                                 lifetime: lifetime,
                                 succeeded: true,
                                 decodeStartedAt: submission.decodeStartedAt,
-                                imageBuffer: imageBuffer as CVPixelBuffer)
+                                imageBuffer: pixelBuffer)
                         },
                         decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
                     let sessionStatus = VTDecompressionSessionCreate(
                         allocator: kCFAllocatorDefault,
                         formatDescription: description,
-                        decoderSpecification: decoderSpec as CFDictionary,
-                        imageBufferAttributes: attributes as CFDictionary,
+                        decoderSpecification: nil,
+                        imageBufferAttributes: DecoderOutputBufferAttributes.make() as CFDictionary,
                         outputCallback: &callback,
                         decompressionSessionOut: &candidateSession)
                     guard sessionStatus == noErr, candidateSession != nil else {
@@ -687,15 +791,6 @@ public final class DecoderManager {
             print("[DecoderManager] H264 format rejected: \(formatStatus)")
             return false
         }
-        let decoderSpec: [String: Any] = [
-            kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String: true
-        ]
-        let attributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String:
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-            kCVPixelBufferMetalCompatibilityKey as String: true,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as CFDictionary
-        ]
         var callback = VTDecompressionOutputCallbackRecord(
             decompressionOutputCallback: { outputRefCon, sourceFrameRefCon, status, _, imageBuffer, _, _ in
                 guard let sourceFrameRefCon else { return }
@@ -707,12 +802,21 @@ public final class DecoderManager {
                     decoder.finish(submission.ticket, lifetime: submission.lifetime, succeeded: false, decodeStartedAt: submission.decodeStartedAt)
                     return
                 }
-                decoder.finish(submission.ticket, lifetime: submission.lifetime, succeeded: true, decodeStartedAt: submission.decodeStartedAt, imageBuffer: imageBuffer as CVPixelBuffer)
+                let pixelBuffer = imageBuffer as CVPixelBuffer
+                if let reason = DecoderOutputBufferAttributes.invalidReason(
+                    for: pixelBuffer,
+                    expectedWidth: submission.expectedWidth,
+                    expectedHeight: submission.expectedHeight) {
+                    print("[DecoderManager] H264 decoded buffer rejected: \(reason)")
+                    decoder.finish(submission.ticket, lifetime: submission.lifetime, succeeded: false, decodeStartedAt: submission.decodeStartedAt)
+                    return
+                }
+                decoder.finish(submission.ticket, lifetime: submission.lifetime, succeeded: true, decodeStartedAt: submission.decodeStartedAt, imageBuffer: pixelBuffer)
             }, decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
         var session: VTDecompressionSession?
         let sessionStatus = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault, formatDescription: description,
-            decoderSpecification: decoderSpec as CFDictionary, imageBufferAttributes: attributes as CFDictionary,
+            decoderSpecification: nil, imageBufferAttributes: DecoderOutputBufferAttributes.make() as CFDictionary,
             outputCallback: &callback, decompressionSessionOut: &session)
         guard sessionStatus == noErr, let session else {
             print("[DecoderManager] H264 session rejected: \(sessionStatus)")
@@ -722,7 +826,6 @@ public final class DecoderManager {
         formatDescription = description
         decompressionSession = session
         setPropertyIfSupported(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue, name: "real-time")
-        setPropertyIfSupported(session, key: kVTDecompressionPropertyKey_MaximizePowerEfficiency, value: kCFBooleanFalse, name: "disable-power-saving")
         if let previous {
             VTDecompressionSessionWaitForAsynchronousFrames(previous)
             VTDecompressionSessionInvalidate(previous)
@@ -800,6 +903,7 @@ public final class DecoderManager {
             activeCodec = .hevc
             hasDecodedH264Idr = false
             parameterSetSessionGate.reset()
+            h264ParameterSetSessionGate.reset()
         }
     }
 

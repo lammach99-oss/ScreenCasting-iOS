@@ -30,28 +30,50 @@ public struct PencilTouchView: UIViewRepresentable {
     /// Kept for backward compatibility with code that passes bytes directly to `sendData`.
     public var onNetworkSend: ((Data) -> Void)?
 
+    /// Normalized aspect-fit rectangle occupied by the remote video in this view.
+    /// The Metal renderer is the source of truth for this displayed geometry.
+    public var contentViewport: VideoContentViewport?
+    var onBoundsChanged: ((CGRect) -> Void)?
+
     // MARK: Init
 
     public init(
         onPencilInput:    ((PencilPacket) -> Void)?                        = nil,
         onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)? = nil,
-        onNetworkSend:    ((Data) -> Void)?                                = nil
+        onNetworkSend:    ((Data) -> Void)?                                = nil,
+        contentViewport:  VideoContentViewport?                             = nil,
+        onBoundsChanged:  ((CGRect) -> Void)?                               = nil
     ) {
         self.onPencilInput    = onPencilInput
         self.onSendTouchEvent = onSendTouchEvent
         self.onNetworkSend    = onNetworkSend
+        self.contentViewport  = contentViewport
+        self.onBoundsChanged  = onBoundsChanged
     }
 
     public func makeUIView(context: Context) -> PencilUIKitView {
         let view = PencilUIKitView()
+        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         updateUIView(view, context: context)
         return view
+    }
+
+    public func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        uiView: PencilUIKitView,
+        context: Context
+    ) -> CGSize? {
+        FullscreenSurfaceLayout.exactSize(
+            width: proposal.width,
+            height: proposal.height)
     }
 
     public func updateUIView(_ uiView: PencilUIKitView, context: Context) {
         uiView.onPencilInput    = onPencilInput
         uiView.onSendTouchEvent = onSendTouchEvent
         uiView.onNetworkSend    = onNetworkSend
+        uiView.contentViewport  = contentViewport
+        uiView.onBoundsChanged  = onBoundsChanged
     }
 }
 
@@ -91,6 +113,12 @@ public class PencilUIKitView: UIView {
     public var onPencilInput:    ((PencilPacket) -> Void)?
     public var onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)?
     public var onNetworkSend:    ((Data) -> Void)?
+    public var contentViewport: VideoContentViewport?
+    public var onBoundsChanged: ((CGRect) -> Void)?
+
+    private var activeTouchIdentifier: ObjectIdentifier?
+    private var lastNormalizedPoint: CGPoint?
+    private var lastReportedBounds: CGRect?
 
     override public init(frame: CGRect) {
         super.init(frame: frame)
@@ -100,6 +128,13 @@ public class PencilUIKitView: UIView {
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
+    }
+
+    override public func layoutSubviews() {
+        super.layoutSubviews()
+        guard bounds != lastReportedBounds else { return }
+        lastReportedBounds = bounds
+        onBoundsChanged?(bounds)
     }
 
     // MARK: - UIKit touch overrides (pass event for coalesced touch access)
@@ -126,17 +161,51 @@ public class PencilUIKitView: UIView {
         guard let primaryTouch = touches.first else { return }
 
         // Consume all 240Hz coalesced samples — every intermediate Pencil position.
-        let allTouches = event?.coalescedTouches(for: primaryTouch) ?? [primaryTouch]
+        let allTouches = flags == 4
+            ? [primaryTouch]
+            : event?.coalescedTouches(for: primaryTouch) ?? [primaryTouch]
 
         let bounds = self.bounds
-        guard bounds.width > 0, bounds.height > 0 else { return }
+        guard
+            bounds.width > 0,
+            bounds.height > 0,
+            let contentViewport
+        else {
+            if flags == 4 {
+                activeTouchIdentifier = nil
+                lastNormalizedPoint = nil
+            }
+            return
+        }
+
+        let touchIdentifier = ObjectIdentifier(primaryTouch)
+        if flags == 1 {
+            guard
+                activeTouchIdentifier == nil,
+                contentViewport.normalizedPoint(
+                    for: primaryTouch.location(in: self),
+                    in: bounds
+                ) != nil
+            else {
+                return
+            }
+            activeTouchIdentifier = touchIdentifier
+        } else {
+            guard activeTouchIdentifier == touchIdentifier else { return }
+        }
 
         for touch in allTouches {
             let location = touch.location(in: self)
+            let normalizedPoint = contentViewport.normalizedPoint(
+                for: location,
+                in: bounds
+            ) ?? (flags == 4 ? lastNormalizedPoint : nil)
+            guard let normalizedPoint else { continue }
+            lastNormalizedPoint = normalizedPoint
 
             // ── Normalised ratios (0.0 – 1.0) ───────────────────────────────
-            let xRatio = Float(location.x / bounds.width) .clamped(0, 1)
-            let yRatio = Float(location.y / bounds.height).clamped(0, 1)
+            let xRatio = Float(normalizedPoint.x).clamped(0, 1)
+            let yRatio = Float(normalizedPoint.y).clamped(0, 1)
 
             // ── Pressure ─────────────────────────────────────────────────────
             let pressureFloat: Float = touch.maximumPossibleForce > 0
@@ -184,6 +253,11 @@ public class PencilUIKitView: UIView {
                 pointerFlags: flags
             )
             onPencilInput?(pencilPacket)
+        }
+
+        if flags == 4 {
+            activeTouchIdentifier = nil
+            lastNormalizedPoint = nil
         }
     }
 }

@@ -2,6 +2,7 @@ import Foundation
 import Metal
 import MetalKit
 import CoreVideo
+import UIKit
 
 enum RenderOfferDecision: Equatable {
     case accepted(replaced: UInt32?)
@@ -87,16 +88,140 @@ struct RenderFreshnessTracker {
 }
 
 /// High-performance zero-copy Metal renderer for a 120 Hz iPad display.
+public struct VideoContentViewport: Equatable {
+    let rect: CGRect
+
+    func contentRect(in container: CGRect) -> CGRect {
+        CGRect(
+            x: container.minX + rect.minX * container.width,
+            y: container.minY + rect.minY * container.height,
+            width: rect.width * container.width,
+            height: rect.height * container.height)
+    }
+
+    static func aspectFit(
+        containerSize: CGSize,
+        videoSize: CGSize
+    ) -> VideoContentViewport? {
+        guard containerSize.width > 0,
+              containerSize.height > 0,
+              videoSize.width > 0,
+              videoSize.height > 0 else {
+            return nil
+        }
+
+        let scale = min(
+            containerSize.width / videoSize.width,
+            containerSize.height / videoSize.height)
+        let renderedSize = CGSize(
+            width: videoSize.width * scale,
+            height: videoSize.height * scale)
+        return VideoContentViewport(
+            rect: CGRect(
+                x: (containerSize.width - renderedSize.width) /
+                    (2 * containerSize.width),
+                y: (containerSize.height - renderedSize.height) /
+                    (2 * containerSize.height),
+                width: renderedSize.width / containerSize.width,
+                height: renderedSize.height / containerSize.height))
+    }
+
+    func normalizedPoint(
+        for location: CGPoint,
+        in container: CGRect
+    ) -> CGPoint? {
+        guard let point = normalizedContainerPoint(for: location, in: container),
+              point.x >= rect.minX,
+              point.x <= rect.maxX,
+              point.y >= rect.minY,
+              point.y <= rect.maxY else {
+            return nil
+        }
+        return CGPoint(
+            x: (point.x - rect.minX) / rect.width,
+            y: (point.y - rect.minY) / rect.height)
+    }
+
+    func clampedNormalizedPoint(
+        for location: CGPoint,
+        in container: CGRect
+    ) -> CGPoint? {
+        guard let point = normalizedContainerPoint(for: location, in: container) else {
+            return nil
+        }
+        return CGPoint(
+            x: min(max((point.x - rect.minX) / rect.width, 0), 1),
+            y: min(max((point.y - rect.minY) / rect.height, 0), 1))
+    }
+
+    private func normalizedContainerPoint(
+        for location: CGPoint,
+        in container: CGRect
+    ) -> CGPoint? {
+        guard container.width > 0,
+              container.height > 0,
+              rect.width > 0,
+              rect.height > 0 else {
+            return nil
+        }
+        return CGPoint(
+            x: (location.x - container.minX) / container.width,
+            y: (location.y - container.minY) / container.height)
+    }
+}
+
+public struct RendererGeometrySnapshot: Equatable {
+    let decodedFrameSize: CGSize
+    let windowBounds: CGRect
+    let safeAreaInsets: UIEdgeInsets
+    let metalBounds: CGRect
+    let drawableSize: CGSize
+    let contentScaleFactor: CGFloat
+    let contentViewport: VideoContentViewport
+
+    public static func == (
+        lhs: RendererGeometrySnapshot,
+        rhs: RendererGeometrySnapshot
+    ) -> Bool {
+        lhs.decodedFrameSize == rhs.decodedFrameSize &&
+            lhs.windowBounds == rhs.windowBounds &&
+            lhs.safeAreaInsets.top == rhs.safeAreaInsets.top &&
+            lhs.safeAreaInsets.left == rhs.safeAreaInsets.left &&
+            lhs.safeAreaInsets.bottom == rhs.safeAreaInsets.bottom &&
+            lhs.safeAreaInsets.right == rhs.safeAreaInsets.right &&
+            lhs.metalBounds == rhs.metalBounds &&
+            lhs.drawableSize == rhs.drawableSize &&
+            lhs.contentScaleFactor == rhs.contentScaleFactor &&
+            lhs.contentViewport == rhs.contentViewport
+    }
+}
+
 public class Renderer: NSObject, MTKViewDelegate {
     public var onFrameRendered: ((UInt32, UInt64) -> Void)?
     public var onDrawableCommitted: ((UInt32, UInt64) -> Void)?
     public var onFrameDropped: ((UInt32, UInt64) -> Void)?
+    var onContentViewportChanged: ((VideoContentViewport?) -> Void)?
+    var onGeometrySnapshotChanged: ((RendererGeometrySnapshot) -> Void)?
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private var pipelineState: MTLRenderPipelineState?
     private var textureCache: CVMetalTextureCache?
+    private var aspectRatioBuffer: MTLBuffer?
     private var currentPixelBuffer: CVPixelBuffer?
     private var freshness = RenderFreshnessTracker()
+    private var publishedContentViewport: VideoContentViewport?
+    private var publishedGeometrySnapshot: RendererGeometrySnapshot?
+
+    static func contentViewport(
+        forDrawableSize drawableSize: CGSize,
+        videoSize: CGSize
+    ) -> VideoContentViewport? {
+        VideoContentViewport.aspectFit(
+            containerSize: drawableSize,
+            videoSize: videoSize)
+    }
+
+    private var lastDecodedFrameSize: CGSize?
     private let lock = NSLock()
 
     public init?(metalView: MTKView) {
@@ -134,6 +259,9 @@ public class Renderer: NSObject, MTKViewDelegate {
         descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
         do {
             pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
+            aspectRatioBuffer = device.makeBuffer(
+                length: MemoryLayout<SIMD2<Float>>.size,
+                options: .storageModeShared)
         } catch {
             print("[Renderer] Failed to create render pipeline: \(error)")
         }
@@ -143,7 +271,16 @@ public class Renderer: NSObject, MTKViewDelegate {
         lock.lock()
         currentPixelBuffer = nil
         freshness.beginSession(generation: generation)
+        let shouldResetContentViewport = publishedContentViewport != nil
+        publishedContentViewport = nil
+        publishedGeometrySnapshot = nil
+        lastDecodedFrameSize = nil
         lock.unlock()
+        if shouldResetContentViewport {
+            DispatchQueue.main.async { [weak self] in
+                self?.onContentViewportChanged?(nil)
+            }
+        }
     }
 
     public func updateFrame(
@@ -166,7 +303,21 @@ public class Renderer: NSObject, MTKViewDelegate {
         if let dropped { onFrameDropped?(dropped, generation) }
     }
 
-    public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+    public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        lock.lock()
+        let decodedFrameSize = lastDecodedFrameSize
+        lock.unlock()
+        guard let decodedFrameSize,
+              let contentViewport = Self.contentViewport(
+                forDrawableSize: size,
+                videoSize: decodedFrameSize) else { return }
+        publishContentViewport(contentViewport)
+        publishGeometrySnapshot(
+            for: view,
+            decodedFrameSize: decodedFrameSize,
+            drawableSize: size,
+            contentViewport: contentViewport)
+    }
 
     public func draw(in view: MTKView) {
         lock.lock()
@@ -188,6 +339,20 @@ public class Renderer: NSObject, MTKViewDelegate {
 
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
+        let decodedFrameSize = CGSize(width: width, height: height)
+        lock.lock()
+        lastDecodedFrameSize = decodedFrameSize
+        lock.unlock()
+        guard CVPixelBufferGetIOSurface(pixelBuffer) != nil else {
+            print("[Renderer] Metal presentation rejected: IOSurface unavailable for \(width)x\(height)")
+            abandon(identity)
+            return
+        }
+        guard CVPixelBufferGetPixelFormatType(pixelBuffer) == DecoderOutputBufferAttributes.pixelFormat else {
+            print("[Renderer] Metal presentation rejected: pixelFormat=\(CVPixelBufferGetPixelFormatType(pixelBuffer)) expected=\(DecoderOutputBufferAttributes.pixelFormat)")
+            abandon(identity)
+            return
+        }
         var yTextureRef: CVMetalTexture?
         let yStatus = CVMetalTextureCacheCreateTextureFromImage(
             kCFAllocatorDefault, textureCache, pixelBuffer, nil,
@@ -202,24 +367,36 @@ public class Renderer: NSObject, MTKViewDelegate {
               let yTextureRef,
               let uvTextureRef,
               let yTexture = CVMetalTextureGetTexture(yTextureRef),
-              let uvTexture = CVMetalTextureGetTexture(uvTextureRef),
-              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let uvTexture = CVMetalTextureGetTexture(uvTextureRef) else {
+            print("[Renderer] CVMetalTextureCacheCreateTextureFromImage failed: yStatus=\(yStatus) uvStatus=\(uvStatus) size=\(width)x\(height) pixelFormat=\(CVPixelBufferGetPixelFormatType(pixelBuffer))")
+            abandon(identity)
+            return
+        }
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeRenderCommandEncoder(
                 descriptor: renderPassDescriptor) else {
             abandon(identity)
             return
         }
 
-        let viewAspect = Float(view.drawableSize.width / view.drawableSize.height)
-        let videoAspect = Float(width) / Float(height)
-        var scale = SIMD2<Float>(1, 1)
-        if videoAspect > viewAspect {
-            scale.y = viewAspect / videoAspect
-        } else {
-            scale.x = videoAspect / viewAspect
+        guard let contentViewport = Self.contentViewport(
+            forDrawableSize: view.drawableSize,
+            videoSize: decodedFrameSize) else {
+            abandon(identity)
+            return
         }
+        publishContentViewport(contentViewport)
+        publishGeometrySnapshot(
+            for: view,
+            decodedFrameSize: decodedFrameSize,
+            drawableSize: view.drawableSize,
+            contentViewport: contentViewport)
+        let scale = SIMD2<Float>(
+            Float(contentViewport.rect.width),
+            Float(contentViewport.rect.height))
+        aspectRatioBuffer?.contents().storeBytes(of: scale, as: SIMD2<Float>.self)
         encoder.setRenderPipelineState(pipelineState)
-        encoder.setVertexBytes(&scale, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
+        encoder.setVertexBuffer(aspectRatioBuffer, offset: 0, index: 0)
         encoder.setFragmentTexture(yTexture, index: 0)
         encoder.setFragmentTexture(uvTexture, index: 1)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
@@ -252,6 +429,47 @@ public class Renderer: NSObject, MTKViewDelegate {
         }
         commandBuffer.commit()
         onDrawableCommitted?(identity.sequence, identity.generation)
+    }
+
+    private func publishContentViewport(_ contentViewport: VideoContentViewport) {
+        lock.lock()
+        let changed = publishedContentViewport != contentViewport
+        publishedContentViewport = contentViewport
+        lock.unlock()
+        guard changed else { return }
+
+        DispatchQueue.main.async { [weak self] in
+            self?.onContentViewportChanged?(contentViewport)
+        }
+    }
+
+    private func publishGeometrySnapshot(
+        for view: MTKView,
+        decodedFrameSize: CGSize,
+        drawableSize: CGSize,
+        contentViewport: VideoContentViewport
+    ) {
+        DispatchQueue.main.async { [weak self, weak view] in
+            guard let self,
+                  let view else {
+                return
+            }
+
+            let snapshot = RendererGeometrySnapshot(
+                decodedFrameSize: decodedFrameSize,
+                windowBounds: view.window?.bounds ?? .zero,
+                safeAreaInsets: view.window?.safeAreaInsets ?? view.safeAreaInsets,
+                metalBounds: view.bounds,
+                drawableSize: drawableSize,
+                contentScaleFactor: view.contentScaleFactor,
+                contentViewport: contentViewport)
+            self.lock.lock()
+            let changed = self.publishedGeometrySnapshot != snapshot
+            self.publishedGeometrySnapshot = snapshot
+            self.lock.unlock()
+            guard changed else { return }
+            self.onGeometrySnapshotChanged?(snapshot)
+        }
     }
 
     private func abandon(_ identity: RenderFrameIdentity) {

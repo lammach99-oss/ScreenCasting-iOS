@@ -30,7 +30,7 @@
 	<string>ScreenCasting requires local network access to discover and connect to your Windows PC secondary monitor host.</string>
 	<key>NSBonjourServices</key>
 	<array>
-		<string>_screencasting._tcp.</string>
+		<string>_screencasting._tcp</string>
 	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
@@ -47,8 +47,12 @@
 	<array>
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
 	</array>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
+	<key>UILaunchScreen</key>
+	<dict/>
 </dict>
 </plist>

@@ -2,6 +2,101 @@ import XCTest
 @testable import iPadCasting
 
 final class WifiTransportNegotiationTests: XCTestCase {
+    func testKnownHostIdentityMustMatchPinnedCertificate() {
+        let fingerprint = String(repeating: "AB", count: 32)
+
+        XCTAssertEqual(
+            WifiHostIdentityPolicy.decide(
+                presentedFingerprint: fingerprint,
+                pinnedFingerprint: fingerprint),
+            .trusted)
+        XCTAssertEqual(
+            WifiHostIdentityPolicy.decide(
+                presentedFingerprint: String(repeating: "CD", count: 32),
+                pinnedFingerprint: fingerprint),
+            .rejected)
+    }
+
+    func testFirstPairingRequiresOutOfBandIdentityConfirmation() {
+        XCTAssertEqual(
+            WifiHostIdentityPolicy.decide(
+                presentedFingerprint: String(repeating: "12", count: 32),
+                pinnedFingerprint: nil),
+            .requiresFirstPairingConfirmation)
+    }
+
+    func testIdentityCodeIsStableAndHumanVerifiable() {
+        let fingerprint = "00112233445566778899AABBCCDDEEFF" +
+            String(repeating: "00", count: 24)
+
+        XCTAssertEqual(
+            WifiHostIdentityPolicy.identityCode(for: fingerprint),
+            "0011-2233-4455-6677")
+    }
+
+    func testMalformedIdentityNeverPassesAsTrusted() {
+        XCTAssertEqual(
+            WifiHostIdentityPolicy.decide(
+                presentedFingerprint: "not-a-fingerprint",
+                pinnedFingerprint: nil),
+            .rejected)
+        XCTAssertNil(WifiHostIdentityPolicy.identityCode(for: "1234"))
+    }
+
+    func testWifiVideoOnlyNegotiationOmitsAudio() throws {
+        let capabilities = ClientCapabilities(
+            version: 1,
+            modes: RealtimeTransportMode.legacyTLS |
+                RealtimeTransportMode.wifiRTP,
+            videoCodecs: VideoCodecCapabilities.hevc,
+            audioCodecs: AudioCodecCapabilities.none,
+            preferredMTU: 1200,
+            feedbackIntervalMs: 50,
+            clientUDPPort: 49152)
+        XCTAssertEqual(
+            ClientCapabilities.decode(capabilities.encode()),
+            capabilities)
+
+        let sessionID = try XCTUnwrap(
+            SessionID(hex: "00112233445566778899aabbccddeeff"))
+        let offer = TransportOffer(
+            version: 1,
+            mode: RealtimeTransportMode.wifiRTP,
+            videoCodec: VideoCodecCapabilities.hevc,
+            audioCodec: AudioCodecCapabilities.none,
+            mtu: 1200,
+            feedbackIntervalMs: 50,
+            hostUDPPort: 27016,
+            sessionID: sessionID,
+            mediaKey: Data(repeating: 1, count: 16),
+            mediaSalt: Data(repeating: 2, count: 12),
+            feedbackKey: Data(repeating: 3, count: 16),
+            feedbackSalt: Data(repeating: 4, count: 12),
+            usbBindingSecret: Data(repeating: 5, count: 32))
+        XCTAssertEqual(
+            TransportOffer.decode(try XCTUnwrap(offer.encode()))?.audioCodec,
+            AudioCodecCapabilities.none)
+
+        let ready = TransportReady(
+            version: 1,
+            mode: RealtimeTransportMode.wifiRTP,
+            status: TransportReadyStatus.ready,
+            sessionID: sessionID,
+            audioCodec: AudioCodecCapabilities.none)
+        XCTAssertEqual(
+            TransportReady.decode(try XCTUnwrap(ready.encode())),
+            ready)
+
+        let commit = TransportCommit(
+            version: 1,
+            mode: RealtimeTransportMode.wifiRTP,
+            sessionID: sessionID,
+            audioCodec: AudioCodecCapabilities.none)
+        XCTAssertEqual(
+            TransportCommit.decode(try XCTUnwrap(commit.encode())),
+            commit)
+    }
+
     func testSessionIdentityDerivesExplicitMediaContract() throws {
         let sessionID = try XCTUnwrap(
             SessionID(hex: "00112233445566778899aabbccddeeff"))

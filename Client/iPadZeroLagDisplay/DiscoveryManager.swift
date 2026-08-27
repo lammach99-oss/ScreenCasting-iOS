@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import Combine
+import os
 
 /// Immutable representation of a discovered ScreenCasting host on the local network via Bonjour mDNS.
 public struct DiscoveredHost: Identifiable, Hashable {
@@ -26,6 +27,12 @@ public struct DiscoveredHost: Identifiable, Hashable {
 
 /// Discovers ScreenCasting Windows host instances on the local LAN using Apple's native `NWBrowser` (mDNS / Bonjour).
 public class DiscoveryManager: ObservableObject {
+    private static let serviceType = "_screencasting._tcp"
+    private static let serviceDomain = "local."
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.iPadZeroLagDisplay.client",
+        category: "bonjour")
+
     /// Array of active, resolved ScreenCasting hosts discovered on the local network.
     @Published public var discoveredHosts: [DiscoveredHost] = []
 
@@ -38,7 +45,9 @@ public class DiscoveryManager: ObservableObject {
     public func startBrowsing() {
         stopBrowsing()
 
-        let descriptor = NWBrowser.Descriptor.bonjour(type: "_screencasting._tcp", domain: "local.")
+        let descriptor = NWBrowser.Descriptor.bonjour(
+            type: Self.serviceType,
+            domain: Self.serviceDomain)
         let parameters = NWParameters.tcp
 
         let browser = NWBrowser(for: descriptor, using: parameters)
@@ -58,19 +67,36 @@ public class DiscoveryManager: ObservableObject {
             DispatchQueue.main.async {
                 self.discoveredHosts = hosts
             }
+
+            Self.logger.notice(
+                "[ScreenCasting][BONJOUR_RESULTS] count=\(hosts.count, privacy: .public)")
         }
 
-        browser.stateUpdateHandler = { state in
+        browser.stateUpdateHandler = { [weak self] state in
             switch state {
+            case .ready:
+                Self.logger.notice(
+                    "[ScreenCasting][BONJOUR_READY] type=\(Self.serviceType, privacy: .public) domain=\(Self.serviceDomain, privacy: .public)")
+            case .waiting(let error):
+                Self.logger.error(
+                    "[ScreenCasting][BONJOUR_WAITING] error=\(String(describing: error), privacy: .public)")
             case .failed(let error):
-                print("[DiscoveryManager] NWBrowser failed with error: \(error)")
-            default:
-                break
+                Self.logger.error(
+                    "[ScreenCasting][BONJOUR_FAILED] error=\(String(describing: error), privacy: .public)")
+                DispatchQueue.main.async {
+                    self?.discoveredHosts = []
+                }
+            case .cancelled:
+                Self.logger.notice("[ScreenCasting][BONJOUR_CANCELLED]")
+            @unknown default:
+                Self.logger.error("[ScreenCasting][BONJOUR_UNKNOWN_STATE]")
             }
         }
 
         browser.start(queue: browserQueue)
         self.browser = browser
+        Self.logger.notice(
+            "[ScreenCasting][BONJOUR_START] type=\(Self.serviceType, privacy: .public) domain=\(Self.serviceDomain, privacy: .public)")
     }
 
     /// Stops browsing for local mDNS services.

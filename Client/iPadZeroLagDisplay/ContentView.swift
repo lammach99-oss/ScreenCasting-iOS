@@ -1,4 +1,7 @@
 import SwiftUI
+import Foundation
+import os
+import UIKit
 
 // MARK: - PIN Shake Modifier
 
@@ -177,9 +180,79 @@ struct PINEntryView: View {
     }
 }
 
+// MARK: - Wi-Fi Host Identity Confirmation
+
+struct HostIdentityConfirmationView: View {
+    let identityCode: String
+    let onConfirm: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.7)
+                .ignoresSafeArea()
+                .onTapGesture { }
+
+            VStack(spacing: 24) {
+                VStack(spacing: 10) {
+                    Image(systemName: "checkmark.shield.fill")
+                        .font(.system(size: 48))
+                        .foregroundStyle(.yellow)
+                    Text("Verify Windows Host")
+                        .font(.system(size: 26, weight: .bold, design: .rounded))
+                        .foregroundColor(.white)
+                    Text("Compare this code with the Host security panel.\nOnly continue when they match.")
+                        .font(.system(size: 14))
+                        .multilineTextAlignment(.center)
+                        .foregroundColor(.white.opacity(0.65))
+                }
+
+                Text(identityCode)
+                    .font(.system(size: 25, weight: .bold, design: .monospaced))
+                    .foregroundColor(.yellow)
+                    .tracking(1.5)
+                    .padding(.vertical, 16)
+                    .frame(maxWidth: .infinity)
+                    .background(Color.yellow.opacity(0.12))
+                    .cornerRadius(12)
+
+                VStack(spacing: 12) {
+                    Button(action: onConfirm) {
+                        Text("I Verified the Host")
+                            .font(.system(size: 16, weight: .semibold, design: .rounded))
+                            .foregroundColor(.black)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 14)
+                            .background(Color.yellow)
+                            .cornerRadius(14)
+                    }
+                    Button(action: onCancel) {
+                        Text("Cancel")
+                            .font(.system(size: 14))
+                            .foregroundColor(.white.opacity(0.45))
+                    }
+                }
+            }
+            .padding(32)
+            .frame(maxWidth: 340)
+            .background(.ultraThinMaterial)
+            .cornerRadius(28)
+            .overlay(
+                RoundedRectangle(cornerRadius: 28)
+                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.4), radius: 30, x: 0, y: 10)
+        }
+    }
+}
+
 // MARK: - ContentView
 
 public struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
+    private static let geometryLogger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.iPadZeroLagDisplay.client",
+        category: "presentation")
 
     @StateObject private var networkManager: NetworkManager
     @StateObject private var streamManager: StreamManager
@@ -193,8 +266,11 @@ public struct ContentView: View {
 
     // UI States
     @State private var isHudVisible: Bool = true
-    @State private var isDisconnectButtonVisible: Bool = false
-    @State private var dismissTimer: Timer? = nil
+    @State private var renderedContentViewport: VideoContentViewport?
+    @State private var rendererGeometrySnapshot: RendererGeometrySnapshot?
+    @State private var presentationGeometry: PresentationSurfaceGeometry?
+    @State private var lastGeometrySnapshotLine = ""
+    @State private var isSettingsPresented = false
 
     public init() {
         let netManager = NetworkManager()
@@ -213,21 +289,37 @@ public struct ContentView: View {
             // LAYER 2: Foreground UI
             foregroundLayer
         }
+        .ignoresSafeArea()
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
+            UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+            networkManager.updateInterfaceOrientation(currentInterfaceOrientation())
             discoveryManager.startBrowsing()
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
+            UIDevice.current.endGeneratingDeviceOrientationNotifications()
             discoveryManager.stopBrowsing()
-            networkManager.stop()
+            networkManager.applicationDidEnterBackground()
         }
         .animation(.easeInOut(duration: 0.3), value: streamManager.isConnected)
         // PIN entry overlay: shown when awaiting PIN or after auth failure
         .overlay {
-            if isPINPhase {
+            if isHostIdentityPhase {
+                HostIdentityConfirmationView(
+                    identityCode: networkManager.hostIdentityCode ?? "Unavailable",
+                    onConfirm: {
+                        networkManager.confirmHostIdentity()
+                    },
+                    onCancel: {
+                        networkManager.stop()
+                    }
+                )
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                .zIndex(10)
+            } else if isPINPhase {
                 PINEntryView(
                     pin: $enteredPIN,
                     authFailed: isAuthFailed,
@@ -249,9 +341,44 @@ public struct ContentView: View {
                 networkManager.sendAuthPIN(enteredPIN)
             }
         }
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .active:
+                networkManager.applicationDidBecomeActive()
+                if let host = discoveryManager.discoveredHosts.first {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                        networkManager.connectDiscoveredHostIfNeeded(host.endpoint)
+                    }
+                }
+            case .inactive, .background:
+                networkManager.applicationDidEnterBackground()
+            @unknown default:
+                break
+            }
+        }
+        .onChange(of: discoveryManager.discoveredHosts) { _, hosts in
+            guard scenePhase == .active, let host = hosts.first else { return }
+            networkManager.connectDiscoveredHostIfNeeded(host.endpoint)
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIDevice.orientationDidChangeNotification)
+        ) { _ in
+            DispatchQueue.main.async {
+                networkManager.updateInterfaceOrientation(
+                    currentInterfaceOrientation())
+            }
+        }
+        .sheet(isPresented: $isSettingsPresented) {
+            SettingsView(networkManager: networkManager)
+        }
     }
 
     // MARK: - Computed Helpers
+
+    private var isHostIdentityPhase: Bool {
+        networkManager.connectionState == .awaitingHostIdentity
+    }
 
     private var isPINPhase: Bool {
         switch networkManager.connectionState {
@@ -272,6 +399,15 @@ public struct ContentView: View {
 
     private var normalizedManualHost: String {
         hostIP.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func currentInterfaceOrientation() -> ClientDisplayOrientation {
+        let activeScene = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+        return activeScene?.interfaceOrientation.isPortrait == true
+            ? .portrait
+            : .landscape
     }
 
     private var isValidManualIPv4: Bool {
@@ -296,19 +432,7 @@ public struct ContentView: View {
     @ViewBuilder
     private var backgroundLayer: some View {
         if streamManager.isConnected {
-            MetalVideoView(networkManager: networkManager) {
-                streamManager.registerFrameRendered()
-            }
-            .ignoresSafeArea()
-
-            PencilTouchView(
-                onPencilInput: { _ in },
-                onSendTouchEvent: { [weak networkManager] type, x, y, pressure in
-                    networkManager?.sendTouchEvent(type: type, x: x, y: y, pressure: pressure)
-                }
-            )
-            .ignoresSafeArea()
-            .allowsHitTesting(true)
+            connectedVideoSurface
         } else {
             // Premium Disconnected Background
             RadialGradient(
@@ -322,6 +446,97 @@ public struct ContentView: View {
             )
             .ignoresSafeArea()
         }
+    }
+
+    // The decoder/renderer owns the viewport it actually draws. Keep the
+    // Metal and UIKit touch surfaces in one full-window container so that the
+    // same normalized viewport describes both surfaces.
+    @ViewBuilder
+    private var connectedVideoSurface: some View {
+        GeometryReader { proxy in
+            let frame = FullscreenSurfaceLayout.edgeToEdgeFrame(
+                proposedBounds: proxy.frame(in: .local),
+                safeAreaInsets: proxy.safeAreaInsets)
+
+            ConnectedPresentationSurface(
+                networkManager: networkManager,
+                onFrameRendered: {
+                    streamManager.registerFrameRendered()
+                },
+                onContentViewportChanged: { viewport in
+                    renderedContentViewport = viewport
+                },
+                onGeometrySnapshotChanged: { snapshot in
+                    rendererGeometrySnapshot = snapshot
+                    if let presentationGeometry {
+                        emitGeometrySnapshot(snapshot, presentationGeometry)
+                    }
+                },
+                onPresentationGeometryChanged: { geometry in
+                    presentationGeometry = geometry
+                    if let rendererGeometrySnapshot {
+                        emitGeometrySnapshot(rendererGeometrySnapshot, geometry)
+                    }
+                },
+                onTouchBoundsChanged: { _ in },
+                onPencilInput: { _ in },
+                onSendTouchEvent: { type, x, y, pressure in
+                    networkManager.sendTouchEvent(
+                        type: type,
+                        x: x,
+                        y: y,
+                        pressure: pressure)
+                })
+                .frame(width: frame.width, height: frame.height)
+                .offset(x: frame.minX, y: frame.minY)
+                .allowsHitTesting(true)
+                // A single touch remains remote input. Only a deliberate
+                // double tap presents local stream controls.
+                .simultaneousGesture(
+                    TapGesture(count: 2)
+                        .onEnded {
+                            isSettingsPresented = true
+                        })
+        }
+        .ignoresSafeArea(.container, edges: .all)
+    }
+
+    private func emitGeometrySnapshot(
+        _ snapshot: RendererGeometrySnapshot,
+        _ geometry: PresentationSurfaceGeometry
+    ) {
+        let line = "[ScreenCasting][VIEW_GEOMETRY] " +
+            "framePx=\(Int(snapshot.decodedFrameSize.width))x\(Int(snapshot.decodedFrameSize.height)) " +
+            "screenBounds=\(format(rect: geometry.screenBounds)) " +
+            "windowBounds=\(format(rect: geometry.windowBounds)) " +
+            "rootBounds=\(format(rect: geometry.rootBounds)) " +
+            "streamContainerBounds=\(format(rect: geometry.streamContainerBounds)) " +
+            "metalBounds=\(format(rect: geometry.metalBounds)) " +
+            "touchBounds=\(format(rect: geometry.touchBounds)) " +
+            "drawableSize=\(format(size: snapshot.drawableSize)) " +
+            "scale=\(format(value: snapshot.contentScaleFactor)) " +
+            "contentRect=\(format(rect: snapshot.contentViewport.contentRect(in: geometry.metalBounds))) " +
+            "contentRectNorm=\(format(rect: snapshot.contentViewport.rect)) " +
+            "safeAreaInsets=\(format(insets: geometry.safeAreaInsets))"
+        guard line != lastGeometrySnapshotLine else { return }
+        lastGeometrySnapshotLine = line
+        Self.geometryLogger.notice("\(line, privacy: .public)")
+    }
+
+    private func format(rect: CGRect) -> String {
+        "(x=\(format(value: rect.origin.x)),y=\(format(value: rect.origin.y)),w=\(format(value: rect.width)),h=\(format(value: rect.height)))"
+    }
+
+    private func format(insets: UIEdgeInsets) -> String {
+        "(t=\(format(value: insets.top)),l=\(format(value: insets.left)),b=\(format(value: insets.bottom)),r=\(format(value: insets.right)))"
+    }
+
+    private func format(size: CGSize) -> String {
+        "\(format(value: size.width))x\(format(value: size.height))"
+    }
+
+    private func format(value: CGFloat) -> String {
+        String(format: "%.2f", Double(value))
     }
 
     @ViewBuilder
@@ -355,7 +570,7 @@ public struct ContentView: View {
                     .font(.system(size: 32, weight: .bold, design: .rounded))
                     .foregroundColor(.white)
 
-                Text("Zero-Lag 120Hz iPad Receiver")
+                Text("Native 60Hz iPad Receiver")
                     .font(.system(size: 16, weight: .medium))
                     .foregroundColor(.gray)
             }
@@ -423,6 +638,10 @@ public struct ContentView: View {
             Text("Connecting & establishing TLS…")
                 .font(.system(size: 15, weight: .semibold, design: .rounded))
                 .foregroundColor(.white)
+        case .awaitingHostIdentity:
+            Text("Verify the Windows Host identity code.")
+                .font(.system(size: 15, weight: .semibold, design: .rounded))
+                .foregroundColor(.yellow)
         case .disconnected(let reason) where !reason.isEmpty:
             Text("Disconnected: \(reason)")
                 .font(.system(size: 14, weight: .medium, design: .rounded))
@@ -443,7 +662,7 @@ public struct ContentView: View {
                 Label("3. Select USB-C Direct and Start on the PC", systemImage: "desktopcomputer")
             } else {
                 Label("1. Open Host App on your Windows PC", systemImage: "desktopcomputer")
-                Label("2. Note the PIN Code shown on screen", systemImage: "lock.badge.key.fill")
+                Label("2. Compare the Host identity code before entering the PIN", systemImage: "checkmark.shield")
                 Label("3. Enter PC IP below and tap Connect", systemImage: "network")
             }
         }
@@ -577,7 +796,7 @@ public struct ContentView: View {
             }
             .disabled(
                 (!useUSBMode && !isValidManualIPv4) ||
-                enteredPIN.count != 4 ||
+                (useUSBMode && enteredPIN.count != 4) ||
                 networkManager.connectionState == .connecting)
 
             if !useUSBMode {
@@ -652,18 +871,6 @@ public struct ContentView: View {
 
     private var streamingHUD: some View {
         ZStack {
-            // Tap gesture intercepts
-            Color.clear
-                .contentShape(Rectangle())
-                .onTapGesture(count: 2) {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
-                        isHudVisible.toggle()
-                    }
-                }
-                .onTapGesture(count: 1) {
-                    showDisconnectButtonTemporary()
-                }
-
             // Stats HUD (Top-Right)
             if isHudVisible {
                 VStack {
@@ -704,43 +911,6 @@ public struct ContentView: View {
                     insertion: .move(edge: .top).combined(with: .opacity),
                     removal: .opacity
                 ))
-            }
-
-            // Disconnect Button (Bottom Center, tap-to-reveal)
-            if isDisconnectButtonVisible {
-                VStack {
-                    Spacer()
-                    Button(action: {
-                        withAnimation { networkManager.stop() }
-                    }) {
-                        HStack(spacing: 8) {
-                            Image(systemName: "xmark.circle.fill").font(.system(size: 18))
-                            Text("Disconnect Stream")
-                                .font(.system(size: 14, weight: .semibold, design: .rounded))
-                        }
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 24).padding(.vertical, 12)
-                        .background(Color.red.opacity(0.85)).cornerRadius(24)
-                        .overlay(RoundedRectangle(cornerRadius: 24).stroke(Color.white.opacity(0.2), lineWidth: 1))
-                        .shadow(color: .red.opacity(0.3), radius: 10, x: 0, y: 5)
-                    }
-                    .padding(.bottom, 24)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-            }
-        }
-    }
-
-    // MARK: - Helpers
-
-    private func showDisconnectButtonTemporary() {
-        dismissTimer?.invalidate()
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-            isDisconnectButtonVisible = true
-        }
-        dismissTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { _ in
-            withAnimation(.easeOut(duration: 0.25)) {
-                isDisconnectButtonVisible = false
             }
         }
     }

@@ -1,5 +1,49 @@
 import Foundation
 
+enum WifiHostIdentityDecision: Equatable {
+    case trusted
+    case requiresFirstPairingConfirmation
+    case rejected
+}
+
+enum WifiHostIdentityPolicy {
+    static func decide(
+        presentedFingerprint: String,
+        pinnedFingerprint: String?
+    ) -> WifiHostIdentityDecision {
+        guard let presented = normalizedFingerprint(presentedFingerprint) else {
+            return .rejected
+        }
+        guard let pinnedFingerprint else {
+            return .requiresFirstPairingConfirmation
+        }
+        guard let pinned = normalizedFingerprint(pinnedFingerprint) else {
+            return .rejected
+        }
+        return presented == pinned ? .trusted : .rejected
+    }
+
+    static func identityCode(for fingerprint: String) -> String? {
+        guard let normalized = normalizedFingerprint(fingerprint) else { return nil }
+        let prefix = normalized.prefix(16)
+        return stride(from: 0, to: prefix.count, by: 4)
+            .map { offset in
+                let start = prefix.index(prefix.startIndex, offsetBy: offset)
+                let end = prefix.index(start, offsetBy: 4)
+                return String(prefix[start..<end])
+            }
+            .joined(separator: "-")
+    }
+
+    private static func normalizedFingerprint(_ fingerprint: String) -> String? {
+        let normalized = fingerprint
+            .filter { $0.isHexDigit }
+            .uppercased()
+        guard normalized.count == 64 else { return nil }
+        return normalized
+    }
+}
+
 enum RealtimeTransportMode {
     static let none: UInt8 = 0
     static let legacyTLS: UInt8 = 1
@@ -73,7 +117,6 @@ struct ClientCapabilities: Equatable {
               modes & ~RealtimeTransportMode.knownMask == 0,
               videoCodecs != VideoCodecCapabilities.none,
               videoCodecs & ~VideoCodecCapabilities.knownMask == 0,
-              audioCodecs != AudioCodecCapabilities.none,
               audioCodecs & ~AudioCodecCapabilities.knownMask == 0,
               (576...1200).contains(preferredMTU),
               (25...200).contains(feedbackIntervalMs) else { return false }
@@ -206,8 +249,7 @@ struct TransportOffer: Equatable {
         version == 1 &&
         isSingleTransportMode(mode) &&
         videoCodec == VideoCodecCapabilities.hevc &&
-        (audioCodec == AudioCodecCapabilities.pcm ||
-         audioCodec == AudioCodecCapabilities.opus) &&
+        isValidAudioSelection(mode: mode, audioCodec: audioCodec) &&
         (576...1200).contains(mtu) &&
         (25...200).contains(feedbackIntervalMs) &&
         (((mode & RealtimeTransportMode.wifiRTP) != 0) ==
@@ -371,7 +413,8 @@ private func isValidAudioSelection(mode: UInt8, audioCodec: UInt8) -> Bool {
     (mode == RealtimeTransportMode.legacyTLS &&
      audioCodec == AudioCodecCapabilities.pcm) ||
     (mode == RealtimeTransportMode.wifiRTP &&
-     audioCodec == AudioCodecCapabilities.opus) ||
+     (audioCodec == AudioCodecCapabilities.opus ||
+      audioCodec == AudioCodecCapabilities.none)) ||
     (mode == RealtimeTransportMode.usbSplitTLS &&
      (audioCodec == AudioCodecCapabilities.opus ||
       audioCodec == AudioCodecCapabilities.none))
