@@ -27,7 +27,7 @@ final class WifiTransportNegotiationTests: XCTestCase {
 
     func testIdentityCodeIsStableAndHumanVerifiable() {
         let fingerprint = "00112233445566778899AABBCCDDEEFF" +
-            String(repeating: "00", count: 24)
+            String(repeating: "00", count: 16)
 
         XCTAssertEqual(
             WifiHostIdentityPolicy.identityCode(for: fingerprint),
