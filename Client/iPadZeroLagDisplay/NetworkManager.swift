@@ -1959,6 +1959,7 @@ public class NetworkManager: ObservableObject {
             case .failed(let error):
                 self.connectionTimeoutWorkItem?.cancel()
                 print("[IPAD][NW_STATE] failed error=\(error)")
+                let shouldReconnect = self.connection != nil
                 self.controlChannelWriter.cancel()
                 self.committedTransportGeneration = nil
                 self.advertisedClientCapabilities = nil
@@ -1966,7 +1967,7 @@ public class NetworkManager: ObservableObject {
                 self.connection = nil
                 if self.usbListener != nil {
                     self.setState(.listening)
-                } else {
+                } else if shouldReconnect {
                     self.setState(.disconnected(reason: error.localizedDescription))
                     self.scheduleAutoReconnect(reset: false)
                 }
@@ -1974,6 +1975,7 @@ public class NetworkManager: ObservableObject {
             case .cancelled:
                 self.connectionTimeoutWorkItem?.cancel()
                 print("[IPAD][NW_STATE] cancelled")
+                let shouldReconnect = self.connection != nil
                 self.controlChannelWriter.cancel()
                 self.committedTransportGeneration = nil
                 self.advertisedClientCapabilities = nil
@@ -1981,7 +1983,7 @@ public class NetworkManager: ObservableObject {
                 self.connection = nil
                 if self.usbListener != nil {
                     self.setState(.listening)
-                } else if self.connectionState != .idle {
+                } else if shouldReconnect && self.connectionState != .idle {
                     self.setState(.disconnected(reason: "Connection cancelled."))
                     self.scheduleAutoReconnect(reset: false)
                 }
@@ -2124,9 +2126,25 @@ public class NetworkManager: ObservableObject {
             return
         }
         let bitrateMbps = Double(state.bitrateBps) / 1_000_000
+        let audioChanged = committedAudioEnabled != state.audioEnabled
         settingsGeneration = state.generation
         committedBitrateMbps = bitrateMbps
         committedAudioEnabled = state.audioEnabled
+        if audioChanged && committedTransportGeneration == connectionGeneration {
+            if state.audioEnabled {
+                if committedRealtimeMode == RealtimeTransportMode.wifiRTP {
+                    AudioManager.shared.beginRealtimeSession(
+                        generation: connectionGeneration,
+                        profile: .wifi)
+                } else if committedRealtimeMode == RealtimeTransportMode.usbSplitTLS {
+                    AudioManager.shared.beginRealtimeSession(
+                        generation: connectionGeneration,
+                        profile: .usb)
+                }
+            } else {
+                AudioManager.shared.reset()
+            }
+        }
         DispatchQueue.main.async {
             self.targetBitrateMbps = bitrateMbps
             self.audioEnabled = state.audioEnabled
@@ -3008,7 +3026,7 @@ public class NetworkManager: ObservableObject {
         wifiLegacyFallbackGeneration = nil
         wifiLegacyFallbackRequestGeneration = nil
         decoder.beginSession(generation: generation)
-        if mode == RealtimeTransportMode.wifiRTP {
+        if mode == RealtimeTransportMode.wifiRTP && audioEnabled {
             AudioManager.shared.beginRealtimeSession(
                 generation: generation,
                 profile: .wifi)
@@ -3229,6 +3247,10 @@ public class NetworkManager: ObservableObject {
 
     private func handleStreamError(_ reason: String) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        // A failed NWConnection can deliver both an error and a subsequent
+        // cancelled callback. The first teardown owns reconnect scheduling;
+        // the second callback must not start another retry chain.
+        guard connection != nil else { return }
         let failedGeneration = connectionGenerationClock.advance()
         wireReceiveActiveGeneration = nil
         wireAuthenticatedGeneration = nil
