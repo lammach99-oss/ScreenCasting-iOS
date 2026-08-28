@@ -257,6 +257,7 @@ enum TrustedReconnectPolicy {
 }
 
 struct TrustedSettingsState: Equatable {
+    let requestID: UInt32
     let generation: UInt64
     let bitrateBps: UInt32
     let audioEnabled: Bool
@@ -267,6 +268,9 @@ struct TrustedSettingsState: Equatable {
               payload[2] <= 4, payload[3] == 0,
               payload[20] == 0, payload[21] == 0,
               payload[22] == 0, payload[23] == 0 else { return nil }
+        let requestID = payload.withUnsafeBytes {
+            $0.loadUnaligned(fromByteOffset: 4, as: UInt32.self).littleEndian
+        }
         let generation = payload.withUnsafeBytes {
             $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self).littleEndian
         }
@@ -276,6 +280,7 @@ struct TrustedSettingsState: Equatable {
         guard bitrateBps >= 3_000_000, bitrateBps <= 50_000_000,
               bitrateBps.isMultiple(of: 1_000_000) else { return nil }
         return TrustedSettingsState(
+            requestID: requestID,
             generation: generation,
             bitrateBps: bitrateBps,
             audioEnabled: payload[1] == 1,
@@ -1137,6 +1142,8 @@ public class NetworkManager: ObservableObject {
     private var nextSettingsRequestID: UInt32 = 1
     private var committedBitrateMbps: Double = 20
     private var committedAudioEnabled = true
+    private var latestSettingsRequestID: UInt32 = 0
+    private var latestSettingsExpectedGeneration: UInt64 = 0
 
     // Convenience computed properties so existing views don't break
     public var isConnected:  Bool { connectionState == .streaming }
@@ -1155,6 +1162,7 @@ public class NetworkManager: ObservableObject {
     private var isForegroundActive = true
     private var reconnectEnabled = true
     private var reconnectAttempt = 0
+    private var reconnectGeneration: UInt64 = 0
     private var reconnectWorkItem: DispatchWorkItem?
     private var connectionTimeoutWorkItem: DispatchWorkItem?
     private var usbListener: NWListener?
@@ -1600,20 +1608,23 @@ public class NetworkManager: ObservableObject {
               roundedMbps >= 3, roundedMbps <= 50 else { return }
         let requestID = nextSettingsRequestID
         nextSettingsRequestID &+= 1
+        let expectedGeneration = settingsGeneration
         var payload = Data(count: 24)
         payload.withUnsafeMutableBytes { bytes in
             bytes.storeBytes(of: UInt8(1), toByteOffset: 0, as: UInt8.self)
             bytes.storeBytes(of: audioEnabled ? UInt8(1) : UInt8(0), toByteOffset: 1, as: UInt8.self)
             bytes.storeBytes(of: UInt8(0), toByteOffset: 2, as: UInt8.self)
             bytes.storeBytes(of: requestID.littleEndian, toByteOffset: 4, as: UInt32.self)
-            bytes.storeBytes(of: settingsGeneration.littleEndian, toByteOffset: 8, as: UInt64.self)
+            bytes.storeBytes(of: expectedGeneration.littleEndian, toByteOffset: 8, as: UInt64.self)
             bytes.storeBytes(
                 of: UInt32(roundedMbps * 1_000_000).littleEndian,
                 toByteOffset: 16,
                 as: UInt32.self)
         }
+        latestSettingsRequestID = requestID
+        latestSettingsExpectedGeneration = expectedGeneration
         settingsApplyStatus = "Applying…"
-        print("[IPAD][SETTINGS_UPDATE] request=\(requestID) expected_generation=\(settingsGeneration) bitrate_bps=\(UInt32(roundedMbps * 1_000_000)) audio=\(audioEnabled)")
+        print("[IPAD][SETTINGS_UPDATE] request=\(requestID) expected_generation=\(expectedGeneration) bitrate_bps=\(UInt32(roundedMbps * 1_000_000)) audio=\(audioEnabled)")
         sendWireMessage(type: .settingsUpdate, payload: payload, sequence: requestID)
     }
 
@@ -2012,6 +2023,8 @@ public class NetworkManager: ObservableObject {
 
     private func scheduleAutoReconnect(reset: Bool) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        reconnectGeneration &+= 1
+        let generation = reconnectGeneration
         let lastKnownHost = UserDefaults.standard.string(
             forKey: Self.lastKnownHostKey)
         guard TrustedReconnectPolicy.shouldSchedule(
@@ -2025,9 +2038,13 @@ public class NetworkManager: ObservableObject {
         reconnectAttempt += 1
         print("[IPAD][AUTO_RECONNECT_ATTEMPT] attempt=\(reconnectAttempt) delay=\(delay)")
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.isForegroundActive, self.reconnectEnabled else { return }
+            guard let self, self.isForegroundActive, self.reconnectEnabled,
+                  self.reconnectGeneration == generation else { return }
             DispatchQueue.main.async {
-                guard self.connection == nil else { return }
+                guard self.isForegroundActive,
+                      self.reconnectEnabled,
+                      self.reconnectGeneration == generation,
+                      self.connection == nil else { return }
                 print("[IPAD][AUTO_RECONNECT_BEGIN] endpoint=last_known")
                 self.connect(to: host)
             }
@@ -2101,6 +2118,11 @@ public class NetworkManager: ObservableObject {
     ) {
         guard let state = TrustedSettingsState.decode(payload),
               state.generation >= settingsGeneration else { return }
+        let isLatest = state.requestID == 0 || state.requestID == latestSettingsRequestID
+        if !isLatest && state.generation <= latestSettingsExpectedGeneration {
+            print("[IPAD][SETTINGS_STALE] request=\(state.requestID) expected=\(latestSettingsRequestID) generation=\(state.generation)")
+            return
+        }
         let bitrateMbps = Double(state.bitrateBps) / 1_000_000
         settingsGeneration = state.generation
         committedBitrateMbps = bitrateMbps
@@ -2109,10 +2131,12 @@ public class NetworkManager: ObservableObject {
             self.targetBitrateMbps = bitrateMbps
             self.audioEnabled = state.audioEnabled
             self.isAdaptiveBitrate = false
-            self.settingsApplyStatus = rejected ? "Failed" : "Applied"
+            if isLatest {
+                self.settingsApplyStatus = rejected ? "Failed" : "Applied"
+            }
         }
         transportTelemetry.recordBitrateMbps(bitrateMbps)
-        print("[IPAD][SETTINGS_RESULT] generation=\(state.generation) bitrate_bps=\(state.bitrateBps) audio=\(state.audioEnabled) rejected=\(rejected)")
+        print("[IPAD][SETTINGS_RESULT] request=\(state.requestID) expected=\(latestSettingsExpectedGeneration) generation=\(state.generation) bitrate_bps=\(state.bitrateBps) audio=\(state.audioEnabled) rejected=\(rejected)")
     }
 
     /// Reads exactly the minimum response bytes for AUTH_SUCCESS or AUTH_FAILED.
@@ -2493,10 +2517,9 @@ public class NetworkManager: ObservableObject {
                 reconnectEnabled = false
                 print("[IPAD][TRUSTED_HOST_FORGOTTEN] credential=deleted")
                 stop()
-                // Forgetting removes only the credential.  Leave discovery
-                // and an explicitly initiated/selected reconnect available;
-                // the next connection will still follow the PIN path because
-                // the trusted credential was deleted above.
+                // Forgetting removes only the credential. Keep discovery and
+                // an explicit reconnect available; the next connection still
+                // follows the PIN path because the credential was deleted.
                 reconnectEnabled = true
             } else {
                 DispatchQueue.main.async {
