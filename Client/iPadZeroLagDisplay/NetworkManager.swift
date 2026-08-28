@@ -1151,6 +1151,7 @@ public class NetworkManager: ObservableObject {
 
     // MARK: Private
     private var connection: NWConnection?
+    private var lastEndpoint: NWEndpoint?
     private var verifiedHostFingerprint: String?
     private var verifiedHostIdentityCode: String?
     private var hostIdentityConfirmationRequired = false
@@ -1345,6 +1346,8 @@ public class NetworkManager: ObservableObject {
     /// - Parameter endpoint: The resolved NWEndpoint (service endpoint or hostPort)
     public func connect(to endpoint: NWEndpoint) {
         guard connectionState == .idle || isDisconnected else { return }
+
+        lastEndpoint = endpoint
 
         _ = connectionGenerationClock.advance()
         // Settings generations are scoped to the Host credential/session.
@@ -2528,6 +2531,7 @@ public class NetworkManager: ObservableObject {
         case .forgetDeviceResult:
             guard payload.count == 2, payload[0] == 1 else { return }
             if payload[1] == 1, let fingerprint = verifiedHostFingerprint {
+                let endpoint = lastEndpoint
                 trustedCredentialStore.delete(fingerprint: fingerprint)
                 trustedHostFingerprintStore.delete()
                 trustedCredential = nil
@@ -2539,6 +2543,12 @@ public class NetworkManager: ObservableObject {
                 // an explicit reconnect available; the next connection still
                 // follows the PIN path because the credential was deleted.
                 reconnectEnabled = true
+                if let endpoint {
+                    networkQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                        guard let self, self.isForegroundActive else { return }
+                        self.connect(to: endpoint)
+                    }
+                }
             } else {
                 DispatchQueue.main.async {
                     self.settingsApplyStatus = "Forget failed"
