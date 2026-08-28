@@ -381,6 +381,9 @@ public final class DecoderManager {
     private var spsData: Data?
     private var ppsData: Data?
     private var activeCodec: VideoDecoderCodec = .hevc
+    // A format-set change (for example landscape -> portrait) invalidates
+    // reference pictures. Wait for the next IRAP/IDR before decoding frames.
+    private var hevcKeyframeRequired = false
     private var hasDecodedH264Idr = false
     private var parameterSetSessionGate = HevcParameterSetSessionGate()
     private var activeParameterSetSignature: HevcParameterSetSignature? {
@@ -505,6 +508,10 @@ public final class DecoderManager {
             return
         }
         guard activeCodec != .h264 || accessUnit.isIDR || hasDecodedH264Idr else {
+            finish(ticket, lifetime: lifetime, succeeded: false)
+            return
+        }
+        guard activeCodec != .hevc || !hevcKeyframeRequired || accessUnit.isIDR else {
             finish(ticket, lifetime: lifetime, succeeded: false)
             return
         }
@@ -757,6 +764,7 @@ public final class DecoderManager {
         let previousSession = decompressionSession
         formatDescription = description
         decompressionSession = session
+        hevcKeyframeRequired = true
         setPropertyIfSupported(
             session,
             key: kVTDecompressionPropertyKey_RealTime,
@@ -879,6 +887,9 @@ public final class DecoderManager {
                 imageBuffer,
                 lifetime.sequence,
                 ticket.sessionGeneration)
+            if activeCodec == .hevc, ticket.unit.isIDR {
+                hevcKeyframeRequired = false
+            }
         }
         lifetime.finish()
         if let next = completion.next {
@@ -901,6 +912,7 @@ public final class DecoderManager {
             spsData = nil
             ppsData = nil
             activeCodec = .hevc
+            hevcKeyframeRequired = false
             hasDecodedH264Idr = false
             parameterSetSessionGate.reset()
             h264ParameterSetSessionGate.reset()
