@@ -1339,6 +1339,12 @@ public class NetworkManager: ObservableObject {
         guard connectionState == .idle || isDisconnected else { return }
 
         _ = connectionGenerationClock.advance()
+        // Settings generations are scoped to the Host credential/session.
+        // After Forget Host (or a fresh pairing), the Host may legitimately
+        // start again at generation zero; retaining the old value would cause
+        // the client to discard the authoritative state and send stale writes.
+        settingsGeneration = 0
+        settingsApplyStatus = ""
         verifiedHostFingerprint = nil
         verifiedHostIdentityCode = nil
         hostIdentityCode = nil
@@ -1395,12 +1401,13 @@ public class NetworkManager: ObservableObject {
             self.isForegroundActive = false
             self.reconnectWorkItem?.cancel()
             self.reconnectWorkItem = nil
-            if self.connection != nil &&
-                self.wireAuthenticatedGeneration != self.connectionGeneration {
-                self.connectionTimeoutWorkItem?.cancel()
-                self.connection?.cancel()
-                self.connection = nil
-                print("[IPAD][AUTO_RECONNECT_CANCELLED] reason=background")
+            if self.connection != nil {
+                // An authenticated NWConnection may remain non-nil while iOS
+                // suspends its receive callbacks. Tear it down so the next
+                // foreground transition cannot mistake a stale socket for a
+                // live session and skip reconnect.
+                self.handleStreamError(
+                    "Application backgrounded; reconnecting on resume.")
             }
             print("[IPAD][APP_LIFECYCLE] state=background")
         }
@@ -1606,6 +1613,7 @@ public class NetworkManager: ObservableObject {
                 as: UInt32.self)
         }
         settingsApplyStatus = "Applying…"
+        print("[IPAD][SETTINGS_UPDATE] request=\(requestID) expected_generation=\(settingsGeneration) bitrate_bps=\(UInt32(roundedMbps * 1_000_000)) audio=\(audioEnabled)")
         sendWireMessage(type: .settingsUpdate, payload: payload, sequence: requestID)
     }
 
@@ -2104,6 +2112,7 @@ public class NetworkManager: ObservableObject {
             self.settingsApplyStatus = rejected ? "Failed" : "Applied"
         }
         transportTelemetry.recordBitrateMbps(bitrateMbps)
+        print("[IPAD][SETTINGS_RESULT] generation=\(state.generation) bitrate_bps=\(state.bitrateBps) audio=\(state.audioEnabled) rejected=\(rejected)")
     }
 
     /// Reads exactly the minimum response bytes for AUTH_SUCCESS or AUTH_FAILED.
@@ -2484,6 +2493,11 @@ public class NetworkManager: ObservableObject {
                 reconnectEnabled = false
                 print("[IPAD][TRUSTED_HOST_FORGOTTEN] credential=deleted")
                 stop()
+                // Forgetting removes only the credential.  Leave discovery
+                // and an explicitly initiated/selected reconnect available;
+                // the next connection will still follow the PIN path because
+                // the trusted credential was deleted above.
+                reconnectEnabled = true
             } else {
                 DispatchQueue.main.async {
                     self.settingsApplyStatus = "Forget failed"
