@@ -1117,6 +1117,7 @@ public class NetworkManager: ObservableObject {
 
     // MARK: Published State
     @Published public var connectionState: ConnectionState = .idle
+    public var connectionGenerationForDiagnostics: UInt64 { connectionGeneration }
     public private(set) var bytesReceived: UInt64 = 0
     @Published public private(set) var hostFingerprint: String?
     @Published public private(set) var hostIdentityCode: String?

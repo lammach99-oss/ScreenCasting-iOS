@@ -337,8 +337,19 @@ public struct ContentView: View {
         }
         .animation(.spring(response: 0.35, dampingFraction: 0.85), value: isPINPhase)
         .onChange(of: networkManager.connectionState) { _, newState in
+            if newState == .streaming {
+                print("[IPAD][TRANSPORT_STREAMING_ENTERED] generation=\(networkManager.connectionGenerationForDiagnostics)")
+                print("[IPAD][VIDEO_SURFACE_MOUNTED] waitingForFirstFrame=true")
+            }
             if newState == .awaitingPIN, enteredPIN.count == 4 {
                 networkManager.sendAuthPIN(enteredPIN)
+            }
+        }
+        .onChange(of: networkManager.currentVideoFrameReady) { _, ready in
+            if ready {
+                print("[IPAD][VIDEO_HEALTHY] currentGeneration=true")
+            } else if networkManager.connectionState == .streaming {
+                print("[IPAD][WAITING_FOR_FIRST_FRAME] currentGeneration=true")
             }
         }
         .onChange(of: scenePhase) { _, phase in
@@ -431,7 +442,10 @@ public struct ContentView: View {
 
     @ViewBuilder
     private var backgroundLayer: some View {
-        if streamManager.isConnected {
+        // Transport commitment controls renderer lifetime. Video health is a
+        // separate gate and remains false until a current-generation drawable
+        // is presented, so the renderer must mount before that first frame.
+        if networkManager.connectionState == .streaming {
             connectedVideoSurface
         } else {
             // Premium Disconnected Background
