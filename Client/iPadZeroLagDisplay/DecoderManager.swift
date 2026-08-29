@@ -440,6 +440,21 @@ public final class DecoderManager {
         }
     }
 
+    /// Drop inter-frames after a live stream setting changes. The host keeps
+    /// the same codec configuration, but the decoder may still hold reference
+    /// pictures from before the encoder refresh. The next IDR restores a clean
+    /// reference chain without recreating the VideoToolbox session.
+    public func requireKeyFrame() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if self.activeCodec == .hevc {
+                self.hevcKeyframeRequired = true
+            } else {
+                self.hasDecodedH264Idr = false
+            }
+        }
+    }
+
     /// Transfers the SCST payload into the capacity-one mailbox and returns
     /// without waiting for the decoder queue.
     public func processInputData(

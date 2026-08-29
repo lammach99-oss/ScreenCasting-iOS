@@ -2132,10 +2132,14 @@ public class NetworkManager: ObservableObject {
             return
         }
         let bitrateMbps = Double(state.bitrateBps) / 1_000_000
+        let bitrateChanged = committedBitrateMbps != bitrateMbps
         let audioChanged = committedAudioEnabled != state.audioEnabled
         settingsGeneration = state.generation
         committedBitrateMbps = bitrateMbps
         committedAudioEnabled = state.audioEnabled
+        if audioChanged || bitrateChanged {
+            decoder.requireKeyFrame()
+        }
         if audioChanged && committedTransportGeneration == connectionGeneration {
             if state.audioEnabled {
                 if committedRealtimeMode == RealtimeTransportMode.wifiRTP {
