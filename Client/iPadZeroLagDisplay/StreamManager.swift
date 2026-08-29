@@ -27,8 +27,26 @@ public class StreamManager: ObservableObject {
             .sink { [weak self] state in
                 guard let self = self else { return }
                 let streaming = (state == .streaming)
-                self.isConnected = streaming
+                self.isConnected = streaming && self.networkManager.currentVideoFrameReady
                 if !streaming {
+                    self.frameCountLock.lock()
+                    self.frameCount = 0
+                    self.frameCountLock.unlock()
+                    self.currentFPS = 0.0
+                    self.frameReceiveMs = 0.0
+                }
+            }
+            .store(in: &cancellables)
+
+        networkManager.$currentVideoFrameReady
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] ready in
+                guard let self else { return }
+                self.isConnected = ready && self.networkManager.connectionState == .streaming
+                if !ready {
+                    self.frameCountLock.lock()
+                    self.frameCount = 0
+                    self.frameCountLock.unlock()
                     self.currentFPS = 0.0
                     self.frameReceiveMs = 0.0
                 }
@@ -68,6 +86,7 @@ public class StreamManager: ObservableObject {
 
     /// Increments frame counter. Call this each time a frame is decoded/rendered.
     public func registerFrameRendered() {
+        guard networkManager.currentVideoFrameReady else { return }
         frameCountLock.lock()
         frameCount += 1
         frameCountLock.unlock()

@@ -1345,6 +1345,13 @@ public class NetworkManager: ObservableObject {
     /// Connect to the Windows host over TLS using an NWEndpoint directly (e.g. from Bonjour discovery).
     /// - Parameter endpoint: The resolved NWEndpoint (service endpoint or hostPort)
     public func connect(to endpoint: NWEndpoint) {
+        networkQueue.async { [weak self] in
+            self?.startConnection(to: endpoint)
+        }
+    }
+
+    private func startConnection(to endpoint: NWEndpoint) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
         // Claim the socket before publishing state so discovery and lifecycle
         // callbacks cannot create two simultaneous reconnect attempts.
         guard connection == nil,
@@ -1365,9 +1372,7 @@ public class NetworkManager: ObservableObject {
         hostIdentityConfirmationRequired = false
         hostIdentityConfirmed = false
         reconnectWorkItem?.cancel()
-        networkQueue.async { [weak self] in
-            self?.resetDisplaySession()
-        }
+        resetDisplaySession()
         let parameters = buildTLSParameters(for: endpoint)
         connection = NWConnection(to: endpoint, using: parameters)
 
@@ -1430,10 +1435,13 @@ public class NetworkManager: ObservableObject {
     }
 
     public func connectDiscoveredHostIfNeeded(_ endpoint: NWEndpoint) {
-        guard isForegroundActive,
-              reconnectEnabled,
-              connectionState == .idle || isDisconnected else { return }
-        connect(to: endpoint)
+        networkQueue.async { [weak self] in
+            guard let self, self.isForegroundActive,
+                  self.reconnectEnabled,
+                  self.connection == nil,
+                  self.connectionState == .idle || self.isDisconnected else { return }
+            self.startConnection(to: endpoint)
+        }
     }
 
     /// Confirms the displayed Wi-Fi Host identity after the user compares it
@@ -2055,14 +2063,14 @@ public class NetworkManager: ObservableObject {
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.isForegroundActive, self.reconnectEnabled,
                   self.reconnectGeneration == generation else { return }
-            DispatchQueue.main.async {
-                guard self.isForegroundActive,
-                      self.reconnectEnabled,
-                      self.reconnectGeneration == generation,
-                      self.connection == nil else { return }
-                print("[IPAD][AUTO_RECONNECT_BEGIN] endpoint=last_known")
-                self.connect(to: host)
-            }
+            guard self.isForegroundActive,
+                  self.reconnectEnabled,
+                  self.reconnectGeneration == generation,
+                  self.connection == nil else { return }
+            print("[IPAD][AUTO_RECONNECT_BEGIN] endpoint=last_known")
+            self.startConnection(to: NWEndpoint.hostPort(
+                host: NWEndpoint.Host(host),
+                port: NWEndpoint.Port(rawValue: 27015)!))
         }
         reconnectWorkItem = work
         networkQueue.asyncAfter(deadline: .now() + delay, execute: work)
@@ -3019,6 +3027,7 @@ public class NetworkManager: ObservableObject {
             self?.effectiveDisplayState = nil
             self?.isDisplayConfigurationPending = false
             self?.displayConfigurationFailureMessage = nil
+            self?.currentVideoFrameReady = false
         }
     }
 
@@ -3319,6 +3328,7 @@ public class NetworkManager: ObservableObject {
     /// Last-frame header-and-payload receive duration in milliseconds, not RTT.
     /// Updated on main thread — safe for SwiftUI binding via StreamManager.
     @Published public var lastFrameReceiveDurationMs: Double = 0.0
+    @Published public private(set) var currentVideoFrameReady = false
 
     /// Last-frame VideoToolbox decode latency in milliseconds.
     /// Set by DecoderManager; read by the 2Hz telemetry timer.
@@ -3337,6 +3347,14 @@ public class NetworkManager: ObservableObject {
         transportTelemetry.recordRenderCompletion(
             sequence: sequence,
             generation: generation)
+        guard generation == connectionGeneration else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, generation == self.connectionGeneration else { return }
+            if !self.currentVideoFrameReady {
+                print("[IPAD][FIRST_FRAME_CURRENT_GENERATION] generation=\(generation)")
+            }
+            self.currentVideoFrameReady = true
+        }
     }
 
     public func recordDrawableCommitted(
