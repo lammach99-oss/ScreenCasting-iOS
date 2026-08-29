@@ -3055,10 +3055,16 @@ public class NetworkManager: ObservableObject {
         guard generation == connectionGeneration,
               wireAuthenticatedGeneration == generation,
               committedTransportGeneration != generation else { return }
+        let mediaReason = committedTransportGeneration == nil ? "initial" : "reconnect"
         committedTransportGeneration = generation
         committedRealtimeMode = mode
         wifiLegacyFallbackGeneration = nil
         wifiLegacyFallbackRequestGeneration = nil
+        DispatchQueue.main.async { [weak self] in
+            guard let self, generation == self.connectionGeneration else { return }
+            self.currentVideoFrameReady = false
+            print("[IPAD][MEDIA_GENERATION_BEGIN] generation=\(generation) reason=\(mediaReason)")
+        }
         decoder.beginSession(generation: generation)
         if mode == RealtimeTransportMode.wifiRTP && audioEnabled {
             AudioManager.shared.beginRealtimeSession(
@@ -3345,14 +3351,15 @@ public class NetworkManager: ObservableObject {
         sequence: UInt32,
         generation: UInt64
     ) {
+        guard generation == connectionGeneration else { return }
         transportTelemetry.recordRenderCompletion(
             sequence: sequence,
             generation: generation)
-        guard generation == connectionGeneration else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self, generation == self.connectionGeneration else { return }
             if !self.currentVideoFrameReady {
                 print("[IPAD][FIRST_FRAME_CURRENT_GENERATION] generation=\(generation)")
+                print("[IPAD][VIDEO_READY] generation=\(generation)")
             }
             self.currentVideoFrameReady = true
         }
@@ -3362,12 +3369,14 @@ public class NetworkManager: ObservableObject {
         sequence: UInt32,
         generation: UInt64
     ) {
+        guard generation == connectionGeneration else { return }
         transportTelemetry.recordDrawableCommitted(
             sequence: sequence,
             generation: generation)
     }
 
     public func recordRenderDrop(sequence: UInt32, generation: UInt64) {
+        guard generation == connectionGeneration else { return }
         transportTelemetry.recordRenderDrop(
             sequence: sequence,
             generation: generation)
