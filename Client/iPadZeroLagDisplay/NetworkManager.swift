@@ -1345,7 +1345,10 @@ public class NetworkManager: ObservableObject {
     /// Connect to the Windows host over TLS using an NWEndpoint directly (e.g. from Bonjour discovery).
     /// - Parameter endpoint: The resolved NWEndpoint (service endpoint or hostPort)
     public func connect(to endpoint: NWEndpoint) {
-        guard connectionState == .idle || isDisconnected else { return }
+        // Claim the socket before publishing state so discovery and lifecycle
+        // callbacks cannot create two simultaneous reconnect attempts.
+        guard connection == nil,
+              connectionState == .idle || isDisconnected else { return }
 
         lastEndpoint = endpoint
 
