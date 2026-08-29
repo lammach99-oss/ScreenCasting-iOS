@@ -1405,7 +1405,9 @@ public class NetworkManager: ObservableObject {
             guard let self else { return }
             self.isForegroundActive = true
             print("[IPAD][APP_LIFECYCLE] state=active")
-            self.scheduleAutoReconnect(reset: true)
+            // Give the host a short grace period to observe the background
+            // socket close before opening a replacement TLS session.
+            self.scheduleAutoReconnect(reset: true, minimumDelay: 1.0)
         }
     }
 
@@ -2029,7 +2031,10 @@ public class NetworkManager: ObservableObject {
         sendWireMessage(type: .clientHello, payload: payload, sequence: 0)
     }
 
-    private func scheduleAutoReconnect(reset: Bool) {
+    private func scheduleAutoReconnect(
+        reset: Bool,
+        minimumDelay: TimeInterval = 0
+    ) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         reconnectGeneration &+= 1
         let generation = reconnectGeneration
@@ -2042,7 +2047,9 @@ public class NetworkManager: ObservableObject {
               let host = lastKnownHost else { return }
         if reset { reconnectAttempt = 0 }
         reconnectWorkItem?.cancel()
-        let delay = TrustedReconnectPolicy.delay(forAttempt: reconnectAttempt)
+        let delay = max(
+            minimumDelay,
+            TrustedReconnectPolicy.delay(forAttempt: reconnectAttempt))
         reconnectAttempt += 1
         print("[IPAD][AUTO_RECONNECT_ATTEMPT] attempt=\(reconnectAttempt) delay=\(delay)")
         let work = DispatchWorkItem { [weak self] in
