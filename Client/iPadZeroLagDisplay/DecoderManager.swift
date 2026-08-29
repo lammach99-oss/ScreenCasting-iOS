@@ -413,6 +413,28 @@ public final class DecoderManager {
         mailbox.beginSession(generation: generation)
         localSessionGeneration = generation
         mailboxStateLock.unlock()
+
+        // A reconnect must not reuse the previous VideoToolbox session or
+        // deliver IOSurface-backed buffers whose owner belongs to the old
+        // connection. Flush and invalidate synchronously before the new
+        // generation can submit compressed frames; the next IDR recreates the
+        // format/session state and repopulates the mailbox with fresh surfaces.
+        queue.sync {
+            if let session = decompressionSession {
+                VTDecompressionSessionWaitForAsynchronousFrames(session)
+                VTDecompressionSessionInvalidate(session)
+                decompressionSession = nil
+            }
+            formatDescription = nil
+            vpsData = nil
+            spsData = nil
+            ppsData = nil
+            activeCodec = .hevc
+            hevcKeyframeRequired = false
+            hasDecodedH264Idr = false
+            parameterSetSessionGate.reset()
+            h264ParameterSetSessionGate.reset()
+        }
         onSessionBegan?(generation)
     }
 
