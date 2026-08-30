@@ -472,6 +472,41 @@ final class HevcRtpReassemblerTests: XCTestCase {
         XCTAssertLessThanOrEqual(receiver.pendingOutcomeCount, 2)
     }
 
+    func testExpiredFrameWithMissingAnchorDoesNotStallFollowingFrames() {
+        let receiver = HevcRtpReassembler(
+            mtu: 1_200,
+            initialExpectedSequence: 100)
+        let first = nal(type: 1, count: 20, fill: 1)
+        let following = nal(type: 1, count: 20, fill: 2)
+
+        // Sequence 100 is lost. The frame's marker still establishes its
+        // boundary, so expiry must advance the anchor to sequence 102.
+        XCTAssertEqual(
+            receiver.consume(
+                packet(
+                    sequence: 101, timestamp: 1, frame: 1, capture: 1,
+                    marker: true, payload: first),
+                authentication: .authenticated,
+                arrivalTime: 0,
+                rttP95Ms: 1),
+            .accepted)
+        XCTAssertEqual(
+            receiver.consume(
+                packet(
+                    sequence: 102, timestamp: 2, frame: 2, capture: 2,
+                    marker: true, payload: following),
+                authentication: .authenticated,
+                arrivalTime: 0.020,
+                rttP95Ms: 1),
+            .expired(frameSequence: 1))
+        XCTAssertEqual(
+            receiver.drainOutcome(),
+            .completed(
+                accessUnit: canonical(following),
+                frameSequence: 2,
+                captureTime90k: 2))
+    }
+
     private func anchoredReassembler()
         -> (HevcRtpReassembler, Data)
     {
