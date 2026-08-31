@@ -50,6 +50,7 @@
 		800111111111111111111001 /* THIRD-PARTY-NOTICES.txt in Resources */ = {isa = PBXBuildFile; fileRef = 800211111111111111111001 /* THIRD-PARTY-NOTICES.txt */; };
 		900111111111111111111001 /* SettingsFoundation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 900211111111111111111001 /* SettingsFoundation.swift */; };
 		900111111111111111111002 /* SettingsFoundationContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 900211111111111111111002 /* SettingsFoundationContractTests.swift */; };
+		901111111111111111111001 /* DisplayOrientationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 901211111111111111111001 /* DisplayOrientationTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -109,6 +110,7 @@
 		800211111111111111111001 /* THIRD-PARTY-NOTICES.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../THIRD-PARTY-NOTICES.txt; sourceTree = "<group>"; };
 		900211111111111111111001 /* SettingsFoundation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../Shared/SettingsFoundation.swift; sourceTree = "<group>"; };
 		900211111111111111111002 /* SettingsFoundationContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../Shared/SettingsFoundationContractTests.swift; sourceTree = "<group>"; };
+		901211111111111111111001 /* DisplayOrientationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayOrientationTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -188,6 +190,7 @@
 				600211111111111111111002 /* TransportNegotiationTests.swift */,
 				700211111111111111111002 /* AudioJitterBufferTests.swift */,
 				900211111111111111111002 /* SettingsFoundationContractTests.swift */,
+				901211111111111111111001 /* DisplayOrientationTests.swift */,
 			);
 			path = ../iPadZeroLagDisplayTests;
 			sourceTree = "<group>";
@@ -337,6 +340,7 @@
 				600111111111111111111002 /* TransportNegotiationTests.swift in Sources */,
 				700111111111111111111002 /* AudioJitterBufferTests.swift in Sources */,
 				900111111111111111111002 /* SettingsFoundationContractTests.swift in Sources */,
+				901111111111111111111001 /* DisplayOrientationTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

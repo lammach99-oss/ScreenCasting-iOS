@@ -271,6 +271,7 @@ public struct ContentView: View {
     @State private var presentationGeometry: PresentationSurfaceGeometry?
     @State private var lastGeometrySnapshotLine = ""
     @State private var isSettingsPresented = false
+    @State private var rootSurfaceSize: CGSize = .zero
 
     public init() {
         let netManager = NetworkManager()
@@ -292,15 +293,23 @@ public struct ContentView: View {
         .ignoresSafeArea()
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
+        .background {
+            GeometryReader { proxy in
+                Color.clear
+                    .onAppear {
+                        updateDisplayOrientation(for: proxy.size)
+                    }
+                    .onChange(of: proxy.size) { _, size in
+                        updateDisplayOrientation(for: size)
+                    }
+            }
+        }
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
-            UIDevice.current.beginGeneratingDeviceOrientationNotifications()
-            networkManager.updateInterfaceOrientation(currentInterfaceOrientation())
             discoveryManager.startBrowsing()
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
-            UIDevice.current.endGeneratingDeviceOrientationNotifications()
             discoveryManager.stopBrowsing()
             networkManager.applicationDidEnterBackground()
         }
@@ -356,6 +365,7 @@ public struct ContentView: View {
             switch phase {
             case .active:
                 networkManager.applicationDidBecomeActive()
+                updateDisplayOrientation(for: rootSurfaceSize)
                 if let host = discoveryManager.discoveredHosts.first {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
                         networkManager.connectDiscoveredHostIfNeeded(host.endpoint)
@@ -370,15 +380,6 @@ public struct ContentView: View {
         .onChange(of: discoveryManager.discoveredHosts) { _, hosts in
             guard scenePhase == .active, let host = hosts.first else { return }
             networkManager.connectDiscoveredHostIfNeeded(host.endpoint)
-        }
-        .onReceive(
-            NotificationCenter.default.publisher(
-                for: UIDevice.orientationDidChangeNotification)
-        ) { _ in
-            DispatchQueue.main.async {
-                networkManager.updateInterfaceOrientation(
-                    currentInterfaceOrientation())
-            }
         }
         .sheet(isPresented: $isSettingsPresented) {
             SettingsView(networkManager: networkManager)
@@ -412,13 +413,12 @@ public struct ContentView: View {
         hostIP.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func currentInterfaceOrientation() -> ClientDisplayOrientation {
-        let activeScene = UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .first { $0.activationState == .foregroundActive }
-        return activeScene?.interfaceOrientation.isPortrait == true
-            ? .portrait
-            : .landscape
+    private func updateDisplayOrientation(for size: CGSize) {
+        rootSurfaceSize = size
+        guard let orientation = DisplayOrientationResolver.resolve(
+            width: size.width,
+            height: size.height) else { return }
+        networkManager.updateInterfaceOrientation(orientation)
     }
 
     private var isValidManualIPv4: Bool {

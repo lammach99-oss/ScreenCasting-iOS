@@ -532,10 +532,18 @@ struct DisplayPreference: Equatable {
     }
 }
 
+enum DisplayOrientationResolver {
+    static func resolve(width: CGFloat, height: CGFloat) -> ClientDisplayOrientation? {
+        guard width > 0, height > 0, width != height else { return nil }
+        return height > width ? .portrait : .landscape
+    }
+}
+
 struct DisplayRequestGate {
     private var nextRequestId: UInt32 = 0
     private(set) var pending: DisplayConfigurationRequest?
     private(set) var effective: DisplayReady?
+    private(set) var latestDesired: DisplayConfigurationRequest?
 
     var isInputSuppressed: Bool { pending != nil }
 
@@ -546,49 +554,42 @@ struct DisplayRequestGate {
             refreshHz: requested.refreshHz,
             orientation: requested.orientation,
             requestId: 0)
-        if let pending, sameConfiguration(pending, candidate) {
+        latestDesired = candidate
+        guard pending == nil else { return nil }
+        guard effective == nil || !sameConfiguration(candidate, effective!) else {
+            latestDesired = nil
             return nil
         }
-        if let effective,
-           effective.width == candidate.width,
-           effective.height == candidate.height,
-           effective.refreshHz == candidate.refreshHz,
-           effective.orientation == candidate.orientation {
-            return nil
-        }
-
-        nextRequestId &+= 1
-        if nextRequestId == 0 { nextRequestId = 1 }
-        let issued = DisplayConfigurationRequest(
-            width: candidate.width,
-            height: candidate.height,
-            refreshHz: candidate.refreshHz,
-            orientation: candidate.orientation,
-            requestId: nextRequestId)
-        pending = issued
-        return issued
+        return issue(candidate)
     }
 
-    mutating func accept(_ ready: DisplayReady) -> Bool {
+    mutating func accept(_ ready: DisplayReady) -> DisplayConfigurationRequest? {
         guard let pending,
               pending.requestId == ready.requestId,
               sameConfiguration(pending, ready) else {
-            return false
+            return nil
         }
         effective = ready
         self.pending = nil
-        return true
+        guard let latestDesired,
+              !sameConfiguration(latestDesired, ready) else {
+            self.latestDesired = nil
+            return nil
+        }
+        return issue(latestDesired)
     }
 
-    mutating func reject(_ failed: DisplayConfigurationFailed) -> Bool {
-        guard pending?.requestId == failed.requestId else { return false }
+    mutating func reject(_ failed: DisplayConfigurationFailed) -> DisplayConfigurationRequest? {
+        guard pending?.requestId == failed.requestId else { return nil }
         pending = nil
-        return true
+        guard let latestDesired else { return nil }
+        return issue(latestDesired)
     }
 
     mutating func reset() {
         pending = nil
         effective = nil
+        latestDesired = nil
     }
 
     private func sameConfiguration(
@@ -609,6 +610,21 @@ struct DisplayRequestGate {
         request.height == ready.height &&
         request.refreshHz == ready.refreshHz &&
         request.orientation == ready.orientation
+    }
+
+    private mutating func issue(
+        _ candidate: DisplayConfigurationRequest
+    ) -> DisplayConfigurationRequest {
+        nextRequestId &+= 1
+        if nextRequestId == 0 { nextRequestId = 1 }
+        let issued = DisplayConfigurationRequest(
+            width: candidate.width,
+            height: candidate.height,
+            refreshHz: candidate.refreshHz,
+            orientation: candidate.orientation,
+            requestId: nextRequestId)
+        pending = issued
+        return issued
     }
 }
 
@@ -1294,7 +1310,8 @@ public class NetworkManager: ObservableObject {
     private var activeDisplayPreference = DisplayPreference.defaultValue
     private var displayRequestGate = DisplayRequestGate()
     private var pendingDisplayPreference: DisplayPreference?
-    private var observedInterfaceOrientation: ClientDisplayOrientation = .landscape
+    private var latestDisplayPreference: DisplayPreference?
+    private var observedInterfaceOrientation: ClientDisplayOrientation?
     private var orientationDebounceWorkItem: DispatchWorkItem?
 
     public init() {
@@ -1701,9 +1718,10 @@ public class NetworkManager: ObservableObject {
     func applyDisplayPreference(_ preference: DisplayPreference) {
         networkQueue.async { [weak self] in
             guard let self else { return }
+            guard let orientation = self.observedInterfaceOrientation else { return }
             self.requestDisplayConfiguration(
                 preference: preference,
-                interfaceOrientation: self.observedInterfaceOrientation)
+                interfaceOrientation: orientation)
         }
     }
 
@@ -1723,7 +1741,7 @@ public class NetworkManager: ObservableObject {
                 }
                 self.requestDisplayConfiguration(
                     preference: self.activeDisplayPreference,
-                    interfaceOrientation: self.observedInterfaceOrientation)
+                    interfaceOrientation: orientation)
             }
             self.orientationDebounceWorkItem = workItem
             self.networkQueue.asyncAfter(
@@ -2955,9 +2973,10 @@ public class NetworkManager: ObservableObject {
             self?.displayCapabilities = capabilities
             self?.displayConfigurationFailureMessage = nil
         }
+        guard let orientation = observedInterfaceOrientation else { return }
         requestDisplayConfiguration(
             preference: reconciledPreference,
-            interfaceOrientation: observedInterfaceOrientation)
+            interfaceOrientation: orientation)
     }
 
     private func requestDisplayConfiguration(
@@ -2971,6 +2990,7 @@ public class NetworkManager: ObservableObject {
         }
 
         let reconciledPreference = preference.reconciled(with: capabilities)
+        latestDisplayPreference = reconciledPreference
         let proposed = reconciledPreference.makeRequest(
             interfaceOrientation: interfaceOrientation,
             requestId: 0)
@@ -2988,11 +3008,25 @@ public class NetworkManager: ObservableObject {
 
     private func receiveDisplayReady(_ ready: DisplayReady) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
-        guard displayRequestGate.accept(ready),
+        guard displayRequestGate.pending?.requestId == ready.requestId else {
+            return
+        }
+        let nextRequest = displayRequestGate.accept(ready)
+        if let nextRequest,
+           let latestPreference = latestDisplayPreference {
+            pendingDisplayPreference = latestPreference
+            sendWireMessage(
+                type: .displayConfigurationRequest,
+                payload: nextRequest.encode(),
+                sequence: nextRequest.requestId)
+            return
+        }
+        guard displayRequestGate.effective != nil,
               let appliedPreference = pendingDisplayPreference else {
             return
         }
         pendingDisplayPreference = nil
+        latestDisplayPreference = nil
         activeDisplayPreference = appliedPreference
         DisplayPreferenceStore.save(appliedPreference)
         DispatchQueue.main.async { [weak self] in
@@ -3007,8 +3041,22 @@ public class NetworkManager: ObservableObject {
         _ failure: DisplayConfigurationFailed
     ) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
-        guard displayRequestGate.reject(failure) else { return }
+        guard displayRequestGate.pending?.requestId == failure.requestId else {
+            return
+        }
+        let nextRequest = displayRequestGate.reject(failure)
+        guard displayRequestGate.pending == nil else { return }
+        if let nextRequest,
+           let latestPreference = latestDisplayPreference {
+            pendingDisplayPreference = latestPreference
+            sendWireMessage(
+                type: .displayConfigurationRequest,
+                payload: nextRequest.encode(),
+                sequence: nextRequest.requestId)
+            return
+        }
         pendingDisplayPreference = nil
+        latestDisplayPreference = nil
         DispatchQueue.main.async { [weak self] in
             self?.isDisplayConfigurationPending = false
             self?.displayConfigurationFailureMessage =
@@ -3022,6 +3070,7 @@ public class NetworkManager: ObservableObject {
         orientationDebounceWorkItem = nil
         activeDisplayCapabilities = nil
         pendingDisplayPreference = nil
+        latestDisplayPreference = nil
         displayRequestGate.reset()
         DispatchQueue.main.async { [weak self] in
             self?.displayCapabilities = nil
