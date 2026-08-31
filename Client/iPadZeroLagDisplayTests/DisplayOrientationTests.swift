@@ -12,6 +12,32 @@ final class DisplayOrientationTests: XCTestCase {
             .landscape)
     }
 
+    func testCapabilitiesBeforeGeometryEmitsOnePortraitRequest() {
+        var gate = DisplayRequestGate()
+        let portrait = DisplayConfigurationRequest(
+            width: 1668, height: 2388, refreshHz: 60,
+            orientation: .portrait, requestId: 0)
+
+        XCTAssertNil(gate.pending)
+        let request = try! XCTUnwrap(gate.begin(portrait))
+        XCTAssertEqual((request.width, request.height), (1668, 2388))
+        XCTAssertNil(gate.begin(portrait))
+    }
+
+    func testGeometryBeforeCapabilitiesEmitsOnePortraitRequest() {
+        var gate = DisplayRequestGate()
+        let portrait = DisplayConfigurationRequest(
+            width: 1668, height: 2388, refreshHz: 60,
+            orientation: .portrait, requestId: 0)
+
+        let request = try! XCTUnwrap(gate.begin(portrait))
+        _ = gate.accept(DisplayReady(
+            width: request.width, height: request.height,
+            refreshHz: request.refreshHz, orientation: request.orientation,
+            requestId: request.requestId, generation: 1))
+        XCTAssertNil(gate.begin(portrait))
+    }
+
     func testRapidRequestsCoalesceToLatestAfterInFlightCompletes() {
         var gate = DisplayRequestGate()
         let landscape = DisplayConfigurationRequest(

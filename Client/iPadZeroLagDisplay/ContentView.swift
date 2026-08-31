@@ -511,6 +511,15 @@ public struct ContentView: View {
                         .onEnded {
                             isSettingsPresented = true
                         })
+                // This container has the committed drawable size. Publish
+                // it as an orientation source so capabilities-first startup
+                // cannot miss the initial portrait request.
+                .onAppear {
+                    updateDisplayOrientation(for: proxy.size)
+                }
+                .onChange(of: proxy.size) { _, size in
+                    updateDisplayOrientation(for: size)
+                }
         }
         .ignoresSafeArea(.container, edges: .all)
     }
