@@ -20,7 +20,8 @@ final class DisplayOrientationTests: XCTestCase {
 
         XCTAssertNil(gate.pending)
         let request = try! XCTUnwrap(gate.begin(portrait))
-        XCTAssertEqual((request.width, request.height), (1668, 2388))
+        XCTAssertEqual(request.width, 1668)
+        XCTAssertEqual(request.height, 2388)
         XCTAssertNil(gate.begin(portrait))
     }
 
