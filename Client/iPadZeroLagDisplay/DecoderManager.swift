@@ -996,7 +996,8 @@ public final class DecoderManager {
             generation: generation,
             details:
                 "size_px=\(width)x\(height) pixel_format=\(VideoQualityDiagnostics.fourCC(pixelFormat)) planes=\(CVPixelBufferGetPlaneCount(imageBuffer))")
-        if let surface = CVPixelBufferGetIOSurface(imageBuffer) {
+        if let surface =
+            CVPixelBufferGetIOSurface(imageBuffer)?.takeUnretainedValue() {
             VideoQualityDiagnostics.log(
                 stage: "iosurface",
                 sequence: sequence,
