@@ -51,6 +51,8 @@
 		900111111111111111111001 /* SettingsFoundation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 900211111111111111111001 /* SettingsFoundation.swift */; };
 		900111111111111111111002 /* SettingsFoundationContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 900211111111111111111002 /* SettingsFoundationContractTests.swift */; };
 		901111111111111111111001 /* DisplayOrientationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 901211111111111111111001 /* DisplayOrientationTests.swift */; };
+		B001111111111111111111001 /* InputGeometryDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = B002111111111111111111001 /* InputGeometryDiagnostics.swift */; };
+		B001111111111111111111002 /* InputGeometryDiagnosticsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B002111111111111111111002 /* InputGeometryDiagnosticsTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -111,6 +113,8 @@
 		900211111111111111111001 /* SettingsFoundation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../Shared/SettingsFoundation.swift; sourceTree = "<group>"; };
 		900211111111111111111002 /* SettingsFoundationContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../Shared/SettingsFoundationContractTests.swift; sourceTree = "<group>"; };
 		901211111111111111111001 /* DisplayOrientationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayOrientationTests.swift; sourceTree = "<group>"; };
+		B002111111111111111111001 /* InputGeometryDiagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputGeometryDiagnostics.swift; sourceTree = "<group>"; };
+		B002111111111111111111002 /* InputGeometryDiagnosticsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputGeometryDiagnosticsTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -146,6 +150,7 @@
 				200611111111111111111116 /* H264VideoConfiguration.swift */,
 				200711111111111111111107 /* NetworkManager.swift */,
 				200911111111111111111109 /* PencilTouchView.swift */,
+				B002111111111111111111001 /* InputGeometryDiagnostics.swift */,
 				201011111111111111111110 /* StreamManager.swift */,
 				201111111111111111111111 /* DiscoveryManager.swift */,
 				201211111111111111111112 /* AudioManager.swift */,
@@ -191,6 +196,7 @@
 				700211111111111111111002 /* AudioJitterBufferTests.swift */,
 				900211111111111111111002 /* SettingsFoundationContractTests.swift */,
 				901211111111111111111001 /* DisplayOrientationTests.swift */,
+				B002111111111111111111002 /* InputGeometryDiagnosticsTests.swift */,
 			);
 			path = ../iPadZeroLagDisplayTests;
 			sourceTree = "<group>";
@@ -304,6 +310,7 @@
 				300111111111111111111107 /* NetworkManager.swift in Sources */,
 				A001111111111111111111101 /* USBServerIdentity.swift in Sources */,
 				300111111111111111111108 /* PencilTouchView.swift in Sources */,
+				B001111111111111111111001 /* InputGeometryDiagnostics.swift in Sources */,
 				300111111111111111111109 /* StreamManager.swift in Sources */,
 				30011111111111111111110A /* DiscoveryManager.swift in Sources */,
 				30011111111111111111110B /* AudioManager.swift in Sources */,
@@ -341,6 +348,7 @@
 				700111111111111111111002 /* AudioJitterBufferTests.swift in Sources */,
 				900111111111111111111002 /* SettingsFoundationContractTests.swift in Sources */,
 				901111111111111111111001 /* DisplayOrientationTests.swift in Sources */,
+				B001111111111111111111002 /* InputGeometryDiagnosticsTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
