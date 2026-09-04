@@ -4,6 +4,55 @@ import MetalKit
 import CoreVideo
 import UIKit
 
+enum VideoQualityDiagnostics {
+    static let sampleInterval: UInt32 = 120
+
+    static func shouldLog(sequence: UInt32) -> Bool {
+        sequence <= 5 || sequence.isMultiple(of: sampleInterval)
+    }
+
+    static func log(
+        stage: String,
+        sequence: UInt32,
+        generation: UInt64,
+        collectibleSink: ((String) -> Void)? = nil,
+        details: @autoclosure () -> String
+    ) {
+        guard shouldLog(sequence: sequence) else { return }
+        let line =
+            "[VIDEO_QUALITY] stage=\(stage) generation=\(generation) sequence=\(sequence) \(details())"
+        print(line)
+        collectibleSink?(line)
+    }
+
+    static func fourCC(_ value: OSType) -> String {
+        let bytes = [
+            UInt8((value >> 24) & 0xff),
+            UInt8((value >> 16) & 0xff),
+            UInt8((value >> 8) & 0xff),
+            UInt8(value & 0xff),
+        ]
+        return String(bytes: bytes, encoding: .ascii) ??
+            String(format: "0x%08X", value)
+    }
+
+    static func pixels(_ size: CGSize) -> String {
+        String(
+            format: "%.0fx%.0f",
+            Double(size.width),
+            Double(size.height))
+    }
+
+    static func rect(_ rect: CGRect) -> String {
+        String(
+            format: "%.4f,%.4f,%.4f,%.4f",
+            Double(rect.minX),
+            Double(rect.minY),
+            Double(rect.width),
+            Double(rect.height))
+    }
+}
+
 enum RenderOfferDecision: Equatable {
     case accepted(replaced: UInt32?)
     case rejected
@@ -202,6 +251,7 @@ public class Renderer: NSObject, MTKViewDelegate {
     public var onFrameDropped: ((UInt32, UInt64) -> Void)?
     var onContentViewportChanged: ((VideoContentViewport?) -> Void)?
     var onGeometrySnapshotChanged: ((RendererGeometrySnapshot) -> Void)?
+    var diagnosticSink: ((String) -> Void)?
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private var pipelineState: MTLRenderPipelineState?
@@ -381,6 +431,20 @@ public class Renderer: NSObject, MTKViewDelegate {
             abandon(identity)
             return
         }
+        VideoQualityDiagnostics.log(
+            stage: "metal_texture",
+            sequence: identity.sequence,
+            generation: identity.generation,
+            collectibleSink: diagnosticSink,
+            details:
+                "y_px=\(yTexture.width)x\(yTexture.height) uv_px=\(uvTexture.width)x\(uvTexture.height) y_format=\(yTexture.pixelFormat.rawValue) uv_format=\(uvTexture.pixelFormat.rawValue)")
+        VideoQualityDiagnostics.log(
+            stage: "drawable",
+            sequence: identity.sequence,
+            generation: identity.generation,
+            collectibleSink: diagnosticSink,
+            details:
+                "texture_px=\(drawable.texture.width)x\(drawable.texture.height) drawable_px=\(VideoQualityDiagnostics.pixels(view.drawableSize)) format=\(drawable.texture.pixelFormat.rawValue)")
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeRenderCommandEncoder(
                 descriptor: renderPassDescriptor) else {
@@ -394,6 +458,13 @@ public class Renderer: NSObject, MTKViewDelegate {
             abandon(identity)
             return
         }
+        VideoQualityDiagnostics.log(
+            stage: "viewport",
+            sequence: identity.sequence,
+            generation: identity.generation,
+            collectibleSink: diagnosticSink,
+            details:
+                "normalized=\(VideoQualityDiagnostics.rect(contentViewport.rect)) pixels=\(VideoQualityDiagnostics.rect(contentViewport.contentRect(in: CGRect(origin: .zero, size: view.drawableSize))))")
         publishContentViewport(contentViewport)
         publishGeometrySnapshot(
             for: view,

@@ -67,6 +67,9 @@ public struct MetalView: UIViewRepresentable {
 
         if let renderer = Renderer(metalView: metalView) {
             context.coordinator.renderer = renderer
+            renderer.diagnosticSink = { [weak networkManager] line in
+                networkManager?.recordDiagnosticLine(line)
+            }
             renderer.beginSession(
                 generation: networkManager.decoder.currentSessionGeneration)
             renderer.onFrameRendered = { [weak coordinator = context.coordinator, weak networkManager] sequence, generation in
@@ -302,6 +305,10 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         let touchView = container.touchView
         touchView.onPencilInput = onPencilInput
         touchView.onSendTouchEvent = onSendTouchEvent
+        touchView.inputGeometryContext = coordinator.inputGeometryContext
+        touchView.diagnosticSink = { [weak networkManager] line in
+            networkManager?.recordDiagnosticLine(line)
+        }
         touchView.onBoundsChanged = { [weak coordinator] bounds in
             coordinator?.onTouchBoundsChanged?(bounds)
         }
@@ -320,6 +327,9 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
 
         coordinator.renderer = renderer
         coordinator.touchView = touchView
+        renderer.diagnosticSink = { [weak networkManager] line in
+            networkManager?.recordDiagnosticLine(line)
+        }
         renderer.beginSession(generation: networkManager.decoder.currentSessionGeneration)
         renderer.onFrameRendered = { [weak coordinator, weak networkManager] sequence, generation in
             networkManager?.recordRenderCompletion(
@@ -341,7 +351,17 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             coordinator?.touchView?.contentViewport = viewport
             coordinator?.onContentViewportChanged?(viewport)
         }
-        renderer.onGeometrySnapshotChanged = { [weak coordinator] snapshot in
+        renderer.onGeometrySnapshotChanged = {
+            [weak coordinator, weak networkManager] snapshot in
+            if let networkManager {
+                let inputGeometryContext = InputGeometryDiagnosticContext(
+                    sessionGeneration:
+                        networkManager.decoder.currentSessionGeneration,
+                    frameSize: snapshot.decodedFrameSize)
+                coordinator?.inputGeometryContext = inputGeometryContext
+                coordinator?.touchView?.inputGeometryContext =
+                    inputGeometryContext
+            }
             coordinator?.onGeometrySnapshotChanged?(snapshot)
         }
 
@@ -359,6 +379,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     public final class Coordinator {
         var renderer: Renderer?
         weak var touchView: PencilUIKitView?
+        var inputGeometryContext: InputGeometryDiagnosticContext?
         var onFrameRendered: (() -> Void)?
         var onContentViewportChanged: ((VideoContentViewport?) -> Void)?
         var onGeometrySnapshotChanged: ((RendererGeometrySnapshot) -> Void)?

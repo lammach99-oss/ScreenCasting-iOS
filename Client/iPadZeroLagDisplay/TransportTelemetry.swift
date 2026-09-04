@@ -445,6 +445,7 @@ final class TransportTelemetry {
     private var frameOrder: [TelemetryFrameKey] = []
     private let frameCapacity = 4_096
     private var frameExportFileURL: URL?
+    private var diagnosticExportFileURL: URL?
 
     func setSessionContext(_ context: TransportTelemetryContext) {
         precondition(
@@ -853,6 +854,8 @@ final class TransportTelemetry {
             "ScreenCasting-Telemetry-\(formatter.string(from: Date()))-\(UUID().uuidString.prefix(8)).csv")
         let frameURL = directory.appendingPathComponent(
             "ScreenCasting-Frame-Telemetry-\(formatter.string(from: Date()))-\(UUID().uuidString.prefix(8)).csv")
+        let diagnosticURL = directory.appendingPathComponent(
+            "ScreenCasting-Diagnostics-\(formatter.string(from: Date()))-\(UUID().uuidString.prefix(8)).log")
         fileQueue.async { [weak self] in
             guard let self else {
                 completion?(nil)
@@ -867,8 +870,10 @@ final class TransportTelemetry {
                 try Self.csvHeader.write(to: url, atomically: true, encoding: .utf8)
                 try (SequenceLatencyReporter.csvHeader.joined(separator: ",") + "\n")
                     .write(to: frameURL, atomically: true, encoding: .utf8)
+                try "".write(to: diagnosticURL, atomically: true, encoding: .utf8)
                 self.exportFileURL = url
                 self.frameExportFileURL = frameURL
+                self.diagnosticExportFileURL = diagnosticURL
                 self.exportStartedAt = ProcessInfo.processInfo.systemUptime
                 print("[TransportTelemetry] CSV log: \(url.lastPathComponent)")
 
@@ -887,10 +892,17 @@ final class TransportTelemetry {
                 print("[TransportTelemetry] Unable to create CSV log: \(error)")
                 self.exportFileURL = nil
                 self.frameExportFileURL = nil
+                self.diagnosticExportFileURL = nil
                 completion?(nil)
             }
         }
         return url
+    }
+
+    func recordDiagnosticLine(_ line: String) {
+        fileQueue.async { [weak self] in
+            self?.appendDiagnosticLine(line)
+        }
     }
 
     /// Enqueues the final cumulative row after all earlier logging operations.
@@ -1062,7 +1074,20 @@ final class TransportTelemetry {
         appendFrameRows()
         exportFileURL = nil
         frameExportFileURL = nil
+        diagnosticExportFileURL = nil
         exportStartedAt = 0
+    }
+
+    private func appendDiagnosticLine(_ line: String) {
+        guard let url = diagnosticExportFileURL else { return }
+        do {
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: Data((line + "\n").utf8))
+        } catch {
+            print("[TransportTelemetry] Unable to append diagnostic log: \(error)")
+        }
     }
 
     private func appendSummary(

@@ -298,4 +298,40 @@ final class TransportTelemetryTests: XCTestCase {
         XCTAssertTrue(rows[2].contains(",4,2.000,100.000,100.000,"))
         XCTAssertTrue(rows[2].contains(",2,3.000,30.000,30.000,"))
     }
+
+    func testDiagnosticMarkersAreWrittenWithoutChangingTelemetryCsv() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let telemetry = TransportTelemetry()
+        let started = expectation(description: "diagnostic export started")
+        let telemetryURL = try XCTUnwrap(telemetry.startLogging(
+            directoryURL: directory,
+            completion: { actualURL in
+                XCTAssertNotNil(actualURL)
+                started.fulfill()
+            }))
+        wait(for: [started], timeout: 2)
+
+        telemetry.recordDiagnosticLine(
+            "[VIDEO_QUALITY] stage=cv_pixel_buffer generation=3 sequence=5")
+        telemetry.recordDiagnosticLine(
+            "[INPUT_GEOMETRY] event=down sessionGeneration=3")
+
+        let finished = expectation(description: "diagnostic export finished")
+        telemetry.stopLogging { finished.fulfill() }
+        wait(for: [finished], timeout: 2)
+
+        let diagnosticURL = try XCTUnwrap(try FileManager.default
+            .contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .first { $0.lastPathComponent.hasPrefix("ScreenCasting-Diagnostics-") })
+        let diagnostics = try String(contentsOf: diagnosticURL, encoding: .utf8)
+        XCTAssertTrue(diagnostics.contains("[VIDEO_QUALITY]"))
+        XCTAssertTrue(diagnostics.contains("[INPUT_GEOMETRY]"))
+
+        let telemetryCsv = try String(contentsOf: telemetryURL, encoding: .utf8)
+        XCTAssertFalse(telemetryCsv.contains("[VIDEO_QUALITY]"))
+        XCTAssertFalse(telemetryCsv.contains("[INPUT_GEOMETRY]"))
+    }
 }

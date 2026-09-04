@@ -1318,6 +1318,9 @@ public class NetworkManager: ObservableObject {
         let savedDisplayPreference = DisplayPreferenceStore.load()
         displayPreference = savedDisplayPreference
         activeDisplayPreference = savedDisplayPreference
+        decoder.diagnosticSink = { [weak self] line in
+            self?.recordDiagnosticLine(line)
+        }
         decoder.onDecodeLatency = {
             [weak self] sequence, generation, decodeStartedAt, latencyMs in
             self?.transportTelemetry.recordDecodeCallback(
@@ -3429,6 +3432,10 @@ public class NetworkManager: ObservableObject {
         transportTelemetry.recordRenderDrop(
             sequence: sequence,
             generation: generation)
+    }
+
+    func recordDiagnosticLine(_ line: String) {
+        transportTelemetry.recordDiagnosticLine(line)
     }
 
 }

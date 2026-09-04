@@ -3,6 +3,7 @@ import VideoToolbox
 import CoreMedia
 import CoreVideo
 import CryptoKit
+import IOSurface
 import QuartzCore
 
 enum DecoderOutputBufferAttributes {
@@ -374,6 +375,7 @@ public final class DecoderManager {
     public var onMailboxAge: ((UInt32, Double) -> Void)?
     public var onFrameDropped: ((UInt32, UInt64) -> Void)?
     public var onRecoveryNeeded: (() -> Void)?
+    var diagnosticSink: ((String) -> Void)?
 
     private var decompressionSession: VTDecompressionSession?
     private var formatDescription: CMVideoFormatDescription?
@@ -711,6 +713,13 @@ public final class DecoderManager {
             flags: decodeFlags,
             frameRefcon: frameRefCon,
             infoFlagsOut: &infoFlags)
+        VideoQualityDiagnostics.log(
+            stage: "encoded_decode",
+            sequence: accessUnit.sequence,
+            generation: ticket.sessionGeneration,
+            collectibleSink: diagnosticSink,
+            details:
+                "codec=\(activeCodec == .h264 ? "h264" : "hevc") encoded_bytes=\(sampleSize) expected_px=\(expectedWidth)x\(expectedHeight) idr=\(accessUnit.isIDR) length_prefixed=\(accessUnit.isLengthPrefixed) decode_status=\(status) info_flags=\(infoFlags.rawValue)")
         if status != noErr {
             let failed = Unmanaged<VideoDecodeSubmission>
                 .fromOpaque(frameRefCon).takeRetainedValue()
@@ -942,6 +951,10 @@ public final class DecoderManager {
             completion.disposition == .deliver && imageBuffer != nil
         emitCompletion(for: ticket.unit.owner, succeeded: delivered)
         if delivered, let imageBuffer, let decodeStartedAt {
+            logDecodedOutput(
+                imageBuffer,
+                sequence: lifetime.sequence,
+                generation: ticket.sessionGeneration)
             if activeCodec == .h264, ticket.unit.isIDR {
                 hasDecodedH264Idr = true
             }
@@ -965,6 +978,36 @@ public final class DecoderManager {
         lifetime.finish()
         if let next = completion.next {
             schedule(next)
+        }
+    }
+
+    private func logDecodedOutput(
+        _ imageBuffer: CVPixelBuffer,
+        sequence: UInt32,
+        generation: UInt64
+    ) {
+        guard VideoQualityDiagnostics.shouldLog(sequence: sequence) else {
+            return
+        }
+        let width = CVPixelBufferGetWidth(imageBuffer)
+        let height = CVPixelBufferGetHeight(imageBuffer)
+        let pixelFormat = CVPixelBufferGetPixelFormatType(imageBuffer)
+        VideoQualityDiagnostics.log(
+            stage: "cv_pixel_buffer",
+            sequence: sequence,
+            generation: generation,
+            collectibleSink: diagnosticSink,
+            details:
+                "size_px=\(width)x\(height) pixel_format=\(VideoQualityDiagnostics.fourCC(pixelFormat)) planes=\(CVPixelBufferGetPlaneCount(imageBuffer))")
+        if let surface =
+            CVPixelBufferGetIOSurface(imageBuffer)?.takeUnretainedValue() {
+            VideoQualityDiagnostics.log(
+                stage: "iosurface",
+                sequence: sequence,
+                generation: generation,
+                collectibleSink: diagnosticSink,
+                details:
+                    "surface_id=\(IOSurfaceGetID(surface)) alloc_bytes=\(IOSurfaceGetAllocSize(surface))")
         }
     }
 
