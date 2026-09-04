@@ -346,19 +346,8 @@ public struct ContentView: View {
         }
         .animation(.spring(response: 0.35, dampingFraction: 0.85), value: isPINPhase)
         .onChange(of: networkManager.connectionState) { _, newState in
-            if newState == .streaming {
-                print("[IPAD][TRANSPORT_STREAMING_ENTERED] generation=\(networkManager.connectionGenerationForDiagnostics)")
-                print("[IPAD][VIDEO_SURFACE_MOUNTED] waitingForFirstFrame=true")
-            }
             if newState == .awaitingPIN, enteredPIN.count == 4 {
                 networkManager.sendAuthPIN(enteredPIN)
-            }
-        }
-        .onChange(of: networkManager.currentVideoFrameReady) { _, ready in
-            if ready {
-                print("[IPAD][VIDEO_HEALTHY] currentGeneration=true")
-            } else if networkManager.connectionState == .streaming {
-                print("[IPAD][WAITING_FOR_FIRST_FRAME] currentGeneration=true")
             }
         }
         .onChange(of: scenePhase) { _, phase in
@@ -442,10 +431,7 @@ public struct ContentView: View {
 
     @ViewBuilder
     private var backgroundLayer: some View {
-        // Transport commitment controls renderer lifetime. Video health is a
-        // separate gate and remains false until a current-generation drawable
-        // is presented, so the renderer must mount before that first frame.
-        if networkManager.connectionState == .streaming {
+        if streamManager.isConnected {
             connectedVideoSurface
         } else {
             // Premium Disconnected Background
@@ -658,7 +644,7 @@ public struct ContentView: View {
                 .font(.system(size: 15, weight: .semibold, design: .rounded))
                 .foregroundColor(.green)
         case .connecting:
-            Text("Connecting & establishing TLS…")
+            Text(useUSBMode ? "Connecting over USB-C…" : "Connecting & establishing TLS…")
                 .font(.system(size: 15, weight: .semibold, design: .rounded))
                 .foregroundColor(.white)
         case .awaitingHostIdentity:
@@ -733,7 +719,6 @@ public struct ContentView: View {
                 networkManager.stop()
                 if usbSelected {
                     discoveryManager.stopBrowsing()
-                    networkManager.startListening(port: 12345)
                 } else {
                     discoveryManager.startBrowsing()
                 }
@@ -742,17 +727,7 @@ public struct ContentView: View {
             if useUSBMode {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("The Windows host connects through iproxy. No IP address is required.")
-                    Text("USB identity: \(UIDevice.current.name)")
-                    if let fingerprint = networkManager.usbServerFingerprint {
-                        Text("Certificate: \(String(fingerprint.prefix(12)))")
-                            .font(.system(size: 11, design: .monospaced))
-                    }
-                    Text("The selected-device UDID hash and certificate pin are shown on the Windows host.")
-                    Button("Reset USB Pairing") {
-                        networkManager.resetUSBPairing()
-                    }
-                    .font(.system(size: 12, weight: .semibold))
-                    .disabled(networkManager.connectionState == .connecting)
+                    Text("USB-C uses the existing ScreenCasting protocol over the cable.")
                 }
                 .font(.system(size: 12))
                 .foregroundColor(.blue.opacity(0.9))
@@ -780,20 +755,22 @@ public struct ContentView: View {
                     .foregroundColor(.orange)
             }
 
-            SecureField("4-digit PIN Code", text: $enteredPIN)
-                .keyboardType(.numberPad)
-                .padding(12)
-                .foregroundColor(.white)
-                .background(Color.white.opacity(0.08))
-                .cornerRadius(10)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10)
-                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
-                )
-                .onChange(of: enteredPIN) { _, newValue in
-                    let digits = newValue.filter(\.isNumber)
-                    enteredPIN = String(digits.prefix(4))
-                }
+            if !useUSBMode {
+                SecureField("4-digit PIN Code", text: $enteredPIN)
+                    .keyboardType(.numberPad)
+                    .padding(12)
+                    .foregroundColor(.white)
+                    .background(Color.white.opacity(0.08))
+                    .cornerRadius(10)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                    )
+                    .onChange(of: enteredPIN) { _, newValue in
+                        let digits = newValue.filter(\.isNumber)
+                        enteredPIN = String(digits.prefix(4))
+                    }
+            }
 
             Button(action: {
                 if useUSBMode {
@@ -819,7 +796,6 @@ public struct ContentView: View {
             }
             .disabled(
                 (!useUSBMode && !isValidManualIPv4) ||
-                (useUSBMode && enteredPIN.count != 4) ||
                 networkManager.connectionState == .connecting)
 
             if !useUSBMode {

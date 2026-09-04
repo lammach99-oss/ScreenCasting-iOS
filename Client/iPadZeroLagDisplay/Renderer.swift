@@ -223,9 +223,6 @@ public class Renderer: NSObject, MTKViewDelegate {
 
     private var lastDecodedFrameSize: CGSize?
     private let lock = NSLock()
-    private let diagnosticLock = NSLock()
-    private var staleGenerationDiagnostics: Set<UInt64> = []
-    private var submitGenerationDiagnostics: Set<UInt64> = []
 
     public init?(metalView: MTKView) {
         guard let defaultDevice = MTLCreateSystemDefaultDevice(),
@@ -279,9 +276,6 @@ public class Renderer: NSObject, MTKViewDelegate {
         publishedGeometrySnapshot = nil
         lastDecodedFrameSize = nil
         lock.unlock()
-        if let textureCache {
-            CVMetalTextureCacheFlush(textureCache, 0)
-        }
         if shouldResetContentViewport {
             DispatchQueue.main.async { [weak self] in
                 self?.onContentViewportChanged?(nil)
@@ -303,9 +297,6 @@ public class Renderer: NSObject, MTKViewDelegate {
             currentPixelBuffer = pixelBuffer
             dropped = replaced
         case .staleSession:
-            if noteStaleGeneration(generation) {
-                print("[IPAD][RENDER_FRAME_DROPPED_STALE] frameGeneration=\(generation) currentGeneration=\(freshness.sessionGeneration ?? 0)")
-            }
             break
         }
         lock.unlock()
@@ -428,14 +419,8 @@ public class Renderer: NSObject, MTKViewDelegate {
             guard let self else { return }
             self.lock.lock()
             let isCurrent = self.freshness.markPresented(identity)
-            let currentGeneration = self.freshness.sessionGeneration ?? 0
             self.lock.unlock()
-            guard isCurrent else {
-                if self.noteStaleGeneration(identity.generation) {
-                    print("[IPAD][RENDER_FRAME_DROPPED_STALE] frameGeneration=\(identity.generation) currentGeneration=\(currentGeneration)")
-                }
-                return
-            }
+            guard isCurrent else { return }
             DispatchQueue.main.async {
                 self.onFrameRendered?(
                     identity.sequence,
@@ -443,12 +428,6 @@ public class Renderer: NSObject, MTKViewDelegate {
             }
         }
         commandBuffer.commit()
-        diagnosticLock.lock()
-        let shouldLogSubmit = submitGenerationDiagnostics.insert(identity.generation).inserted
-        diagnosticLock.unlock()
-        if shouldLogSubmit {
-            print("[IPAD][RENDER_FRAME_SUBMIT] generation=\(identity.generation)")
-        }
         onDrawableCommitted?(identity.sequence, identity.generation)
     }
 
@@ -500,11 +479,5 @@ public class Renderer: NSObject, MTKViewDelegate {
         if isCurrent {
             onFrameDropped?(identity.sequence, identity.generation)
         }
-    }
-
-    private func noteStaleGeneration(_ generation: UInt64) -> Bool {
-        diagnosticLock.lock()
-        defer { diagnosticLock.unlock() }
-        return staleGenerationDiagnostics.insert(generation).inserted
     }
 }

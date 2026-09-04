@@ -381,10 +381,6 @@ public final class DecoderManager {
     private var spsData: Data?
     private var ppsData: Data?
     private var activeCodec: VideoDecoderCodec = .hevc
-    // A format-set change (for example landscape -> portrait) invalidates
-    // reference pictures. Wait for the next IRAP/IDR before decoding frames.
-    private var hevcKeyframeRequired = false
-    private var waitingForIDR = true
     private var hasDecodedH264Idr = false
     private var parameterSetSessionGate = HevcParameterSetSessionGate()
     private var activeParameterSetSignature: HevcParameterSetSignature? {
@@ -401,11 +397,8 @@ public final class DecoderManager {
     private let mailboxStateLock = NSLock()
     private var localSessionGeneration: UInt64 = 0
     private let completionIdentityLock = NSLock()
-    private let diagnosticLock = NSLock()
     private var completionIdentities:
         [ObjectIdentifier: DecodeCompletionIdentity] = [:]
-    private var staleCallbackDiagnostics: Set<UInt64> = []
-    private var idrWaitDiagnostics: Set<UInt64> = []
 
     public init() {
         localSessionGeneration = 1
@@ -413,35 +406,10 @@ public final class DecoderManager {
     }
 
     public func beginSession(generation: UInt64) {
-        let oldGeneration = currentSessionGeneration
         mailboxStateLock.lock()
         mailbox.beginSession(generation: generation)
         localSessionGeneration = generation
         mailboxStateLock.unlock()
-
-        // A reconnect must not reuse the previous VideoToolbox session or
-        // deliver IOSurface-backed buffers whose owner belongs to the old
-        // connection. Flush and invalidate synchronously before the new
-        // generation can submit compressed frames; the next IDR recreates the
-        // format/session state and repopulates the mailbox with fresh surfaces.
-        queue.sync {
-            if let session = decompressionSession {
-                VTDecompressionSessionWaitForAsynchronousFrames(session)
-                VTDecompressionSessionInvalidate(session)
-                decompressionSession = nil
-                print("[IPAD][DECODER_INVALIDATED] oldGeneration=\(oldGeneration)")
-            }
-            formatDescription = nil
-            vpsData = nil
-            spsData = nil
-            ppsData = nil
-            activeCodec = .hevc
-            hevcKeyframeRequired = false
-            waitingForIDR = true
-            hasDecodedH264Idr = false
-            parameterSetSessionGate.reset()
-            h264ParameterSetSessionGate.reset()
-        }
         onSessionBegan?(generation)
     }
 
@@ -466,21 +434,6 @@ public final class DecoderManager {
             ppsData = pps
             _ = h264ParameterSetSessionGate.replaceIfChanged(sps: sps, pps: pps) { true }
             return true
-        }
-    }
-
-    /// Drop inter-frames after a live stream setting changes. The host keeps
-    /// the same codec configuration, but the decoder may still hold reference
-    /// pictures from before the encoder refresh. The next IDR restores a clean
-    /// reference chain without recreating the VideoToolbox session.
-    public func requireKeyFrame() {
-        queue.async { [weak self] in
-            guard let self else { return }
-            if self.activeCodec == .hevc {
-                self.hevcKeyframeRequired = true
-            } else {
-                self.hasDecodedH264Idr = false
-            }
         }
     }
 
@@ -539,11 +492,6 @@ public final class DecoderManager {
             ticket.unit.owner.release()
             return
         }
-        guard ticket.sessionGeneration == currentSessionGeneration else {
-            logStaleDecoderCallback(frameGeneration: ticket.sessionGeneration)
-            ticket.unit.owner.release()
-            return
-        }
         let accessUnit = ticket.unit
         onMailboxAge?(
             accessUnit.sequence,
@@ -557,17 +505,6 @@ public final class DecoderManager {
             return
         }
         guard activeCodec != .h264 || accessUnit.isIDR || hasDecodedH264Idr else {
-            logWaitingForIDR(generation: accessUnit.sessionGeneration, frameType: "delta")
-            finish(ticket, lifetime: lifetime, succeeded: false)
-            return
-        }
-        guard activeCodec != .hevc || !hevcKeyframeRequired || accessUnit.isIDR else {
-            logWaitingForIDR(generation: accessUnit.sessionGeneration, frameType: "delta")
-            finish(ticket, lifetime: lifetime, succeeded: false)
-            return
-        }
-        guard !waitingForIDR || accessUnit.isIDR else {
-            logWaitingForIDR(generation: accessUnit.sessionGeneration, frameType: "delta")
             finish(ticket, lifetime: lifetime, succeeded: false)
             return
         }
@@ -820,9 +757,6 @@ public final class DecoderManager {
         let previousSession = decompressionSession
         formatDescription = description
         decompressionSession = session
-        hevcKeyframeRequired = true
-        waitingForIDR = true
-        print("[IPAD][DECODER_CREATED] generation=\(currentSessionGeneration)")
         setPropertyIfSupported(
             session,
             key: kVTDecompressionPropertyKey_RealTime,
@@ -891,8 +825,6 @@ public final class DecoderManager {
         let previous = decompressionSession
         formatDescription = description
         decompressionSession = session
-        waitingForIDR = true
-        print("[IPAD][DECODER_CREATED] generation=\(currentSessionGeneration)")
         setPropertyIfSupported(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue, name: "real-time")
         if let previous {
             VTDecompressionSessionWaitForAsynchronousFrames(previous)
@@ -930,21 +862,14 @@ public final class DecoderManager {
         decodeStartedAt: TimeInterval? = nil,
         imageBuffer: CVPixelBuffer? = nil
     ) {
-        guard ticket.sessionGeneration == currentSessionGeneration else {
-            logStaleDecoderCallback(frameGeneration: ticket.sessionGeneration)
-            emitCompletion(for: ticket.unit.owner, succeeded: false)
-            lifetime.finish()
-            onFrameDropped?(ticket.unit.sequence, ticket.sessionGeneration)
-            return
-        }
         let completion = mailbox.complete(ticket, succeeded: succeeded)
+        if succeeded, activeCodec == .h264, ticket.unit.isIDR {
+            hasDecodedH264Idr = true
+        }
         let delivered =
             completion.disposition == .deliver && imageBuffer != nil
         emitCompletion(for: ticket.unit.owner, succeeded: delivered)
         if delivered, let imageBuffer, let decodeStartedAt {
-            if activeCodec == .h264, ticket.unit.isIDR {
-                hasDecodedH264Idr = true
-            }
             onDecodeLatency?(
                 lifetime.sequence,
                 ticket.sessionGeneration,
@@ -954,13 +879,6 @@ public final class DecoderManager {
                 imageBuffer,
                 lifetime.sequence,
                 ticket.sessionGeneration)
-            if activeCodec == .hevc, ticket.unit.isIDR {
-                hevcKeyframeRequired = false
-            }
-            if ticket.unit.isIDR {
-                waitingForIDR = false
-                print("[IPAD][FIRST_IDR_CURRENT_GENERATION] generation=\(ticket.sessionGeneration)")
-            }
         }
         lifetime.finish()
         if let next = completion.next {
@@ -977,36 +895,15 @@ public final class DecoderManager {
                 VTDecompressionSessionWaitForAsynchronousFrames(session)
                 VTDecompressionSessionInvalidate(session)
                 decompressionSession = nil
-                print("[IPAD][DECODER_INVALIDATED] oldGeneration=\(currentSessionGeneration)")
             }
             formatDescription = nil
             vpsData = nil
             spsData = nil
             ppsData = nil
             activeCodec = .hevc
-            hevcKeyframeRequired = false
-            waitingForIDR = true
             hasDecodedH264Idr = false
             parameterSetSessionGate.reset()
             h264ParameterSetSessionGate.reset()
-        }
-    }
-
-    private func logStaleDecoderCallback(frameGeneration: UInt64) {
-        diagnosticLock.lock()
-        let shouldLog = staleCallbackDiagnostics.insert(frameGeneration).inserted
-        diagnosticLock.unlock()
-        if shouldLog {
-            print("[IPAD][FRAME_DROPPED_STALE_GENERATION] frameGeneration=\(frameGeneration) currentGeneration=\(currentSessionGeneration)")
-        }
-    }
-
-    private func logWaitingForIDR(generation: UInt64, frameType: String) {
-        diagnosticLock.lock()
-        let shouldLog = idrWaitDiagnostics.insert(generation).inserted
-        diagnosticLock.unlock()
-        if shouldLog {
-            print("[IPAD][WAITING_FOR_IDR] generation=\(generation) frameType=\(frameType)")
         }
     }
 

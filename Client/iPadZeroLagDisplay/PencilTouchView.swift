@@ -119,8 +119,6 @@ public class PencilUIKitView: UIView {
     private var activeTouchIdentifier: ObjectIdentifier?
     private var lastNormalizedPoint: CGPoint?
     private var lastReportedBounds: CGRect?
-    private var lastCorrelationLogUptime: TimeInterval = 0
-    private var moveCorrelationLogged = false
 
     override public init(frame: CGRect) {
         super.init(frame: frame)
@@ -228,20 +226,6 @@ public class PencilUIKitView: UIView {
             let wirePressure = UInt8 (clamping: Int((pressureFloat * 255  ).rounded()))
             let wireType     = touchEventType(for: flags)
 
-            let now = ProcessInfo.processInfo.systemUptime
-            let sampleCorrelation = flags != 2 ||
-                !moveCorrelationLogged ||
-                now - lastCorrelationLogUptime >= 0.35
-            if sampleCorrelation {
-                print("[IPAD][TOUCH_CORRELATION] event=\(wireType) " +
-                    "touchLocal=(\(String(format: "%.2f", location.x)),\(String(format: "%.2f", location.y))) " +
-                    "touchBounds=(\(String(format: "%.2f", bounds.width)),\(String(format: "%.2f", bounds.height))) " +
-                    "viewport=(\(String(format: "%.4f", contentViewport.rect.minX)),\(String(format: "%.4f", contentViewport.rect.minY)),\(String(format: "%.4f", contentViewport.rect.width)),\(String(format: "%.4f", contentViewport.rect.height))) " +
-                    "normalized=(\(String(format: "%.5f", xRatio)),\(String(format: "%.5f", yRatio))) wire=(\(wireX),\(wireY))")
-                lastCorrelationLogUptime = now
-                moveCorrelationLogged = flags == 2
-            }
-
             // ── Emit: typed callback (primary path) ───────────────────────────
             onSendTouchEvent?(wireType, wireX, wireY, wirePressure)
 
@@ -272,7 +256,6 @@ public class PencilUIKitView: UIView {
         }
 
         if flags == 4 {
-            moveCorrelationLogged = false
             activeTouchIdentifier = nil
             lastNormalizedPoint = nil
         }
