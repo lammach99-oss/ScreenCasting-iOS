@@ -114,11 +114,13 @@ public class PencilUIKitView: UIView {
     public var onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)?
     public var onNetworkSend:    ((Data) -> Void)?
     public var contentViewport: VideoContentViewport?
+    var inputGeometryContext: InputGeometryDiagnosticContext?
     public var onBoundsChanged: ((CGRect) -> Void)?
 
     private var activeTouchIdentifier: ObjectIdentifier?
     private var lastNormalizedPoint: CGPoint?
     private var lastReportedBounds: CGRect?
+    private var inputGeometrySampler = InputGeometryDiagnosticSampler()
     private var lastCorrelationLogUptime: TimeInterval = 0
     private var moveCorrelationLogged = false
 
@@ -181,14 +183,19 @@ public class PencilUIKitView: UIView {
         }
 
         let touchIdentifier = ObjectIdentifier(primaryTouch)
+        let primaryLocation = primaryTouch.location(in: self)
+        let primaryMappedPoint = contentViewport.normalizedPoint(
+            for: primaryLocation,
+            in: bounds)
         if flags == 1 {
-            guard
-                activeTouchIdentifier == nil,
-                contentViewport.normalizedPoint(
-                    for: primaryTouch.location(in: self),
-                    in: bounds
-                ) != nil
-            else {
+            guard activeTouchIdentifier == nil, primaryMappedPoint != nil else {
+                logRejectedTouchIfNeeded(
+                    event: touchEventType(for: flags),
+                    location: primaryLocation,
+                    bounds: bounds,
+                    contentViewport: contentViewport,
+                    insideContent: primaryMappedPoint != nil,
+                    timestamp: primaryTouch.timestamp)
                 return
             }
             activeTouchIdentifier = touchIdentifier
@@ -198,11 +205,21 @@ public class PencilUIKitView: UIView {
 
         for touch in allTouches {
             let location = touch.location(in: self)
-            let normalizedPoint = contentViewport.normalizedPoint(
+            let mappedNormalizedPoint = contentViewport.normalizedPoint(
                 for: location,
-                in: bounds
-            ) ?? (flags == 4 ? lastNormalizedPoint : nil)
-            guard let normalizedPoint else { continue }
+                in: bounds)
+            let normalizedPoint = mappedNormalizedPoint ??
+                (flags == 4 ? lastNormalizedPoint : nil)
+            guard let normalizedPoint else {
+                logRejectedTouchIfNeeded(
+                    event: touchEventType(for: flags),
+                    location: location,
+                    bounds: bounds,
+                    contentViewport: contentViewport,
+                    insideContent: false,
+                    timestamp: touch.timestamp)
+                continue
+            }
             lastNormalizedPoint = normalizedPoint
 
             // ── Normalised ratios (0.0 – 1.0) ───────────────────────────────
@@ -227,6 +244,25 @@ public class PencilUIKitView: UIView {
             let wireY        = UInt16(clamping: Int((yRatio        * 65535).rounded()))
             let wirePressure = UInt8 (clamping: Int((pressureFloat * 255  ).rounded()))
             let wireType     = touchEventType(for: flags)
+
+            if let inputGeometryContext {
+                let snapshot = InputGeometrySnapshot.make(
+                    event: wireType,
+                    context: inputGeometryContext,
+                    touchPoint: location,
+                    touchBounds: bounds,
+                    contentRect: contentViewport.contentRect(in: bounds),
+                    insideContent: mappedNormalizedPoint != nil,
+                    normalizedPoint: normalizedPoint,
+                    wireX: wireX,
+                    wireY: wireY)
+                if inputGeometrySampler.shouldLog(
+                    event: wireType,
+                    timestamp: touch.timestamp,
+                    context: inputGeometryContext) {
+                    InputGeometryDiagnostics.log(snapshot)
+                }
+            }
 
             let now = ProcessInfo.processInfo.systemUptime
             let sampleCorrelation = flags != 2 ||
@@ -276,6 +312,33 @@ public class PencilUIKitView: UIView {
             activeTouchIdentifier = nil
             lastNormalizedPoint = nil
         }
+    }
+
+    private func logRejectedTouchIfNeeded(
+        event: TouchEventType,
+        location: CGPoint,
+        bounds: CGRect,
+        contentViewport: VideoContentViewport,
+        insideContent: Bool,
+        timestamp: TimeInterval
+    ) {
+        guard let inputGeometryContext,
+              inputGeometrySampler.shouldLog(
+                event: event,
+                timestamp: timestamp,
+                context: inputGeometryContext) else {
+            return
+        }
+        InputGeometryDiagnostics.log(InputGeometrySnapshot.make(
+            event: event,
+            context: inputGeometryContext,
+            touchPoint: location,
+            touchBounds: bounds,
+            contentRect: contentViewport.contentRect(in: bounds),
+            insideContent: insideContent,
+            normalizedPoint: nil,
+            wireX: nil,
+            wireY: nil))
     }
 }
 
