@@ -402,11 +402,6 @@ public class Renderer: NSObject, MTKViewDelegate {
         lock.lock()
         lastDecodedFrameSize = decodedFrameSize
         lock.unlock()
-        guard CVPixelBufferGetIOSurface(pixelBuffer) != nil else {
-            print("[Renderer] Metal presentation rejected: IOSurface unavailable for \(width)x\(height)")
-            abandon(identity)
-            return
-        }
         guard CVPixelBufferGetPixelFormatType(pixelBuffer) == DecoderOutputBufferAttributes.pixelFormat else {
             print("[Renderer] Metal presentation rejected: pixelFormat=\(CVPixelBufferGetPixelFormatType(pixelBuffer)) expected=\(DecoderOutputBufferAttributes.pixelFormat)")
             abandon(identity)

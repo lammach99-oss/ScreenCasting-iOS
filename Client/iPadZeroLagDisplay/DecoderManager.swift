@@ -22,9 +22,6 @@ enum DecoderOutputBufferAttributes {
         expectedWidth: Int,
         expectedHeight: Int
     ) -> String? {
-        guard CVPixelBufferGetIOSurface(pixelBuffer) != nil else {
-            return "IOSurface unavailable"
-        }
         guard CVPixelBufferGetPixelFormatType(pixelBuffer) == pixelFormat else {
             return "pixelFormat=\(CVPixelBufferGetPixelFormatType(pixelBuffer)) expected=\(pixelFormat)"
         }
