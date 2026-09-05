@@ -12,7 +12,6 @@ enum DecoderOutputBufferAttributes {
     static func make() -> [String: Any] {
         [
             kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
             kCVPixelBufferMetalCompatibilityKey as String: true
         ]
     }
