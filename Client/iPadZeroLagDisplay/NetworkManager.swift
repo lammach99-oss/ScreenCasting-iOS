@@ -1174,7 +1174,7 @@ public class NetworkManager: ObservableObject {
     private var reconnectWorkItem: DispatchWorkItem?
     private var connectionTimeoutWorkItem: DispatchWorkItem?
     private var usbListener: NWListener?
-    private var usbProbeConnection: NWConnection?
+    private var usbScdpConnection: NWConnection?
     private let connectionGenerationClock = ConnectionGenerationClock()
     private var connectionGeneration: UInt64 {
         connectionGenerationClock.current
@@ -1661,8 +1661,8 @@ public class NetworkManager: ObservableObject {
         connection = nil
         usbListener?.cancel()
         usbListener = nil
-        usbProbeConnection?.cancel()
-        usbProbeConnection = nil
+        usbScdpConnection?.cancel()
+        usbScdpConnection = nil
         usbLaneServer.abort()
         usbLaneConnections.values.forEach { $0.cancel() }
         usbLaneConnections.removeAll()
@@ -1737,7 +1737,7 @@ public class NetworkManager: ObservableObject {
         DispatchQueue.main.async { self.usbServerFingerprint = nil }
     }
 
-    /// Starts the temporary Phase 1 raw TCP echo endpoint used through iproxy.
+    /// Starts the fixed-port TCP endpoint used to carry SCDP through iproxy.
     public func startListening(port: UInt16 = 42042) {
         stop()
         DispatchQueue.main.async {
@@ -1763,14 +1763,14 @@ public class NetworkManager: ObservableObject {
                       generation == self.listenerGeneration else { return }
                 switch state {
                 case .ready:
-                    print("[IPAD][USB_RAW_LISTENING] port=\(port)")
+                    print("[IPAD][USB_SCDP_LISTENING] port=\(port)")
                     self.setState(.listening)
                 case .failed(let error):
                     self.usbListener = nil
                     self.setState(.disconnected(
                         reason: "USB listener failed: \(error.localizedDescription)"))
                 case .cancelled:
-                    if self.usbProbeConnection == nil {
+                    if self.usbScdpConnection == nil {
                         self.setState(.idle)
                     }
                 default:
@@ -1784,34 +1784,13 @@ public class NetworkManager: ObservableObject {
                     newConnection.cancel()
                     return
                 }
-                guard self.usbProbeConnection == nil else {
+                guard self.usbScdpConnection == nil else {
                     newConnection.cancel()
                     return
                 }
-                self.usbProbeConnection = newConnection
-                newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
-                    guard let self, let newConnection,
-                          generation == self.listenerGeneration,
-                          self.usbProbeConnection === newConnection else { return }
-                    switch state {
-                    case .ready:
-                        print("[IPAD][USB_RAW_CONNECT]")
-                        self.setState(.listening)
-                        self.receiveUSBProbeData(from: newConnection, generation: generation)
-                    case .failed(let error):
-                        self.finishUSBProbeConnection(
-                            newConnection,
-                            generation: generation,
-                            reason: error.localizedDescription)
-                    case .cancelled:
-                        self.finishUSBProbeConnection(
-                            newConnection,
-                            generation: generation,
-                            reason: "cancelled")
-                    default:
-                        break
-                    }
-                }
+                self.usbScdpConnection = newConnection
+                self.connection = newConnection
+                self.setupStateHandler()
                 self.setState(.connecting)
                 newConnection.start(queue: self.networkQueue)
             }
@@ -1820,63 +1799,6 @@ public class NetworkManager: ObservableObject {
             usbListener = nil
             setState(.disconnected(
                 reason: "Unable to start USB listener: \(error.localizedDescription)"))
-        }
-    }
-
-    private func receiveUSBProbeData(
-        from probeConnection: NWConnection,
-        generation: UInt64
-    ) {
-        probeConnection.receive(
-            minimumIncompleteLength: 1,
-            maximumLength: 64 * 1024
-        ) { [weak self, weak probeConnection] content, _, isComplete, error in
-            guard let self, let probeConnection,
-                  generation == self.listenerGeneration,
-                  self.usbProbeConnection === probeConnection else { return }
-            if let content, !content.isEmpty {
-                probeConnection.send(content: content, completion: .contentProcessed { sendError in
-                    if let sendError {
-                        self.finishUSBProbeConnection(
-                            probeConnection,
-                            generation: generation,
-                            reason: sendError.localizedDescription)
-                    } else if isComplete {
-                        self.finishUSBProbeConnection(
-                            probeConnection,
-                            generation: generation,
-                            reason: "peer closed")
-                    } else {
-                        self.receiveUSBProbeData(
-                            from: probeConnection,
-                            generation: generation)
-                    }
-                })
-            } else if isComplete || error != nil {
-                self.finishUSBProbeConnection(
-                    probeConnection,
-                    generation: generation,
-                    reason: error?.localizedDescription ?? "peer closed")
-            } else {
-                self.receiveUSBProbeData(
-                    from: probeConnection,
-                    generation: generation)
-            }
-        }
-    }
-
-    private func finishUSBProbeConnection(
-        _ probeConnection: NWConnection,
-        generation: UInt64,
-        reason: String
-    ) {
-        guard generation == listenerGeneration,
-              usbProbeConnection === probeConnection else { return }
-        print("[IPAD][USB_RAW_UNPLUG] reason=\(reason)")
-        usbProbeConnection = nil
-        probeConnection.cancel()
-        if usbListener != nil {
-            setState(.listening)
         }
     }
 
@@ -2027,7 +1949,10 @@ public class NetworkManager: ObservableObject {
                         self.sendTrustedClientHello(generation: generation)
                     }
                 } else {
-                    self.setState(.awaitingPIN)
+                    self.startWireReceiveLoop(generation: generation)
+                    self.wireAuthenticatedGeneration = generation
+                    print("[IPAD][USB_SCDP_READY] generation=\(generation)")
+                    self.setState(.listening)
                 }
 
             case .failed(let error):
@@ -2037,6 +1962,7 @@ public class NetworkManager: ObservableObject {
                 self.committedTransportGeneration = nil
                 self.advertisedClientCapabilities = nil
                 self.clearPendingTransportOffer()
+                self.usbScdpConnection = nil
                 self.connection = nil
                 if self.usbListener != nil {
                     self.setState(.listening)
@@ -2052,6 +1978,7 @@ public class NetworkManager: ObservableObject {
                 self.committedTransportGeneration = nil
                 self.advertisedClientCapabilities = nil
                 self.clearPendingTransportOffer()
+                self.usbScdpConnection = nil
                 self.connection = nil
                 if self.usbListener != nil {
                     self.setState(.listening)
@@ -3338,6 +3265,7 @@ public class NetworkManager: ObservableObject {
         AudioManager.shared.reset()
         connection?.cancel()
         connection = nil
+        usbScdpConnection = nil
         usbLaneServer.abort()
         usbLaneConnections.values.forEach { $0.cancel() }
         usbLaneConnections.removeAll()
