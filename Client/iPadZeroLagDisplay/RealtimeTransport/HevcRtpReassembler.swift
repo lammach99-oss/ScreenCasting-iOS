@@ -178,11 +178,7 @@ final class HevcRtpReassembler {
         let ownedAnchor = expectedNextSequence.map {
             frame.packets[$0] != nil
         } ?? true
-        // A lost packet can leave expectedNextSequence pointing forever at
-        // the missing sequence. Once this frame expires, its marker is the
-        // authoritative boundary: skip the incomplete frame and let the next
-        // complete frame become eligible instead of buffering indefinitely.
-        if ownedAnchor || frame.markerSequence != nil {
+        if ownedAnchor {
             expectedNextSequence = frame.markerSequence.map { $0 &+ 1 }
             maySelfAnchor = false
         }

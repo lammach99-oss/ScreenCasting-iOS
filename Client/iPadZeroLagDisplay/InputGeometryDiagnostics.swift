@@ -11,6 +11,7 @@ struct InputGeometryDiagnosticContext: Equatable {
         return "unknown"
     }
 }
+
 struct InputGeometrySnapshot: Equatable {
     let event: TouchEventType
     let context: InputGeometryDiagnosticContext

@@ -18,6 +18,8 @@ final class DisplayOrientationTests: XCTestCase {
             width: 1668, height: 2388, refreshHz: 60,
             orientation: .portrait, requestId: 0)
 
+        // Capabilities may arrive before the first committed geometry. No
+        // placeholder landscape request is allowed in that state.
         XCTAssertNil(gate.pending)
         let request = try! XCTUnwrap(gate.begin(portrait))
         XCTAssertEqual(request.width, 1668)
