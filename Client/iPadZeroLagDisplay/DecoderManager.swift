@@ -440,7 +440,6 @@ public final class DecoderManager {
             parameterSetSessionGate.reset()
             h264ParameterSetSessionGate.reset()
         }
-        IOSurfaceIsolationDiagnostics.shared.reset()
         onSessionBegan?(generation)
     }
 
@@ -704,9 +703,6 @@ public final class DecoderManager {
         // Async is enabled, while temporal processing is deliberately omitted:
         // VideoToolbox therefore has no permission to delay output for reorder.
         let decodeFlags = VTDecodeFrameFlags(rawValue: 1 << 0)
-        IOSurfaceIsolationDiagnostics.shared.record(
-            .decodeSubmit,
-            collectibleSink: diagnosticSink)
         let status = VTDecompressionSessionDecodeFrame(
             session,
             sampleBuffer: sampleBuffer,
@@ -774,9 +770,6 @@ public final class DecoderManager {
                             }
                             let decoder = Unmanaged<DecoderManager>
                                 .fromOpaque(outputRefCon).takeUnretainedValue()
-                            IOSurfaceIsolationDiagnostics.shared.record(
-                                .decodeCallback,
-                                collectibleSink: decoder.diagnosticSink)
                             guard status == noErr, let imageBuffer else {
                                 decoder.finish(
                                     submission.ticket,
@@ -798,9 +791,6 @@ public final class DecoderManager {
                                     decodeStartedAt: submission.decodeStartedAt)
                                 return
                             }
-                            IOSurfaceIsolationDiagnostics.shared.record(
-                                .pixelBuffer,
-                                collectibleSink: decoder.diagnosticSink)
                             decoder.finish(
                                 submission.ticket,
                                 lifetime: lifetime,
@@ -809,18 +799,11 @@ public final class DecoderManager {
                                 imageBuffer: pixelBuffer)
                         },
                         decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
-                    let destinationAttributes =
-                        DecoderOutputBufferAttributes.make()
-                    IOSurfaceIsolationDiagnostics.shared
-                        .logDestinationAttributes(
-                            destinationAttributes,
-                            collectibleSink: diagnosticSink)
                     let sessionStatus = VTDecompressionSessionCreate(
                         allocator: kCFAllocatorDefault,
                         formatDescription: description,
                         decoderSpecification: nil,
-                        imageBufferAttributes:
-                            destinationAttributes as CFDictionary,
+                        imageBufferAttributes: DecoderOutputBufferAttributes.make() as CFDictionary,
                         outputCallback: &callback,
                         decompressionSessionOut: &candidateSession)
                     guard sessionStatus == noErr, candidateSession != nil else {
@@ -886,9 +869,6 @@ public final class DecoderManager {
                     .fromOpaque(sourceFrameRefCon).takeRetainedValue()
                 guard let outputRefCon else { submission.lifetime.finish(); return }
                 let decoder = Unmanaged<DecoderManager>.fromOpaque(outputRefCon).takeUnretainedValue()
-                IOSurfaceIsolationDiagnostics.shared.record(
-                    .decodeCallback,
-                    collectibleSink: decoder.diagnosticSink)
                 guard status == noErr, let imageBuffer else {
                     decoder.finish(submission.ticket, lifetime: submission.lifetime, succeeded: false, decodeStartedAt: submission.decodeStartedAt)
                     return
@@ -902,20 +882,12 @@ public final class DecoderManager {
                     decoder.finish(submission.ticket, lifetime: submission.lifetime, succeeded: false, decodeStartedAt: submission.decodeStartedAt)
                     return
                 }
-                IOSurfaceIsolationDiagnostics.shared.record(
-                    .pixelBuffer,
-                    collectibleSink: decoder.diagnosticSink)
                 decoder.finish(submission.ticket, lifetime: submission.lifetime, succeeded: true, decodeStartedAt: submission.decodeStartedAt, imageBuffer: pixelBuffer)
             }, decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
         var session: VTDecompressionSession?
-        let destinationAttributes = DecoderOutputBufferAttributes.make()
-        IOSurfaceIsolationDiagnostics.shared.logDestinationAttributes(
-            destinationAttributes,
-            collectibleSink: diagnosticSink)
         let sessionStatus = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault, formatDescription: description,
-            decoderSpecification: nil,
-            imageBufferAttributes: destinationAttributes as CFDictionary,
+            decoderSpecification: nil, imageBufferAttributes: DecoderOutputBufferAttributes.make() as CFDictionary,
             outputCallback: &callback, decompressionSessionOut: &session)
         guard sessionStatus == noErr, let session else {
             print("[DecoderManager] H264 session rejected: \(sessionStatus)")
