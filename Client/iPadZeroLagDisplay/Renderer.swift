@@ -54,21 +54,21 @@ enum VideoQualityDiagnostics {
 }
 
 enum IOSurfaceIsolationStage: String, Equatable {
-    case decodeOnly = "A_DECODE_ONLY"
-    case metalWrapOnly = "B_METAL_WRAP_ONLY"
-    case normalPresentation = "C_NORMAL_PRESENTATION"
+    case drawableSetupOnly = "C1_DRAWABLE_SETUP_ONLY"
+    case commandSubmissionOnly = "C2_COMMAND_SUBMISSION_NO_PRESENT"
+    case normalPresentation = "C3_NORMAL_PRESENTATION"
 }
 
 struct IOSurfaceIsolationPolicy: Equatable {
-    let decodeEnabled: Bool
-    let metalWrapEnabled: Bool
+    let renderEncodingEnabled: Bool
+    let commandCommitEnabled: Bool
     let presentationEnabled: Bool
 }
 
 enum IOSurfaceIsolationSchedule {
     static func stage(elapsed: TimeInterval) -> IOSurfaceIsolationStage {
-        if elapsed < 15 { return .decodeOnly }
-        if elapsed < 30 { return .metalWrapOnly }
+        if elapsed < 12 { return .drawableSetupOnly }
+        if elapsed < 24 { return .commandSubmissionOnly }
         return .normalPresentation
     }
 
@@ -76,20 +76,20 @@ enum IOSurfaceIsolationSchedule {
         for stage: IOSurfaceIsolationStage
     ) -> IOSurfaceIsolationPolicy {
         switch stage {
-        case .decodeOnly:
+        case .drawableSetupOnly:
             return IOSurfaceIsolationPolicy(
-                decodeEnabled: true,
-                metalWrapEnabled: false,
+                renderEncodingEnabled: false,
+                commandCommitEnabled: false,
                 presentationEnabled: false)
-        case .metalWrapOnly:
+        case .commandSubmissionOnly:
             return IOSurfaceIsolationPolicy(
-                decodeEnabled: true,
-                metalWrapEnabled: true,
+                renderEncodingEnabled: true,
+                commandCommitEnabled: true,
                 presentationEnabled: false)
         case .normalPresentation:
             return IOSurfaceIsolationPolicy(
-                decodeEnabled: true,
-                metalWrapEnabled: true,
+                renderEncodingEnabled: true,
+                commandCommitEnabled: true,
                 presentationEnabled: true)
         }
     }
@@ -101,12 +101,18 @@ enum IOSurfaceIsolationEvent: Hashable {
     case pixelBuffer
     case metalYCreate
     case metalUVCreate
-    case renderCommand
-    case commandCommit
+    case drawableAcquire
+    case renderPassDescriptor
+    case commandBufferCreate
+    case renderEncoderCreate
+    case renderEncode
     case present
+    case commandCommit
+    case commandScheduled
+    case commandCompleted
 }
 
-/// Temporary one-IPA diagnostic. Remove after the A/B/C physical capture.
+/// Temporary one-IPA diagnostic. Remove after the C1/C2/C3 physical capture.
 final class IOSurfaceIsolationDiagnostics {
     static let shared = IOSurfaceIsolationDiagnostics()
 
@@ -117,6 +123,8 @@ final class IOSurfaceIsolationDiagnostics {
     private var counts: [IOSurfaceIsolationEvent: Int] = [:]
     private var completeLogged = false
     private var destinationAttributesLogged = false
+    private var failuresLogged: Set<String> = []
+    private var inFlightCommandBuffers = 0
 
     private init() {}
 
@@ -128,6 +136,8 @@ final class IOSurfaceIsolationDiagnostics {
         counts.removeAll(keepingCapacity: true)
         completeLogged = false
         destinationAttributesLogged = false
+        failuresLogged.removeAll(keepingCapacity: true)
+        inFlightCommandBuffers = 0
         lock.unlock()
     }
 
@@ -176,6 +186,19 @@ final class IOSurfaceIsolationDiagnostics {
             collectibleSink: collectibleSink)
     }
 
+    func logFailure(
+        _ failure: String,
+        collectibleSink: ((String) -> Void)? = nil
+    ) {
+        lock.lock()
+        let shouldLog = failuresLogged.insert(failure).inserted
+        lock.unlock()
+        guard shouldLog else { return }
+        emit(
+            "[METAL_STAGEC_FAILURE] \(failure)",
+            collectibleSink: collectibleSink)
+    }
+
     private func update(
         event: IOSurfaceIsolationEvent?,
         collectibleSink: ((String) -> Void)?,
@@ -205,9 +228,16 @@ final class IOSurfaceIsolationDiagnostics {
                     elapsed,
                     Date().ISO8601Format()))
         }
-        if let event { counts[event, default: 0] += 1 }
+        if let event {
+            counts[event, default: 0] += 1
+            if event == .commandCommit {
+                inFlightCommandBuffers += 1
+            } else if event == .commandCompleted {
+                inFlightCommandBuffers = max(0, inFlightCommandBuffers - 1)
+            }
+        }
 
-        if elapsed >= 45, !completeLogged {
+        if elapsed >= 36, !completeLogged {
             completeLogged = true
             lines.append("[IOSURFACE_ISOLATION_COMPLETE]")
         }
@@ -221,16 +251,18 @@ final class IOSurfaceIsolationDiagnostics {
             }
             lines.append(
                 String(
-                    format: "[IOSURFACE_ISOLATION_RATE] stage=%@ decodeSubmitPerSec=%.1f decodeCallbackPerSec=%.1f pixelBufferPerSec=%.1f metalYCreatePerSec=%.1f metalUVCreatePerSec=%.1f renderCommandPerSec=%.1f commandCommitPerSec=%.1f presentPerSec=%.1f",
+                    format: "[METAL_STAGEC_RATE] stage=%@ drawableAcquirePerSec=%.1f renderPassDescriptorPerSec=%.1f commandBufferCreatePerSec=%.1f renderEncoderCreatePerSec=%.1f renderEncodePerSec=%.1f presentCallPerSec=%.1f commitCallPerSec=%.1f commandScheduledPerSec=%.1f commandCompletedPerSec=%.1f inFlightCommandBuffers=%d",
                     stage.rawValue,
-                    rate(.decodeSubmit),
-                    rate(.decodeCallback),
-                    rate(.pixelBuffer),
-                    rate(.metalYCreate),
-                    rate(.metalUVCreate),
-                    rate(.renderCommand),
+                    rate(.drawableAcquire),
+                    rate(.renderPassDescriptor),
+                    rate(.commandBufferCreate),
+                    rate(.renderEncoderCreate),
+                    rate(.renderEncode),
+                    rate(.present),
                     rate(.commandCommit),
-                    rate(.present)))
+                    rate(.commandScheduled),
+                    rate(.commandCompleted),
+                    inFlightCommandBuffers))
             self.rateStartedAt = now
             counts.removeAll(keepingCapacity: true)
         }
@@ -542,18 +574,6 @@ public class Renderer: NSObject, MTKViewDelegate {
         sequence: UInt32,
         generation: UInt64
     ) {
-        let isolation = IOSurfaceIsolationDiagnostics.shared
-        let isolationStage = isolation.stage(
-            collectibleSink: diagnosticSink) ?? .decodeOnly
-        let isolationPolicy = IOSurfaceIsolationSchedule.policy(
-            for: isolationStage)
-        if !isolationPolicy.presentationEnabled {
-            if isolationPolicy.metalWrapEnabled {
-                wrapForIOSurfaceIsolation(pixelBuffer)
-            }
-            return
-        }
-
         var dropped: UInt32?
         lock.lock()
         switch freshness.offer(sequence, generation: generation) {
@@ -570,38 +590,6 @@ public class Renderer: NSObject, MTKViewDelegate {
         }
         lock.unlock()
         if let dropped { onFrameDropped?(dropped, generation) }
-    }
-
-    private func wrapForIOSurfaceIsolation(_ pixelBuffer: CVPixelBuffer) {
-        guard let textureCache,
-              CVPixelBufferGetPixelFormatType(pixelBuffer) ==
-                DecoderOutputBufferAttributes.pixelFormat else {
-            return
-        }
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
-        var yTextureRef: CVMetalTexture?
-        let yStatus = CVMetalTextureCacheCreateTextureFromImage(
-            kCFAllocatorDefault, textureCache, pixelBuffer, nil,
-            .r8Unorm, width, height, 0, &yTextureRef)
-        IOSurfaceIsolationDiagnostics.shared.record(
-            .metalYCreate,
-            collectibleSink: diagnosticSink)
-        var uvTextureRef: CVMetalTexture?
-        let uvStatus = CVMetalTextureCacheCreateTextureFromImage(
-            kCFAllocatorDefault, textureCache, pixelBuffer, nil,
-            .rg8Unorm, width / 2, height / 2, 1, &uvTextureRef)
-        IOSurfaceIsolationDiagnostics.shared.record(
-            .metalUVCreate,
-            collectibleSink: diagnosticSink)
-        guard yStatus == kCVReturnSuccess,
-              uvStatus == kCVReturnSuccess,
-              let yTextureRef,
-              let uvTextureRef,
-              CVMetalTextureGetTexture(yTextureRef) != nil,
-              CVMetalTextureGetTexture(uvTextureRef) != nil else {
-            return
-        }
     }
 
     public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
@@ -630,10 +618,37 @@ public class Renderer: NSObject, MTKViewDelegate {
         currentPixelBuffer = nil
         lock.unlock()
 
-        guard let textureCache,
-              let pipelineState,
-              let drawable = view.currentDrawable,
-              let renderPassDescriptor = view.currentRenderPassDescriptor else {
+        let isolation = IOSurfaceIsolationDiagnostics.shared
+        let isolationStage = isolation.stage(
+            collectibleSink: diagnosticSink) ?? .drawableSetupOnly
+        let isolationPolicy = IOSurfaceIsolationSchedule.policy(
+            for: isolationStage)
+
+        guard let drawable = view.currentDrawable else {
+            isolation.logFailure(
+                "stage=\(isolationStage.rawValue) drawable=nil",
+                collectibleSink: diagnosticSink)
+            abandon(identity)
+            return
+        }
+        isolation.record(.drawableAcquire, collectibleSink: diagnosticSink)
+        guard let renderPassDescriptor = view.currentRenderPassDescriptor else {
+            isolation.logFailure(
+                "stage=\(isolationStage.rawValue) renderPassDescriptor=nil",
+                collectibleSink: diagnosticSink)
+            abandon(identity)
+            return
+        }
+        isolation.record(.renderPassDescriptor, collectibleSink: diagnosticSink)
+        guard isolationPolicy.renderEncodingEnabled,
+              isolationPolicy.commandCommitEnabled else {
+            abandon(identity)
+            return
+        }
+        guard let textureCache, let pipelineState else {
+            isolation.logFailure(
+                "stage=\(isolationStage.rawValue) rendererResources=nil",
+                collectibleSink: diagnosticSink)
             abandon(identity)
             return
         }
@@ -688,15 +703,23 @@ public class Renderer: NSObject, MTKViewDelegate {
             collectibleSink: diagnosticSink,
             details:
                 "texture_px=\(drawable.texture.width)x\(drawable.texture.height) drawable_px=\(VideoQualityDiagnostics.pixels(view.drawableSize)) format=\(drawable.texture.pixelFormat.rawValue)")
-        guard let commandBuffer = commandQueue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeRenderCommandEncoder(
-                descriptor: renderPassDescriptor) else {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            isolation.logFailure(
+                "stage=\(isolationStage.rawValue) commandBuffer=nil",
+                collectibleSink: diagnosticSink)
             abandon(identity)
             return
         }
-        IOSurfaceIsolationDiagnostics.shared.record(
-            .renderCommand,
-            collectibleSink: diagnosticSink)
+        isolation.record(.commandBufferCreate, collectibleSink: diagnosticSink)
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(
+            descriptor: renderPassDescriptor) else {
+            isolation.logFailure(
+                "stage=\(isolationStage.rawValue) renderEncoder=nil",
+                collectibleSink: diagnosticSink)
+            abandon(identity)
+            return
+        }
+        isolation.record(.renderEncoderCreate, collectibleSink: diagnosticSink)
 
         guard let contentViewport = Self.contentViewport(
             forDrawableSize: view.drawableSize,
@@ -727,6 +750,7 @@ public class Renderer: NSObject, MTKViewDelegate {
         encoder.setFragmentTexture(uvTexture, index: 1)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         encoder.endEncoding()
+        isolation.record(.renderEncode, collectibleSink: diagnosticSink)
 
         lock.lock()
         let shouldCommit = freshness.shouldCommit(identity)
@@ -736,15 +760,30 @@ public class Renderer: NSObject, MTKViewDelegate {
             return
         }
 
-        commandBuffer.present(drawable)
-        IOSurfaceIsolationDiagnostics.shared.record(
-            .present,
-            collectibleSink: diagnosticSink)
+        if isolationPolicy.presentationEnabled {
+            commandBuffer.present(drawable)
+            isolation.record(.present, collectibleSink: diagnosticSink)
+        }
         let retainedPixelBuffer = pixelBuffer
-        commandBuffer.addCompletedHandler { [weak self] _ in
+        let collectibleSink = diagnosticSink
+        commandBuffer.addScheduledHandler { _ in
+            isolation.record(
+                .commandScheduled,
+                collectibleSink: collectibleSink)
+        }
+        commandBuffer.addCompletedHandler { [weak self] completedBuffer in
             _ = yTextureRef
             _ = uvTextureRef
             _ = retainedPixelBuffer
+            isolation.record(
+                .commandCompleted,
+                collectibleSink: collectibleSink)
+            if completedBuffer.status == .error {
+                isolation.logFailure(
+                    "stage=\(isolationStage.rawValue) commandStatus=error detail=\(String(describing: completedBuffer.error))",
+                    collectibleSink: collectibleSink)
+            }
+            guard isolationPolicy.presentationEnabled else { return }
             guard let self else { return }
             self.lock.lock()
             let isCurrent = self.freshness.markPresented(identity)
@@ -762,17 +801,17 @@ public class Renderer: NSObject, MTKViewDelegate {
                     identity.generation)
             }
         }
+        isolation.record(.commandCommit, collectibleSink: diagnosticSink)
         commandBuffer.commit()
-        IOSurfaceIsolationDiagnostics.shared.record(
-            .commandCommit,
-            collectibleSink: diagnosticSink)
         diagnosticLock.lock()
         let shouldLogSubmit = submitGenerationDiagnostics.insert(identity.generation).inserted
         diagnosticLock.unlock()
         if shouldLogSubmit {
             print("[IPAD][RENDER_FRAME_SUBMIT] generation=\(identity.generation)")
         }
-        onDrawableCommitted?(identity.sequence, identity.generation)
+        if isolationPolicy.presentationEnabled {
+            onDrawableCommitted?(identity.sequence, identity.generation)
+        }
     }
 
     private func publishContentViewport(_ contentViewport: VideoContentViewport) {

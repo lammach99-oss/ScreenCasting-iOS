@@ -360,33 +360,45 @@ final class RenderFreshnessTrackerTests: XCTestCase {
 }
 
 final class IOSurfaceIsolationScheduleTests: XCTestCase {
-    func testAutomaticABCStageBoundariesUseMonotonicElapsedTime() {
-        XCTAssertEqual(IOSurfaceIsolationSchedule.stage(elapsed: 0), .decodeOnly)
-        XCTAssertEqual(IOSurfaceIsolationSchedule.stage(elapsed: 14.999), .decodeOnly)
-        XCTAssertEqual(IOSurfaceIsolationSchedule.stage(elapsed: 15), .metalWrapOnly)
-        XCTAssertEqual(IOSurfaceIsolationSchedule.stage(elapsed: 29.999), .metalWrapOnly)
-        XCTAssertEqual(IOSurfaceIsolationSchedule.stage(elapsed: 30), .normalPresentation)
-        XCTAssertEqual(IOSurfaceIsolationSchedule.stage(elapsed: 45), .normalPresentation)
+    func testAutomaticC123StageBoundariesUseMonotonicElapsedTime() {
+        XCTAssertEqual(
+            IOSurfaceIsolationSchedule.stage(elapsed: 0),
+            .drawableSetupOnly)
+        XCTAssertEqual(
+            IOSurfaceIsolationSchedule.stage(elapsed: 11.999),
+            .drawableSetupOnly)
+        XCTAssertEqual(
+            IOSurfaceIsolationSchedule.stage(elapsed: 12),
+            .commandSubmissionOnly)
+        XCTAssertEqual(
+            IOSurfaceIsolationSchedule.stage(elapsed: 23.999),
+            .commandSubmissionOnly)
+        XCTAssertEqual(
+            IOSurfaceIsolationSchedule.stage(elapsed: 24),
+            .normalPresentation)
+        XCTAssertEqual(
+            IOSurfaceIsolationSchedule.stage(elapsed: 36),
+            .normalPresentation)
     }
 
-    func testStagePoliciesGateOnlyMetalWrappingAndPresentation() {
+    func testStagePoliciesIsolateSetupSubmissionAndPresentation() {
         XCTAssertEqual(
-            IOSurfaceIsolationSchedule.policy(for: .decodeOnly),
+            IOSurfaceIsolationSchedule.policy(for: .drawableSetupOnly),
             IOSurfaceIsolationPolicy(
-                decodeEnabled: true,
-                metalWrapEnabled: false,
+                renderEncodingEnabled: false,
+                commandCommitEnabled: false,
                 presentationEnabled: false))
         XCTAssertEqual(
-            IOSurfaceIsolationSchedule.policy(for: .metalWrapOnly),
+            IOSurfaceIsolationSchedule.policy(for: .commandSubmissionOnly),
             IOSurfaceIsolationPolicy(
-                decodeEnabled: true,
-                metalWrapEnabled: true,
+                renderEncodingEnabled: true,
+                commandCommitEnabled: true,
                 presentationEnabled: false))
         XCTAssertEqual(
             IOSurfaceIsolationSchedule.policy(for: .normalPresentation),
             IOSurfaceIsolationPolicy(
-                decodeEnabled: true,
-                metalWrapEnabled: true,
+                renderEncodingEnabled: true,
+                commandCommitEnabled: true,
                 presentationEnabled: true))
     }
 }
