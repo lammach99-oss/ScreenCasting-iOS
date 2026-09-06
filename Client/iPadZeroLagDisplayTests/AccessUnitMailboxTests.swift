@@ -358,3 +358,35 @@ final class RenderFreshnessTrackerTests: XCTestCase {
         XCTAssertEqual(tracker.acceptedSequence, 1)
     }
 }
+
+final class IOSurfaceIsolationScheduleTests: XCTestCase {
+    func testAutomaticABCStageBoundariesUseMonotonicElapsedTime() {
+        XCTAssertEqual(IOSurfaceIsolationSchedule.stage(elapsed: 0), .decodeOnly)
+        XCTAssertEqual(IOSurfaceIsolationSchedule.stage(elapsed: 14.999), .decodeOnly)
+        XCTAssertEqual(IOSurfaceIsolationSchedule.stage(elapsed: 15), .metalWrapOnly)
+        XCTAssertEqual(IOSurfaceIsolationSchedule.stage(elapsed: 29.999), .metalWrapOnly)
+        XCTAssertEqual(IOSurfaceIsolationSchedule.stage(elapsed: 30), .normalPresentation)
+        XCTAssertEqual(IOSurfaceIsolationSchedule.stage(elapsed: 45), .normalPresentation)
+    }
+
+    func testStagePoliciesGateOnlyMetalWrappingAndPresentation() {
+        XCTAssertEqual(
+            IOSurfaceIsolationSchedule.policy(for: .decodeOnly),
+            IOSurfaceIsolationPolicy(
+                decodeEnabled: true,
+                metalWrapEnabled: false,
+                presentationEnabled: false))
+        XCTAssertEqual(
+            IOSurfaceIsolationSchedule.policy(for: .metalWrapOnly),
+            IOSurfaceIsolationPolicy(
+                decodeEnabled: true,
+                metalWrapEnabled: true,
+                presentationEnabled: false))
+        XCTAssertEqual(
+            IOSurfaceIsolationSchedule.policy(for: .normalPresentation),
+            IOSurfaceIsolationPolicy(
+                decodeEnabled: true,
+                metalWrapEnabled: true,
+                presentationEnabled: true))
+    }
+}
