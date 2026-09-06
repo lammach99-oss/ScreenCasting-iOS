@@ -640,7 +640,7 @@ public struct ContentView: View {
                 .font(.system(size: 15, weight: .semibold, design: .rounded))
                 .foregroundColor(.white)
         case .listening:
-            Text("USB listener ready on port 12345.")
+            Text("USB listener ready on port 42042.")
                 .font(.system(size: 15, weight: .semibold, design: .rounded))
                 .foregroundColor(.green)
         case .connecting:
