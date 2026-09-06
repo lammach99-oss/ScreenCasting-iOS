@@ -1951,6 +1951,7 @@ public class NetworkManager: ObservableObject {
                 } else {
                     self.startWireReceiveLoop(generation: generation)
                     self.wireAuthenticatedGeneration = generation
+                    self.commitLegacyTransport(generation: generation)
                     print("[IPAD][USB_SCDP_READY] generation=\(generation)")
                     self.setState(.listening)
                 }
