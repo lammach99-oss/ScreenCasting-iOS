@@ -1184,7 +1184,7 @@ public class NetworkManager: ObservableObject {
     private lazy var controlChannelWriter = ControlChannelWriter(
         queue: networkQueue,
         sender: { [weak self] data, completion in
-            guard let connection = self?.connection else {
+            guard let connection = self?.activeControlConnection else {
                 completion(nil)
                 return
             }
@@ -1951,8 +1951,8 @@ public class NetworkManager: ObservableObject {
                 } else {
                     self.startWireReceiveLoop(generation: generation)
                     self.wireAuthenticatedGeneration = generation
+                    self.commitLegacyTransport(generation: generation)
                     print("[IPAD][USB_SCDP_READY] generation=\(generation)")
-                    self.setState(.listening)
                 }
 
             case .failed(let error):
@@ -2837,6 +2837,10 @@ public class NetworkManager: ObservableObject {
 
     private var activeTransportKind: ActiveTransportKind {
         usbListener == nil ? .wifi : .usb
+    }
+
+    private var activeControlConnection: NWConnection? {
+        activeTransportKind == .usb ? usbScdpConnection : connection
     }
 
     private func sendClientCapabilities(for kind: ActiveTransportKind) {
