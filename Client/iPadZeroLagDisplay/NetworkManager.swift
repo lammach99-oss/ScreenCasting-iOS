@@ -1949,7 +1949,7 @@ public class NetworkManager: ObservableObject {
             "diagnosticSequence=\(diagnostic.sequence) activeTransportKind=usb " +
             "usbConnectionPresent=\(connection != nil) " +
             "connectionIdentity=\(identity) clientGeneration=\(generation) " +
-            "committedGeneration=\(committedTransportGeneration.map { String($0) } ?? \"none\") " +
+            "committedGeneration=\(committedTransportGeneration.map { String($0) } ?? "none") " +
             "inputSuppressed=\(displayRequestGate.isInputSuppressed) " +
             "payloadLength=\(payloadLength) result=\(result) reason=\(reason)")
     }
@@ -1969,9 +1969,9 @@ public class NetworkManager: ObservableObject {
             "diagnosticSequence=\(diagnostic.sequence) activeTransportKind=usb " +
             "usbConnectionPresent=\(connection != nil) " +
             "connectionIdentity=\(identity) clientGeneration=\(connectionGeneration) " +
-            "committedGeneration=\(committedTransportGeneration.map { String($0) } ?? \"none\") " +
+            "committedGeneration=\(committedTransportGeneration.map { String($0) } ?? "none") " +
             "inputSuppressed=\(displayRequestGate.isInputSuppressed) " +
-            "payloadLength=\(payloadLength) error=\(error ?? \"none\")")
+            "payloadLength=\(payloadLength) error=\(error ?? "none")")
     }
 
     // MARK: - Private: TLS Configuration
