@@ -1921,8 +1921,8 @@ public class NetworkManager: ObservableObject {
 
     private func setupStateHandler(for connection: NWConnection) {
         let generation = connectionGeneration
-        connection.stateUpdateHandler = { [weak self] state in
-            guard let self = self else { return }
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self, let connection else { return }
             guard generation == self.connectionGeneration,
                   self.connection === connection else { return }
             if self.usbListener != nil,
