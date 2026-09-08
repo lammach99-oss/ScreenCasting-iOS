@@ -1376,9 +1376,10 @@ public class NetworkManager: ObservableObject {
             self?.resetDisplaySession()
         }
         let parameters = buildTLSParameters(for: endpoint)
-        connection = NWConnection(to: endpoint, using: parameters)
+        let newConnection = NWConnection(to: endpoint, using: parameters)
+        connection = newConnection
 
-        setupStateHandler()
+        setupStateHandler(for: newConnection)
         setState(.connecting)
         print("[IPAD][TCP_CONNECT] endpoint=\(endpoint)")
         connectionTimeoutWorkItem?.cancel()
@@ -1784,15 +1785,14 @@ public class NetworkManager: ObservableObject {
                     newConnection.cancel()
                     return
                 }
-                guard self.usbScdpConnection == nil else {
-                    newConnection.cancel()
-                    return
-                }
+                let previousConnection = self.usbScdpConnection
+                _ = self.connectionGenerationClock.advance()
                 self.usbScdpConnection = newConnection
                 self.connection = newConnection
-                self.setupStateHandler()
+                self.setupStateHandler(for: newConnection)
                 self.setState(.connecting)
                 newConnection.start(queue: self.networkQueue)
+                previousConnection?.cancel()
             }
             listener.start(queue: networkQueue)
         } catch {
@@ -1919,11 +1919,14 @@ public class NetworkManager: ObservableObject {
         return false
     }
 
-    private func setupStateHandler() {
+    private func setupStateHandler(for connection: NWConnection) {
         let generation = connectionGeneration
-        connection?.stateUpdateHandler = { [weak self] state in
+        connection.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
-            guard generation == self.connectionGeneration else { return }
+            guard generation == self.connectionGeneration,
+                  self.connection === connection else { return }
+            if self.usbListener != nil,
+               self.usbScdpConnection !== connection { return }
             switch state {
             case .setup:
                 print("[IPAD][NW_STATE] setup")
@@ -1939,6 +1942,14 @@ public class NetworkManager: ObservableObject {
             case .ready:
                 self.connectionTimeoutWorkItem?.cancel()
                 print("[IPAD][NW_STATE] ready TLS_VERIFY_COMPLETE accepted")
+                let telemetryKind: StreamingTransportKind =
+                    self.activeTransportKind == .usb ? .usbTypeC : .wifi
+                self.transportTelemetry.setSessionContext(TransportTelemetryContext(
+                    transportKind: telemetryKind,
+                    transportBackend: self.activeTransportKind == .usb
+                        ? "localhost_scdp"
+                        : "network_framework",
+                    connectionGeneration: generation))
                 self.controlChannelWriter.begin(generation: generation)
                 if self.activeTransportKind == .wifi {
                     self.startWireReceiveLoop(generation: generation)

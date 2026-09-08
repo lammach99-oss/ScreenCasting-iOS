@@ -535,14 +535,19 @@ final class TransportTelemetry {
             generation: resolvedGeneration,
             sequence: sequence)
         receiveTicks[key] = receivedAt
+        let resolvedTransportKind =
+            transportKind ?? sessionContext.transportKind.rawValue
         let dimensions = makeDimensionsLocked(
             sequence: sequence,
             isIDR: isIDR,
             packetCount: 1,
             bytes: payloadBytes,
             generation: generation,
-            transportKind: transportKind,
-            routeKind: "legacy_tls")
+            transportKind: resolvedTransportKind,
+            routeKind: resolvedTransportKind ==
+                StreamingTransportKind.usbTypeC.rawValue
+                ? "localhost_scdp"
+                : "legacy_tls")
         storeDimensionsLocked(dimensions)
         lock.unlock()
         sequenceReporter.record(LocalStageRecord(
