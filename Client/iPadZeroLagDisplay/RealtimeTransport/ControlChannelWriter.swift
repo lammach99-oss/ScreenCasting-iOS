@@ -4,7 +4,16 @@ import Network
 /// Serializes every send issued against one control `NWConnection`.
 /// Callers must invoke this object only on its injected queue.
 final class ControlChannelWriter {
-    typealias Sender = (Data, @escaping (NWError?) -> Void) -> Void
+    struct DiagnosticContext {
+        let sequence: UInt64
+        let event: String
+    }
+
+    typealias Sender = (
+        Data,
+        DiagnosticContext?,
+        @escaping (NWError?) -> Void
+    ) -> Void
 
     private enum Priority {
         case reliable
@@ -16,6 +25,7 @@ final class ControlChannelWriter {
         let data: Data
         let priority: Priority
         let generation: UInt64
+        let diagnostic: DiagnosticContext?
         let completion: (NWError?) -> Void
     }
 
@@ -46,6 +56,7 @@ final class ControlChannelWriter {
     @discardableResult
     func enqueue(
         _ data: Data,
+        diagnostic: DiagnosticContext? = nil,
         completion: @escaping (NWError?) -> Void = { _ in }
     ) -> Bool {
         dispatchPrecondition(condition: .onQueue(queue))
@@ -56,6 +67,7 @@ final class ControlChannelWriter {
             data: data,
             priority: .reliable,
             generation: generation,
+            diagnostic: diagnostic,
             completion: completion))
         drain()
         return true
@@ -65,6 +77,7 @@ final class ControlChannelWriter {
     /// transitions within the bounded queue without creating a second writer.
     func enqueueTelemetry(
         _ data: Data,
+        diagnostic: DiagnosticContext? = nil,
         completion: @escaping (NWError?) -> Void = { _ in }
     ) {
         dispatchPrecondition(condition: .onQueue(queue))
@@ -73,6 +86,7 @@ final class ControlChannelWriter {
             data: data,
             priority: .telemetry,
             generation: generation,
+            diagnostic: diagnostic,
             completion: completion))
         drain()
     }
@@ -82,6 +96,7 @@ final class ControlChannelWriter {
     /// pointer position and vice versa.
     func enqueueMovement(
         _ data: Data,
+        diagnostic: DiagnosticContext? = nil,
         completion: @escaping (NWError?) -> Void = { _ in }
     ) {
         dispatchPrecondition(condition: .onQueue(queue))
@@ -90,6 +105,7 @@ final class ControlChannelWriter {
             data: data,
             priority: .movement,
             generation: generation,
+            diagnostic: diagnostic,
             completion: completion))
         drain()
     }
@@ -103,7 +119,7 @@ final class ControlChannelWriter {
         inFlight = next
         activeSendID &+= 1
         let sendID = activeSendID
-        sender(next.data) { [weak self] error in
+        sender(next.data, next.diagnostic) { [weak self] error in
             guard let self else { return }
             self.queue.async {
                 guard self.sending, self.activeSendID == sendID else { return }

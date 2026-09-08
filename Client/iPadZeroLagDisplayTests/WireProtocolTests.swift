@@ -408,7 +408,7 @@ private final class ConcurrentSenderSpy {
         self.queue = queue
     }
 
-    lazy var send: ControlChannelWriter.Sender = { [weak self] _, completion in
+    lazy var send: ControlChannelWriter.Sender = { [weak self] _, _, completion in
         guard let self else { return }
         self.lock.lock()
         self.inFlight += 1
@@ -428,7 +428,7 @@ private final class ManualSender {
     private var completions: [(NWError?) -> Void] = []
     private(set) var sent: [Data] = []
 
-    lazy var send: ControlChannelWriter.Sender = { [weak self] data, completion in
+    lazy var send: ControlChannelWriter.Sender = { [weak self] data, _, completion in
         guard let self else { return }
         self.lock.lock()
         self.sent.append(data)
