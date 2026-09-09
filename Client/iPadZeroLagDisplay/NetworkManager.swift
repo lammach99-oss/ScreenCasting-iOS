@@ -1183,14 +1183,45 @@ public class NetworkManager: ObservableObject {
     private let networkQueue = DispatchQueue(label: "com.iPadCasting.network", qos: .userInteractive)
     private lazy var controlChannelWriter = ControlChannelWriter(
         queue: networkQueue,
-        sender: { [weak self] data, completion in
-            guard let connection = self?.activeControlConnection else {
+        sender: { [weak self] data, diagnostic, completion in
+            guard let self else {
+                completion(nil)
+                return
+            }
+            let connection = self.activeControlConnection
+            if let diagnostic {
+                self.recordUsbTouchSendDiagnostic(
+                    "[USB_TOUCH_SEND_ATTEMPT]",
+                    diagnostic: diagnostic,
+                    payloadLength: data.count,
+                    error: nil)
+            }
+            guard let connection else {
+                if let diagnostic {
+                    self.recordUsbTouchSendDiagnostic(
+                        "[USB_TOUCH_SEND_FAILURE]",
+                        diagnostic: diagnostic,
+                        payloadLength: data.count,
+                        error: "no_active_control_connection")
+                }
+                // Preserve the existing no-connection completion behavior.
                 completion(nil)
                 return
             }
             connection.send(
                 content: data,
-                completion: .contentProcessed(completion))
+                completion: .contentProcessed { [weak self] error in
+                    if let diagnostic, let self {
+                        self.recordUsbTouchSendDiagnostic(
+                            error == nil
+                                ? "[USB_TOUCH_SEND_SUCCESS]"
+                                : "[USB_TOUCH_SEND_FAILURE]",
+                            diagnostic: diagnostic,
+                            payloadLength: data.count,
+                            error: error.map { String(describing: $0) })
+                    }
+                    completion(error)
+                })
         })
     private lazy var wireParser = WireParserQueueDomain(
         generation: connectionGeneration,
@@ -1304,6 +1335,9 @@ public class NetworkManager: ObservableObject {
     private var latestDisplayPreference: DisplayPreference?
     private var observedInterfaceOrientation: ClientDisplayOrientation?
     private var orientationDebounceWorkItem: DispatchWorkItem?
+    private static let usbTouchMoveDiagnosticInterval: TimeInterval = 0.25
+    private var usbTouchDiagnosticSequence: UInt64 = 0
+    private var lastUsbTouchMoveDiagnosticAt: TimeInterval = 0
 
     public init() {
         let savedDisplayPreference = DisplayPreferenceStore.load()
@@ -1517,7 +1551,20 @@ public class NetworkManager: ObservableObject {
     ///   - y:        Vertical position in logical pixels (0–65535 for normalised use).
     ///   - pressure: Normalised pressure mapped to 0–255 byte range.
     public func sendTouchEvent(type: TouchEventType, x: UInt16, y: UInt16, pressure: UInt8) {
-        guard connectionState == .streaming else { return }
+        guard connectionState == .streaming else {
+            networkQueue.async { [weak self] in
+                guard let self, self.activeTransportKind == .usb else { return }
+                let diagnostic = self.nextUsbTouchDiagnostic(type: type)
+                guard diagnostic.shouldLog else { return }
+                self.recordUsbTouchGuardDiagnostic(
+                    diagnostic: diagnostic.context,
+                    generation: self.connectionGeneration,
+                    payloadLength: TouchWireProtocol.packetSize,
+                    result: "drop",
+                    reason: "connection_state_\(self.connectionState)")
+            }
+            return
+        }
 
         // Build the 8-byte packet inline — stack allocation, no heap alloc.
         var packet = Data(count: TouchWireProtocol.packetSize)
@@ -1541,12 +1588,32 @@ public class NetworkManager: ObservableObject {
 
         let generation = connectionGeneration
         networkQueue.async { [weak self] in
-            guard let self,
-                  generation == self.connectionGeneration,
-                  self.committedTransportGeneration == generation,
-                  !self.displayRequestGate.isInputSuppressed else {
-                return
+            guard let self else { return }
+            let isUsb = self.activeTransportKind == .usb
+            let diagnostic = isUsb
+                ? self.nextUsbTouchDiagnostic(type: type)
+                : nil
+            let isCommittedGeneration =
+                self.committedTransportGeneration == generation
+            let dropReason: String?
+            if generation != self.connectionGeneration {
+                dropReason = "stale_client_generation"
+            } else if !isCommittedGeneration {
+                dropReason = "generation_not_committed"
+            } else if self.displayRequestGate.isInputSuppressed {
+                dropReason = "input_suppressed"
+            } else {
+                dropReason = nil
             }
+            if let diagnostic, diagnostic.shouldLog {
+                self.recordUsbTouchGuardDiagnostic(
+                    diagnostic: diagnostic.context,
+                    generation: generation,
+                    payloadLength: packet.count,
+                    result: dropReason == nil ? "pass" : "drop",
+                    reason: dropReason ?? "none")
+            }
+            guard dropReason == nil else { return }
             let delivery = InputDeliveryPolicy.forEvent(type)
             if self.committedRealtimeMode == RealtimeTransportMode.wifiRTP,
                delivery == .unreliableLatest {
@@ -1563,9 +1630,13 @@ public class NetworkManager: ObservableObject {
             if delivery == .unreliableLatest {
                 self.controlChannelWriter.enqueueMovement(
                     packet,
+                    diagnostic: diagnostic?.shouldLog == true
+                        ? diagnostic?.context : nil,
                     completion: completion)
             } else if !self.controlChannelWriter.enqueue(
                 packet,
+                diagnostic: diagnostic?.shouldLog == true
+                    ? diagnostic?.context : nil,
                 completion: completion) {
                 self.handleStreamError(
                     "Control queue reached its 64-message bound.")
@@ -1800,6 +1871,65 @@ public class NetworkManager: ObservableObject {
             setState(.disconnected(
                 reason: "Unable to start USB listener: \(error.localizedDescription)"))
         }
+    }
+
+    private func nextUsbTouchDiagnostic(
+        type: TouchEventType
+    ) -> (context: ControlChannelWriter.DiagnosticContext, shouldLog: Bool) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        usbTouchDiagnosticSequence &+= 1
+        let context = ControlChannelWriter.DiagnosticContext(
+            sequence: usbTouchDiagnosticSequence,
+            event: String(describing: type).capitalized)
+        guard type == .move else { return (context, true) }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastUsbTouchMoveDiagnosticAt >=
+                Self.usbTouchMoveDiagnosticInterval else {
+            return (context, false)
+        }
+        lastUsbTouchMoveDiagnosticAt = now
+        return (context, true)
+    }
+
+    private func recordUsbTouchGuardDiagnostic(
+        diagnostic: ControlChannelWriter.DiagnosticContext,
+        generation: UInt64,
+        payloadLength: Int,
+        result: String,
+        reason: String
+    ) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        let identity = activeControlConnection.map {
+            String(describing: ObjectIdentifier($0))
+        } ?? "none"
+        recordDiagnosticLine(
+            "[USB_TOUCH_SEND_GUARD] event=\(diagnostic.event) " +
+            "diagnosticSequence=\(diagnostic.sequence) activeTransportKind=usb " +
+            "usbConnectionPresent=\(usbScdpConnection != nil) " +
+            "connectionIdentity=\(identity) clientGeneration=\(generation) " +
+            "committedGeneration=\(committedTransportGeneration.map { String($0) } ?? "none") " +
+            "inputSuppressed=\(displayRequestGate.isInputSuppressed) " +
+            "payloadLength=\(payloadLength) result=\(result) reason=\(reason)")
+    }
+
+    private func recordUsbTouchSendDiagnostic(
+        _ marker: String,
+        diagnostic: ControlChannelWriter.DiagnosticContext,
+        payloadLength: Int,
+        error: String?
+    ) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        let identity = activeControlConnection.map {
+            String(describing: ObjectIdentifier($0))
+        } ?? "none"
+        recordDiagnosticLine(
+            "\(marker) event=\(diagnostic.event) " +
+            "diagnosticSequence=\(diagnostic.sequence) activeTransportKind=usb " +
+            "usbConnectionPresent=\(usbScdpConnection != nil) " +
+            "connectionIdentity=\(identity) clientGeneration=\(connectionGeneration) " +
+            "committedGeneration=\(committedTransportGeneration.map { String($0) } ?? "none") " +
+            "inputSuppressed=\(displayRequestGate.isInputSuppressed) " +
+            "payloadLength=\(payloadLength) error=\(error ?? "none")")
     }
 
     // MARK: - Private: TLS Configuration

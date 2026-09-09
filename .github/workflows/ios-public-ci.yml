@@ -190,6 +190,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
+      - name: Verify canonical USB Type-C lineage
+        run: python3 Client/scripts/verify_usb_type_c_lineage.py
       - name: Verify iPad-only target
         run: ./Client/scripts/verify_ipad_target.sh
       - name: Verify identity persistence boundary
@@ -263,6 +265,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
+      - name: Verify canonical USB Type-C lineage
+        run: python3 Client/scripts/verify_usb_type_c_lineage.py
       - name: Verify iPad-only target
         run: ./Client/scripts/verify_ipad_target.sh
       - name: Download verified native dependency artifact
