@@ -575,9 +575,13 @@ struct DisplayRequestGate {
     }
 
     mutating func reject(_ failed: DisplayConfigurationFailed) -> DisplayConfigurationRequest? {
-        guard pending?.requestId == failed.requestId else { return nil }
-        pending = nil
-        guard let latestDesired else { return nil }
+        guard let pending, pending.requestId == failed.requestId else { return nil }
+        self.pending = nil
+        // Retry only a newer desired mode, never the rejected request itself.
+        guard let latestDesired, !sameConfiguration(latestDesired, pending) else {
+            self.latestDesired = nil
+            return nil
+        }
         return issue(latestDesired)
     }
 
@@ -3109,7 +3113,6 @@ public class NetworkManager: ObservableObject {
             return
         }
         let nextRequest = displayRequestGate.reject(failure)
-        guard displayRequestGate.pending == nil else { return }
         if let nextRequest,
            let latestPreference = latestDisplayPreference {
             pendingDisplayPreference = latestPreference
@@ -3119,6 +3122,7 @@ public class NetworkManager: ObservableObject {
                 sequence: nextRequest.requestId)
             return
         }
+        guard displayRequestGate.pending == nil else { return }
         pendingDisplayPreference = nil
         latestDisplayPreference = nil
         DispatchQueue.main.async { [weak self] in
