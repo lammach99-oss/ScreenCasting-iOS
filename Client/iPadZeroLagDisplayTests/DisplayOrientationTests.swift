@@ -2,6 +2,82 @@ import XCTest
 @testable import iPadCasting
 
 final class DisplayOrientationTests: XCTestCase {
+    func testRejectedInitialDisplayRequestReleasesTouchSuppression() throws {
+        var gate = DisplayRequestGate()
+        let desired = DisplayConfigurationRequest(
+            width: 2388, height: 1668, refreshHz: 60,
+            orientation: .landscape, requestId: 0)
+        let request = try XCTUnwrap(gate.begin(desired))
+        XCTAssertTrue(gate.isInputSuppressed)
+
+        let next = gate.reject(DisplayConfigurationFailed(
+            requestId: request.requestId, reason: .applyFailed))
+
+        XCTAssertNil(next, "A rejected request must not silently retry itself")
+        XCTAssertNil(gate.pending)
+        XCTAssertNil(gate.latestDesired)
+        XCTAssertFalse(gate.isInputSuppressed,
+            "A terminal display rejection must not permanently block USB touch")
+        XCTAssertNil(gate.effective, "Failure is not a successful display commit")
+    }
+
+    func testRepeatedSameDesiredModeDoesNotRetryAfterRejection() throws {
+        var gate = DisplayRequestGate()
+        let desired = DisplayConfigurationRequest(
+            width: 2388, height: 1668, refreshHz: 60,
+            orientation: .landscape, requestId: 0)
+        let request = try XCTUnwrap(gate.begin(desired))
+        XCTAssertNil(gate.begin(desired))
+        XCTAssertNil(gate.reject(DisplayConfigurationFailed(
+            requestId: request.requestId, reason: .applyFailed)))
+        XCTAssertFalse(gate.isInputSuppressed)
+        XCTAssertNotNil(gate.begin(desired), "A later explicit request remains allowed")
+    }
+
+    func testRejectedRequestKeepsOnlyNewerDesiredModePendingUntilReady() throws {
+        var gate = DisplayRequestGate()
+        let first = try XCTUnwrap(gate.begin(DisplayConfigurationRequest(
+            width: 2388, height: 1668, refreshHz: 60,
+            orientation: .landscape, requestId: 0)))
+        XCTAssertNil(gate.begin(DisplayConfigurationRequest(
+            width: 1668, height: 2388, refreshHz: 60,
+            orientation: .portrait, requestId: 0)))
+
+        let next = try XCTUnwrap(gate.reject(DisplayConfigurationFailed(
+            requestId: first.requestId, reason: .applyFailed)))
+        XCTAssertNotEqual(next.requestId, first.requestId)
+        XCTAssertEqual(next.orientation, .portrait)
+        XCTAssertTrue(gate.isInputSuppressed)
+        XCTAssertNil(gate.reject(DisplayConfigurationFailed(
+            requestId: first.requestId, reason: .applyFailed)))
+        XCTAssertEqual(gate.pending, next, "Stale rejection must not unlock input")
+
+        XCTAssertNil(gate.accept(DisplayReady(
+            width: next.width, height: next.height, refreshHz: next.refreshHz,
+            orientation: next.orientation, requestId: next.requestId, generation: 2)))
+        XCTAssertFalse(gate.isInputSuppressed)
+        XCTAssertEqual(gate.effective?.orientation, .portrait)
+    }
+
+    func testRejectedChangePreservesLastEffectiveDisplay() throws {
+        var gate = DisplayRequestGate()
+        let first = try XCTUnwrap(gate.begin(DisplayConfigurationRequest(
+            width: 2388, height: 1668, refreshHz: 60,
+            orientation: .landscape, requestId: 0)))
+        let ready = DisplayReady(width: first.width, height: first.height,
+            refreshHz: first.refreshHz, orientation: first.orientation,
+            requestId: first.requestId, generation: 1)
+        _ = gate.accept(ready)
+        let change = try XCTUnwrap(gate.begin(DisplayConfigurationRequest(
+            width: 1668, height: 2388, refreshHz: 60,
+            orientation: .portrait, requestId: 0)))
+        XCTAssertTrue(gate.isInputSuppressed)
+        XCTAssertNil(gate.reject(DisplayConfigurationFailed(
+            requestId: change.requestId, reason: .applyFailed)))
+        XCTAssertFalse(gate.isInputSuppressed)
+        XCTAssertEqual(gate.effective, ready)
+    }
+
     func testCommittedGeometryResolvesInitialOrientation() {
         XCTAssertNil(DisplayOrientationResolver.resolve(width: 0, height: 0))
         XCTAssertEqual(
