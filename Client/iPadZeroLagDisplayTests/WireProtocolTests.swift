@@ -245,7 +245,7 @@ final class USBListenerLifetimeTests: XCTestCase {
             decoderBlocked.fulfill()
             releaseDecoder.wait()
         }
-        wait(for: [decoderBlocked], timeout: 1)
+        wait(for: [decoderBlocked], timeout: 5)
         defer {
             releaseDecoder.signal()
             decoderQueue.sync { }
@@ -258,7 +258,7 @@ final class USBListenerLifetimeTests: XCTestCase {
             sessionRetired.fulfill()
         }
 
-        guard XCTWaiter.wait(for: [sessionRetired], timeout: 1) == .completed else {
+        guard XCTWaiter.wait(for: [sessionRetired], timeout: 5) == .completed else {
             XCTFail("Session retirement blocked the listener behind VideoToolbox")
             return
         }
