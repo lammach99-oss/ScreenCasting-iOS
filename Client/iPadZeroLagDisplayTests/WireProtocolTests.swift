@@ -319,22 +319,25 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertEqual(after.orientation, .portrait)
     }
 
-    func testEOFAndLiveReplacementClearOldDisplayRequest() throws {
+    func testHealthyCommittedSessionRejectsLateCandidate() throws {
         let firstPeer = try connect()
+        manager.simulateSessionAuthenticatedAndCommitted()
         manager.updateInterfaceOrientation(.landscape)
         let listener = manager.usbSessionSnapshot().listener
+        let committed = manager.usbSessionSnapshot()
 
-        // Accept replacement while firstPeer still active
-        let secondPeer = try connect()
+        let latePeer = try connect()
         let snap = manager.usbSessionSnapshot()
-        XCTAssertTrue(snap.connection === secondPeer)
+        XCTAssertTrue(snap.connection === firstPeer)
         XCTAssertTrue(snap.listener === listener)
+        XCTAssertEqual(snap.generation, committed.generation)
+        XCTAssertEqual(snap.committedGeneration, committed.committedGeneration)
+        XCTAssertNil(latePeer.stateUpdateHandler)
 
-        try deliver(.cancelled, to: secondPeer)
-        let afterCancel = manager.usbSessionSnapshot()
-        XCTAssertTrue(afterCancel.listener === listener)
-        XCTAssertNil(afterCancel.connection)
-        XCTAssertNil(afterCancel.committedGeneration)
+        try deliver(.failed(.posix(.ECONNRESET)), to: firstPeer)
+        let replacement = try connect()
+        XCTAssertTrue(manager.usbSessionSnapshot().connection === replacement)
+        XCTAssertGreaterThan(manager.usbSessionSnapshot().generation, committed.generation)
     }
 
     func testExplicitStopRejectsLateAcceptUntilExplicitStart() throws {

@@ -1893,22 +1893,22 @@ public class NetworkManager: ObservableObject {
                     newConnection.cancel()
                     return
                 }
-                let previousConnection = self.usbScdpConnection
-                if let previousConnection {
-                    self.teardownUsbSession(
-                        connection: previousConnection,
-                        generation: self.connectionGeneration,
-                        reason: "replaced_by_new_candidate")
+                if self.usbScdpConnection != nil {
+                    self.recordUsbLifecycleDiagnostic(
+                        "[USB_RECOVERY_CANDIDATE] attempt=\(self.connectionGeneration &+ 1) generation=\(self.connectionGeneration) state=rejected_stale")
+                    newConnection.cancel()
+                    return
                 }
                 _ = self.connectionGenerationClock.advance()
                 self.usbScdpConnection = newConnection
                 self.connection = newConnection
                 self.recordUsbLifecycleDiagnostic(
+                    "[USB_RECOVERY_CANDIDATE] attempt=\(self.connectionGeneration) generation=\(self.connectionGeneration) state=start")
+                self.recordUsbLifecycleDiagnostic(
                     "[USB_SESSION_ACCEPT] generation=\(self.connectionGeneration) connectionId=\(ObjectIdentifier(newConnection))")
                 self.setupStateHandler(for: newConnection)
                 self.setState(.connecting)
                 newConnection.start(queue: self.networkQueue)
-                previousConnection?.cancel()
             }
             listener.start(queue: networkQueue)
         } catch {
@@ -3249,6 +3249,8 @@ public class NetworkManager: ObservableObject {
         setState(.streaming)
         startVideoReceiveLoop(generation: generation)
         if activeTransportKind == .usb {
+            recordUsbLifecycleDiagnostic(
+                "[USB_RECOVERY_CANDIDATE] attempt=\(generation) generation=\(generation) state=committed")
             recordUsbLifecycleDiagnostic("[USB_SESSION_COMMIT] generation=\(generation)")
         }
     }
@@ -3491,12 +3493,16 @@ public class NetworkManager: ObservableObject {
         }
         recordUsbLifecycleDiagnostic(
             "[USB_SESSION_LOST] generation=\(generation) connectionId=\(ObjectIdentifier(connection)) listenerStillReady=\(listenerStillReady) reason=\(reason)")
+        recordUsbLifecycleDiagnostic(
+            "[USB_RECOVERY_CANDIDATE] attempt=\(generation) generation=\(generation) state=failed")
         teardownCurrentSession()
         // Sends are serialized per socket. A retired socket must not hold the
         // replacement socket behind a completion that may never arrive.
         controlChannelWriter.abandonConnection()
         recordUsbLifecycleDiagnostic(
             "[USB_LISTENER_REUSE] oldGeneration=\(generation) acceptingNext=\(listenerStillReady)")
+        recordUsbLifecycleDiagnostic(
+            "[USB_RECOVERY_CANDIDATE] attempt=\(generation) generation=\(generation) state=retired")
         setState(.listening)
     }
 
