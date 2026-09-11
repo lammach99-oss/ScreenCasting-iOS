@@ -3553,26 +3553,37 @@ public class NetworkManager: ObservableObject {
     }
 
     var networkQueueForTesting: DispatchQueue { networkQueue }
+    var networkQueueKeyForTesting: DispatchSpecificKey<Bool> { networkQueueKey }
     var decoderForTesting: DecoderManager { decoder }
 
     func usbSessionSnapshot() -> USBSessionSnapshot {
-        networkQueue.sync {
+        let block = {
             USBSessionSnapshot(
-                listener: usbListener,
-                listenerIntent: usbListenerExplicitlyStarted,
-                connection: usbScdpConnection,
-                generation: connectionGeneration,
-                authenticatedGeneration: wireAuthenticatedGeneration,
-                committedGeneration: committedTransportGeneration,
-                pendingDisplay: displayRequestGate.pending,
-                orientation: observedInterfaceOrientation)
+                listener: self.usbListener,
+                listenerIntent: self.usbListenerExplicitlyStarted,
+                connection: self.usbScdpConnection,
+                generation: self.connectionGeneration,
+                authenticatedGeneration: self.wireAuthenticatedGeneration,
+                committedGeneration: self.committedTransportGeneration,
+                pendingDisplay: self.displayRequestGate.pending,
+                orientation: self.observedInterfaceOrientation)
+        }
+        if DispatchQueue.getSpecific(key: networkQueueKey) != nil {
+            return block()
+        } else {
+            return networkQueue.sync(execute: block)
         }
     }
 
     func simulateSessionAuthenticatedAndCommitted(mode: UInt8 = RealtimeTransportMode.legacyTLS) {
-        networkQueue.sync {
+        let block = {
             self.wireAuthenticatedGeneration = self.connectionGeneration
             self.commitRealtimeTransport(generation: self.connectionGeneration, mode: mode)
+        }
+        if DispatchQueue.getSpecific(key: networkQueueKey) != nil {
+            block()
+        } else {
+            networkQueue.sync(execute: block)
         }
     }
     #endif

@@ -252,7 +252,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         }
 
         let sessionRetired = expectation(description: "listener queue remains available")
-        manager.networkQueueForTesting.async {
+        DispatchQueue.global().async {
             self.manager.simulateSessionAuthenticatedAndCommitted()
             try? self.deliver(.failed(.posix(.ECONNRESET)), to: old)
             sessionRetired.fulfill()
@@ -410,8 +410,12 @@ final class USBListenerLifetimeTests: XCTestCase {
 
     private func deliver(_ state: NWConnection.State, to connection: NWConnection) throws {
         let callback = try XCTUnwrap(connection.stateUpdateHandler)
-        manager.networkQueueForTesting.sync {
+        if DispatchQueue.getSpecific(key: manager.networkQueueKeyForTesting) != nil {
             callback(state)
+        } else {
+            manager.networkQueueForTesting.sync {
+                callback(state)
+            }
         }
     }
 }
