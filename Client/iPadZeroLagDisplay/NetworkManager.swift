@@ -3533,7 +3533,7 @@ public class NetworkManager: ObservableObject {
         recordDiagnosticLine(timed)
     }
 
-    #if DEBUG
+    #if targetEnvironment(simulator)
     // Read-only ownership snapshot for real Network.framework regression tests.
     struct USBSessionSnapshot {
         let listener: NWListener?

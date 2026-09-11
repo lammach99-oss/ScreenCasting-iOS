@@ -953,7 +953,7 @@ public final class DecoderManager {
         }
     }
 
-    #if DEBUG
+    #if targetEnvironment(simulator)
     var sessionQueueForTesting: DispatchQueue { queue }
     #endif
 
