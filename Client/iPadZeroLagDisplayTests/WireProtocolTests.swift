@@ -319,6 +319,47 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertEqual(after.orientation, .portrait)
     }
 
+    func testDeadSessionAllowsReplacementImmediately() throws {
+        let firstPeer = try connect()
+        manager.simulateSessionAuthenticatedAndCommitted()
+        let listener = try XCTUnwrap(manager.usbSessionSnapshot().listener)
+        let oldGen = manager.usbSessionSnapshot().generation
+
+        // Simulate transport loss
+        try deliver(.failed(.posix(.ECONNRESET)), to: firstPeer)
+        let lostSnap = manager.usbSessionSnapshot()
+        XCTAssertTrue(lostSnap.listener === listener)
+        XCTAssertNil(lostSnap.connection)
+
+        // Replacement candidate arrives immediately
+        let replacement = try connect()
+        let repSnap = manager.usbSessionSnapshot()
+        XCTAssertTrue(repSnap.listener === listener)
+        XCTAssertTrue(repSnap.connection === replacement)
+        XCTAssertGreaterThan(repSnap.generation, oldGen)
+    }
+
+    func testControlCenterAppInactivityDoesNotTearDownUsbSession() throws {
+        let peer = try connect()
+        manager.simulateSessionAuthenticatedAndCommitted()
+        let listener = try XCTUnwrap(manager.usbSessionSnapshot().listener)
+        let snapBefore = manager.usbSessionSnapshot()
+
+        // Control center / background transition
+        manager.applicationDidEnterBackground()
+        let snapDuring = manager.usbSessionSnapshot()
+        XCTAssertTrue(snapDuring.listener === listener)
+        XCTAssertTrue(snapDuring.connection === peer)
+        XCTAssertEqual(snapDuring.generation, snapBefore.generation)
+        XCTAssertEqual(snapDuring.committedGeneration, snapBefore.committedGeneration)
+
+        manager.applicationDidBecomeActive()
+        let snapAfter = manager.usbSessionSnapshot()
+        XCTAssertTrue(snapAfter.listener === listener)
+        XCTAssertTrue(snapAfter.connection === peer)
+        XCTAssertEqual(snapAfter.generation, snapBefore.generation)
+    }
+
     func testHealthyCommittedSessionRejectsLateCandidate() throws {
         let firstPeer = try connect()
         manager.simulateSessionAuthenticatedAndCommitted()

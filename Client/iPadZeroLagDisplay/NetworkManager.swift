@@ -1464,7 +1464,7 @@ public class NetworkManager: ObservableObject {
             self.isForegroundActive = false
             self.reconnectWorkItem?.cancel()
             self.reconnectWorkItem = nil
-            if self.connection != nil {
+            if self.connection != nil && !self.usbListenerExplicitlyStarted {
                 // An authenticated NWConnection may remain non-nil while iOS
                 // suspends its receive callbacks. Tear it down so the next
                 // foreground transition cannot mistake a stale socket for a
@@ -1893,11 +1893,19 @@ public class NetworkManager: ObservableObject {
                     newConnection.cancel()
                     return
                 }
-                if self.usbScdpConnection != nil {
-                    self.recordUsbLifecycleDiagnostic(
-                        "[USB_RECOVERY_CANDIDATE] attempt=\(self.connectionGeneration &+ 1) generation=\(self.connectionGeneration) state=rejected_stale")
-                    newConnection.cancel()
-                    return
+                if self.usbScdpConnection != nil, let current = self.usbScdpConnection {
+                    let isHealthy = (self.committedTransportGeneration == self.connectionGeneration && current.state == .ready)
+                    let isConnecting = (self.connectionState == .connecting && self.committedTransportGeneration == nil && (current.state == .setup || current.state == .preparing))
+                    if isHealthy || isConnecting {
+                        self.recordUsbLifecycleDiagnostic(
+                            "[USB_RECOVERY_CANDIDATE] attempt=\(self.connectionGeneration &+ 1) generation=\(self.connectionGeneration) state=rejected_stale")
+                        newConnection.cancel()
+                        return
+                    }
+                    self.teardownUsbSession(
+                        connection: current,
+                        generation: self.connectionGeneration,
+                        reason: "replaced_by_new_candidate_not_stale")
                 }
                 _ = self.connectionGenerationClock.advance()
                 self.usbScdpConnection = newConnection
