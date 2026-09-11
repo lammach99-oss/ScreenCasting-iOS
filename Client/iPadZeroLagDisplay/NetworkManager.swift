@@ -1178,12 +1178,14 @@ public class NetworkManager: ObservableObject {
     private var reconnectWorkItem: DispatchWorkItem?
     private var connectionTimeoutWorkItem: DispatchWorkItem?
     private var usbListener: NWListener?
+    private var usbListenerExplicitlyStarted = false
     private var usbScdpConnection: NWConnection?
     private let connectionGenerationClock = ConnectionGenerationClock()
     private var connectionGeneration: UInt64 {
         connectionGenerationClock.current
     }
     private var listenerGeneration: UInt64 = 0
+    private let networkQueueKey = DispatchSpecificKey<Bool>()
     private let networkQueue = DispatchQueue(label: "com.iPadCasting.network", qos: .userInteractive)
     private lazy var controlChannelWriter = ControlChannelWriter(
         queue: networkQueue,
@@ -1344,6 +1346,7 @@ public class NetworkManager: ObservableObject {
     private var lastUsbTouchMoveDiagnosticAt: TimeInterval = 0
 
     public init() {
+        networkQueue.setSpecific(key: networkQueueKey, value: true)
         let savedDisplayPreference = DisplayPreferenceStore.load()
         displayPreference = savedDisplayPreference
         activeDisplayPreference = savedDisplayPreference
@@ -1726,6 +1729,13 @@ public class NetworkManager: ObservableObject {
 
     /// Gracefully tears down the connection and resets to .idle.
     public func stop() {
+        // Serialize explicit Stop with accept, receive and state callbacks.
+        if DispatchQueue.getSpecific(key: networkQueueKey) == nil {
+            networkQueue.sync { self.stop() }
+            return
+        }
+        let wasUSB = usbListenerExplicitlyStarted
+        usbListenerExplicitlyStarted = false
         reconnectEnabled = false
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
@@ -1742,18 +1752,20 @@ public class NetworkManager: ObservableObject {
         usbLaneServer.abort()
         usbLaneConnections.values.forEach { $0.cancel() }
         usbLaneConnections.removeAll()
-        networkQueue.async { [weak self] in
-            guard let self,
-                  stoppedGeneration == self.connectionGeneration else { return }
-            self.wireReceiveActiveGeneration = nil
-            self.wireAuthenticatedGeneration = nil
-            self.committedTransportGeneration = nil
-            self.advertisedClientCapabilities = nil
-            self.resetDisplaySession()
-            self.clearPendingTransportOffer()
-            self.wireParser.reset(generation: stoppedGeneration)
-            self.controlChannelWriter.cancel()
-            self.stopTelemetryTimer()
+        wireReceiveActiveGeneration = nil
+        wireAuthenticatedGeneration = nil
+        committedTransportGeneration = nil
+        committedRealtimeMode = nil
+        committedRealtimeSessionID = nil
+        advertisedClientCapabilities = nil
+        resetDisplaySession()
+        clearPendingTransportOffer()
+        wireParser.reset(generation: stoppedGeneration)
+        controlChannelWriter.cancel()
+        if wasUSB { controlChannelWriter.abandonConnection() }
+        stopTelemetryTimer()
+        if wasUSB {
+            recordUsbLifecycleDiagnostic("[USB_LISTENER_STATE] state=cancelled reason=explicit_stop")
         }
         setState(.idle)
     }
@@ -1788,8 +1800,11 @@ public class NetworkManager: ObservableObject {
                 return
             }
             self.orientationDebounceWorkItem?.cancel()
+            let generation = self.connectionGeneration
             let workItem = DispatchWorkItem { [weak self] in
                 guard let self,
+                      generation == self.connectionGeneration,
+                      self.observedInterfaceOrientation == orientation,
                       self.activeDisplayPreference.orientationMode == .automatic else {
                     return
                 }
@@ -1815,7 +1830,14 @@ public class NetworkManager: ObservableObject {
 
     /// Starts the fixed-port TCP endpoint used to carry SCDP through iproxy.
     public func startListening(port: UInt16 = 42042) {
+        if DispatchQueue.getSpecific(key: networkQueueKey) == nil {
+            networkQueue.sync { self.startListening(port: port) }
+            return
+        }
+        // Repeated Start must not create a gap in an already owned listener.
+        guard !usbListenerExplicitlyStarted || usbListener == nil else { return }
         stop()
+        usbListenerExplicitlyStarted = true
         DispatchQueue.main.async {
             self.bytesReceived = 0
             self.lastFrameReceiveDurationMs = 0
@@ -1834,36 +1856,49 @@ public class NetworkManager: ObservableObject {
                 on: listenerPort)
             usbListener = listener
 
-            listener.stateUpdateHandler = { [weak self] state in
-                guard let self,
+            listener.stateUpdateHandler = { [weak self, weak listener] state in
+                guard let self, let listener,
+                      self.usbListenerExplicitlyStarted,
+                      self.usbListener === listener,
                       generation == self.listenerGeneration else { return }
                 switch state {
                 case .ready:
                     print("[IPAD][USB_SCDP_LISTENING] port=\(port)")
-                    self.setState(.listening)
+                    self.recordUsbLifecycleDiagnostic("[USB_LISTENER_STATE] state=ready port=\(port)")
+                    if self.usbScdpConnection == nil { self.setState(.listening) }
                 case .failed(let error):
-                    self.usbListener = nil
+                    self.stop()
+                    self.recordUsbLifecycleDiagnostic("[USB_LISTENER_STATE] state=failed port=\(port) reason=\(error)")
                     self.setState(.disconnected(
                         reason: "USB listener failed: \(error.localizedDescription)"))
                 case .cancelled:
-                    if self.usbScdpConnection == nil {
-                        self.setState(.idle)
-                    }
+                    self.stop()
+                    self.recordUsbLifecycleDiagnostic("[USB_LISTENER_STATE] state=cancelled port=\(port) reason=listener_cancelled")
                 default:
                     break
                 }
             }
 
-            listener.newConnectionHandler = { [weak self] newConnection in
-                guard let self,
+            listener.newConnectionHandler = { [weak self, weak listener] newConnection in
+                guard let self, let listener,
+                      self.usbListenerExplicitlyStarted,
+                      self.usbListener === listener,
                       generation == self.listenerGeneration else {
                     newConnection.cancel()
                     return
                 }
                 let previousConnection = self.usbScdpConnection
+                if let previousConnection {
+                    self.teardownUsbSession(
+                        connection: previousConnection,
+                        generation: self.connectionGeneration,
+                        reason: "replaced_by_new_candidate")
+                }
                 _ = self.connectionGenerationClock.advance()
                 self.usbScdpConnection = newConnection
                 self.connection = newConnection
+                self.recordUsbLifecycleDiagnostic(
+                    "[USB_SESSION_ACCEPT] generation=\(self.connectionGeneration) connectionId=\(ObjectIdentifier(newConnection))")
                 self.setupStateHandler(for: newConnection)
                 self.setState(.connecting)
                 newConnection.start(queue: self.networkQueue)
@@ -1871,6 +1906,7 @@ public class NetworkManager: ObservableObject {
             }
             listener.start(queue: networkQueue)
         } catch {
+            usbListenerExplicitlyStarted = false
             usbListener = nil
             setState(.disconnected(
                 reason: "Unable to start USB listener: \(error.localizedDescription)"))
@@ -2103,6 +2139,12 @@ public class NetworkManager: ObservableObject {
             case .failed(let error):
                 self.connectionTimeoutWorkItem?.cancel()
                 print("[IPAD][NW_STATE] failed error=\(error)")
+                if self.usbListenerExplicitlyStarted {
+                    self.teardownUsbSession(
+                        connection: connection, generation: generation,
+                        reason: "failed: \(error)")
+                    return
+                }
                 self.controlChannelWriter.cancel()
                 self.committedTransportGeneration = nil
                 self.advertisedClientCapabilities = nil
@@ -2119,6 +2161,12 @@ public class NetworkManager: ObservableObject {
             case .cancelled:
                 self.connectionTimeoutWorkItem?.cancel()
                 print("[IPAD][NW_STATE] cancelled")
+                if self.usbListenerExplicitlyStarted {
+                    self.teardownUsbSession(
+                        connection: connection, generation: generation,
+                        reason: "cancelled")
+                    return
+                }
                 self.controlChannelWriter.cancel()
                 self.committedTransportGeneration = nil
                 self.advertisedClientCapabilities = nil
@@ -2495,8 +2543,9 @@ public class NetworkManager: ObservableObject {
         movement: Bool = false,
         completion: @escaping (NWError?) -> Void = { _ in }
     ) {
+        let generation = connectionGeneration
         networkQueue.async { [weak self] in
-            guard let self else { return }
+            guard let self, generation == self.connectionGeneration else { return }
             if telemetry {
                 self.controlChannelWriter.enqueueTelemetry(data, completion: completion)
             } else if movement {
@@ -2535,6 +2584,7 @@ public class NetworkManager: ObservableObject {
         ) { [weak self] data, _, isComplete, error in
             guard let self,
                   generation == self.connectionGeneration,
+                  self.connection === connection,
                   self.wireReceiveActiveGeneration == generation else { return }
             if let error {
                 self.handleStreamError("SCST receive error: \(error.localizedDescription)")
@@ -2981,7 +3031,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private var activeTransportKind: ActiveTransportKind {
-        usbListener == nil ? .wifi : .usb
+        usbListenerExplicitlyStarted ? .usb : .wifi
     }
 
     private var activeControlConnection: NWConnection? {
@@ -3063,6 +3113,10 @@ public class NetworkManager: ObservableObject {
             interfaceOrientation: interfaceOrientation,
             requestId: 0)
         guard let request = displayRequestGate.begin(proposed) else { return }
+        if activeTransportKind == .usb {
+            recordUsbLifecycleDiagnostic(
+                "[USB_RECONNECT_DISPLAY] generation=\(connectionGeneration) desiredOrientation=\(request.orientation)")
+        }
         pendingDisplayPreference = reconciledPreference
         DispatchQueue.main.async { [weak self] in
             self?.isDisplayConfigurationPending = true
@@ -3188,6 +3242,9 @@ public class NetworkManager: ObservableObject {
         }
         setState(.streaming)
         startVideoReceiveLoop(generation: generation)
+        if activeTransportKind == .usb {
+            recordUsbLifecycleDiagnostic("[USB_SESSION_COMMIT] generation=\(generation)")
+        }
     }
 
     private func clearPendingTransportOffer(
@@ -3397,6 +3454,50 @@ public class NetworkManager: ObservableObject {
 
     private func handleStreamError(_ reason: String) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        if usbListenerExplicitlyStarted {
+            guard let current = usbScdpConnection else { return }
+            teardownUsbSession(
+                connection: current, generation: connectionGeneration,
+                reason: reason)
+            return
+        }
+        teardownCurrentSession()
+        print("[NetworkManager] ⚠️ \(reason)")
+        setState(.disconnected(reason: reason))
+        scheduleAutoReconnect(reset: false)
+    }
+
+    private func teardownUsbSession(
+        connection: NWConnection,
+        generation: UInt64,
+        reason: String
+    ) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard usbListenerExplicitlyStarted,
+              generation == connectionGeneration,
+              usbScdpConnection === connection,
+              self.connection === connection else { return }
+        let listenerStillReady: Bool
+        if let listener = usbListener, case .ready = listener.state {
+            listenerStillReady = true
+        } else {
+            listenerStillReady = false
+        }
+        recordUsbLifecycleDiagnostic(
+            "[USB_SESSION_LOST] generation=\(generation) connectionId=\(ObjectIdentifier(connection)) listenerStillReady=\(listenerStillReady) reason=\(reason)")
+        teardownCurrentSession()
+        // Sends are serialized per socket. A retired socket must not hold the
+        // replacement socket behind a completion that may never arrive.
+        controlChannelWriter.abandonConnection()
+        recordUsbLifecycleDiagnostic(
+            "[USB_LISTENER_REUSE] oldGeneration=\(generation) acceptingNext=\(listenerStillReady)")
+        setState(.listening)
+    }
+
+    private func teardownCurrentSession() {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        connectionTimeoutWorkItem?.cancel()
+        connectionTimeoutWorkItem = nil
         let failedGeneration = connectionGenerationClock.advance()
         wireReceiveActiveGeneration = nil
         wireAuthenticatedGeneration = nil
@@ -3410,7 +3511,7 @@ public class NetworkManager: ObservableObject {
         clearPendingTransportOffer()
         wireParser.reset(generation: failedGeneration)
         controlChannelWriter.cancel()
-        decoder.invalidate()
+        decoder.invalidate(waitForCompletion: !usbListenerExplicitlyStarted)
         AudioManager.shared.reset()
         connection?.cancel()
         connection = nil
@@ -3419,17 +3520,46 @@ public class NetworkManager: ObservableObject {
         usbLaneConnections.values.forEach { $0.cancel() }
         usbLaneConnections.removeAll()
         wifiMediaReceiver.cancel()
-        print("[NetworkManager] ⚠️ \(reason)")
         stopTelemetryTimer()
-        if usbListener != nil {
-            setState(.listening)
-        } else {
-            setState(.disconnected(reason: reason))
-            scheduleAutoReconnect(reset: false)
-        }
     }
 
     // MARK: - Private: Thread-Safe State Transition
+
+    private func recordUsbLifecycleDiagnostic(_ line: String) {
+        let timed = "\(line) uptime=\(ProcessInfo.processInfo.systemUptime)"
+        // The listener also exists between telemetry files; keep these sparse
+        // events visible in the device console throughout that interval.
+        print(timed)
+        recordDiagnosticLine(timed)
+    }
+
+    #if DEBUG
+    // Read-only ownership snapshot for real Network.framework regression tests.
+    struct USBSessionSnapshot {
+        let listener: NWListener?
+        let listenerIntent: Bool
+        let connection: NWConnection?
+        let generation: UInt64
+        let authenticatedGeneration: UInt64?
+        let committedGeneration: UInt64?
+        let pendingDisplay: DisplayConfigurationRequest?
+        let orientation: ClientDisplayOrientation?
+    }
+
+    func usbSessionSnapshot() -> USBSessionSnapshot {
+        networkQueue.sync {
+            USBSessionSnapshot(
+                listener: usbListener,
+                listenerIntent: usbListenerExplicitlyStarted,
+                connection: usbScdpConnection,
+                generation: connectionGeneration,
+                authenticatedGeneration: wireAuthenticatedGeneration,
+                committedGeneration: committedTransportGeneration,
+                pendingDisplay: displayRequestGate.pending,
+                orientation: observedInterfaceOrientation)
+        }
+    }
+    #endif
 
     private func setState(_ newState: ConnectionState) {
         DispatchQueue.main.async {

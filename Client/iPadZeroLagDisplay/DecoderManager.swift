@@ -925,26 +925,37 @@ public final class DecoderManager {
         }
     }
 
-    public func invalidate() {
+    public func invalidate(waitForCompletion: Bool = true) {
         mailboxStateLock.lock()
         mailbox.invalidate()
         mailboxStateLock.unlock()
-        queue.sync {
-            if let session = decompressionSession {
+        let cleanup = { [self] in
+            if let session = self.decompressionSession {
                 VTDecompressionSessionWaitForAsynchronousFrames(session)
                 VTDecompressionSessionInvalidate(session)
-                decompressionSession = nil
+                self.decompressionSession = nil
             }
-            formatDescription = nil
-            vpsData = nil
-            spsData = nil
-            ppsData = nil
-            activeCodec = .hevc
-            hasDecodedH264Idr = false
-            parameterSetSessionGate.reset()
-            h264ParameterSetSessionGate.reset()
+            self.formatDescription = nil
+            self.vpsData = nil
+            self.spsData = nil
+            self.ppsData = nil
+            self.activeCodec = .hevc
+            self.hasDecodedH264Idr = false
+            self.parameterSetSessionGate.reset()
+            self.h264ParameterSetSessionGate.reset()
+        }
+        // Invalidation of the mailbox above is immediate. FIFO ordering keeps
+        // this old-session cleanup ahead of N+1's configuration/decode work.
+        if waitForCompletion {
+            queue.sync(execute: cleanup)
+        } else {
+            queue.async(execute: cleanup)
         }
     }
+
+    #if DEBUG
+    var sessionQueueForTesting: DispatchQueue { queue }
+    #endif
 
     private func makeMailbox() -> AccessUnitMailbox {
         AccessUnitMailbox(

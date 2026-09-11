@@ -140,6 +140,16 @@ final class ControlChannelWriter {
         pending.removeAll(keepingCapacity: true)
     }
 
+    /// Use only after retiring the underlying connection. Ordinary cancel()
+    /// retains serialization when the same socket may still be in use.
+    func abandonConnection() {
+        dispatchPrecondition(condition: .onQueue(queue))
+        cancel()
+        activeSendID &+= 1
+        sending = false
+        inFlight = nil
+    }
+
     private var reliableCount: Int {
         pending.reduce(into: 0) { count, item in
             if item.priority == .reliable { count += 1 }
