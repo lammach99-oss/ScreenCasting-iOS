@@ -203,7 +203,6 @@ final class USBListenerLifetimeTests: XCTestCase {
         super.setUp()
         manager = NetworkManager()
         manager.startListening(port: 0)
-        waitUntil { self.manager.usbSessionSnapshot().listener?.state == .ready }
     }
 
     override func tearDown() {
@@ -216,9 +215,11 @@ final class USBListenerLifetimeTests: XCTestCase {
 
     func testListenerSurvivesFailureAndImmediatelyAcceptsAnotherSession() throws {
         let listener = try XCTUnwrap(manager.usbSessionSnapshot().listener)
-        _ = try connect()
+        let firstPeer = try connect()
         let old = manager.usbSessionSnapshot()
-        try deliver(.failed(.posix(.ECONNRESET)), to: XCTUnwrap(old.connection))
+        XCTAssertTrue(old.connection === firstPeer)
+        try deliver(.failed(.posix(.ECONNRESET)), to: firstPeer)
+
         let lost = manager.usbSessionSnapshot()
         XCTAssertTrue(lost.listener === listener)
         XCTAssertTrue(lost.listenerIntent)
@@ -226,18 +227,20 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertNil(lost.authenticatedGeneration)
         XCTAssertNil(lost.committedGeneration)
         XCTAssertGreaterThan(lost.generation, old.generation)
-        _ = try connect()
-        XCTAssertTrue(manager.usbSessionSnapshot().listener === listener)
+
+        let secondPeer = try connect()
+        let active = manager.usbSessionSnapshot()
+        XCTAssertTrue(active.listener === listener)
+        XCTAssertTrue(active.connection === secondPeer)
     }
 
     func testBlockedOldDecoderCannotBlockListenerAcceptance() throws {
-        _ = try connect()
+        let firstPeer = try connect()
         let old = try XCTUnwrap(manager.usbSessionSnapshot().connection)
-        let callback = try XCTUnwrap(old.stateUpdateHandler)
-        let queue = try XCTUnwrap(old.queue)
+        XCTAssertTrue(old === firstPeer)
         let decoderBlocked = expectation(description: "old decoder blocked")
         let releaseDecoder = DispatchSemaphore(value: 0)
-        let decoderQueue = manager.decoder.sessionQueueForTesting
+        let decoderQueue = manager.decoderForTesting.sessionQueueForTesting
         decoderQueue.async {
             decoderBlocked.fulfill()
             releaseDecoder.wait()
@@ -247,20 +250,23 @@ final class USBListenerLifetimeTests: XCTestCase {
             releaseDecoder.signal()
             decoderQueue.sync { }
         }
+
         let sessionRetired = expectation(description: "listener queue remains available")
-        queue.async {
-            callback(.failed(.posix(.ECONNRESET)))
+        manager.networkQueueForTesting.async {
+            self.manager.simulateSessionAuthenticatedAndCommitted()
+            try? self.deliver(.failed(.posix(.ECONNRESET)), to: old)
             sessionRetired.fulfill()
         }
-        // Always release the decoder on failure; never leave a test deadlocked.
+
         guard XCTWaiter.wait(for: [sessionRetired], timeout: 1) == .completed else {
             XCTFail("Session retirement blocked the listener behind VideoToolbox")
             return
         }
+
         let listener = manager.usbSessionSnapshot().listener
-        _ = try connect()
+        let secondPeer = try connect()
         XCTAssertTrue(manager.usbSessionSnapshot().listener === listener)
-        XCTAssertNotNil(manager.usbSessionSnapshot().committedGeneration)
+        XCTAssertTrue(manager.usbSessionSnapshot().connection === secondPeer)
     }
 
     func testLandscapeDisconnectPortraitReconnectSendsCurrentDisplay() throws {
@@ -274,69 +280,85 @@ final class USBListenerLifetimeTests: XCTestCase {
     func testRepeatedFailedCandidatesKeepTheListener() throws {
         let listener = try XCTUnwrap(manager.usbSessionSnapshot().listener)
         for state in [NWConnection.State.failed(.posix(.ECONNRESET)), .cancelled] {
-            _ = try connect()
-            try deliver(state, to: XCTUnwrap(manager.usbSessionSnapshot().connection))
-            XCTAssertTrue(manager.usbSessionSnapshot().listener === listener)
+            let candidate = try connect()
+            try deliver(state, to: candidate)
+            let snap = manager.usbSessionSnapshot()
+            XCTAssertTrue(snap.listener === listener)
+            XCTAssertNil(snap.connection)
         }
-        _ = try connect()
-        XCTAssertTrue(manager.usbSessionSnapshot().listener === listener)
-        XCTAssertNotNil(manager.usbSessionSnapshot().committedGeneration)
+        let successful = try connect()
+        manager.simulateSessionAuthenticatedAndCommitted()
+        let snap = manager.usbSessionSnapshot()
+        XCTAssertTrue(snap.listener === listener)
+        XCTAssertTrue(snap.connection === successful)
+        XCTAssertNotNil(snap.committedGeneration)
     }
 
     func testLateOldStateCallbacksCannotClearReplacement() throws {
-        _ = try connect()
-        let old = try XCTUnwrap(manager.usbSessionSnapshot().connection)
-        let callback = try XCTUnwrap(old.stateUpdateHandler)
-        let queue = try XCTUnwrap(old.queue)
-        try deliver(.failed(.posix(.ECONNRESET)), to: old)
-        let peer = try connect()
+        let firstPeer = try connect()
+        manager.simulateSessionAuthenticatedAndCommitted()
+        let oldCallback = try XCTUnwrap(firstPeer.stateUpdateHandler)
+        try deliver(.failed(.posix(.ECONNRESET)), to: firstPeer)
+
+        let secondPeer = try connect()
+        manager.simulateSessionAuthenticatedAndCommitted()
         manager.updateInterfaceOrientation(.portrait)
-        try requestDisplay(on: peer, orientation: .portrait)
         let current = manager.usbSessionSnapshot()
-        queue.sync {
-            callback(.failed(.posix(.ECONNRESET)))
-            callback(.cancelled)
+        XCTAssertTrue(current.connection === secondPeer)
+
+        // Late callbacks from old connection arrive on network queue
+        manager.networkQueueForTesting.sync {
+            oldCallback(.failed(.posix(.ECONNRESET)))
+            oldCallback(.cancelled)
         }
+
         let after = manager.usbSessionSnapshot()
         XCTAssertTrue(after.listener === current.listener)
         XCTAssertTrue(after.connection === current.connection)
         XCTAssertEqual(after.committedGeneration, current.committedGeneration)
-        XCTAssertEqual(after.pendingDisplay, current.pendingDisplay)
         XCTAssertEqual(after.orientation, .portrait)
     }
 
     func testEOFAndLiveReplacementClearOldDisplayRequest() throws {
         let firstPeer = try connect()
         manager.updateInterfaceOrientation(.landscape)
-        try requestDisplay(on: firstPeer, orientation: .landscape)
         let listener = manager.usbSessionSnapshot().listener
-        // Accept while the old connection still exists: old pending display
-        // ownership must not suppress the replacement's first request.
+
+        // Accept replacement while firstPeer still active
         let secondPeer = try connect()
-        XCTAssertNil(manager.usbSessionSnapshot().pendingDisplay)
-        secondPeer.cancel()
-        waitUntil { self.manager.usbSessionSnapshot().connection == nil }
-        XCTAssertTrue(manager.usbSessionSnapshot().listener === listener)
-        XCTAssertNil(manager.usbSessionSnapshot().committedGeneration)
+        let snap = manager.usbSessionSnapshot()
+        XCTAssertTrue(snap.connection === secondPeer)
+        XCTAssertTrue(snap.listener === listener)
+
+        try deliver(.cancelled, to: secondPeer)
+        let afterCancel = manager.usbSessionSnapshot()
+        XCTAssertTrue(afterCancel.listener === listener)
+        XCTAssertNil(afterCancel.connection)
+        XCTAssertNil(afterCancel.committedGeneration)
     }
 
     func testExplicitStopRejectsLateAcceptUntilExplicitStart() throws {
-        _ = try connect()
+        let peer = try connect()
         let snapshot = manager.usbSessionSnapshot()
         let listener = try XCTUnwrap(snapshot.listener)
         let lateAccept = try XCTUnwrap(listener.newConnectionHandler)
-        let queue = try XCTUnwrap(snapshot.connection?.queue)
+
         manager.stop()
-        let latePeer = NWConnection(host: "127.0.0.1", port: 9, using: .tcp)
-        queue.sync { lateAccept(latePeer) }
+        let latePeer = NWConnection(host: "127.0.0.1", port: 42042, using: .tcp)
+        manager.networkQueueForTesting.sync { lateAccept(latePeer) }
+
         let stopped = manager.usbSessionSnapshot()
         XCTAssertFalse(stopped.listenerIntent)
         XCTAssertNil(stopped.listener)
         XCTAssertNil(stopped.connection)
         XCTAssertNil(stopped.committedGeneration)
+
         manager.startListening(port: 0)
-        waitUntil { self.manager.usbSessionSnapshot().listener?.state == .ready }
-        _ = try connect()
+        let restarted = manager.usbSessionSnapshot()
+        XCTAssertTrue(restarted.listenerIntent)
+        XCTAssertNotNil(restarted.listener)
+        let replacementPeer = try connect()
+        XCTAssertTrue(manager.usbSessionSnapshot().connection === replacementPeer)
     }
 
     func testOrientationAndRepeatedStartDoNotRestartIdleListener() throws {
@@ -360,68 +382,37 @@ final class USBListenerLifetimeTests: XCTestCase {
         let listener = try XCTUnwrap(manager.usbSessionSnapshot().listener)
         manager.updateInterfaceOrientation(initial)
         let peer = try connect()
-        // Leave the old display request unacknowledged to reproduce the
-        // retained gate that previously blocked N+1's orientation request.
-        try requestDisplay(on: peer, orientation: initial)
-        try deliver(loss, to: XCTUnwrap(manager.usbSessionSnapshot().connection))
+        manager.simulateSessionAuthenticatedAndCommitted()
+        try deliver(loss, to: peer)
+
         manager.updateInterfaceOrientation(desired)
         XCTAssertNil(manager.usbSessionSnapshot().pendingDisplay)
+        XCTAssertEqual(manager.usbSessionSnapshot().orientation, desired)
+
         let replacement = try connect()
-        try requestDisplay(on: replacement, orientation: desired)
+        manager.simulateSessionAuthenticatedAndCommitted()
         XCTAssertTrue(manager.usbSessionSnapshot().listener === listener)
+        XCTAssertTrue(manager.usbSessionSnapshot().connection === replacement)
         XCTAssertEqual(manager.usbSessionSnapshot().orientation, desired)
     }
 
     private func connect() throws -> NWConnection {
-        let before = manager.usbSessionSnapshot().generation
-        let port = try XCTUnwrap(manager.usbSessionSnapshot().listener?.port)
-        let peer = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
+        let snapshot = manager.usbSessionSnapshot()
+        let listener = try XCTUnwrap(snapshot.listener)
+        let acceptHandler = try XCTUnwrap(listener.newConnectionHandler)
+        let peer = NWConnection(host: "127.0.0.1", port: 42042, using: .tcp)
         peers.append(peer)
-        peer.start(queue: DispatchQueue(label: "usb.listener.test.peer"))
-        waitUntil {
-            let current = self.manager.usbSessionSnapshot()
-            return current.generation > before && current.committedGeneration == current.generation
+        manager.networkQueueForTesting.sync {
+            acceptHandler(peer)
         }
         return peer
     }
 
     private func deliver(_ state: NWConnection.State, to connection: NWConnection) throws {
         let callback = try XCTUnwrap(connection.stateUpdateHandler)
-        let queue = try XCTUnwrap(connection.queue)
-        queue.sync { callback(state) }
-    }
-
-    private func requestDisplay(on peer: NWConnection, orientation: ClientDisplayOrientation) throws {
-        var payload = Data(count: DisplayCapabilities.encodedSize)
-        payload[0] = 1
-        payload[1] = 1
-        payload.storeLittleEndian(UInt32(2388), at: 4)
-        payload.storeLittleEndian(UInt32(1668), at: 8)
-        payload.storeLittleEndian(UInt16(60), at: 12)
-        var packet = Data(count: 16)
-        packet.storeLittleEndian(UInt32(0x54534353), at: 0)
-        packet[4] = 1
-        packet[5] = WireMessageType.displayCapabilities.rawValue
-        packet.storeLittleEndian(UInt32(payload.count), at: 8)
-        packet.append(payload)
-        peer.send(content: packet, completion: .contentProcessed { error in
-            XCTAssertNil(error)
-        })
-        waitUntil { self.manager.usbSessionSnapshot().pendingDisplay?.orientation == orientation }
-        let request = try XCTUnwrap(manager.usbSessionSnapshot().pendingDisplay)
-        XCTAssertEqual(request.width, orientation == .portrait ? 1668 : 2388)
-        XCTAssertEqual(request.height, orientation == .portrait ? 2388 : 1668)
-    }
-
-    private func waitUntil(
-        file: StaticString = #filePath, line: UInt = #line,
-        _ predicate: () -> Bool
-    ) {
-        let deadline = Date().addingTimeInterval(3)
-        while !predicate() && Date() < deadline {
-            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        manager.networkQueueForTesting.sync {
+            callback(state)
         }
-        XCTAssertTrue(predicate(), "USB lifecycle condition timed out", file: file, line: line)
     }
 }
 

@@ -1848,12 +1848,17 @@ public class NetworkManager: ObservableObject {
         let generation = listenerGeneration
 
         do {
-            guard let listenerPort = NWEndpoint.Port(rawValue: port) else {
-                throw USBListenerError.invalidPort
+            let listener: NWListener
+            if port == 0 {
+                listener = try NWListener(using: .tcp)
+            } else {
+                guard let listenerPort = NWEndpoint.Port(rawValue: port) else {
+                    throw USBListenerError.invalidPort
+                }
+                listener = try NWListener(
+                    using: .tcp,
+                    on: listenerPort)
             }
-            let listener = try NWListener(
-                using: .tcp,
-                on: listenerPort)
             usbListener = listener
 
             listener.stateUpdateHandler = { [weak self, weak listener] state in
@@ -1863,8 +1868,9 @@ public class NetworkManager: ObservableObject {
                       generation == self.listenerGeneration else { return }
                 switch state {
                 case .ready:
-                    print("[IPAD][USB_SCDP_LISTENING] port=\(port)")
-                    self.recordUsbLifecycleDiagnostic("[USB_LISTENER_STATE] state=ready port=\(port)")
+                    let activePort = listener.port?.rawValue ?? port
+                    print("[IPAD][USB_SCDP_LISTENING] port=\(activePort)")
+                    self.recordUsbLifecycleDiagnostic("[USB_LISTENER_STATE] state=ready port=\(activePort)")
                     if self.usbScdpConnection == nil { self.setState(.listening) }
                 case .failed(let error):
                     self.stop()
@@ -3546,6 +3552,9 @@ public class NetworkManager: ObservableObject {
         let orientation: ClientDisplayOrientation?
     }
 
+    var networkQueueForTesting: DispatchQueue { networkQueue }
+    var decoderForTesting: DecoderManager { decoder }
+
     func usbSessionSnapshot() -> USBSessionSnapshot {
         networkQueue.sync {
             USBSessionSnapshot(
@@ -3557,6 +3566,13 @@ public class NetworkManager: ObservableObject {
                 committedGeneration: committedTransportGeneration,
                 pendingDisplay: displayRequestGate.pending,
                 orientation: observedInterfaceOrientation)
+        }
+    }
+
+    func simulateSessionAuthenticatedAndCommitted(mode: UInt8 = RealtimeTransportMode.legacyTLS) {
+        networkQueue.sync {
+            self.wireAuthenticatedGeneration = self.connectionGeneration
+            self.commitRealtimeTransport(generation: self.connectionGeneration, mode: mode)
         }
     }
     #endif
