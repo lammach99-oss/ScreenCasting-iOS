@@ -1894,7 +1894,8 @@ public class NetworkManager: ObservableObject {
                     return
                 }
                 if self.usbScdpConnection != nil, let current = self.usbScdpConnection {
-                    let isHealthy = (self.committedTransportGeneration == self.connectionGeneration && current.state == .ready)
+                    let isCommitted = (self.committedTransportGeneration == self.connectionGeneration)
+                    let isHealthy = isCommitted && (current.state == .ready || current.state == .setup)
                     let isConnecting = (self.connectionState == .connecting && self.committedTransportGeneration == nil && (current.state == .setup || current.state == .preparing))
                     if isHealthy || isConnecting {
                         self.recordUsbLifecycleDiagnostic(
