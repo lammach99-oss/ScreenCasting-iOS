@@ -106,21 +106,52 @@ state_handler = section(
 require(state_handler, "self.usbScdpConnection !== connection", "accepted-connection identity guard")
 usb_ready = section(
     state_handler,
-    "} else {",
+    "} else {\n                    self.startWireReceiveLoop(generation: generation)",
     "case .failed",
     "USB ready branch",
 )
+require(usb_ready, "self.startWireReceiveLoop(generation: generation)", "USB ready branch")
+require(usb_ready, "[USB_SCDP_PROVISIONAL]", "USB ready branch")
+reject(usb_ready, "awaitingPIN", "USB ready branch")
+reject(usb_ready, "wireAuthenticatedGeneration = generation", "USB ready branch")
+reject(usb_ready, "commitLegacyTransport", "USB ready branch")
+reject(usb_ready, "[IPAD][USB_SCDP_READY]", "USB ready branch")
+
+pre_auth = section(
+    network,
+    "guard wireAuthenticatedGeneration == generation else {",
+    "if header.type == .pairingRequired {",
+    "pre-auth USB receive branch",
+)
 require_order(
-    usb_ready,
+    pre_auth,
     [
-        "self.startWireReceiveLoop(generation: generation)",
+        "if activeTransportKind == .usb",
+        "guard generation == connectionGeneration",
+        "wireReceiveActiveGeneration == generation",
+        "connection != nil",
+        "usbScdpConnection != nil",
+        "connection === usbScdpConnection",
+        "guard header.type == .ping, payload.count == 16 else",
+        "sendWireMessage(",
+        "type: .pong",
+        "payload: payload",
+        "sequence: header.sequence",
+        ") { [weak self] error in",
+        "guard let self",
+        "error == nil",
+        "generation == self.connectionGeneration",
+        "self.wireReceiveActiveGeneration == generation",
+        "self.connection != nil",
+        "self.usbScdpConnection != nil",
+        "self.connection === self.usbScdpConnection",
+        "self.wireAuthenticatedGeneration == nil",
         "self.wireAuthenticatedGeneration = generation",
         "self.commitLegacyTransport(generation: generation)",
         "[IPAD][USB_SCDP_READY]",
     ],
-    "USB receive/authenticate/commit sequence",
+    "Ping/Pong commit sequence",
 )
-reject(usb_ready, "awaitingPIN", "USB ready branch")
 
 transport_anchor = content.find('Picker("Connection Transport"')
 if transport_anchor < 0:
