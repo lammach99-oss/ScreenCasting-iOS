@@ -355,20 +355,11 @@ public struct ContentView: View {
             case .active:
                 networkManager.applicationDidBecomeActive()
                 updateDisplayOrientation(for: rootSurfaceSize)
-                if let host = discoveryManager.discoveredHosts.first {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                        networkManager.connectDiscoveredHostIfNeeded(host.endpoint)
-                    }
-                }
             case .inactive, .background:
                 networkManager.applicationDidEnterBackground()
             @unknown default:
                 break
             }
-        }
-        .onChange(of: discoveryManager.discoveredHosts) { _, hosts in
-            guard scenePhase == .active, let host = hosts.first else { return }
-            networkManager.connectDiscoveredHostIfNeeded(host.endpoint)
         }
         .sheet(isPresented: $isSettingsPresented) {
             SettingsView(networkManager: networkManager)

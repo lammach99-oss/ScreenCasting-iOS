@@ -290,3 +290,47 @@ final class WifiTransportNegotiationTests: XCTestCase {
         data[offset + 3] = UInt8(truncatingIfNeeded: value)
     }
 }
+
+final class TrustedReconnectPolicyTests: XCTestCase {
+    func testFreshLaunchDoesNotAutoReconnect() {
+        XCTAssertFalse(
+            TrustedReconnectPolicy.shouldSchedule(
+                isForegroundActive: true,
+                reconnectEnabled: false,
+                lastKnownHost: "192.168.1.10"),
+            "fresh launch without user-started connection must not schedule auto-reconnect")
+    }
+
+    func testActiveSessionReconnectsWhenForeground() {
+        XCTAssertTrue(
+            TrustedReconnectPolicy.shouldSchedule(
+                isForegroundActive: true,
+                reconnectEnabled: true,
+                lastKnownHost: "192.168.1.10"),
+            "user-owned active session should schedule auto-reconnect on disconnect")
+    }
+
+    func testBackgroundDoesNotScheduleReconnect() {
+        XCTAssertFalse(
+            TrustedReconnectPolicy.shouldSchedule(
+                isForegroundActive: false,
+                reconnectEnabled: true,
+                lastKnownHost: "192.168.1.10"),
+            "background state must not schedule auto-reconnect")
+    }
+
+    func testEmptyHostDoesNotScheduleReconnect() {
+        XCTAssertFalse(
+            TrustedReconnectPolicy.shouldSchedule(
+                isForegroundActive: true,
+                reconnectEnabled: true,
+                lastKnownHost: ""),
+            "empty host must not schedule auto-reconnect")
+        XCTAssertFalse(
+            TrustedReconnectPolicy.shouldSchedule(
+                isForegroundActive: true,
+                reconnectEnabled: true,
+                lastKnownHost: nil),
+            "nil host must not schedule auto-reconnect")
+    }
+}

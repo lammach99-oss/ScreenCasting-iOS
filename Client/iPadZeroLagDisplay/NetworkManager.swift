@@ -1173,7 +1173,7 @@ public class NetworkManager: ObservableObject {
     private let trustedHostFingerprintStore = TrustedHostFingerprintStore()
     private let trustedDeviceID = TrustedDeviceIdentity.loadOrCreate()
     private var isForegroundActive = true
-    private var reconnectEnabled = true
+    private var reconnectEnabled = false
     private var reconnectAttempt = 0
     private var reconnectWorkItem: DispatchWorkItem?
     private var connectionTimeoutWorkItem: DispatchWorkItem?
@@ -1398,6 +1398,7 @@ public class NetworkManager: ObservableObject {
     /// Connect to the Windows host over TLS using an NWEndpoint directly (e.g. from Bonjour discovery).
     /// - Parameter endpoint: The resolved NWEndpoint (service endpoint or hostPort)
     public func connect(to endpoint: NWEndpoint) {
+        reconnectEnabled = true
         guard connectionState == .idle || isDisconnected else { return }
 
         _ = connectionGenerationClock.advance()
@@ -1479,6 +1480,8 @@ public class NetworkManager: ObservableObject {
     public func connectDiscoveredHostIfNeeded(_ endpoint: NWEndpoint) {
         guard isForegroundActive,
               reconnectEnabled,
+              !usbListenerExplicitlyStarted,
+              activeTransportKind != .usb,
               connectionState == .idle || isDisconnected else { return }
         connect(to: endpoint)
     }
@@ -1906,7 +1909,7 @@ public class NetworkManager: ObservableObject {
                     self.teardownUsbSession(
                         connection: current,
                         generation: self.connectionGeneration,
-                        reason: "replaced_by_new_candidate_not_stale")
+                        reason: "replacement_candidate_accepted")
                 }
                 _ = self.connectionGenerationClock.advance()
                 self.usbScdpConnection = newConnection
