@@ -1154,6 +1154,7 @@ public class NetworkManager: ObservableObject {
     @Published public private(set) var audioEnabled: Bool = true
     @Published public private(set) var settingsApplyStatus: String = ""
     @Published public private(set) var settingsGeneration: UInt64 = 0
+    private var authoritativeSettingsGeneration: UInt64 = 0
     private var nextSettingsRequestID: UInt32 = 1
     private var committedBitrateMbps: Double = 20
     private var committedAudioEnabled = true
@@ -1164,6 +1165,7 @@ public class NetworkManager: ObservableObject {
 
     // MARK: Private
     private var connection: NWConnection?
+    private var transportState: ConnectionState = .idle
     private var verifiedHostFingerprint: String?
     private var verifiedHostIdentityCode: String?
     private var hostIdentityConfirmationRequired = false
@@ -1191,7 +1193,7 @@ public class NetworkManager: ObservableObject {
         queue: networkQueue,
         sender: { [weak self] data, diagnostic, completion in
             guard let self else {
-                completion(nil)
+                completion(.posix(.ECANCELED))
                 return
             }
             let connection = self.activeControlConnection
@@ -1210,8 +1212,7 @@ public class NetworkManager: ObservableObject {
                         payloadLength: data.count,
                         error: "no_active_control_connection")
                 }
-                // Preserve the existing no-connection completion behavior.
-                completion(nil)
+                completion(.posix(.ENOTCONN))
                 return
             }
             connection.send(
@@ -1398,25 +1399,33 @@ public class NetworkManager: ObservableObject {
     /// Connect to the Windows host over TLS using an NWEndpoint directly (e.g. from Bonjour discovery).
     /// - Parameter endpoint: The resolved NWEndpoint (service endpoint or hostPort)
     public func connect(to endpoint: NWEndpoint) {
+        networkQueue.async { [weak self] in
+            self?.connectOnQueue(to: endpoint)
+        }
+    }
+
+    private func connectOnQueue(to endpoint: NWEndpoint) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
         reconnectEnabled = true
-        guard connectionState == .idle || isDisconnected else { return }
+        guard transportState == .idle || isDisconnectedOnQueue else { return }
 
         _ = connectionGenerationClock.advance()
         // Settings generations are scoped to the Host credential/session.
         // After Forget Host (or a fresh pairing), the Host may legitimately
         // start again at generation zero; retaining the old value would cause
         // the client to discard the authoritative state and send stale writes.
-        settingsGeneration = 0
-        settingsApplyStatus = ""
+        authoritativeSettingsGeneration = 0
+        DispatchQueue.main.async {
+            self.settingsGeneration = 0
+            self.settingsApplyStatus = ""
+            self.hostIdentityCode = nil
+        }
         verifiedHostFingerprint = nil
         verifiedHostIdentityCode = nil
-        hostIdentityCode = nil
         hostIdentityConfirmationRequired = false
         hostIdentityConfirmed = false
         reconnectWorkItem?.cancel()
-        networkQueue.async { [weak self] in
-            self?.resetDisplaySession()
-        }
+        resetDisplaySession()
         let parameters = buildTLSParameters(for: endpoint)
         let newConnection = NWConnection(to: endpoint, using: parameters)
         connection = newConnection
@@ -1426,7 +1435,7 @@ public class NetworkManager: ObservableObject {
         print("[IPAD][TCP_CONNECT] endpoint=\(endpoint)")
         connectionTimeoutWorkItem?.cancel()
         let timeout = DispatchWorkItem { [weak self] in
-            guard let self, self.connectionState == .connecting else { return }
+            guard let self, self.transportState == .connecting else { return }
             print("[IPAD][TIMEOUT] stage=TCP/TLS timeout=8s")
             self.connection?.cancel()
             self.setState(.disconnected(reason: "Timed out connecting to Windows host."))
@@ -1442,7 +1451,6 @@ public class NetworkManager: ObservableObject {
     ///   - port: TCP port the Windows NetworkManager listens on (default 27015)
     public func connect(to host: String, port: UInt16 = 27015) {
         UserDefaults.standard.set(host, forKey: Self.lastKnownHostKey)
-        reconnectEnabled = true
         let endpoint = NWEndpoint.hostPort(
             host: NWEndpoint.Host(host),
             port: NWEndpoint.Port(rawValue: port)!
@@ -1478,12 +1486,15 @@ public class NetworkManager: ObservableObject {
     }
 
     public func connectDiscoveredHostIfNeeded(_ endpoint: NWEndpoint) {
-        guard isForegroundActive,
-              reconnectEnabled,
-              !usbListenerExplicitlyStarted,
-              activeTransportKind != .usb,
-              connectionState == .idle || isDisconnected else { return }
-        connect(to: endpoint)
+        networkQueue.async { [weak self] in
+            guard let self,
+                  self.isForegroundActive,
+                  self.reconnectEnabled,
+                  !self.usbListenerExplicitlyStarted,
+                  self.activeTransportKind != .usb,
+                  self.transportState == .idle || self.isDisconnectedOnQueue else { return }
+            self.connectOnQueue(to: endpoint)
+        }
     }
 
     /// Confirms the displayed Wi-Fi Host identity after the user compares it
@@ -1494,7 +1505,7 @@ public class NetworkManager: ObservableObject {
                   self.hostIdentityConfirmationRequired,
                   self.verifiedHostFingerprint != nil,
                   self.verifiedHostIdentityCode != nil,
-                  self.connectionState == .awaitingHostIdentity else { return }
+                  self.transportState == .awaitingHostIdentity else { return }
             self.hostIdentityConfirmed = true
             self.hostIdentityConfirmationRequired = false
             self.sendTrustedClientHello(generation: self.connectionGeneration)
@@ -1504,23 +1515,24 @@ public class NetworkManager: ObservableObject {
     /// Sends the 4-digit PIN to the server as an 8-byte AuthPacketHeader.
     /// Should only be called when state == .awaitingPIN.
     public func sendAuthPIN(_ pin: String) {
-        guard (connectionState == .awaitingPIN || isAuthFailed),
-              activeTransportKind == .usb || hostIdentityConfirmed,
-              let pinValue = UInt32(pin), pin.count == 4 else { return }
-
-        var packet = Data(count: AuthProtocol.packetSize)
-        packet.withUnsafeMutableBytes { buf in
-            buf.storeBytes(of: AuthProtocol.magic.littleEndian, toByteOffset: 0, as: UInt32.self)
-            buf.storeBytes(of: pinValue.littleEndian,            toByteOffset: 4, as: UInt32.self)
-        }
-
-        let generation = connectionGeneration
-        enqueueControlData(packet) { [weak self] error in
-            guard let self else { return }
-            if let error {
-                self.setState(.disconnected(reason: "PIN send failed: \(error)"))
-            } else if generation == self.connectionGeneration {
-                self.receiveAuthResponse(generation: generation)
+        networkQueue.async { [weak self] in
+            guard let self,
+                  (self.transportState == .awaitingPIN || self.isAuthFailedOnQueue),
+                  self.activeTransportKind == .usb || self.hostIdentityConfirmed,
+                  let pinValue = UInt32(pin), pin.count == 4 else { return }
+            var packet = Data(count: AuthProtocol.packetSize)
+            packet.withUnsafeMutableBytes { buf in
+                buf.storeBytes(of: AuthProtocol.magic.littleEndian, toByteOffset: 0, as: UInt32.self)
+                buf.storeBytes(of: pinValue.littleEndian, toByteOffset: 4, as: UInt32.self)
+            }
+            let generation = self.connectionGeneration
+            self.enqueueControlData(packet) { [weak self] error in
+                guard let self else { return }
+                if let error {
+                    self.setState(.disconnected(reason: "PIN send failed: \(error)"))
+                } else if generation == self.connectionGeneration {
+                    self.receiveAuthResponse(generation: generation)
+                }
             }
         }
     }
@@ -1528,10 +1540,12 @@ public class NetworkManager: ObservableObject {
     /// Sends raw data back to the host.
     /// ⚠️ Legacy method — prefer `sendTouchEvent(type:x:y:pressure:)` for typed packets.
     public func sendData(_ data: Data) {
-        guard connectionState == .streaming else { return }
-        enqueueControlData(data) { error in
-            if let error {
-                print("[NetworkManager] sendData error: \(error)")
+        networkQueue.async { [weak self] in
+            guard let self, self.transportState == .streaming else { return }
+            self.enqueueControlData(data) { error in
+                if let error {
+                    print("[NetworkManager] sendData error: \(error)")
+                }
             }
         }
     }
@@ -1561,21 +1575,6 @@ public class NetworkManager: ObservableObject {
     ///   - y:        Vertical position in logical pixels (0–65535 for normalised use).
     ///   - pressure: Normalised pressure mapped to 0–255 byte range.
     public func sendTouchEvent(type: TouchEventType, x: UInt16, y: UInt16, pressure: UInt8) {
-        guard connectionState == .streaming else {
-            networkQueue.async { [weak self] in
-                guard let self, self.activeTransportKind == .usb else { return }
-                let diagnostic = self.nextUsbTouchDiagnostic(type: type)
-                guard diagnostic.shouldLog else { return }
-                self.recordUsbTouchGuardDiagnostic(
-                    diagnostic: diagnostic.context,
-                    generation: self.connectionGeneration,
-                    payloadLength: TouchWireProtocol.packetSize,
-                    result: "drop",
-                    reason: "connection_state_\(self.connectionState)")
-            }
-            return
-        }
-
         // Build the 8-byte packet inline — stack allocation, no heap alloc.
         var packet = Data(count: TouchWireProtocol.packetSize)
         packet.withUnsafeMutableBytes { buf in
@@ -1596,9 +1595,9 @@ public class NetworkManager: ObservableObject {
                            toByteOffset: 6, as: UInt16.self)
         }
 
-        let generation = connectionGeneration
         networkQueue.async { [weak self] in
             guard let self else { return }
+            let generation = self.connectionGeneration
             let isUsb = self.activeTransportKind == .usb
             let diagnostic = isUsb
                 ? self.nextUsbTouchDiagnostic(type: type)
@@ -1606,8 +1605,8 @@ public class NetworkManager: ObservableObject {
             let isCommittedGeneration =
                 self.committedTransportGeneration == generation
             let dropReason: String?
-            if generation != self.connectionGeneration {
-                dropReason = "stale_client_generation"
+            if self.transportState != .streaming {
+                dropReason = "transport_state_\(self.transportState)"
             } else if !isCommittedGeneration {
                 dropReason = "generation_not_committed"
             } else if self.displayRequestGate.isInputSuppressed {
@@ -1685,58 +1684,68 @@ public class NetworkManager: ObservableObject {
     ///   - frameReceiveDurationMs: Header-and-payload receive duration, not RTT.
     ///   - decodeLatencyMs:  Last-frame VideoToolbox decode latency in milliseconds.
     public func sendLegacyFrameStagePacket(frameReceiveDurationMs: UInt16, decodeLatencyMs: UInt16) {
-        guard connectionState == .streaming else { return }
-
-        var pkt = Data(count: TelemetryWireProtocol.packetSize)
-        pkt.withUnsafeMutableBytes { buf in
-            buf.storeBytes(of: TelemetryWireProtocol.magic.littleEndian, toByteOffset: 0, as: UInt16.self)
-            buf.storeBytes(of: UInt16(0),                                toByteOffset: 2, as: UInt16.self) // reserved
-            buf.storeBytes(of: frameReceiveDurationMs.littleEndian,      toByteOffset: 4, as: UInt16.self)
-            buf.storeBytes(of: decodeLatencyMs.littleEndian,             toByteOffset: 6, as: UInt16.self)
+        networkQueue.async { [weak self] in
+            guard let self, self.transportState == .streaming else { return }
+            var pkt = Data(count: TelemetryWireProtocol.packetSize)
+            pkt.withUnsafeMutableBytes { buf in
+                buf.storeBytes(of: TelemetryWireProtocol.magic.littleEndian, toByteOffset: 0, as: UInt16.self)
+                buf.storeBytes(of: UInt16(0), toByteOffset: 2, as: UInt16.self)
+                buf.storeBytes(of: frameReceiveDurationMs.littleEndian, toByteOffset: 4, as: UInt16.self)
+                buf.storeBytes(of: decodeLatencyMs.littleEndian, toByteOffset: 6, as: UInt16.self)
+            }
+            self.enqueueControlData(pkt, telemetry: true)
         }
-        enqueueControlData(pkt, telemetry: true)
     }
 
     public func sendSettingsUpdate(bitrateMbps: Double, audioEnabled: Bool) {
-        let roundedMbps = round(bitrateMbps)
-        guard connectionState == .streaming,
-              roundedMbps >= 3, roundedMbps <= 50 else { return }
-        let requestID = nextSettingsRequestID
-        nextSettingsRequestID &+= 1
-        var payload = Data(count: 24)
-        payload.withUnsafeMutableBytes { bytes in
-            bytes.storeBytes(of: UInt8(1), toByteOffset: 0, as: UInt8.self)
-            bytes.storeBytes(of: audioEnabled ? UInt8(1) : UInt8(0), toByteOffset: 1, as: UInt8.self)
-            bytes.storeBytes(of: UInt8(0), toByteOffset: 2, as: UInt8.self)
-            bytes.storeBytes(of: requestID.littleEndian, toByteOffset: 4, as: UInt32.self)
-            bytes.storeBytes(of: settingsGeneration.littleEndian, toByteOffset: 8, as: UInt64.self)
-            bytes.storeBytes(
-                of: UInt32(roundedMbps * 1_000_000).littleEndian,
-                toByteOffset: 16,
-                as: UInt32.self)
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            let roundedMbps = round(bitrateMbps)
+            guard self.transportState == .streaming,
+                  roundedMbps >= 3, roundedMbps <= 50 else { return }
+            let requestID = self.nextSettingsRequestID
+            self.nextSettingsRequestID &+= 1
+            let generation = self.authoritativeSettingsGeneration
+            var payload = Data(count: 24)
+            payload.withUnsafeMutableBytes { bytes in
+                bytes.storeBytes(of: UInt8(1), toByteOffset: 0, as: UInt8.self)
+                bytes.storeBytes(of: audioEnabled ? UInt8(1) : UInt8(0), toByteOffset: 1, as: UInt8.self)
+                bytes.storeBytes(of: UInt8(0), toByteOffset: 2, as: UInt8.self)
+                bytes.storeBytes(of: requestID.littleEndian, toByteOffset: 4, as: UInt32.self)
+                bytes.storeBytes(of: generation.littleEndian, toByteOffset: 8, as: UInt64.self)
+                bytes.storeBytes(of: UInt32(roundedMbps * 1_000_000).littleEndian, toByteOffset: 16, as: UInt32.self)
+            }
+            DispatchQueue.main.async { self.settingsApplyStatus = "Applying…" }
+            print("[IPAD][SETTINGS_UPDATE] request=\(requestID) expected_generation=\(generation) bitrate_bps=\(UInt32(roundedMbps * 1_000_000)) audio=\(audioEnabled)")
+            self.sendWireMessage(type: .settingsUpdate, payload: payload, sequence: requestID)
         }
-        settingsApplyStatus = "Applying…"
-        print("[IPAD][SETTINGS_UPDATE] request=\(requestID) expected_generation=\(settingsGeneration) bitrate_bps=\(UInt32(roundedMbps * 1_000_000)) audio=\(audioEnabled)")
-        sendWireMessage(type: .settingsUpdate, payload: payload, sequence: requestID)
     }
 
     public func forgetTrustedHost() {
-        guard connectionState == .streaming,
-              let credential = trustedCredential,
-              credential.deviceID.count == 16 else { return }
-        var payload = Data([1])
-        payload.append(credential.deviceID)
-        settingsApplyStatus = "Forgetting…"
-        sendWireMessage(type: .forgetDevice, payload: payload, sequence: 0)
+        networkQueue.async { [weak self] in
+            guard let self,
+                  self.transportState == .streaming,
+                  let credential = self.trustedCredential,
+                  credential.deviceID.count == 16 else { return }
+            var payload = Data([1])
+            payload.append(credential.deviceID)
+            DispatchQueue.main.async { self.settingsApplyStatus = "Forgetting…" }
+            self.sendWireMessage(type: .forgetDevice, payload: payload, sequence: 0)
+        }
     }
 
     /// Gracefully tears down the connection and resets to .idle.
     public func stop() {
         // Serialize explicit Stop with accept, receive and state callbacks.
         if DispatchQueue.getSpecific(key: networkQueueKey) == nil {
-            networkQueue.sync { self.stop() }
+            networkQueue.async { [weak self] in self?.stopOnQueue() }
             return
         }
+        stopOnQueue()
+    }
+
+    private func stopOnQueue() {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
         let wasUSB = usbListenerExplicitlyStarted
         usbListenerExplicitlyStarted = false
         reconnectEnabled = false
@@ -1833,10 +1842,13 @@ public class NetworkManager: ObservableObject {
 
     /// Starts the fixed-port TCP endpoint used to carry SCDP through iproxy.
     public func startListening(port: UInt16 = 42042) {
-        if DispatchQueue.getSpecific(key: networkQueueKey) == nil {
-            networkQueue.sync { self.startListening(port: port) }
-            return
+        networkQueue.async { [weak self] in
+            self?.startListeningOnQueue(port: port)
         }
+    }
+
+    private func startListeningOnQueue(port: UInt16) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
         // Repeated Start must not create a gap in an already owned listener.
         guard !usbListenerExplicitlyStarted || usbListener == nil else { return }
         stop()
@@ -1899,7 +1911,7 @@ public class NetworkManager: ObservableObject {
                 if self.usbScdpConnection != nil, let current = self.usbScdpConnection {
                     let isCommitted = (self.committedTransportGeneration == self.connectionGeneration)
                     let isHealthy = isCommitted && (current.state == .ready || current.state == .setup)
-                    let isConnecting = (self.connectionState == .connecting && self.committedTransportGeneration == nil && (current.state == .setup || current.state == .preparing))
+                    let isConnecting = (self.transportState == .connecting && self.committedTransportGeneration == nil && (current.state == .setup || current.state == .preparing || current.state == .ready))
                     if isHealthy || isConnecting {
                         self.recordUsbLifecycleDiagnostic(
                             "[USB_RECOVERY_CANDIDATE] attempt=\(self.connectionGeneration &+ 1) generation=\(self.connectionGeneration) state=rejected_stale")
@@ -2097,13 +2109,15 @@ public class NetworkManager: ObservableObject {
 
     // MARK: - Private: Connection Lifecycle
 
-    private var isDisconnected: Bool {
-        if case .disconnected = connectionState { return true }
+    private var isDisconnectedOnQueue: Bool {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        if case .disconnected = transportState { return true }
         return false
     }
 
-    private var isAuthFailed: Bool {
-        if case .authFailed = connectionState { return true }
+    private var isAuthFailedOnQueue: Bool {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        if case .authFailed = transportState { return true }
         return false
     }
 
@@ -2149,9 +2163,8 @@ public class NetworkManager: ObservableObject {
                     }
                 } else {
                     self.startWireReceiveLoop(generation: generation)
-                    self.wireAuthenticatedGeneration = generation
-                    self.commitLegacyTransport(generation: generation)
-                    print("[IPAD][USB_SCDP_READY] generation=\(generation)")
+                    self.recordUsbLifecycleDiagnostic(
+                        "[USB_SCDP_PROVISIONAL] generation=\(generation)")
                 }
 
             case .failed(let error):
@@ -2193,7 +2206,7 @@ public class NetworkManager: ObservableObject {
                 self.connection = nil
                 if self.usbListener != nil {
                     self.setState(.listening)
-                } else if self.connectionState != .idle {
+                } else if self.transportState != .idle {
                     self.setState(.disconnected(reason: "Connection cancelled."))
                     self.scheduleAutoReconnect(reset: false)
                 }
@@ -2323,12 +2336,13 @@ public class NetworkManager: ObservableObject {
         rejected: Bool = false
     ) {
         guard let state = TrustedSettingsState.decode(payload),
-              state.generation >= settingsGeneration else { return }
+              state.generation >= authoritativeSettingsGeneration else { return }
         let bitrateMbps = Double(state.bitrateBps) / 1_000_000
-        settingsGeneration = state.generation
+        authoritativeSettingsGeneration = state.generation
         committedBitrateMbps = bitrateMbps
         committedAudioEnabled = state.audioEnabled
         DispatchQueue.main.async {
+            self.settingsGeneration = state.generation
             self.targetBitrateMbps = bitrateMbps
             self.audioEnabled = state.audioEnabled
             self.isAdaptiveBitrate = false
@@ -2534,7 +2548,8 @@ public class NetworkManager: ObservableObject {
         type: WireMessageType,
         payload: Data,
         sequence: UInt32,
-        flags: UInt16 = 0
+        flags: UInt16 = 0,
+        completion: @escaping (NWError?) -> Void = { _ in }
     ) {
         guard payload.count <= WireProtocol.maxPayloadSize else { return }
         var message = Data(count: WireProtocol.headerSize)
@@ -2552,6 +2567,7 @@ public class NetworkManager: ObservableObject {
             telemetry: type == .videoFeedback,
             completion: { [weak self] error in
                 if let error { self?.handleStreamError("Control send error: \(error)") }
+                completion(error)
             })
     }
 
@@ -2647,6 +2663,38 @@ public class NetworkManager: ObservableObject {
         let payload = message.payload
 
         guard wireAuthenticatedGeneration == generation else {
+            if activeTransportKind == .usb {
+                guard generation == connectionGeneration,
+                      wireReceiveActiveGeneration == generation,
+                      connection != nil,
+                      usbScdpConnection != nil,
+                      connection === usbScdpConnection else { return }
+                guard header.type == .ping, payload.count == 16 else {
+                    handleStreamError(
+                        "Expected a 16-byte SCDP Ping before USB session commit.")
+                    return
+                }
+                sendWireMessage(
+                    type: .pong,
+                    payload: payload,
+                    sequence: header.sequence
+                ) { [weak self] error in
+                    guard let self,
+                          error == nil,
+                          generation == self.connectionGeneration,
+                          self.wireReceiveActiveGeneration == generation,
+                          self.connection != nil,
+                          self.usbScdpConnection != nil,
+                          self.connection === self.usbScdpConnection,
+                          self.wireAuthenticatedGeneration == nil else { return }
+                    self.wireAuthenticatedGeneration = generation
+                    self.commitLegacyTransport(generation: generation)
+                    print("[IPAD][USB_SCDP_READY] generation=\(generation)")
+                    self.recordUsbLifecycleDiagnostic(
+                        "[USB_SCDP_READY] generation=\(generation)")
+                }
+                return
+            }
             if header.type == .pairingRequired {
                 print("[IPAD][PAIRING_REQUIRED] host=unknown")
                 setState(.awaitingPIN)
@@ -3574,6 +3622,21 @@ public class NetworkManager: ObservableObject {
     var networkQueueKeyForTesting: DispatchSpecificKey<Bool> { networkQueueKey }
     var decoderForTesting: DecoderManager { decoder }
 
+    func stopForTesting() {
+        networkQueue.sync { self.stopOnQueue() }
+    }
+
+    func enqueueControlForTesting(
+        completion: @escaping (NWError?) -> Void
+    ) {
+        networkQueue.async {
+            self.controlChannelWriter.begin(generation: self.connectionGeneration)
+            _ = self.controlChannelWriter.enqueue(
+                Data([0x01]),
+                completion: completion)
+        }
+    }
+
     func usbSessionSnapshot() -> USBSessionSnapshot {
         let block = {
             USBSessionSnapshot(
@@ -3607,6 +3670,8 @@ public class NetworkManager: ObservableObject {
     #endif
 
     private func setState(_ newState: ConnectionState) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        transportState = newState
         DispatchQueue.main.async {
             self.connectionState = newState
         }

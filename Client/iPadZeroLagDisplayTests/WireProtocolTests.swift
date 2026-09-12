@@ -206,7 +206,7 @@ final class USBListenerLifetimeTests: XCTestCase {
     }
 
     override func tearDown() {
-        manager.stop()
+        manager.stopForTesting()
         peers.forEach { $0.cancel() }
         peers.removeAll()
         manager = nil
@@ -387,7 +387,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         let listener = try XCTUnwrap(snapshot.listener)
         let lateAccept = try XCTUnwrap(listener.newConnectionHandler)
 
-        manager.stop()
+        manager.stopForTesting()
         let latePeer = NWConnection(host: "127.0.0.1", port: 42042, using: .tcp)
         manager.networkQueueForTesting.sync { lateAccept(latePeer) }
 
@@ -465,6 +465,29 @@ final class USBListenerLifetimeTests: XCTestCase {
 }
 
 final class ControlChannelWriterTests: XCTestCase {
+    func testNetworkManagerReportsMissingControlConnectionAsNotConnected() {
+        let manager = NetworkManager()
+        let completed = expectation(description: "control completion")
+        manager.enqueueControlForTesting { error in
+            guard case .posix(.ENOTCONN)? = error else {
+                XCTFail("Unsent control packet must report ENOTCONN, got \(String(describing: error))")
+                completed.fulfill()
+                return
+            }
+            completed.fulfill()
+        }
+        wait(for: [completed], timeout: 1)
+    }
+
+    func testReadyUsbSocketRemainsProvisionalUntilHostPing() throws {
+        let peer = try connect()
+        try deliver(.ready, to: peer)
+        let snapshot = manager.usbSessionSnapshot()
+        XCTAssertNil(snapshot.authenticatedGeneration)
+        XCTAssertNil(snapshot.committedGeneration)
+        XCTAssertNotEqual(manager.connectionState, .streaming)
+    }
+
     func testRetiredSocketDoesNotBlockReplacementOrDeliverLateCompletion() {
         let queue = DispatchQueue(label: "control.writer.retired-socket")
         let sender = ManualSender()
