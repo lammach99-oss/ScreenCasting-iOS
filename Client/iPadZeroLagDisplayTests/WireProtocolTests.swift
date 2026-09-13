@@ -418,6 +418,15 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertTrue(manager.usbSessionSnapshot().listener === listener)
     }
 
+    func testReadyUsbSocketRemainsProvisionalUntilHostPing() throws {
+        let peer = try connect()
+        try deliver(.ready, to: peer)
+        let snapshot = manager.usbSessionSnapshot()
+        XCTAssertNil(snapshot.authenticatedGeneration)
+        XCTAssertNil(snapshot.committedGeneration)
+        XCTAssertNotEqual(manager.connectionState, .streaming)
+    }
+
     private func reconnect(
         from initial: ClientDisplayOrientation,
         to desired: ClientDisplayOrientation,
@@ -477,15 +486,6 @@ final class ControlChannelWriterTests: XCTestCase {
             completed.fulfill()
         }
         wait(for: [completed], timeout: 1)
-    }
-
-    func testReadyUsbSocketRemainsProvisionalUntilHostPing() throws {
-        let peer = try connect()
-        try deliver(.ready, to: peer)
-        let snapshot = manager.usbSessionSnapshot()
-        XCTAssertNil(snapshot.authenticatedGeneration)
-        XCTAssertNil(snapshot.committedGeneration)
-        XCTAssertNotEqual(manager.connectionState, .streaming)
     }
 
     func testRetiredSocketDoesNotBlockReplacementOrDeliverLateCompletion() {
