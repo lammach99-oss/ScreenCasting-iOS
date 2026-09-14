@@ -261,20 +261,76 @@ final class WifiTransportNegotiationTests: XCTestCase {
         XCTAssertTrue(decoded[0].2)
     }
 
+    func testAuthenticatedMediaProcessorUsesProvidedRttForReassemblyDeadline() {
+        var outcomes: [HevcReassemblyOutcome] = []
+        let processor = WifiAuthenticatedMediaProcessor(
+            mtu: 1_200,
+            initialSequence: 10,
+            unprotect: { _ in true },
+            decoder: { _, _, _, _ in },
+            outcomeObserver: { outcomes.append($0) },
+            rttP95Provider: { 20 })
+        let dependent = Data([0x02, 0x01])
+
+        processor.consume(
+            makeMediaPacket(
+                sequence: 10,
+                timestamp: 1,
+                frameSequence: 1,
+                marker: false,
+                payload: dependent),
+            arrivalTime: 0)
+        processor.consume(
+            makeMediaPacket(
+                sequence: 11,
+                timestamp: 2,
+                frameSequence: 2,
+                marker: true,
+                payload: dependent),
+            arrivalTime: 0.020)
+        XCTAssertFalse(outcomes.contains(.expired(frameSequence: 1)))
+
+        processor.consume(
+            makeMediaPacket(
+                sequence: 12,
+                timestamp: 3,
+                frameSequence: 3,
+                marker: true,
+                payload: dependent),
+            arrivalTime: 0.040)
+        XCTAssertTrue(outcomes.contains(.expired(frameSequence: 1)))
+    }
+
     private func makeSingleNalPacket(sequence: UInt16) -> Data {
-        var packet = Data(count: RtpPacketView.headerLength + 2)
+        makeMediaPacket(
+            sequence: sequence,
+            timestamp: 9,
+            frameSequence: 7,
+            marker: true,
+            payload: Data([0x26, 0x01]))
+    }
+
+    private func makeMediaPacket(
+        sequence: UInt16,
+        timestamp: UInt32,
+        frameSequence: UInt32,
+        marker: Bool,
+        payload: Data
+    ) -> Data {
+        var packet = Data(count: RtpPacketView.headerLength + payload.count)
         packet[0] = 0x90
-        packet[1] = 0x80 | 96
+        packet[1] = (marker ? 0x80 : 0) | 96
         storeBE16(sequence, in: &packet, at: 2)
-        storeBE32(9, in: &packet, at: 4)
+        storeBE32(timestamp, in: &packet, at: 4)
         storeBE32(0x2d74465a, in: &packet, at: 8)
         storeBE16(0xBEDE, in: &packet, at: 12)
         storeBE16(3, in: &packet, at: 14)
         packet[16] = 0x17
-        storeBE32(7, in: &packet, at: 17)
+        storeBE32(frameSequence, in: &packet, at: 17)
         storeBE32(8, in: &packet, at: 21)
-        packet[28] = 0x26
-        packet[29] = 0x01
+        packet.replaceSubrange(
+            RtpPacketView.headerLength..<packet.count,
+            with: payload)
         return packet
     }
 

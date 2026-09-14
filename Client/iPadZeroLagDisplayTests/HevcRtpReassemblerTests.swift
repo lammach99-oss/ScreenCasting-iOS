@@ -538,6 +538,102 @@ final class HevcRtpReassemblerTests: XCTestCase {
                 captureTime90k: 4))
     }
 
+    func testPartialAnchoredFrameLossRequiresFreshIDRBeforeDependentFrameCanComplete() {
+        let receiver = HevcRtpReassembler(
+            mtu: 1_200,
+            initialExpectedSequence: 10)
+        let dependent = nal(type: 1, count: 40, fill: 2)
+
+        XCTAssertEqual(
+            receiver.consume(
+                packet(
+                    sequence: 10, timestamp: 1, frame: 1, capture: 1,
+                    marker: false,
+                    payload: fu(
+                        dependent,
+                        bytes: dependent.subdata(in: 2..<14),
+                        start: true,
+                        end: false)),
+                authentication: .authenticated,
+                arrivalTime: 0,
+                rttP95Ms: 1),
+            .accepted)
+        XCTAssertEqual(
+            receiver.consume(
+                packet(
+                    sequence: 12, timestamp: 1, frame: 1, capture: 1,
+                    marker: true,
+                    payload: fu(
+                        dependent,
+                        bytes: dependent.subdata(in: 28..<dependent.count),
+                        start: false,
+                        end: true)),
+                authentication: .authenticated,
+                arrivalTime: 0.001,
+                rttP95Ms: 1),
+            .accepted)
+        XCTAssertEqual(
+            receiver.expire(at: 0.020),
+            [
+                .sequenceAnchorLost(expectedSequence: 10),
+                .expired(frameSequence: 1)
+            ])
+
+        XCTAssertEqual(
+            receiver.consume(
+                packet(
+                    sequence: 13, timestamp: 2, frame: 2, capture: 2,
+                    marker: true, payload: dependent),
+                authentication: .authenticated,
+                arrivalTime: 0.021,
+                rttP95Ms: 1),
+            .accepted)
+
+        let idr = nal(type: 19, count: 20, fill: 3)
+        XCTAssertEqual(
+            receiver.consume(
+                packet(
+                    sequence: 14, timestamp: 3, frame: 3, capture: 3,
+                    marker: true, payload: idr),
+                authentication: .authenticated,
+                arrivalTime: 0.022,
+                rttP95Ms: 1),
+            .completed(
+                accessUnit: canonical(idr),
+                frameSequence: 3,
+                captureTime90k: 3))
+    }
+
+    func testAnchorLossSurvivesTwoFrameExpiryOutcomePressure() {
+        let receiver = HevcRtpReassembler(
+            mtu: 1_200,
+            initialExpectedSequence: 10)
+        let dependent = nal(type: 1, count: 20, fill: 2)
+
+        _ = receiver.consume(
+            packet(
+                sequence: 11, timestamp: 2, frame: 2, capture: 2,
+                marker: true, payload: dependent),
+            authentication: .authenticated,
+            arrivalTime: 0,
+            rttP95Ms: 1)
+        _ = receiver.consume(
+            packet(
+                sequence: 12, timestamp: 3, frame: 3, capture: 3,
+                marker: true, payload: dependent),
+            authentication: .authenticated,
+            arrivalTime: 0.001,
+            rttP95Ms: 1)
+
+        XCTAssertEqual(
+            receiver.expire(at: 0.020),
+            [
+                .sequenceAnchorLost(expectedSequence: 10),
+                .expired(frameSequence: 2),
+                .expired(frameSequence: 3)
+            ])
+    }
+
     private func anchoredReassembler()
         -> (HevcRtpReassembler, Data)
     {
