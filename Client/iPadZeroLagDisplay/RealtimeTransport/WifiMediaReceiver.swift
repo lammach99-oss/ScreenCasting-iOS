@@ -340,6 +340,7 @@ final class WifiAuthenticatedMediaProcessor {
     typealias TimedOutcomeObserver = (
         HevcReassemblyOutcome, TimeInterval
     ) -> Void
+    typealias RttP95Provider = () -> Double
 
     private let reassembler: HevcRtpReassembler
     private let unprotect: Unprotect
@@ -348,6 +349,7 @@ final class WifiAuthenticatedMediaProcessor {
     private let outcomeObserver: OutcomeObserver?
     private let framePacketObserver: FramePacketObserver?
     private let timedOutcomeObserver: TimedOutcomeObserver?
+    private let rttP95Provider: RttP95Provider
     private(set) var authenticationFailures = 0
 
     init(
@@ -358,6 +360,7 @@ final class WifiAuthenticatedMediaProcessor {
         packetObserver: PacketObserver? = nil,
         outcomeObserver: OutcomeObserver? = nil,
         framePacketObserver: FramePacketObserver? = nil,
+        rttP95Provider: @escaping RttP95Provider = { 4 },
         timedOutcomeObserver: TimedOutcomeObserver? = nil
     ) {
         reassembler = HevcRtpReassembler(
@@ -369,6 +372,7 @@ final class WifiAuthenticatedMediaProcessor {
         self.outcomeObserver = outcomeObserver
         self.framePacketObserver = framePacketObserver
         self.timedOutcomeObserver = timedOutcomeObserver
+        self.rttP95Provider = rttP95Provider
     }
 
     var allocatedFrameCount: Int {
@@ -406,7 +410,7 @@ final class WifiAuthenticatedMediaProcessor {
             packet,
             authentication: .authenticated,
             arrivalTime: arrivalTime,
-            rttP95Ms: 4)
+            rttP95Ms: rttP95Provider())
         while let current = outcome {
             outcomeObserver?(current)
             self.timedOutcomeObserver?(current, arrivalTime)
@@ -1055,6 +1059,10 @@ final class WifiMediaReceiver {
                         isIDR,
                         bytes,
                         arrivalTime)
+                },
+                rttP95Provider: { [weak self] in
+                    guard let self else { return 0 }
+                    return Double(self.rttP95Ms())
                 },
                 timedOutcomeObserver: { outcome, observedAt in
                     self.timedOutcomeObserver?(

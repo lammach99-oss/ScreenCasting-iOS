@@ -24,6 +24,8 @@ enum HevcReassemblyOutcome: Equatable {
 }
 
 final class HevcRtpReassembler {
+    private static let maximumPendingOutcomes = 3
+
     private struct Frame {
         let timestamp: UInt32
         let frameSequence: UInt32
@@ -189,32 +191,41 @@ final class HevcRtpReassembler {
         }
         let ownedAnchor = frame.packets[expected] != nil
         if ownedAnchor {
-            expectedNextSequence = frame.markerSequence.map { $0 &+ 1 }
-            maySelfAnchor = false
+            loseSequenceAnchor(expected)
         } else {
             let hasViableAnchor = frames.values.contains {
                 $0.packets[expected] != nil
             }
             if !hasViableAnchor {
-                expectedNextSequence = nil
-                maySelfAnchor = true
-                requiresIDRAnchor = true
-                enqueue(.sequenceAnchorLost(expectedSequence: expected))
+                loseSequenceAnchor(expected)
             }
         }
         enqueue(outcome)
     }
 
+    private func loseSequenceAnchor(_ expected: UInt16) {
+        expectedNextSequence = nil
+        maySelfAnchor = true
+        requiresIDRAnchor = true
+        enqueue(.sequenceAnchorLost(expectedSequence: expected))
+    }
+
     private func enqueue(_ outcome: HevcReassemblyOutcome) {
         guard outcome != .accepted else { return }
-        if pendingOutcomes.count == 2 {
-            // Completion/drop outcomes are bounded with the two-frame store.
-            // Low-value duplicate notifications yield to state transitions.
-            if outcome == .duplicate { return }
+        if outcome == .duplicate,
+           pendingOutcomes.count >= Self.maximumPendingOutcomes {
+            return
+        }
+        if pendingOutcomes.count >= Self.maximumPendingOutcomes {
             if let duplicate = pendingOutcomes.firstIndex(of: .duplicate) {
                 pendingOutcomes.remove(at: duplicate)
+            } else if let removable = pendingOutcomes.firstIndex(where: {
+                if case .sequenceAnchorLost = $0 { return false }
+                return true
+            }) {
+                pendingOutcomes.remove(at: removable)
             } else {
-                pendingOutcomes.removeFirst()
+                return
             }
         }
         pendingOutcomes.append(outcome)
