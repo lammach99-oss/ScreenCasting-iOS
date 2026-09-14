@@ -66,16 +66,17 @@ public final class AudioManager {
     // MARK: - Engine Setup
 
     private func setupEngine() {
+        #if !targetEnvironment(simulator)
         engine.attach(playerNode)
 
-        // Connect playerNode → mainMixerNode using our target format.
+        // Connect playerNode to mainMixerNode using our target format.
         // The mixer converts to the hardware format automatically.
         engine.connect(
             playerNode,
             to   : engine.mainMixerNode,
             format: pcmFormat)
 
-        // Prepare but don't start yet — startEngineIfNeeded() handles that.
+        // Prepare but don't start yet - startEngineIfNeeded() handles that.
         engine.prepare()
 
         // Listen for audio session interruptions (phone calls, Siri, etc.)
@@ -87,16 +88,19 @@ public final class AudioManager {
 
         // Configure audio session for playback
         configureAudioSession()
+        #endif
     }
 
     private func configureAudioSession() {
+        #if !targetEnvironment(simulator)
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try session.setActive(true)
         } catch {
-            print("[AudioManager] ⚠️ AVAudioSession setup failed: \(error)")
+            print("[AudioManager] Warning: AVAudioSession setup failed: \(error)")
         }
+        #endif
     }
 
     private func startEngineIfNeeded() {

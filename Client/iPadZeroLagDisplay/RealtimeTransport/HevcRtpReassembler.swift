@@ -16,6 +16,7 @@ enum HevcReassemblyOutcome: Equatable {
     case expired(frameSequence: UInt32)
     case authenticationFailure
     case malformed
+    case sequenceAnchorLost(expectedSequence: UInt16)
     case completed(
         accessUnit: Data,
         frameSequence: UInt32,
@@ -36,6 +37,7 @@ final class HevcRtpReassembler {
     private var frames: [UInt32: Frame] = [:]
     private var expectedNextSequence: UInt16?
     private var maySelfAnchor: Bool
+    private var requiresIDRAnchor = false
     private var pendingOutcomes: [HevcReassemblyOutcome] = []
     private let mtu: Int
 
@@ -58,6 +60,7 @@ final class HevcRtpReassembler {
     func resetExpectedSequence(_ sequence: UInt16) {
         expectedNextSequence = sequence
         maySelfAnchor = false
+        requiresIDRAnchor = false
         reevaluateBufferedFrames()
     }
 
@@ -141,8 +144,13 @@ final class HevcRtpReassembler {
         frames[packet.timestamp] = frame
 
         if maySelfAnchor {
-            maySelfAnchor = false
-            if !packet.marker && Self.isNalBoundary(packet.payload) {
+            let canAnchor = requiresIDRAnchor
+                ? Self.isIDR(packet.payload) &&
+                    Self.isNalBoundary(packet.payload)
+                : !packet.marker && Self.isNalBoundary(packet.payload)
+            if canAnchor {
+                maySelfAnchor = false
+                requiresIDRAnchor = false
                 expectedNextSequence = packet.sequence
             }
         }
@@ -175,16 +183,24 @@ final class HevcRtpReassembler {
         outcome: HevcReassemblyOutcome
     ) {
         frames.removeValue(forKey: frame.timestamp)
-        let ownedAnchor = expectedNextSequence.map {
-            frame.packets[$0] != nil
-        } ?? true
-        // A lost packet can leave expectedNextSequence pointing forever at
-        // the missing sequence. Once this frame expires, its marker is the
-        // authoritative boundary: skip the incomplete frame and let the next
-        // complete frame become eligible instead of buffering indefinitely.
-        if ownedAnchor || frame.markerSequence != nil {
+        guard let expected = expectedNextSequence else {
+            enqueue(outcome)
+            return
+        }
+        let ownedAnchor = frame.packets[expected] != nil
+        if ownedAnchor {
             expectedNextSequence = frame.markerSequence.map { $0 &+ 1 }
             maySelfAnchor = false
+        } else {
+            let hasViableAnchor = frames.values.contains {
+                $0.packets[expected] != nil
+            }
+            if !hasViableAnchor {
+                expectedNextSequence = nil
+                maySelfAnchor = true
+                requiresIDRAnchor = true
+                enqueue(.sequenceAnchorLost(expectedSequence: expected))
+            }
         }
         enqueue(outcome)
     }
@@ -244,6 +260,7 @@ final class HevcRtpReassembler {
                 expectedNextSequence =
                     frame.markerSequence.map { $0 &+ 1 }
                 maySelfAnchor = false
+                requiresIDRAnchor = false
                 enqueue(.completed(
                     accessUnit: accessUnit,
                     frameSequence: frame.frameSequence,

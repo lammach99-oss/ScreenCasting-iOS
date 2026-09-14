@@ -472,39 +472,67 @@ final class HevcRtpReassemblerTests: XCTestCase {
         XCTAssertLessThanOrEqual(receiver.pendingOutcomeCount, 2)
     }
 
-    func testExpiredFrameWithMissingAnchorDoesNotStallFollowingFrames() {
+    func testWholeFrameLossReanchorsOnlyOnFreshIDRBeforeSequenceWrap() {
         let receiver = HevcRtpReassembler(
             mtu: 1_200,
-            initialExpectedSequence: 100)
-        let first = nal(type: 1, count: 20, fill: 1)
-        let following = nal(type: 1, count: 20, fill: 2)
-
-        // Sequence 100 is lost. The frame's marker still establishes its
-        // boundary, so expiry must advance the anchor to sequence 102.
+            initialExpectedSequence: 10)
+        let anchor = nal(type: 32, count: 20, fill: 1)
         XCTAssertEqual(
             receiver.consume(
                 packet(
-                    sequence: 101, timestamp: 1, frame: 1, capture: 1,
-                    marker: true, payload: first),
+                    sequence: 10, timestamp: 1, frame: 1, capture: 1,
+                    marker: true, payload: anchor),
                 authentication: .authenticated,
                 arrivalTime: 0,
                 rttP95Ms: 1),
-            .accepted)
+            .completed(
+                accessUnit: canonical(anchor),
+                frameSequence: 1,
+                captureTime90k: 1))
+
+        // Sequence 11 is wholly lost. A later dependent frame proves the old
+        // anchor cannot be satisfied, then expires far before UInt16 wrap.
+        let dependent = nal(type: 1, count: 20, fill: 2)
+        _ = receiver.consume(
+            packet(
+                sequence: 12, timestamp: 2, frame: 2, capture: 2,
+                marker: true, payload: dependent),
+            authentication: .authenticated,
+            arrivalTime: 0.001,
+            rttP95Ms: 1)
+        XCTAssertEqual(
+            receiver.expire(at: 0.020),
+            [
+                .sequenceAnchorLost(expectedSequence: 11),
+                .expired(frameSequence: 2)
+            ])
+
         XCTAssertEqual(
             receiver.consume(
                 packet(
-                    sequence: 102, timestamp: 2, frame: 2, capture: 2,
-                    marker: true, payload: following),
+                    sequence: 13, timestamp: 3, frame: 3, capture: 3,
+                    marker: true, payload: dependent),
                 authentication: .authenticated,
-                arrivalTime: 0.020,
+                arrivalTime: 0.021,
                 rttP95Ms: 1),
-            .expired(frameSequence: 1))
+            .accepted)
         XCTAssertEqual(
-            receiver.drainOutcome(),
+            receiver.expire(at: 0.040),
+            [.expired(frameSequence: 3)])
+
+        let idr = nal(type: 19, count: 20, fill: 3)
+        XCTAssertEqual(
+            receiver.consume(
+                packet(
+                    sequence: 14, timestamp: 4, frame: 4, capture: 4,
+                    marker: true, payload: idr),
+                authentication: .authenticated,
+                arrivalTime: 0.041,
+                rttP95Ms: 1),
             .completed(
-                accessUnit: canonical(following),
-                frameSequence: 2,
-                captureTime90k: 2))
+                accessUnit: canonical(idr),
+                frameSequence: 4,
+                captureTime90k: 4))
     }
 
     private func anchoredReassembler()

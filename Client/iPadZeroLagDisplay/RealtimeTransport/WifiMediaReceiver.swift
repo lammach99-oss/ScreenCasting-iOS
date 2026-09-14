@@ -1030,7 +1030,18 @@ final class WifiMediaReceiver {
                         }
                     case .expired:
                         self.expiredFrames &+= 1
-                        self.sendFeedback(immediate: true)
+                        if !self.dependencyBreakActive {
+                            self.sendFeedback(immediate: true)
+                        }
+                    case .sequenceAnchorLost(let expectedSequence):
+                        print(
+                            "[RTP_REASSEMBLY_RECOVERY] " +
+                            "reason=anchor_lost " +
+                            "old_expected_sequence=\(expectedSequence) " +
+                            "action=reanchor_for_idr")
+                        if !self.dependencyBreakActive {
+                            self.beginRecoveryEpisode()
+                        }
                     default:
                         break
                     }
