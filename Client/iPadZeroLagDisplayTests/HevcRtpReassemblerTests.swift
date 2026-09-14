@@ -112,7 +112,7 @@ final class HevcRtpReassemblerTests: XCTestCase {
             0.050)
     }
 
-    func testMarkerFirstMissingLeadingNalExpiresWithoutSuffix() {
+    func testMarkerFirstCompletesWhenLeadingFragmentArrives() {
         let idr = nal(type: 19, count: 40, fill: 3)
         let first = idr.subdata(in: 2..<20)
         let last = idr.subdata(in: 20..<idr.count)
@@ -138,10 +138,13 @@ final class HevcRtpReassemblerTests: XCTestCase {
                 authentication: .authenticated,
                 arrivalTime: 0.001,
                 rttP95Ms: 1),
-            .accepted)
+            .completed(
+                accessUnit: canonical(idr),
+                frameSequence: 8,
+                captureTime90k: 0))
         XCTAssertEqual(
             reassembler.expire(at: 0.051),
-            [.expired(frameSequence: 8)])
+            [])
     }
 
     func testInitialSingleNalAndFuOnlyInOrderDoNotStall() {
