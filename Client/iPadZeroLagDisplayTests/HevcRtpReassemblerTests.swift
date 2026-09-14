@@ -275,7 +275,8 @@ final class HevcRtpReassemblerTests: XCTestCase {
                     authentication: .authenticated,
                     arrivalTime: 0.002,
                     rttP95Ms: 1),
-                .malformed)
+                .sequenceAnchorLost(expectedSequence: 10))
+            XCTAssertEqual(reassembler.drainOutcome(), .malformed)
         }
     }
 
@@ -302,7 +303,8 @@ final class HevcRtpReassemblerTests: XCTestCase {
                     authentication: .authenticated,
                     arrivalTime: 0.002,
                     rttP95Ms: 1),
-                .malformed)
+                .sequenceAnchorLost(expectedSequence: 10))
+            XCTAssertEqual(reassembler.drainOutcome(), .malformed)
         }
         do {
             let (reassembler, idr) = anchoredReassembler()
@@ -335,7 +337,8 @@ final class HevcRtpReassemblerTests: XCTestCase {
                     authentication: .authenticated,
                     arrivalTime: 0.003,
                     rttP95Ms: 1),
-                .malformed)
+                .sequenceAnchorLost(expectedSequence: 10))
+            XCTAssertEqual(reassembler.drainOutcome(), .malformed)
         }
     }
 
@@ -427,13 +430,9 @@ final class HevcRtpReassemblerTests: XCTestCase {
                 authentication: .authenticated,
                 arrivalTime: 0.002,
                 rttP95Ms: 1),
-            .malformed)
-        XCTAssertEqual(
-            receiver.drainOutcome(),
-            .completed(
-                accessUnit: canonical(valid),
-                frameSequence: 2,
-                captureTime90k: 2))
+            .sequenceAnchorLost(expectedSequence: 10))
+        XCTAssertEqual(receiver.drainOutcome(), .malformed)
+        XCTAssertNil(receiver.drainOutcome())
         XCTAssertLessThanOrEqual(receiver.pendingOutcomeCount, 2)
     }
 
@@ -470,7 +469,8 @@ final class HevcRtpReassemblerTests: XCTestCase {
                 authentication: .authenticated,
                 arrivalTime: 0.020,
                 rttP95Ms: 0),
-            .expired(frameSequence: 1))
+            .sequenceAnchorLost(expectedSequence: 10))
+        XCTAssertEqual(receiver.drainOutcome(), .expired(frameSequence: 1))
         XCTAssertEqual(receiver.drainOutcome(), .duplicate)
         XCTAssertLessThanOrEqual(receiver.pendingOutcomeCount, 2)
     }
