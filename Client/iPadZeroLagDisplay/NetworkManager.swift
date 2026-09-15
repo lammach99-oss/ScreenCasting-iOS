@@ -2536,8 +2536,8 @@ public class NetworkManager: ObservableObject {
             legacyHost: legacyHost)
         guard let target, let endpoint = target.endpoint else { return nil }
         if WifiReconnectTargetStore.load() == nil,
-           case .hostPort(let host, let port) = target {
-            WifiReconnectTargetStore.save(.hostPort(host: host, port: port))
+           target.kind == .hostPort {
+            WifiReconnectTargetStore.save(target)
         }
         return endpoint
     }
