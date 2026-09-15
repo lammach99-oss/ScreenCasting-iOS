@@ -3,6 +3,10 @@ import Foundation
 import os
 import UIKit
 
+enum ClientPreferenceKeys {
+    static let showPerformanceHUD = "ScreenCasting.client.showPerformanceHUD"
+}
+
 // MARK: - PIN Shake Modifier
 
 struct ShakeEffect: GeometryEffect {
@@ -265,7 +269,8 @@ public struct ContentView: View {
     @State private var useUSBMode: Bool = false
 
     // UI States
-    @State private var isHudVisible: Bool = true
+    @AppStorage(ClientPreferenceKeys.showPerformanceHUD)
+    private var isHudVisible: Bool = true
     @State private var renderedContentViewport: VideoContentViewport?
     @State private var rendererGeometrySnapshot: RendererGeometrySnapshot?
     @State private var presentationGeometry: PresentationSurfaceGeometry?
@@ -307,11 +312,11 @@ public struct ContentView: View {
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
             discoveryManager.startBrowsing()
+            networkManager.applicationDidBecomeActive()
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
             discoveryManager.stopBrowsing()
-            networkManager.applicationDidEnterBackground()
         }
         .animation(.easeInOut(duration: 0.3), value: streamManager.isConnected)
         // PIN entry overlay: shown when awaiting PIN or after auth failure
@@ -355,7 +360,9 @@ public struct ContentView: View {
             case .active:
                 networkManager.applicationDidBecomeActive()
                 updateDisplayOrientation(for: rootSurfaceSize)
-            case .inactive, .background:
+            case .inactive:
+                networkManager.applicationWillResignActive()
+            case .background:
                 networkManager.applicationDidEnterBackground()
             @unknown default:
                 break

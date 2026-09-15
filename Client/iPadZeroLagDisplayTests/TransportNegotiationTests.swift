@@ -389,4 +389,191 @@ final class TrustedReconnectPolicyTests: XCTestCase {
                 lastKnownHost: nil),
             "nil host must not schedule auto-reconnect")
     }
+
+    func testRecentWifiResumeIntentIsValidInsideRelaunchWindow() {
+        XCTAssertTrue(
+            RecentWifiResumePolicy.isValid(
+                resumeUntil: 130,
+                now: 120))
+    }
+
+    func testRecentWifiResumeIntentExpiresOutsideRelaunchWindow() {
+        XCTAssertFalse(
+            RecentWifiResumePolicy.isValid(
+                resumeUntil: 120,
+                now: 121))
+    }
+
+    func testMissingResumeIntentDoesNotEnableRelaunchReconnect() {
+        XCTAssertFalse(
+            RecentWifiResumePolicy.isValid(
+                resumeUntil: nil,
+                now: 120))
+    }
+
+    func testWifiLifecycleUsesBoundedBackgroundGrace() {
+        XCTAssertEqual(WifiLifecyclePolicy.backgroundGrace, 5)
+        XCTAssertFalse(
+            WifiLifecyclePolicy.shouldTearDownAfterGrace(
+                isForegroundActive: true,
+                isUSB: false,
+                scheduledGeneration: 7,
+                currentGeneration: 7,
+                hasSameConnection: true))
+    }
+
+    func testOldGenerationBackgroundTeardownCannotReplaceCurrentSession() {
+        XCTAssertFalse(
+            WifiLifecyclePolicy.shouldTearDownAfterGrace(
+                isForegroundActive: false,
+                isUSB: false,
+                scheduledGeneration: 7,
+                currentGeneration: 8,
+                hasSameConnection: true))
+        XCTAssertFalse(
+            WifiLifecyclePolicy.shouldTearDownAfterGrace(
+                isForegroundActive: false,
+                isUSB: false,
+                scheduledGeneration: 7,
+                currentGeneration: 7,
+                hasSameConnection: false))
+    }
+
+    func testOnlyMatchingBackgroundWifiSessionTearsDownAfterGrace() {
+        XCTAssertTrue(
+            WifiLifecyclePolicy.shouldTearDownAfterGrace(
+                isForegroundActive: false,
+                isUSB: false,
+                scheduledGeneration: 7,
+                currentGeneration: 7,
+                hasSameConnection: true))
+        XCTAssertFalse(
+            WifiLifecyclePolicy.shouldTearDownAfterGrace(
+                isForegroundActive: false,
+                isUSB: true,
+                scheduledGeneration: 7,
+                currentGeneration: 7,
+                hasSameConnection: true))
+    }
+}
+
+final class ClientPreferenceTests: XCTestCase {
+    func testPerformanceHudPreferenceDefaultsOnAndPersists() {
+        let suiteName = "ScreenCasting.ClientPreferenceTests"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        XCTAssertTrue(
+            defaults.object(forKey: ClientPreferenceKeys.showPerformanceHUD)
+                as? Bool ?? true)
+        defaults.set(false, forKey: ClientPreferenceKeys.showPerformanceHUD)
+        XCTAssertFalse(defaults.bool(forKey: ClientPreferenceKeys.showPerformanceHUD))
+        defaults.set(true, forKey: ClientPreferenceKeys.showPerformanceHUD)
+        XCTAssertTrue(defaults.bool(forKey: ClientPreferenceKeys.showPerformanceHUD))
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+}
+
+final class WifiReconnectTargetTests: XCTestCase {
+    func testWifiReconnectHostPortTargetRoundTrips() throws {
+        let target = WifiReconnectTarget.hostPort(
+            host: "192.168.1.50",
+            port: 27015)
+        let endpoint = try XCTUnwrap(target.endpoint)
+        guard case .hostPort(let host, let port) = endpoint else {
+            return XCTFail("Expected hostPort endpoint")
+        }
+        XCTAssertEqual(String(describing: host), "192.168.1.50")
+        XCTAssertEqual(port.rawValue, 27015)
+    }
+
+    func testWifiReconnectServiceTargetRoundTrips() throws {
+        let target = WifiReconnectTarget.service(
+            name: "ScreenCasting-PC",
+            type: "_screencasting._tcp",
+            domain: "local.")
+        let endpoint = try XCTUnwrap(target.endpoint)
+        guard case .service(let name, let type, let domain, _) = endpoint else {
+            return XCTFail("Expected service endpoint")
+        }
+        XCTAssertEqual(name, "ScreenCasting-PC")
+        XCTAssertEqual(type, "_screencasting._tcp")
+        XCTAssertEqual(domain, "local.")
+    }
+
+    func testDiscoveredServiceEndpointPersistsReconnectIdentity() throws {
+        let endpoint = NWEndpoint.service(
+            name: "Office-PC",
+            type: "_screencasting._tcp",
+            domain: "local.",
+            interface: nil)
+        let target = try XCTUnwrap(WifiReconnectTargetPolicy.target(from: endpoint))
+        XCTAssertEqual(
+            target,
+            .service(
+                name: "Office-PC",
+                type: "_screencasting._tcp",
+                domain: "local."))
+    }
+
+    func testWifiReconnectTargetStorePersistsTarget() throws {
+        let suite = "ScreenCasting.WifiReconnectTargetStoreTests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let expected = WifiReconnectTarget.hostPort(host: "10.0.0.2", port: 27015)
+        WifiReconnectTargetStore.save(expected, defaults: defaults)
+        XCTAssertEqual(WifiReconnectTargetStore.load(defaults: defaults), expected)
+    }
+
+    func testStructuredReconnectTargetWinsOverStaleLegacyHost() {
+        let discovered = WifiReconnectTarget.service(
+            name: "Current-PC",
+            type: "_screencasting._tcp",
+            domain: "local.")
+        XCTAssertEqual(
+            WifiReconnectTargetSelection.preferred(
+                structured: discovered,
+                legacyHost: "192.168.1.99"),
+            discovered)
+    }
+
+    func testLegacyReconnectHostMigratesWhenStructuredTargetMissing() {
+        XCTAssertEqual(
+            WifiReconnectTargetSelection.preferred(
+                structured: nil,
+                legacyHost: "192.168.1.10"),
+            .hostPort(host: "192.168.1.10", port: 27015))
+    }
+
+    func testRecentWifiResumeIntentIsConsumedOnlyOnce() throws {
+        let suite = "ScreenCasting.RecentWifiResumeStoreTests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        RecentWifiResumeStore.mark(now: 100, defaults: defaults)
+        XCTAssertTrue(RecentWifiResumeStore.consumeIfValid(now: 110, defaults: defaults))
+        XCTAssertFalse(RecentWifiResumeStore.consumeIfValid(now: 111, defaults: defaults))
+    }
+
+    func testExpiredRecentWifiResumeIntentIsConsumedAndRemoved() throws {
+        let suite = "ScreenCasting.RecentWifiResumeExpiredTests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        RecentWifiResumeStore.mark(now: 100, defaults: defaults)
+        XCTAssertFalse(RecentWifiResumeStore.consumeIfValid(now: 131, defaults: defaults))
+        XCTAssertFalse(RecentWifiResumeStore.consumeIfValid(now: 110, defaults: defaults))
+    }
+
+    func testWifiReconnectTargetStoreClearRemovesTarget() throws {
+        let suite = "ScreenCasting.WifiReconnectTargetClearTests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        WifiReconnectTargetStore.save(
+            .hostPort(host: "10.0.0.2", port: 27015),
+            defaults: defaults)
+        WifiReconnectTargetStore.clear(defaults: defaults)
+        XCTAssertNil(WifiReconnectTargetStore.load(defaults: defaults))
+    }
 }

@@ -256,6 +256,162 @@ enum TrustedReconnectPolicy {
     }
 }
 
+enum RecentWifiResumePolicy {
+    static let relaunchWindow: TimeInterval = 30
+
+    static func isValid(
+        resumeUntil: TimeInterval?,
+        now: TimeInterval
+    ) -> Bool {
+        guard let resumeUntil else { return false }
+        return resumeUntil >= now
+    }
+}
+
+enum WifiLifecyclePolicy {
+    static let backgroundGrace: TimeInterval = 5
+
+    static func shouldTearDownAfterGrace(
+        isForegroundActive: Bool,
+        isUSB: Bool,
+        scheduledGeneration: UInt64,
+        currentGeneration: UInt64,
+        hasSameConnection: Bool
+    ) -> Bool {
+        !isForegroundActive && !isUSB &&
+            scheduledGeneration == currentGeneration && hasSameConnection
+    }
+}
+
+enum RecentWifiResumeStore {
+    private static let key = "ScreenCasting.wifi.relaunchResumeUntil"
+
+    static func mark(
+        now: TimeInterval = Date().timeIntervalSince1970,
+        defaults: UserDefaults = .standard
+    ) {
+        defaults.set(
+            now + RecentWifiResumePolicy.relaunchWindow,
+            forKey: key)
+    }
+
+    static func consumeIfValid(
+        now: TimeInterval = Date().timeIntervalSince1970,
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        let value = defaults.object(forKey: key) as? NSNumber
+        let resumeUntil = value?.doubleValue
+        defaults.removeObject(forKey: key)
+        return RecentWifiResumePolicy.isValid(
+            resumeUntil: resumeUntil,
+            now: now)
+    }
+
+    static func clear(defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: key)
+    }
+}
+
+struct WifiReconnectTarget: Codable, Equatable {
+    enum Kind: String, Codable {
+        case hostPort
+        case service
+    }
+
+    let kind: Kind
+    let host: String?
+    let port: UInt16?
+    let serviceName: String?
+    let serviceType: String?
+    let serviceDomain: String?
+
+    static func hostPort(host: String, port: UInt16) -> Self {
+        Self(
+            kind: .hostPort,
+            host: host,
+            port: port,
+            serviceName: nil,
+            serviceType: nil,
+            serviceDomain: nil)
+    }
+
+    static func service(name: String, type: String, domain: String) -> Self {
+        Self(
+            kind: .service,
+            host: nil,
+            port: nil,
+            serviceName: name,
+            serviceType: type,
+            serviceDomain: domain)
+    }
+
+    var endpoint: NWEndpoint? {
+        switch kind {
+        case .hostPort:
+            guard let host, !host.isEmpty,
+                  let port,
+                  let nwPort = NWEndpoint.Port(rawValue: port) else { return nil }
+            return .hostPort(host: NWEndpoint.Host(host), port: nwPort)
+        case .service:
+            guard let serviceName, !serviceName.isEmpty,
+                  let serviceType, !serviceType.isEmpty,
+                  let serviceDomain, !serviceDomain.isEmpty else { return nil }
+            return .service(
+                name: serviceName,
+                type: serviceType,
+                domain: serviceDomain,
+                interface: nil)
+        }
+    }
+}
+
+enum WifiReconnectTargetPolicy {
+    static func target(from endpoint: NWEndpoint) -> WifiReconnectTarget? {
+        switch endpoint {
+        case .hostPort(let host, let port):
+            return .hostPort(host: String(describing: host), port: port.rawValue)
+        case .service(let name, let type, let domain, _):
+            return .service(name: name, type: type, domain: domain)
+        default:
+            return nil
+        }
+    }
+}
+
+enum WifiReconnectTargetSelection {
+    static func preferred(
+        structured: WifiReconnectTarget?,
+        legacyHost: String?
+    ) -> WifiReconnectTarget? {
+        if let structured { return structured }
+        guard let legacyHost, !legacyHost.isEmpty else { return nil }
+        return .hostPort(host: legacyHost, port: 27015)
+    }
+}
+
+enum WifiReconnectTargetStore {
+    private static let key = "ScreenCasting.wifi.reconnectTarget.v1"
+
+    static func save(
+        _ target: WifiReconnectTarget,
+        defaults: UserDefaults = .standard
+    ) {
+        guard let data = try? JSONEncoder().encode(target) else { return }
+        defaults.set(data, forKey: key)
+    }
+
+    static func load(
+        defaults: UserDefaults = .standard
+    ) -> WifiReconnectTarget? {
+        guard let data = defaults.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(WifiReconnectTarget.self, from: data)
+    }
+
+    static func clear(defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: key)
+    }
+}
+
 struct TrustedSettingsState: Equatable {
     let generation: UInt64
     let bitrateBps: UInt32
@@ -1178,6 +1334,7 @@ public class NetworkManager: ObservableObject {
     private var reconnectEnabled = false
     private var reconnectAttempt = 0
     private var reconnectWorkItem: DispatchWorkItem?
+    private var wifiBackgroundDisconnectWorkItem: DispatchWorkItem?
     private var connectionTimeoutWorkItem: DispatchWorkItem?
     private var usbListener: NWListener?
     private var usbListenerExplicitlyStarted = false
@@ -1345,9 +1502,15 @@ public class NetworkManager: ObservableObject {
     private static let usbTouchMoveDiagnosticInterval: TimeInterval = 0.25
     private var usbTouchDiagnosticSequence: UInt64 = 0
     private var lastUsbTouchMoveDiagnosticAt: TimeInterval = 0
+    private static let wifiBackgroundDisconnectGrace =
+        WifiLifecyclePolicy.backgroundGrace
 
     public init() {
         networkQueue.setSpecific(key: networkQueueKey, value: true)
+        reconnectEnabled = RecentWifiResumeStore.consumeIfValid()
+        print(
+            "[IPAD][APP_LIFECYCLE] state=relaunch_resume " +
+            "intent=\(reconnectEnabled ? "accepted" : "expired_or_absent")")
         let savedDisplayPreference = DisplayPreferenceStore.load()
         displayPreference = savedDisplayPreference
         activeDisplayPreference = savedDisplayPreference
@@ -1400,7 +1563,11 @@ public class NetworkManager: ObservableObject {
     /// - Parameter endpoint: The resolved NWEndpoint (service endpoint or hostPort)
     public func connect(to endpoint: NWEndpoint) {
         networkQueue.async { [weak self] in
-            self?.connectOnQueue(to: endpoint)
+            guard let self else { return }
+            if let target = WifiReconnectTargetPolicy.target(from: endpoint) {
+                WifiReconnectTargetStore.save(target)
+            }
+            self.connectOnQueue(to: endpoint)
         }
     }
 
@@ -1462,8 +1629,40 @@ public class NetworkManager: ObservableObject {
         networkQueue.async { [weak self] in
             guard let self else { return }
             self.isForegroundActive = true
+            self.wifiBackgroundDisconnectWorkItem?.cancel()
+            self.wifiBackgroundDisconnectWorkItem = nil
+            RecentWifiResumeStore.clear()
+
+            if !self.usbListenerExplicitlyStarted,
+               self.connection != nil,
+               self.transportState == .streaming,
+               self.wireAuthenticatedGeneration == self.connectionGeneration {
+                if self.committedRealtimeMode == RealtimeTransportMode.wifiRTP {
+                    self.wifiMediaReceiver.requestImmediateRecoveryFeedback(
+                        generation: self.connectionGeneration)
+                }
+                self.sendClientPingIfDue()
+                print(
+                    "[IPAD][APP_LIFECYCLE] state=active transport=wifi " +
+                    "action=resume_preserved generation=\(self.connectionGeneration)")
+                return
+            }
+
             print("[IPAD][APP_LIFECYCLE] state=active")
-            self.scheduleAutoReconnect(reset: true)
+            if self.connection == nil || self.isDisconnectedOnQueue {
+                print("[IPAD][APP_LIFECYCLE] state=active transport=wifi action=reconnect")
+                self.scheduleAutoReconnect(reset: true)
+            }
+        }
+    }
+
+    public func applicationWillResignActive() {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.isForegroundActive = false
+            self.reconnectWorkItem?.cancel()
+            self.reconnectWorkItem = nil
+            print("[IPAD][APP_LIFECYCLE] state=inactive action=preserve_session")
         }
     }
 
@@ -1473,15 +1672,45 @@ public class NetworkManager: ObservableObject {
             self.isForegroundActive = false
             self.reconnectWorkItem?.cancel()
             self.reconnectWorkItem = nil
-            if self.connection != nil && !self.usbListenerExplicitlyStarted {
-                // An authenticated NWConnection may remain non-nil while iOS
-                // suspends its receive callbacks. Tear it down so the next
-                // foreground transition cannot mistake a stale socket for a
-                // live session and skip reconnect.
-                self.handleStreamError(
-                    "Application backgrounded; reconnecting on resume.")
+            self.wifiBackgroundDisconnectWorkItem?.cancel()
+            self.wifiBackgroundDisconnectWorkItem = nil
+
+            guard !self.usbListenerExplicitlyStarted else {
+                print("[IPAD][APP_LIFECYCLE] state=background transport=usb action=preserve_session")
+                return
             }
-            print("[IPAD][APP_LIFECYCLE] state=background")
+
+            guard let currentConnection = self.connection else {
+                print("[IPAD][APP_LIFECYCLE] state=background transport=wifi connection=none")
+                return
+            }
+
+            let generation = self.connectionGeneration
+            self.markRecentWifiResumeIntentIfEligible()
+            let work = DispatchWorkItem { [weak self, weak currentConnection] in
+                guard let self,
+                      let currentConnection,
+                      WifiLifecyclePolicy.shouldTearDownAfterGrace(
+                        isForegroundActive: self.isForegroundActive,
+                        isUSB: self.usbListenerExplicitlyStarted,
+                        scheduledGeneration: generation,
+                        currentGeneration: self.connectionGeneration,
+                        hasSameConnection: self.connection === currentConnection) else {
+                    return
+                }
+                print(
+                    "[IPAD][APP_LIFECYCLE] state=background action=teardown_after_grace " +
+                    "generation=\(generation)")
+                self.handleStreamError(
+                    "Application remained backgrounded; reconnecting on resume.")
+            }
+            self.wifiBackgroundDisconnectWorkItem = work
+            self.networkQueue.asyncAfter(
+                deadline: .now() + Self.wifiBackgroundDisconnectGrace,
+                execute: work)
+            print(
+                "[IPAD][APP_LIFECYCLE] state=background transport=wifi " +
+                "action=graceful_preserve grace_s=\(Self.wifiBackgroundDisconnectGrace)")
         }
     }
 
@@ -1751,6 +1980,9 @@ public class NetworkManager: ObservableObject {
         reconnectEnabled = false
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
+        wifiBackgroundDisconnectWorkItem?.cancel()
+        wifiBackgroundDisconnectWorkItem = nil
+        RecentWifiResumeStore.clear()
         let stoppedGeneration = connectionGenerationClock.advance()
         listenerGeneration &+= 1
         decoder.invalidate()
@@ -2284,15 +2516,37 @@ public class NetworkManager: ObservableObject {
         sendWireMessage(type: .clientHello, payload: payload, sequence: 0)
     }
 
+    private func markRecentWifiResumeIntentIfEligible() {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard reconnectEnabled,
+              !usbListenerExplicitlyStarted,
+              connection != nil,
+              transportState == .streaming else {
+            RecentWifiResumeStore.clear()
+            return
+        }
+        RecentWifiResumeStore.mark()
+    }
+
+    private func loadWifiReconnectEndpoint() -> NWEndpoint? {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        let legacyHost = UserDefaults.standard.string(forKey: Self.lastKnownHostKey)
+        let target = WifiReconnectTargetSelection.preferred(
+            structured: WifiReconnectTargetStore.load(),
+            legacyHost: legacyHost)
+        guard let target, let endpoint = target.endpoint else { return nil }
+        if WifiReconnectTargetStore.load() == nil,
+           case .hostPort(let host, let port) = target {
+            WifiReconnectTargetStore.save(.hostPort(host: host, port: port))
+        }
+        return endpoint
+    }
+
     private func scheduleAutoReconnect(reset: Bool) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
-        let lastKnownHost = UserDefaults.standard.string(
-            forKey: Self.lastKnownHostKey)
-        guard TrustedReconnectPolicy.shouldSchedule(
-                isForegroundActive: isForegroundActive,
-                reconnectEnabled: reconnectEnabled,
-                lastKnownHost: lastKnownHost),
-              let host = lastKnownHost else { return }
+        guard isForegroundActive,
+              reconnectEnabled,
+              let endpoint = loadWifiReconnectEndpoint() else { return }
         if reset { reconnectAttempt = 0 }
         reconnectWorkItem?.cancel()
         let delay = TrustedReconnectPolicy.delay(forAttempt: reconnectAttempt)
@@ -2300,11 +2554,9 @@ public class NetworkManager: ObservableObject {
         print("[IPAD][AUTO_RECONNECT_ATTEMPT] attempt=\(reconnectAttempt) delay=\(delay)")
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.isForegroundActive, self.reconnectEnabled else { return }
-            DispatchQueue.main.async {
-                guard self.connection == nil else { return }
-                print("[IPAD][AUTO_RECONNECT_BEGIN] endpoint=last_known")
-                self.connect(to: host)
-            }
+            guard self.connection == nil else { return }
+            print("[IPAD][AUTO_RECONNECT_BEGIN] endpoint=persisted_target")
+            self.connectOnQueue(to: endpoint)
         }
         reconnectWorkItem = work
         networkQueue.asyncAfter(deadline: .now() + delay, execute: work)
@@ -2804,10 +3056,8 @@ public class NetworkManager: ObservableObject {
                 reconnectEnabled = false
                 print("[IPAD][TRUSTED_HOST_FORGOTTEN] credential=deleted")
                 stop()
-                // Forgetting removes only the credential. Keep discovery and
-                // an explicit reconnect available; the next connection still
-                // follows the PIN path because the credential was deleted.
-                reconnectEnabled = true
+                RecentWifiResumeStore.clear()
+                WifiReconnectTargetStore.clear()
             } else {
                 DispatchQueue.main.async {
                     self.settingsApplyStatus = "Forget failed"

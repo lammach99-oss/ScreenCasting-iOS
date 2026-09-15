@@ -34,6 +34,8 @@ public struct SettingsView: View {
     @State private var draftRefreshHz: UInt32 = DisplayPreference.defaultValue.refreshHz
     @State private var draftOrientationMode: DisplayOrientationMode = .automatic
     @State private var showForgetConfirmation = false
+    @AppStorage(ClientPreferenceKeys.showPerformanceHUD)
+    private var showPerformanceHUD: Bool = true
 
     // MARK: Body
 
@@ -131,6 +133,23 @@ public struct SettingsView: View {
                                 }
                                 .buttonStyle(.bordered)
                                 .tint(.red)
+                            }
+                        }
+
+                        settingsCard {
+                            VStack(alignment: .leading, spacing: 14) {
+                                Label("On-Screen Display", systemImage: "speedometer")
+                                    .font(.system(size: 15, weight: .bold))
+                                    .foregroundColor(.white)
+
+                                Divider().background(Color.white.opacity(0.12))
+
+                                Toggle("Show Performance HUD", isOn: $showPerformanceHUD)
+                                    .tint(Color(hex: "#0EA5E9"))
+
+                                Text("Shows FPS and frame receive timing while streaming.")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.white.opacity(0.55))
                             }
                         }
 
