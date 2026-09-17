@@ -5,14 +5,13 @@ import SwiftUI
 /// Full-screen Settings overlay for the ScreenCasting iPad client.
 ///
 /// ## Responsibilities
-///   1. Display and control the Host-authoritative bitrate.
-///   2. Reflect Host-applied settings via @ObservedObject bindings.
-///   3. Send versioned settings updates when the user commits a control.
+///   1. Own the Client's desired bitrate and audio preferences.
+///   2. Display Host-reported effective settings separately.
+///   3. Persist and reconcile desired settings through `NetworkManager`.
 ///
 /// ## State Ownership
-///   All bitrate state lives in `NetworkManager` (@Published properties).
-///   `SettingsView` reads and writes through the `networkManager` reference
-///   so the HUD in `ContentView` stays in sync automatically.
+///   Client intent and Host effective state are distinct published values in
+///   `NetworkManager`; Host reports never move these controls.
 
 public struct SettingsView: View {
 
@@ -22,14 +21,9 @@ public struct SettingsView: View {
     // MARK: Local UI State
     @Environment(\.dismiss) private var dismiss
 
-    /// Local draft of targetBitrateMbps for slider editing.
-    /// Committed to the host only on `.onEditingChanged(false)`.
+    /// Client-owned desired values. Host reports are displayed separately.
     @State private var draftBitrate: Double = 20.0
     @State private var draftAudioEnabled = true
-
-    /// Prevent a feedback loop when the server pushes a settings state that updates
-    /// `networkManager.targetBitrateMbps` — we don't want to echo it back.
-    @State private var suppressSend = false
     @State private var draftResolution = DisplayPreference.defaultValue.resolution
     @State private var draftRefreshHz: UInt32 = DisplayPreference.defaultValue.refreshHz
     @State private var draftOrientationMode: DisplayOrientationMode = .automatic
@@ -161,7 +155,7 @@ public struct SettingsView: View {
 
                                 Divider().background(Color.white.opacity(0.12))
 
-                                // Manual bitrate is authoritative on the Host.
+                                // Client desired bitrate is authoritative; Host reports the effective value.
                                 VStack(alignment: .leading, spacing: 8) {
                                     HStack {
                                         Text("Target Bitrate")
@@ -182,7 +176,7 @@ public struct SettingsView: View {
                                         step: 1,
                                         onEditingChanged: { editing in
                                             if !editing {
-                                                sendSettingsUpdate()
+                                                saveDesiredSettings()
                                             }
                                         }
                                     )
@@ -203,9 +197,16 @@ public struct SettingsView: View {
                                     get: { draftAudioEnabled },
                                     set: { value in
                                         draftAudioEnabled = value
-                                        sendSettingsUpdate()
+                                        saveDesiredSettings()
                                     }))
                                     .tint(Color(hex: "#0EA5E9"))
+                                Text(
+                                    String(
+                                        format: "Host effective: %.0f Mbps • Audio %@",
+                                        networkManager.effectiveBitrateMbps,
+                                        networkManager.effectiveAudioEnabled ? "On" : "Off"))
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.white.opacity(0.55))
                                 if !networkManager.settingsApplyStatus.isEmpty {
                                     Text(networkManager.settingsApplyStatus)
                                         .font(.system(size: 11, weight: .semibold))
@@ -242,7 +243,7 @@ public struct SettingsView: View {
                                     telemetryTile(
                                         label:  "Active Bitrate",
                                         value:  String(format: "%.0f Mbps",
-                                                       networkManager.targetBitrateMbps),
+                                                       networkManager.effectiveBitrateMbps),
                                         color:  Color(hex: "#38BDF8")
                                     )
                                 }
@@ -265,13 +266,10 @@ public struct SettingsView: View {
                 }
             }
         }
-        // Sync the draft when the Host publishes committed settings.
-        .onReceive(networkManager.$targetBitrateMbps) { newMbps in
-            if !suppressSend {
-                draftBitrate = newMbps
-            }
+        .onReceive(networkManager.$desiredBitrateMbps) { newMbps in
+            draftBitrate = newMbps
         }
-        .onReceive(networkManager.$audioEnabled) { enabled in
+        .onReceive(networkManager.$desiredAudioEnabled) { enabled in
             draftAudioEnabled = enabled
         }
         .onReceive(networkManager.$displayCapabilities) { _ in
@@ -281,8 +279,8 @@ public struct SettingsView: View {
             synchronizeDisplayDraft()
         }
         .onAppear {
-            draftBitrate = networkManager.targetBitrateMbps
-            draftAudioEnabled = networkManager.audioEnabled
+            draftBitrate = networkManager.desiredBitrateMbps
+            draftAudioEnabled = networkManager.desiredAudioEnabled
             synchronizeDisplayDraft()
         }
         .confirmationDialog(
@@ -318,17 +316,10 @@ public struct SettingsView: View {
             orientationMode: draftOrientationMode))
     }
 
-    /// Sends one versioned Host-authoritative settings update.
-    private func sendSettingsUpdate() {
-        guard networkManager.isConnected else { return }
-        suppressSend = true
-        networkManager.sendSettingsUpdate(
+    private func saveDesiredSettings() {
+        networkManager.setDesiredStreamSettings(
             bitrateMbps: draftBitrate,
             audioEnabled: draftAudioEnabled)
-        // Allow ~1 frame delay before re-enabling receive-echo
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            suppressSend = false
-        }
     }
 
     /// Returns a latency-based colour for the telemetry tiles (green → amber → red).

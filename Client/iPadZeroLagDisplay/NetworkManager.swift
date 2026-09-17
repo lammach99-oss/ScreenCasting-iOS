@@ -412,15 +412,208 @@ enum WifiReconnectTargetStore {
     }
 }
 
+struct ClientStreamSettingsPreference: Equatable {
+    static let minimumBitrateMbps: Double = 3
+    static let maximumBitrateMbps: Double = 50
+    static let defaultBitrateMbps: Double = 20
+    static let defaultAudioEnabled = true
+
+    let bitrateMbps: Double
+    let audioEnabled: Bool
+
+    static func normalized(
+        bitrateMbps: Double,
+        audioEnabled: Bool
+    ) -> ClientStreamSettingsPreference {
+        let rounded = round(bitrateMbps)
+        return ClientStreamSettingsPreference(
+            bitrateMbps: min(
+                maximumBitrateMbps,
+                max(minimumBitrateMbps, rounded)),
+            audioEnabled: audioEnabled)
+    }
+}
+
+enum ClientStreamSettingsStore {
+    private static let bitrateKey =
+        "ScreenCasting.client.desiredBitrateMbps.v1"
+    private static let audioKey =
+        "ScreenCasting.client.desiredAudioEnabled.v1"
+
+    static func load(
+        defaults: UserDefaults = .standard
+    ) -> ClientStreamSettingsPreference {
+        let bitrate =
+            (defaults.object(forKey: bitrateKey) as? NSNumber)?.doubleValue
+            ?? ClientStreamSettingsPreference.defaultBitrateMbps
+        let audioEnabled =
+            (defaults.object(forKey: audioKey) as? NSNumber)?.boolValue
+            ?? ClientStreamSettingsPreference.defaultAudioEnabled
+        return .normalized(
+            bitrateMbps: bitrate,
+            audioEnabled: audioEnabled)
+    }
+
+    static func save(
+        _ preference: ClientStreamSettingsPreference,
+        defaults: UserDefaults = .standard
+    ) {
+        let normalized = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: preference.bitrateMbps,
+            audioEnabled: preference.audioEnabled)
+        defaults.set(normalized.bitrateMbps, forKey: bitrateKey)
+        defaults.set(normalized.audioEnabled, forKey: audioKey)
+    }
+}
+
+enum TrustedSettingsRejectReason: UInt8, Equatable {
+    case none = 0
+    case invalidBitrate = 1
+    case staleGeneration = 2
+    case runtimeApplyFailed = 3
+    case invalidRequest = 4
+}
+
+enum ClientSettingsApplyOutcome: Equatable {
+    case state
+    case applied
+    case rejected(TrustedSettingsRejectReason)
+}
+
+enum ClientSettingsReconciliationDecision: Equatable {
+    case inSync
+    case send
+    case suppressHardRejection
+    case suppressAlreadyAttempted
+}
+
+struct ClientSettingsReconciliationGate {
+    private(set) var lastAutomaticAttemptGeneration: UInt64?
+    private(set) var lastStaleRetryGeneration: UInt64?
+    private(set) var hardRejectedGeneration: UInt64?
+
+    mutating func decision(
+        hostGeneration: UInt64,
+        desired: ClientStreamSettingsPreference,
+        effective: ClientStreamSettingsPreference,
+        outcome: ClientSettingsApplyOutcome
+    ) -> ClientSettingsReconciliationDecision {
+        guard desired != effective else {
+            return .inSync
+        }
+        if hardRejectedGeneration == hostGeneration {
+            return .suppressHardRejection
+        }
+        if case .rejected(let reason) = outcome {
+            if reason == .staleGeneration {
+                guard lastAutomaticAttemptGeneration != hostGeneration else {
+                    return .suppressAlreadyAttempted
+                }
+                guard lastStaleRetryGeneration != hostGeneration else {
+                    return .suppressAlreadyAttempted
+                }
+                lastStaleRetryGeneration = hostGeneration
+                lastAutomaticAttemptGeneration = hostGeneration
+                return .send
+            }
+            hardRejectedGeneration = hostGeneration
+            lastAutomaticAttemptGeneration = hostGeneration
+            return .suppressHardRejection
+        }
+        guard lastAutomaticAttemptGeneration != hostGeneration else {
+            return .suppressAlreadyAttempted
+        }
+        lastAutomaticAttemptGeneration = hostGeneration
+        return .send
+    }
+
+    mutating func reset() {
+        lastAutomaticAttemptGeneration = nil
+        lastStaleRetryGeneration = nil
+        hardRejectedGeneration = nil
+    }
+}
+
+struct ClientSettingsStateModel {
+    private(set) var desired: ClientStreamSettingsPreference
+    private(set) var effective: ClientStreamSettingsPreference
+    private(set) var generation: UInt64 = 0
+
+    init(desired: ClientStreamSettingsPreference) {
+        self.desired = desired
+        self.effective = .normalized(
+            bitrateMbps: ClientStreamSettingsPreference.defaultBitrateMbps,
+            audioEnabled: ClientStreamSettingsPreference.defaultAudioEnabled)
+    }
+
+    mutating func receiveHostState(
+        _ effective: ClientStreamSettingsPreference,
+        generation: UInt64
+    ) {
+        self.effective = effective
+        self.generation = generation
+    }
+
+    mutating func setDesired(_ desired: ClientStreamSettingsPreference) {
+        self.desired = desired
+    }
+
+    mutating func resetHostGeneration() {
+        generation = 0
+    }
+}
+
+struct ClientSettingsSyncPolicy {
+    private(set) var lastUsbSettingsGetGeneration: UInt64?
+
+    mutating func shouldRequestUsbSettings(
+        committedGeneration: UInt64
+    ) -> Bool {
+        guard lastUsbSettingsGetGeneration != committedGeneration else {
+            return false
+        }
+        lastUsbSettingsGetGeneration = committedGeneration
+        return true
+    }
+
+    mutating func reset() {
+        lastUsbSettingsGetGeneration = nil
+    }
+}
+
+enum DesiredSettingsSendResult: Equatable {
+    case sent(requestID: UInt32)
+    case waitingForHost
+}
+
+enum DesiredSettingsSendDecision: Equatable {
+    case send
+    case waitingForHost
+}
+
+enum DesiredSettingsSendPolicy {
+    static func decision(canSend: Bool) -> DesiredSettingsSendDecision {
+        canSend ? .send : .waitingForHost
+    }
+
+    static func status(for result: DesiredSettingsSendResult) -> String {
+        switch result {
+        case .sent: return "Applying…"
+        case .waitingForHost: return "Waiting for Host"
+        }
+    }
+}
+
 struct TrustedSettingsState: Equatable {
     let generation: UInt64
     let bitrateBps: UInt32
     let audioEnabled: Bool
-    let rejectionReason: UInt8
+    let rejectionReason: TrustedSettingsRejectReason
 
     static func decode(_ payload: Data) -> TrustedSettingsState? {
         guard payload.count == 24, payload[0] == 1, payload[1] <= 1,
-              payload[2] <= 4, payload[3] == 0,
+              let rejectionReason = TrustedSettingsRejectReason(rawValue: payload[2]),
+              payload[3] == 0,
               payload[20] == 0, payload[21] == 0,
               payload[22] == 0, payload[23] == 0 else { return nil }
         let generation = payload.withUnsafeBytes {
@@ -435,7 +628,7 @@ struct TrustedSettingsState: Equatable {
             generation: generation,
             bitrateBps: bitrateBps,
             audioEnabled: payload[1] == 1,
-            rejectionReason: payload[2])
+            rejectionReason: rejectionReason)
     }
 }
 
@@ -1301,19 +1494,21 @@ public class NetworkManager: ObservableObject {
     @Published private(set) var displayConfigurationFailureMessage: String?
     @Published private(set) var isDisplayConfigurationPending = false
 
-    // MARK: Published Host-authoritative settings
+    // MARK: Published stream settings
     /// Retained for compatibility with the existing telemetry surface. The
     /// persistent client settings contract is manual-only.
     @Published public var isAdaptiveBitrate: Bool   = false
-    /// Current target bitrate in Mbps (3–50). Reflects the latest Host state.
-    @Published public var targetBitrateMbps: Double = 20.0
-    @Published public private(set) var audioEnabled: Bool = true
+    @Published public private(set) var desiredBitrateMbps: Double = 20
+    @Published public private(set) var desiredAudioEnabled: Bool = true
+    @Published public private(set) var effectiveBitrateMbps: Double = 20
+    @Published public private(set) var effectiveAudioEnabled: Bool = true
     @Published public private(set) var settingsApplyStatus: String = ""
     @Published public private(set) var settingsGeneration: UInt64 = 0
-    private var authoritativeSettingsGeneration: UInt64 = 0
     private var nextSettingsRequestID: UInt32 = 1
-    private var committedBitrateMbps: Double = 20
-    private var committedAudioEnabled = true
+    private var clientSettingsState = ClientSettingsStateModel(
+        desired: .normalized(bitrateMbps: 20, audioEnabled: true))
+    private var settingsReconciliationGate = ClientSettingsReconciliationGate()
+    private var settingsSyncPolicy = ClientSettingsSyncPolicy()
 
     // Convenience computed properties so existing views don't break
     public var isConnected:  Bool { connectionState == .streaming }
@@ -1507,6 +1702,10 @@ public class NetworkManager: ObservableObject {
 
     public init() {
         networkQueue.setSpecific(key: networkQueueKey, value: true)
+        let desired = ClientStreamSettingsStore.load()
+        clientSettingsState = ClientSettingsStateModel(desired: desired)
+        desiredBitrateMbps = desired.bitrateMbps
+        desiredAudioEnabled = desired.audioEnabled
         reconnectEnabled = RecentWifiResumeStore.consumeIfValid()
         print(
             "[IPAD][APP_LIFECYCLE] state=relaunch_resume " +
@@ -1581,7 +1780,9 @@ public class NetworkManager: ObservableObject {
         // After Forget Host (or a fresh pairing), the Host may legitimately
         // start again at generation zero; retaining the old value would cause
         // the client to discard the authoritative state and send stale writes.
-        authoritativeSettingsGeneration = 0
+        clientSettingsState.resetHostGeneration()
+        settingsReconciliationGate.reset()
+        settingsSyncPolicy.reset()
         DispatchQueue.main.async {
             self.settingsGeneration = 0
             self.settingsApplyStatus = ""
@@ -1926,28 +2127,107 @@ public class NetworkManager: ObservableObject {
         }
     }
 
-    public func sendSettingsUpdate(bitrateMbps: Double, audioEnabled: Bool) {
+    public func setDesiredStreamSettings(
+        bitrateMbps: Double,
+        audioEnabled: Bool
+    ) {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: bitrateMbps,
+            audioEnabled: audioEnabled)
+        ClientStreamSettingsStore.save(desired)
+        DispatchQueue.main.async {
+            self.desiredBitrateMbps = desired.bitrateMbps
+            self.desiredAudioEnabled = desired.audioEnabled
+        }
         networkQueue.async { [weak self] in
             guard let self else { return }
-            let roundedMbps = round(bitrateMbps)
-            guard self.transportState == .streaming,
-                  roundedMbps >= 3, roundedMbps <= 50 else { return }
-            let requestID = self.nextSettingsRequestID
-            self.nextSettingsRequestID &+= 1
-            let generation = self.authoritativeSettingsGeneration
-            var payload = Data(count: 24)
-            payload.withUnsafeMutableBytes { bytes in
-                bytes.storeBytes(of: UInt8(1), toByteOffset: 0, as: UInt8.self)
-                bytes.storeBytes(of: audioEnabled ? UInt8(1) : UInt8(0), toByteOffset: 1, as: UInt8.self)
-                bytes.storeBytes(of: UInt8(0), toByteOffset: 2, as: UInt8.self)
-                bytes.storeBytes(of: requestID.littleEndian, toByteOffset: 4, as: UInt32.self)
-                bytes.storeBytes(of: generation.littleEndian, toByteOffset: 8, as: UInt64.self)
-                bytes.storeBytes(of: UInt32(roundedMbps * 1_000_000).littleEndian, toByteOffset: 16, as: UInt32.self)
-            }
-            DispatchQueue.main.async { self.settingsApplyStatus = "Applying…" }
-            print("[IPAD][SETTINGS_UPDATE] request=\(requestID) expected_generation=\(generation) bitrate_bps=\(UInt32(roundedMbps * 1_000_000)) audio=\(audioEnabled)")
-            self.sendWireMessage(type: .settingsUpdate, payload: payload, sequence: requestID)
+            self.clientSettingsState.setDesired(desired)
+            print(
+                "[IPAD][SETTINGS_DESIRED] bitrate_mbps=\(Int(desired.bitrateMbps)) " +
+                "audio=\(desired.audioEnabled) source=user")
+            _ = self.sendDesiredSettingsIfPossible(reason: "user_change")
         }
+    }
+
+    public func sendSettingsUpdate(bitrateMbps: Double, audioEnabled: Bool) {
+        setDesiredStreamSettings(
+            bitrateMbps: bitrateMbps,
+            audioEnabled: audioEnabled)
+    }
+
+    @discardableResult
+    private func sendDesiredSettingsIfPossible(
+        reason: String
+    ) -> DesiredSettingsSendResult {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard transportState == .streaming,
+              wireAuthenticatedGeneration == connectionGeneration,
+              committedTransportGeneration == connectionGeneration else {
+            let result = DesiredSettingsSendResult.waitingForHost
+            DispatchQueue.main.async {
+                self.settingsApplyStatus = DesiredSettingsSendPolicy.status(for: result)
+            }
+            print("[IPAD][SETTINGS_SEND] result=waiting_for_host reason=\(reason)")
+            return result
+        }
+        let desired = clientSettingsState.desired
+        let requestID = nextSettingsRequestID
+        nextSettingsRequestID &+= 1
+        let generation = clientSettingsState.generation
+        var payload = Data(count: 24)
+        payload.withUnsafeMutableBytes { bytes in
+            bytes.storeBytes(of: UInt8(1), toByteOffset: 0, as: UInt8.self)
+            bytes.storeBytes(
+                of: desired.audioEnabled ? UInt8(1) : UInt8(0),
+                toByteOffset: 1,
+                as: UInt8.self)
+            bytes.storeBytes(of: UInt8(0), toByteOffset: 2, as: UInt8.self)
+            bytes.storeBytes(
+                of: requestID.littleEndian,
+                toByteOffset: 4,
+                as: UInt32.self)
+            bytes.storeBytes(
+                of: generation.littleEndian,
+                toByteOffset: 8,
+                as: UInt64.self)
+            bytes.storeBytes(
+                of: UInt32(desired.bitrateMbps * 1_000_000).littleEndian,
+                toByteOffset: 16,
+                as: UInt32.self)
+        }
+        let result = DesiredSettingsSendResult.sent(requestID: requestID)
+        DispatchQueue.main.async {
+            self.settingsApplyStatus = DesiredSettingsSendPolicy.status(for: result)
+        }
+        print(
+            "[IPAD][SETTINGS_UPDATE] request=\(requestID) " +
+            "expected_generation=\(generation) " +
+            "bitrate_bps=\(UInt32(desired.bitrateMbps * 1_000_000)) " +
+            "audio=\(desired.audioEnabled) reason=\(reason)")
+        sendWireMessage(
+            type: .settingsUpdate,
+            payload: payload,
+            sequence: requestID)
+        return result
+    }
+
+    private func requestCurrentUsbSettingsIfNeeded(generation: UInt64) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard activeTransportKind == .usb,
+              generation == connectionGeneration,
+              wireAuthenticatedGeneration == generation,
+              committedTransportGeneration == generation,
+              settingsSyncPolicy.shouldRequestUsbSettings(
+                committedGeneration: generation) else { return }
+        let requestID = nextSettingsRequestID
+        nextSettingsRequestID &+= 1
+        print(
+            "[IPAD][SETTINGS_SYNC_REQUEST] transport=usb " +
+            "generation=\(generation) request=\(requestID)")
+        sendWireMessage(
+            type: .settingsGet,
+            payload: Data(count: 24),
+            sequence: requestID)
     }
 
     public func forgetTrustedHost() {
@@ -2002,6 +2282,7 @@ public class NetworkManager: ObservableObject {
         committedRealtimeMode = nil
         committedRealtimeSessionID = nil
         advertisedClientCapabilities = nil
+        settingsSyncPolicy.reset()
         resetDisplaySession()
         clearPendingTransportOffer()
         wireParser.reset(generation: stoppedGeneration)
@@ -2172,6 +2453,8 @@ public class NetworkManager: ObservableObject {
                         reason: "replacement_candidate_accepted")
                 }
                 _ = self.connectionGenerationClock.advance()
+                self.clientSettingsState.resetHostGeneration()
+                self.settingsReconciliationGate.reset()
                 self.usbScdpConnection = newConnection
                 self.connection = newConnection
                 self.recordUsbLifecycleDiagnostic(
@@ -2623,23 +2906,58 @@ public class NetworkManager: ObservableObject {
 
     private func receiveSettingsState(
         _ payload: Data,
-        rejected: Bool = false
+        outcome: ClientSettingsApplyOutcome
     ) {
         guard let state = TrustedSettingsState.decode(payload),
-              state.generation >= authoritativeSettingsGeneration else { return }
+              state.generation >= clientSettingsState.generation else { return }
         let bitrateMbps = Double(state.bitrateBps) / 1_000_000
-        authoritativeSettingsGeneration = state.generation
-        committedBitrateMbps = bitrateMbps
-        committedAudioEnabled = state.audioEnabled
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: bitrateMbps,
+            audioEnabled: state.audioEnabled)
+        clientSettingsState.receiveHostState(
+            effective,
+            generation: state.generation)
+        let resolvedOutcome: ClientSettingsApplyOutcome
+        if case .rejected = outcome {
+            resolvedOutcome = .rejected(state.rejectionReason)
+        } else {
+            resolvedOutcome = outcome
+        }
+        let decision = settingsReconciliationGate.decision(
+            hostGeneration: state.generation,
+            desired: clientSettingsState.desired,
+            effective: effective,
+            outcome: resolvedOutcome)
+        let isInSync = clientSettingsState.desired == effective
+        let rejected: Bool
+        if case .rejected = resolvedOutcome { rejected = true } else { rejected = false }
+        let status: String
+        if isInSync {
+            status = "Applied"
+        } else if rejected && decision == .suppressHardRejection {
+            status = "Rejected by Host"
+        } else {
+            status = "Waiting for Host"
+        }
         DispatchQueue.main.async {
             self.settingsGeneration = state.generation
-            self.targetBitrateMbps = bitrateMbps
-            self.audioEnabled = state.audioEnabled
+            self.effectiveBitrateMbps = bitrateMbps
+            self.effectiveAudioEnabled = state.audioEnabled
             self.isAdaptiveBitrate = false
-            self.settingsApplyStatus = rejected ? "Failed" : "Applied"
+            self.settingsApplyStatus = status
         }
         transportTelemetry.recordBitrateMbps(bitrateMbps)
-        print("[IPAD][SETTINGS_RESULT] generation=\(state.generation) bitrate_bps=\(state.bitrateBps) audio=\(state.audioEnabled) rejected=\(rejected)")
+        print("[IPAD][SETTINGS_RESULT] generation=\(state.generation) bitrate_bps=\(state.bitrateBps) audio=\(state.audioEnabled) rejected=\(rejected) reason=\(state.rejectionReason)")
+        if decision == .send {
+            let reason = state.rejectionReason == .staleGeneration
+                ? "stale_generation_retry"
+                : "host_mismatch"
+            _ = sendDesiredSettingsIfPossible(reason: reason)
+        } else if rejected && !isInSync {
+            print(
+                "[IPAD][SETTINGS_RECONCILE_SUPPRESS] reason=\(state.rejectionReason) " +
+                "generation=\(state.generation) decision=\(decision)")
+        }
     }
 
     /// Reads exactly the minimum response bytes for AUTH_SUCCESS or AUTH_FAILED.
@@ -3040,11 +3358,16 @@ public class NetworkManager: ObservableObject {
         case .sessionResumeResult:
             updateResumedSession(payload)
 
-        case .settingsState, .settingsApplied:
-            receiveSettingsState(payload)
+        case .settingsState:
+            receiveSettingsState(payload, outcome: .state)
+
+        case .settingsApplied:
+            receiveSettingsState(payload, outcome: .applied)
 
         case .settingsRejected:
-            receiveSettingsState(payload, rejected: true)
+            receiveSettingsState(
+                payload,
+                outcome: .rejected(.none))
 
         case .forgetDeviceResult:
             guard payload.count == 2, payload[0] == 1 else { return }
@@ -3199,7 +3522,7 @@ public class NetworkManager: ObservableObject {
             transportTelemetry.recordBitrateMbps(Double(target))
             DispatchQueue.main.async {
                 self.isAdaptiveBitrate = adaptive
-                self.targetBitrateMbps = Double(target)
+                self.effectiveBitrateMbps = Double(target)
             }
 
         case .protocolError:
@@ -3597,6 +3920,7 @@ public class NetworkManager: ObservableObject {
         setState(.streaming)
         startVideoReceiveLoop(generation: generation)
         if activeTransportKind == .usb {
+            requestCurrentUsbSettingsIfNeeded(generation: generation)
             recordUsbLifecycleDiagnostic(
                 "[USB_RECOVERY_CANDIDATE] attempt=\(generation) generation=\(generation) state=committed")
             recordUsbLifecycleDiagnostic("[USB_SESSION_COMMIT] generation=\(generation)")

@@ -578,3 +578,308 @@ final class WifiReconnectTargetTests: XCTestCase {
         XCTAssertNil(WifiReconnectTargetStore.load(defaults: defaults))
     }
 }
+
+final class ClientStreamSettingsPreferenceTests: XCTestCase {
+    func testClientStreamSettingsDefaultTo20MbpsAndAudioOn() throws {
+        let suite = "ScreenCasting.ClientStreamSettingsDefaultsTests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        XCTAssertEqual(
+            ClientStreamSettingsStore.load(defaults: defaults),
+            .normalized(bitrateMbps: 20, audioEnabled: true))
+    }
+
+    func testClientStreamSettingsPersistBitrateAndAudio() throws {
+        let suite = "ScreenCasting.ClientStreamSettingsStoreTests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+
+        ClientStreamSettingsStore.save(desired, defaults: defaults)
+
+        XCTAssertEqual(ClientStreamSettingsStore.load(defaults: defaults), desired)
+    }
+
+    func testClientStreamSettingsClampBitrateToSupportedRange() {
+        XCTAssertEqual(
+            ClientStreamSettingsPreference.normalized(
+                bitrateMbps: 1,
+                audioEnabled: true).bitrateMbps,
+            3)
+        XCTAssertEqual(
+            ClientStreamSettingsPreference.normalized(
+                bitrateMbps: 80,
+                audioEnabled: false).bitrateMbps,
+            50)
+        XCTAssertEqual(
+            ClientStreamSettingsPreference.normalized(
+                bitrateMbps: 12.6,
+                audioEnabled: false).bitrateMbps,
+            13)
+    }
+
+    func testHostEffectiveStateDoesNotOverwriteClientDesiredSettings() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        var model = ClientSettingsStateModel(desired: desired)
+        let host = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 50,
+            audioEnabled: true)
+
+        model.receiveHostState(host, generation: 7)
+
+        XCTAssertEqual(model.desired, desired)
+        XCTAssertEqual(model.effective, host)
+        XCTAssertEqual(model.generation, 7)
+        var gate = ClientSettingsReconciliationGate()
+        XCTAssertEqual(gate.decision(
+            hostGeneration: model.generation,
+            desired: model.desired,
+            effective: model.effective,
+            outcome: .state), .send)
+    }
+
+    func testClientReconcilesMismatchOncePerHostGeneration() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 20,
+            audioEnabled: true)
+        var gate = ClientSettingsReconciliationGate()
+
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 7,
+            desired: desired,
+            effective: effective,
+            outcome: .state), .send)
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 7,
+            desired: desired,
+            effective: effective,
+            outcome: .state), .suppressAlreadyAttempted)
+    }
+
+    func testMatchingHostStateDoesNotSendReconcile() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        var gate = ClientSettingsReconciliationGate()
+
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 7,
+            desired: desired,
+            effective: desired,
+            outcome: .state), .inSync)
+    }
+
+    func testStaleGenerationRejectionRetriesOnceWithCurrentGeneration() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 20,
+            audioEnabled: true)
+        var gate = ClientSettingsReconciliationGate()
+
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 7,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.staleGeneration)), .send)
+    }
+
+    func testRepeatedStaleGenerationDoesNotLoop() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 20,
+            audioEnabled: true)
+        var gate = ClientSettingsReconciliationGate()
+
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 7,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.staleGeneration)), .send)
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 7,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.staleGeneration)), .suppressAlreadyAttempted)
+    }
+
+    func testNormalMismatchThenStaleRejectionSameGenerationDoesNotSendTwice() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 20,
+            audioEnabled: true)
+        var gate = ClientSettingsReconciliationGate()
+
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 7,
+            desired: desired,
+            effective: effective,
+            outcome: .state), .send)
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 7,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.staleGeneration)), .suppressAlreadyAttempted)
+    }
+
+    func testStaleGenerationRetriesWhenNoAttemptForCurrentGenerationExists() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 20,
+            audioEnabled: true)
+        var gate = ClientSettingsReconciliationGate()
+
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 6,
+            desired: desired,
+            effective: effective,
+            outcome: .state), .send)
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 7,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.staleGeneration)), .send)
+    }
+
+    func testRuntimeApplyFailedDoesNotAutoRetrySameGeneration() {
+        assertHardRejectionDoesNotRetry(.runtimeApplyFailed)
+    }
+
+    func testInvalidRequestDoesNotAutoRetrySameGeneration() {
+        assertHardRejectionDoesNotRetry(.invalidRequest)
+    }
+
+    func testInvalidBitrateDoesNotAutoRetrySameGeneration() {
+        assertHardRejectionDoesNotRetry(.invalidBitrate)
+    }
+
+    private func assertHardRejectionDoesNotRetry(
+        _ reason: TrustedSettingsRejectReason
+    ) {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 20,
+            audioEnabled: true)
+        var gate = ClientSettingsReconciliationGate()
+
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 7,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(reason)), .suppressHardRejection)
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 7,
+            desired: desired,
+            effective: effective,
+            outcome: .state), .suppressHardRejection)
+    }
+
+    func testExplicitUserChangeCanSendAfterAutomaticRejection() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 20,
+            audioEnabled: true)
+        var gate = ClientSettingsReconciliationGate()
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 7,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.runtimeApplyFailed)), .suppressHardRejection)
+        XCTAssertEqual(
+            DesiredSettingsSendPolicy.decision(canSend: true),
+            .send)
+    }
+
+    func testDisconnectedDesiredChangeReportsWaitingForHost() {
+        XCTAssertEqual(
+            DesiredSettingsSendPolicy.status(for: .waitingForHost),
+            "Waiting for Host")
+    }
+
+    func testConnectedSendReportsApplyingOnlyWhenRequestIsActuallySent() {
+        XCTAssertEqual(
+            DesiredSettingsSendPolicy.status(for: .sent(requestID: 9)),
+            "Applying…")
+        XCTAssertEqual(
+            DesiredSettingsSendPolicy.status(for: .waitingForHost),
+            "Waiting for Host")
+    }
+
+    func testNewerHostGenerationCanReconcileAgain() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 20,
+            audioEnabled: true)
+        var gate = ClientSettingsReconciliationGate()
+
+        _ = gate.decision(
+            hostGeneration: 7,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.runtimeApplyFailed))
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 8,
+            desired: desired,
+            effective: effective,
+            outcome: .state), .send)
+    }
+
+    func testUsbCommittedGenerationRequestsSettingsStateOnce() {
+        var policy = ClientSettingsSyncPolicy()
+        XCTAssertTrue(policy.shouldRequestUsbSettings(committedGeneration: 12))
+    }
+
+    func testUsbSettingsSyncDoesNotRepeatForSameGeneration() {
+        var policy = ClientSettingsSyncPolicy()
+        XCTAssertTrue(policy.shouldRequestUsbSettings(committedGeneration: 12))
+        XCTAssertFalse(policy.shouldRequestUsbSettings(committedGeneration: 12))
+    }
+
+    func testNewUsbGenerationCanRequestSettingsStateAgain() {
+        var policy = ClientSettingsSyncPolicy()
+        XCTAssertTrue(policy.shouldRequestUsbSettings(committedGeneration: 12))
+        XCTAssertTrue(policy.shouldRequestUsbSettings(committedGeneration: 13))
+    }
+
+    func testPersistedDesiredSettingsReconcileAfterUsbSettingsState() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        var model = ClientSettingsStateModel(desired: desired)
+        model.receiveHostState(
+            .normalized(bitrateMbps: 20, audioEnabled: true),
+            generation: 0)
+        var sync = ClientSettingsSyncPolicy()
+        var gate = ClientSettingsReconciliationGate()
+
+        XCTAssertTrue(sync.shouldRequestUsbSettings(committedGeneration: 1))
+        XCTAssertEqual(gate.decision(
+            hostGeneration: model.generation,
+            desired: model.desired,
+            effective: model.effective,
+            outcome: .state), .send)
+    }
+}
