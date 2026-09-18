@@ -292,6 +292,39 @@ private final class ReleaseCounter {
 }
 
 final class RenderFreshnessTrackerTests: XCTestCase {
+    func testPendingReplacementIsNotTelemetryDrop() {
+        var tracker = RenderFreshnessTracker()
+        tracker.beginSession(generation: 1)
+        XCTAssertEqual(tracker.offer(20, generation: 1), .accepted(replaced: nil))
+
+        let replacement = tracker.offer(21, generation: 1)
+        XCTAssertEqual(replacement, .accepted(replaced: 20))
+        XCTAssertNil(replacement.telemetryDropSequence(for: 21))
+        XCTAssertEqual(tracker.pendingIdentity?.sequence, 21)
+    }
+
+    func testRejectedFrameRemainsTelemetryDrop() {
+        var tracker = RenderFreshnessTracker()
+        tracker.beginSession(generation: 1)
+        _ = tracker.offer(20, generation: 1)
+
+        let rejected = tracker.offer(19, generation: 1)
+        XCTAssertEqual(rejected, .rejected)
+        XCTAssertEqual(rejected.telemetryDropSequence(for: 19), 19)
+    }
+
+    func testPrecommitSupersessionIsNotTelemetryDrop() {
+        var tracker = RenderFreshnessTracker()
+        tracker.beginSession(generation: 1)
+        _ = tracker.offer(20, generation: 1)
+        let taken = tracker.takePending()!
+
+        XCTAssertEqual(tracker.offer(21, generation: 1), .accepted(replaced: nil))
+        XCTAssertEqual(
+            tracker.commitDecision(for: taken),
+            .superseded)
+    }
+
     func testAcceptedWatermarkRejectsOlderFrameAfterPendingSlotIsEmpty() {
         var tracker = RenderFreshnessTracker()
         tracker.beginSession(generation: 1)

@@ -2,6 +2,68 @@ import XCTest
 import Network
 @testable import iPadCasting
 
+final class Display120HzSourceTests: XCTestCase {
+    func testCapabilitiesDecodeCanonical120HzNativeModes() throws {
+        var payload = Data(count: DisplayCapabilities.encodedSize)
+        payload[0] = 1
+        payload[1] = 2
+
+        func put(_ value: UInt32, at offset: Int) {
+            var little = value.littleEndian
+            withUnsafeBytes(of: &little) { bytes in
+                payload.replaceSubrange(offset..<(offset + 4), with: bytes)
+            }
+        }
+        func put16(_ value: UInt16, at offset: Int) {
+            var little = value.littleEndian
+            withUnsafeBytes(of: &little) { bytes in
+                payload.replaceSubrange(offset..<(offset + 2), with: bytes)
+            }
+        }
+
+        put(2388, at: 4)
+        put(1668, at: 8)
+        put16(120, at: 12)
+        put(2388, at: 16)
+        put(1668, at: 20)
+        put16(60, at: 24)
+
+        let capabilities = try XCTUnwrap(DisplayCapabilities.decode(payload))
+        XCTAssertEqual(capabilities.preferred.refreshHz, 120)
+        XCTAssertEqual(capabilities.refreshRates(for: DisplayResolution(width: 2388, height: 1668)), [120, 60])
+    }
+
+    func testDefaultSourceRequestIsAlways120Hz() {
+        let request = DisplayPreference.defaultValue.makeRequest(
+            interfaceOrientation: .landscape,
+            requestId: 1)
+        XCTAssertEqual(request.width, 2388)
+        XCTAssertEqual(request.height, 1668)
+        XCTAssertEqual(request.refreshHz, 120)
+    }
+
+    func testPresentationRateCapsToPanelWithoutChangingSource() {
+        XCTAssertEqual(ClientPresentationRatePolicy.preferredFramesPerSecond(maximumFramesPerSecond: 60), 60)
+        XCTAssertEqual(ClientPresentationRatePolicy.preferredFramesPerSecond(maximumFramesPerSecond: 120), 120)
+        XCTAssertEqual(ClientPresentationRatePolicy.preferredFramesPerSecond(maximumFramesPerSecond: 144), 120)
+        let oldPersistedPreference = DisplayPreference(
+            width: 2388,
+            height: 1668,
+            refreshHz: 60,
+            orientationMode: .automatic)
+        let capabilities = DisplayCapabilities(
+            modes: [
+                DisplayMode(width: 2388, height: 1668, refreshHz: 120, isExperimental: false),
+                DisplayMode(width: 2388, height: 1668, refreshHz: 60, isExperimental: false),
+            ],
+            preferred: DisplayMode(width: 2388, height: 1668, refreshHz: 120, isExperimental: false))
+        XCTAssertEqual(oldPersistedPreference.reconciled(with: capabilities).refreshHz, 120)
+        XCTAssertEqual(DisplayPreference.defaultValue.makeRequest(
+            interfaceOrientation: .landscape,
+            requestId: 2).refreshHz, 120)
+    }
+}
+
 final class WifiTransportNegotiationTests: XCTestCase {
     func testKnownHostIdentityMustMatchPinnedCertificate() {
         let fingerprint = String(repeating: "AB", count: 32)

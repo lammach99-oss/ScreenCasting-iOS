@@ -50,7 +50,7 @@ public struct SettingsView: View {
                                 Divider().background(Color.white.opacity(0.12))
 
                                 if let capabilities = networkManager.displayCapabilities {
-                                    Text("Native 2388 x 1668 @ 60 Hz")
+                                    Text("Native 2388 x 1668 @ \(DisplayPreference.nativeRefreshHz) Hz source")
                                         .font(.system(size: 13, weight: .semibold))
                                         .foregroundColor(.white.opacity(0.85))
 

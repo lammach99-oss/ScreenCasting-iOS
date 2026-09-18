@@ -4,6 +4,16 @@ import MetalKit
 import CoreVideo
 import UIKit
 
+enum ClientPresentationRatePolicy {
+    static let sourceRefreshHz = 120
+
+    static func preferredFramesPerSecond(
+        maximumFramesPerSecond: Int
+    ) -> Int {
+        min(sourceRefreshHz, max(1, maximumFramesPerSecond))
+    }
+}
+
 enum VideoQualityDiagnostics {
     static let sampleInterval: UInt32 = 120
 
@@ -57,6 +67,20 @@ enum RenderOfferDecision: Equatable {
     case accepted(replaced: UInt32?)
     case rejected
     case staleSession
+
+    func telemetryDropSequence(for sequence: UInt32) -> UInt32? {
+        switch self {
+        case .rejected:
+            return sequence
+        case .accepted, .staleSession:
+            return nil
+        }
+    }
+}
+
+enum RenderCommitDecision: Equatable {
+    case commit
+    case superseded
 }
 
 struct RenderFrameIdentity: Equatable {
@@ -114,6 +138,10 @@ struct RenderFreshnessTracker {
             return false
         }
         return true
+    }
+
+    func commitDecision(for identity: RenderFrameIdentity) -> RenderCommitDecision {
+        shouldCommit(identity) ? .commit : .superseded
     }
 
     mutating func markPresented(_ identity: RenderFrameIdentity) -> Bool {
@@ -284,7 +312,16 @@ public class Renderer: NSObject, MTKViewDelegate {
         metalView.device = defaultDevice
         super.init()
         metalView.delegate = self
-        metalView.preferredFramesPerSecond = 120
+        let maximumPanelFPS = UIScreen.main.maximumFramesPerSecond
+        let configuredPresentationFPS =
+            ClientPresentationRatePolicy.preferredFramesPerSecond(
+                maximumFramesPerSecond: maximumPanelFPS)
+        metalView.preferredFramesPerSecond = configuredPresentationFPS
+        print(
+            "[IPAD][PRESENTATION_RATE] " +
+            "source_hz=\(ClientPresentationRatePolicy.sourceRefreshHz) " +
+            "maximum_panel_fps=\(maximumPanelFPS) " +
+            "configured_present_fps=\(configuredPresentationFPS)")
         metalView.framebufferOnly = true
         metalView.clearColor = MTLClearColor(red: 0.05, green: 0.09, blue: 0.16, alpha: 1)
         setupTextureCache()
@@ -340,15 +377,14 @@ public class Renderer: NSObject, MTKViewDelegate {
     ) {
         var dropped: UInt32?
         lock.lock()
-        switch freshness.offer(sequence, generation: generation) {
-        case .rejected:
-            dropped = sequence
-        case .accepted(let replaced):
+        let decision = freshness.offer(sequence, generation: generation)
+        switch decision {
+        case .accepted:
             currentPixelBuffer = pixelBuffer
-            dropped = replaced
-        case .staleSession:
+        case .rejected, .staleSession:
             break
         }
+        dropped = decision.telemetryDropSequence(for: sequence)
         lock.unlock()
         if let dropped { onFrameDropped?(dropped, generation) }
     }
@@ -469,10 +505,9 @@ public class Renderer: NSObject, MTKViewDelegate {
         encoder.endEncoding()
 
         lock.lock()
-        let shouldCommit = freshness.shouldCommit(identity)
+        let commitDecision = freshness.commitDecision(for: identity)
         lock.unlock()
-        guard shouldCommit else {
-            abandon(identity)
+        guard commitDecision == .commit else {
             return
         }
 

@@ -790,12 +790,13 @@ struct DisplayCapabilities: Equatable {
         let nativeModes = decodedModes.filter {
             $0.width == 2388 &&
             $0.height == 1668 &&
-            $0.refreshHz == 60 &&
+            ($0.refreshHz == 120 || $0.refreshHz == 60) &&
             !$0.isExperimental
         }
-        guard decodedModes.count == 1,
-              nativeModes.count == 1,
-              let preferred = nativeModes.first else { return nil }
+        guard !nativeModes.isEmpty,
+              nativeModes.count == decodedModes.count,
+              let preferred = nativeModes.first(where: { $0.refreshHz == 120 })
+                ?? nativeModes.first else { return nil }
         return DisplayCapabilities(modes: nativeModes, preferred: preferred)
     }
 }
@@ -871,7 +872,7 @@ struct DisplayConfigurationFailed: Equatable {
 struct DisplayPreference: Equatable {
     static let nativeLandscapeWidth: UInt32 = 2388
     static let nativeLandscapeHeight: UInt32 = 1668
-    static let nativeRefreshHz: UInt32 = 60
+    static let nativeRefreshHz: UInt32 = 120
     static let defaultValue = DisplayPreference(
         width: nativeLandscapeWidth,
         height: nativeLandscapeHeight,
@@ -905,14 +906,19 @@ struct DisplayPreference: Equatable {
     }
 
     func reconciled(with capabilities: DisplayCapabilities) -> DisplayPreference {
-        guard capabilities.supports(self) else {
+        let canonical = DisplayPreference(
+            width: Self.nativeLandscapeWidth,
+            height: Self.nativeLandscapeHeight,
+            refreshHz: Self.nativeRefreshHz,
+            orientationMode: orientationMode)
+        guard capabilities.supports(canonical) else {
             return DisplayPreference(
                 width: capabilities.preferred.width,
                 height: capabilities.preferred.height,
                 refreshHz: capabilities.preferred.refreshHz,
                 orientationMode: orientationMode)
         }
-        return self
+        return canonical
     }
 }
 
@@ -1034,9 +1040,9 @@ private enum DisplayPreferenceStore {
             return DisplayPreference.defaultValue
         }
         return DisplayPreference(
-            width: width,
-            height: height,
-            refreshHz: refreshHz,
+            width: DisplayPreference.nativeLandscapeWidth,
+            height: DisplayPreference.nativeLandscapeHeight,
+            refreshHz: DisplayPreference.nativeRefreshHz,
             orientationMode: orientationMode)
     }
 
