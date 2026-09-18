@@ -759,7 +759,311 @@ final class ClientStreamSettingsPreferenceTests: XCTestCase {
     }
 
     func testRuntimeApplyFailedDoesNotAutoRetrySameGeneration() {
-        assertHardRejectionDoesNotRetry(.runtimeApplyFailed)
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 24,
+            audioEnabled: true)
+        var gate = ClientSettingsReconciliationGate()
+
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.runtimeApplyFailed)), .suppressHardRejection)
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.runtimeApplyFailed)), .suppressHardRejection)
+    }
+
+    func testRuntimeApplyFailedDoesNotRetryImmediately() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 24,
+            audioEnabled: true)
+        var gate = ClientSettingsReconciliationGate()
+
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.runtimeApplyFailed)), .suppressHardRejection)
+        XCTAssertEqual(gate.runtimeApplyFailedGeneration, 40)
+        XCTAssertNil(gate.runtimeReadyRetryGeneration)
+    }
+
+    func testPostRuntimeReadyStateRetriesRuntimeApplyFailedExactlyOnce() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 24,
+            audioEnabled: true)
+        var gate = ClientSettingsReconciliationGate()
+
+        _ = gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.runtimeApplyFailed))
+
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .state), .send)
+        XCTAssertEqual(gate.runtimeReadyRetryGeneration, 40)
+    }
+
+    func testDuplicatePostRuntimeReadyStateDoesNotRetryTwice() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 24,
+            audioEnabled: true)
+        var gate = ClientSettingsReconciliationGate()
+
+        _ = gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.runtimeApplyFailed))
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .state), .send)
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .state), .suppressHardRejection)
+    }
+
+    func testSecondRuntimeApplyFailedSameGenerationDoesNotLoop() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 24,
+            audioEnabled: true)
+        var gate = ClientSettingsReconciliationGate()
+
+        _ = gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.runtimeApplyFailed))
+        _ = gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .state)
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.runtimeApplyFailed)), .suppressHardRejection)
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .state), .suppressHardRejection)
+    }
+
+    func testPostReadyRetryUsesLatestClientDesiredValues() {
+        let initial = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let latest = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 18,
+            audioEnabled: true)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 24,
+            audioEnabled: true)
+        var model = ClientSettingsStateModel(desired: initial)
+        var gate = ClientSettingsReconciliationGate()
+
+        _ = gate.decision(
+            hostGeneration: 40,
+            desired: model.desired,
+            effective: effective,
+            outcome: .rejected(.runtimeApplyFailed))
+        model.setDesired(latest)
+
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 40,
+            desired: model.desired,
+            effective: effective,
+            outcome: .state), .send)
+        XCTAssertEqual(model.desired, latest)
+    }
+
+    func testPostReadyRetryUsesCurrentHostGeneration() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 24,
+            audioEnabled: true)
+        var model = ClientSettingsStateModel(desired: desired)
+        var gate = ClientSettingsReconciliationGate()
+
+        _ = gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.runtimeApplyFailed))
+        model.receiveHostState(effective, generation: 41)
+
+        XCTAssertEqual(gate.decision(
+            hostGeneration: model.generation,
+            desired: model.desired,
+            effective: model.effective,
+            outcome: .state), .send)
+        XCTAssertEqual(gate.runtimeReadyRetryGeneration, 41)
+        XCTAssertEqual(model.generation, 41)
+    }
+
+    func testRuntimeRecoveryFailureAtNewerGenerationDoesNotRearmSameGeneration() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 24,
+            audioEnabled: true)
+        var gate = ClientSettingsReconciliationGate()
+
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.runtimeApplyFailed)), .suppressHardRejection)
+        XCTAssertEqual(gate.runtimeApplyFailedGeneration, 40)
+        XCTAssertNil(gate.runtimeReadyRetryGeneration)
+
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 41,
+            desired: desired,
+            effective: effective,
+            outcome: .state), .send)
+        XCTAssertEqual(gate.runtimeReadyRetryGeneration, 41)
+
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 41,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.runtimeApplyFailed)), .suppressHardRejection)
+        XCTAssertEqual(gate.runtimeApplyFailedGeneration, 41)
+        XCTAssertEqual(gate.runtimeReadyRetryGeneration, 41)
+
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 41,
+            desired: desired,
+            effective: effective,
+            outcome: .state), .suppressHardRejection)
+        XCTAssertEqual(gate.runtimeReadyRetryGeneration, 41)
+    }
+
+    func testNewerGenerationReconcilesAfterConsumedRuntimeRecoveryFailure() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 24,
+            audioEnabled: true)
+        var gate = ClientSettingsReconciliationGate()
+
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.runtimeApplyFailed)), .suppressHardRejection)
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 41,
+            desired: desired,
+            effective: effective,
+            outcome: .state), .send)
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 41,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.runtimeApplyFailed)), .suppressHardRejection)
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 41,
+            desired: desired,
+            effective: effective,
+            outcome: .state), .suppressHardRejection)
+
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 42,
+            desired: desired,
+            effective: effective,
+            outcome: .state), .send)
+        XCTAssertNil(gate.runtimeApplyFailedGeneration)
+        XCTAssertNil(gate.runtimeReadyRetryGeneration)
+        XCTAssertEqual(gate.lastAutomaticAttemptGeneration, 42)
+    }
+
+    func testSettingsDomainResetClearsRuntimeRecoveryState() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 24,
+            audioEnabled: true)
+        var gate = ClientSettingsReconciliationGate()
+
+        _ = gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.runtimeApplyFailed))
+        gate.reset()
+
+        XCTAssertNil(gate.runtimeApplyFailedGeneration)
+        XCTAssertNil(gate.runtimeReadyRetryGeneration)
+        XCTAssertEqual(gate.decision(
+            hostGeneration: 0,
+            desired: desired,
+            effective: effective,
+            outcome: .state), .send)
+    }
+
+    func testExplicitUserMutationStillSendsAfterRuntimeRetrySuppressed() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 12,
+            audioEnabled: false)
+        let effective = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 24,
+            audioEnabled: true)
+        var gate = ClientSettingsReconciliationGate()
+
+        _ = gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.runtimeApplyFailed))
+        _ = gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .state)
+        _ = gate.decision(
+            hostGeneration: 40,
+            desired: desired,
+            effective: effective,
+            outcome: .rejected(.runtimeApplyFailed))
+
+        XCTAssertEqual(
+            DesiredSettingsSendPolicy.decision(canSend: true),
+            .send)
     }
 
     func testInvalidRequestDoesNotAutoRetrySameGeneration() {

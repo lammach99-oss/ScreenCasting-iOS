@@ -491,6 +491,8 @@ struct ClientSettingsReconciliationGate {
     private(set) var lastAutomaticAttemptGeneration: UInt64?
     private(set) var lastStaleRetryGeneration: UInt64?
     private(set) var hardRejectedGeneration: UInt64?
+    private(set) var runtimeApplyFailedGeneration: UInt64?
+    private(set) var runtimeReadyRetryGeneration: UInt64?
 
     mutating func decision(
         hostGeneration: UInt64,
@@ -499,10 +501,12 @@ struct ClientSettingsReconciliationGate {
         outcome: ClientSettingsApplyOutcome
     ) -> ClientSettingsReconciliationDecision {
         guard desired != effective else {
+            runtimeApplyFailedGeneration = nil
+            runtimeReadyRetryGeneration = nil
+            if hardRejectedGeneration == hostGeneration {
+                hardRejectedGeneration = nil
+            }
             return .inSync
-        }
-        if hardRejectedGeneration == hostGeneration {
-            return .suppressHardRejection
         }
         if case .rejected(let reason) = outcome {
             if reason == .staleGeneration {
@@ -516,8 +520,42 @@ struct ClientSettingsReconciliationGate {
                 lastAutomaticAttemptGeneration = hostGeneration
                 return .send
             }
+            if reason == .runtimeApplyFailed {
+                if runtimeReadyRetryGeneration == hostGeneration {
+                    runtimeApplyFailedGeneration = hostGeneration
+                } else if runtimeApplyFailedGeneration != hostGeneration {
+                    runtimeApplyFailedGeneration = hostGeneration
+                    runtimeReadyRetryGeneration = nil
+                }
+                hardRejectedGeneration = hostGeneration
+                lastAutomaticAttemptGeneration = hostGeneration
+                return .suppressHardRejection
+            }
+            runtimeApplyFailedGeneration = nil
+            runtimeReadyRetryGeneration = nil
             hardRejectedGeneration = hostGeneration
             lastAutomaticAttemptGeneration = hostGeneration
+            return .suppressHardRejection
+        }
+        if case .state = outcome,
+           runtimeApplyFailedGeneration != nil {
+            if let retryGeneration = runtimeReadyRetryGeneration {
+                if retryGeneration == hostGeneration {
+                    return .suppressHardRejection
+                }
+                runtimeApplyFailedGeneration = nil
+                runtimeReadyRetryGeneration = nil
+                if hardRejectedGeneration == retryGeneration {
+                    hardRejectedGeneration = nil
+                }
+            } else {
+                runtimeReadyRetryGeneration = hostGeneration
+                hardRejectedGeneration = nil
+                lastAutomaticAttemptGeneration = hostGeneration
+                return .send
+            }
+        }
+        if hardRejectedGeneration == hostGeneration {
             return .suppressHardRejection
         }
         guard lastAutomaticAttemptGeneration != hostGeneration else {
@@ -531,6 +569,8 @@ struct ClientSettingsReconciliationGate {
         lastAutomaticAttemptGeneration = nil
         lastStaleRetryGeneration = nil
         hardRejectedGeneration = nil
+        runtimeApplyFailedGeneration = nil
+        runtimeReadyRetryGeneration = nil
     }
 }
 
@@ -2928,6 +2968,14 @@ public class NetworkManager: ObservableObject {
             desired: clientSettingsState.desired,
             effective: effective,
             outcome: resolvedOutcome)
+        if case .rejected(.runtimeApplyFailed) = resolvedOutcome {
+            let desired = clientSettingsState.desired
+            print(
+                "[IPAD][SETTINGS_RUNTIME_RECOVERY_ARMED] " +
+                "generation=\(state.generation) " +
+                "desired_bitrate=\(UInt32(desired.bitrateMbps * 1_000_000)) " +
+                "desired_audio=\(desired.audioEnabled)")
+        }
         let isInSync = clientSettingsState.desired == effective
         let rejected: Bool
         if case .rejected = resolvedOutcome { rejected = true } else { rejected = false }
@@ -2949,14 +2997,34 @@ public class NetworkManager: ObservableObject {
         transportTelemetry.recordBitrateMbps(bitrateMbps)
         print("[IPAD][SETTINGS_RESULT] generation=\(state.generation) bitrate_bps=\(state.bitrateBps) audio=\(state.audioEnabled) rejected=\(rejected) reason=\(state.rejectionReason)")
         if decision == .send {
-            let reason = state.rejectionReason == .staleGeneration
-                ? "stale_generation_retry"
-                : "host_mismatch"
+            let isRuntimeRecovery = resolvedOutcome == .state &&
+                settingsReconciliationGate.runtimeReadyRetryGeneration ==
+                    state.generation
+            let reason: String
+            if isRuntimeRecovery {
+                reason = "runtime_ready_recovery"
+            } else if state.rejectionReason == .staleGeneration {
+                reason = "stale_generation_retry"
+            } else {
+                reason = "host_mismatch"
+            }
+            if isRuntimeRecovery {
+                print(
+                    "[IPAD][SETTINGS_RUNTIME_RECOVERY] " +
+                    "generation=\(state.generation) action=retry")
+            }
             _ = sendDesiredSettingsIfPossible(reason: reason)
         } else if rejected && !isInSync {
             print(
                 "[IPAD][SETTINGS_RECONCILE_SUPPRESS] reason=\(state.rejectionReason) " +
                 "generation=\(state.generation) decision=\(decision)")
+        } else if resolvedOutcome == .state &&
+                    settingsReconciliationGate.runtimeReadyRetryGeneration != nil &&
+                    !isInSync {
+            print(
+                "[IPAD][SETTINGS_RUNTIME_RECOVERY] " +
+                "generation=\(state.generation) " +
+                "action=suppress_already_retried")
         }
     }
 
