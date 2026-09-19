@@ -341,23 +341,116 @@ final class USBListenerLifetimeTests: XCTestCase {
 
     func testControlCenterAppInactivityDoesNotTearDownUsbSession() throws {
         let peer = try connect()
-        manager.simulateSessionAuthenticatedAndCommitted()
+        manager.simulateSessionAuthenticatedAndCommitted(
+            mode: RealtimeTransportMode.usbSplitTLS)
         let listener = try XCTUnwrap(manager.usbSessionSnapshot().listener)
         let snapBefore = manager.usbSessionSnapshot()
+        let decoderInvalidations = manager.decoderForTesting.invalidateCountForTesting
+        let feedbacks = manager.videoFeedbackCountForTesting
 
-        // Control center / background transition
-        manager.applicationDidEnterBackground()
+        manager.applicationWillResignActive()
+        manager.applicationDidBecomeActive()
         let snapDuring = manager.usbSessionSnapshot()
         XCTAssertTrue(snapDuring.listener === listener)
         XCTAssertTrue(snapDuring.connection === peer)
         XCTAssertEqual(snapDuring.generation, snapBefore.generation)
         XCTAssertEqual(snapDuring.committedGeneration, snapBefore.committedGeneration)
+        XCTAssertEqual(
+            manager.decoderForTesting.invalidateCountForTesting,
+            decoderInvalidations)
+        XCTAssertEqual(manager.videoFeedbackCountForTesting, feedbacks)
+    }
+
+    func testUsbBackgroundForegroundRearmsDecoderOnceForSameGeneration() throws {
+        let peer = try connect()
+        manager.simulateSessionAuthenticatedAndCommitted(
+            mode: RealtimeTransportMode.usbSplitTLS)
+        let before = manager.usbSessionSnapshot()
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+        let sessions = manager.decoderForTesting.sessionBeganCountForTesting
+        let feedbacks = manager.videoFeedbackCountForTesting
+        manager.decoderForTesting.resetLifecycleEventsForTesting()
+
+        manager.applicationDidEnterBackground()
+        manager.applicationDidBecomeActive()
+
+        let after = manager.usbSessionSnapshot()
+        XCTAssertTrue(after.connection === peer)
+        XCTAssertEqual(after.generation, before.generation)
+        XCTAssertEqual(after.committedGeneration, before.committedGeneration)
+        XCTAssertEqual(
+            manager.decoderForTesting.invalidateCountForTesting,
+            invalidations + 1)
+        XCTAssertEqual(
+            manager.decoderForTesting.sessionBeganCountForTesting,
+            sessions + 1)
+        XCTAssertEqual(manager.videoFeedbackCountForTesting, feedbacks + 1)
+        XCTAssertEqual(
+            manager.decoderForTesting.lifecycleEventsForTesting,
+            ["invalidate-begin", "invalidate-end", "begin-\(before.generation)"])
 
         manager.applicationDidBecomeActive()
-        let snapAfter = manager.usbSessionSnapshot()
-        XCTAssertTrue(snapAfter.listener === listener)
-        XCTAssertTrue(snapAfter.connection === peer)
-        XCTAssertEqual(snapAfter.generation, snapBefore.generation)
+        XCTAssertEqual(
+            manager.decoderForTesting.invalidateCountForTesting,
+            invalidations + 1)
+        XCTAssertEqual(manager.videoFeedbackCountForTesting, feedbacks + 1)
+    }
+
+    func testStaleUsbBackgroundTokenCannotRearmReplacementGeneration() throws {
+        let first = try connect()
+        manager.simulateSessionAuthenticatedAndCommitted(
+            mode: RealtimeTransportMode.usbSplitTLS)
+        manager.applicationDidEnterBackground()
+        try deliver(.failed(.posix(.ECONNRESET)), to: first)
+        let replacement = try connect()
+        manager.simulateSessionAuthenticatedAndCommitted(
+            mode: RealtimeTransportMode.usbSplitTLS)
+        let before = manager.usbSessionSnapshot()
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+        let feedbacks = manager.videoFeedbackCountForTesting
+
+        manager.applicationDidBecomeActive()
+
+        let after = manager.usbSessionSnapshot()
+        XCTAssertTrue(after.connection === replacement)
+        XCTAssertEqual(after.generation, before.generation)
+        XCTAssertEqual(
+            manager.decoderForTesting.invalidateCountForTesting,
+            invalidations)
+        XCTAssertEqual(manager.videoFeedbackCountForTesting, feedbacks)
+    }
+
+    func testUsbBackgroundStopRevokesDecoderRearm() throws {
+        let peer = try connect()
+        manager.simulateSessionAuthenticatedAndCommitted(
+            mode: RealtimeTransportMode.usbSplitTLS)
+        manager.applicationDidEnterBackground()
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+        let feedbacks = manager.videoFeedbackCountForTesting
+
+        manager.stopForTesting()
+        manager.applicationDidBecomeActive()
+
+        XCTAssertNil(manager.usbSessionSnapshot().connection)
+        XCTAssertEqual(
+            manager.decoderForTesting.invalidateCountForTesting,
+            invalidations + 1)
+        XCTAssertEqual(manager.videoFeedbackCountForTesting, feedbacks)
+        _ = peer
+    }
+
+    func testUsbListenerOnlyBackgroundDoesNotRearmDecoder() throws {
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+        let feedbacks = manager.videoFeedbackCountForTesting
+
+        manager.applicationDidEnterBackground()
+        manager.applicationDidBecomeActive()
+
+        XCTAssertNil(manager.usbSessionSnapshot().connection)
+        XCTAssertEqual(
+            manager.decoderForTesting.invalidateCountForTesting,
+            invalidations)
+        XCTAssertEqual(manager.videoFeedbackCountForTesting, feedbacks)
     }
 
     func testHealthyCommittedSessionRejectsLateCandidate() throws {

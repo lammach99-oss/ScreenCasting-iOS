@@ -1745,6 +1745,12 @@ public class NetworkManager: ObservableObject {
     private var lastUsbTouchMoveDiagnosticAt: TimeInterval = 0
     private static let wifiBackgroundDisconnectGrace =
         WifiLifecyclePolicy.backgroundGrace
+    private var pendingUsbForegroundDecoderRearmGeneration: UInt64?
+
+    #if targetEnvironment(simulator)
+    private var testingVideoFeedbackCount = 0
+    var videoFeedbackCountForTesting: Int { testingVideoFeedbackCount }
+    #endif
 
     public init() {
         networkQueue.setSpecific(key: networkQueueKey, value: true)
@@ -1880,6 +1886,26 @@ public class NetworkManager: ObservableObject {
             self.wifiBackgroundDisconnectWorkItem = nil
             RecentWifiResumeStore.clear()
 
+            if let generation = self.consumeUsbForegroundDecoderRearmIfEligibleOnQueue() {
+                self.recordUsbLifecycleDiagnostic(
+                    "[USB_MEDIA_RECOVERY] generation=\(generation) " +
+                    "action=decoder_invalidate_begin")
+                self.decoder.invalidate(waitForCompletion: true)
+                guard self.isCurrentCommittedUsbStreamingSessionOnQueue(
+                    generation: generation) else {
+                    self.recordUsbLifecycleDiagnostic(
+                        "[USB_MEDIA_RECOVERY] scheduled_generation=\(generation) " +
+                        "current_generation=\(self.connectionGeneration) action=skip_stale")
+                    return
+                }
+                self.decoder.beginSession(generation: generation)
+                self.sendVideoFeedback()
+                self.recordUsbLifecycleDiagnostic(
+                    "[USB_MEDIA_RECOVERY] generation=\(generation) " +
+                    "action=decoder_rearmed recovery_requested=true")
+                return
+            }
+
             if !self.usbListenerExplicitlyStarted,
                self.connection != nil,
                self.transportState == .streaming,
@@ -1923,7 +1949,18 @@ public class NetworkManager: ObservableObject {
             self.wifiBackgroundDisconnectWorkItem = nil
 
             guard !self.usbListenerExplicitlyStarted else {
-                print("[IPAD][APP_LIFECYCLE] state=background transport=usb action=preserve_session")
+                if self.isCurrentCommittedUsbStreamingSessionOnQueue() {
+                    self.pendingUsbForegroundDecoderRearmGeneration =
+                        self.connectionGeneration
+                    print(
+                        "[IPAD][APP_LIFECYCLE] state=background transport=usb " +
+                        "action=preserve_session " +
+                        "decoder_rearm_generation=\(self.connectionGeneration)")
+                } else {
+                    print(
+                        "[IPAD][APP_LIFECYCLE] state=background transport=usb " +
+                        "action=preserve_session")
+                }
                 return
             }
 
@@ -2308,6 +2345,7 @@ public class NetworkManager: ObservableObject {
         reconnectWorkItem = nil
         wifiBackgroundDisconnectWorkItem?.cancel()
         wifiBackgroundDisconnectWorkItem = nil
+        pendingUsbForegroundDecoderRearmGeneration = nil
         RecentWifiResumeStore.clear()
         let stoppedGeneration = connectionGenerationClock.advance()
         listenerGeneration &+= 1
@@ -3153,6 +3191,9 @@ public class NetworkManager: ObservableObject {
 
     private func sendVideoFeedback() {
         guard wireAuthenticatedGeneration == connectionGeneration else { return }
+        #if targetEnvironment(simulator)
+        testingVideoFeedbackCount += 1
+        #endif
         sendClientPingIfDue()
         let feedback = transportTelemetry.makeFeedback()
         var payload = Data(count: 16)
@@ -3785,6 +3826,41 @@ public class NetworkManager: ObservableObject {
         usbListenerExplicitlyStarted ? .usb : .wifi
     }
 
+    private func isCurrentCommittedUsbStreamingSessionOnQueue(
+        generation: UInt64? = nil
+    ) -> Bool {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard activeTransportKind == .usb,
+              usbListenerExplicitlyStarted,
+              transportState == .streaming,
+              let usbConnection = usbScdpConnection,
+              connection === usbConnection,
+              wireAuthenticatedGeneration == connectionGeneration,
+              committedTransportGeneration == connectionGeneration else {
+            return false
+        }
+        if let generation {
+            return generation == connectionGeneration
+        }
+        return true
+    }
+
+    private func consumeUsbForegroundDecoderRearmIfEligibleOnQueue()
+        -> UInt64? {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard let scheduledGeneration = pendingUsbForegroundDecoderRearmGeneration
+        else { return nil }
+        pendingUsbForegroundDecoderRearmGeneration = nil
+        guard isCurrentCommittedUsbStreamingSessionOnQueue(
+            generation: scheduledGeneration) else {
+            recordUsbLifecycleDiagnostic(
+                "[USB_MEDIA_RECOVERY] scheduled_generation=\(scheduledGeneration) " +
+                "current_generation=\(connectionGeneration) action=skip_stale")
+            return nil
+        }
+        return scheduledGeneration
+    }
+
     private var activeControlConnection: NWConnection? {
         activeTransportKind == .usb ? usbScdpConnection : connection
     }
@@ -4254,6 +4330,7 @@ public class NetworkManager: ObservableObject {
 
     private func teardownCurrentSession() {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        pendingUsbForegroundDecoderRearmGeneration = nil
         connectionTimeoutWorkItem?.cancel()
         connectionTimeoutWorkItem = nil
         let failedGeneration = connectionGenerationClock.advance()

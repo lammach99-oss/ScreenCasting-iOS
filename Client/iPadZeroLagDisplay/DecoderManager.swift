@@ -398,12 +398,28 @@ public final class DecoderManager {
     private var completionIdentities:
         [ObjectIdentifier: DecodeCompletionIdentity] = [:]
 
+    #if targetEnvironment(simulator)
+    private var testingSessionBeganCount = 0
+    private var testingInvalidateCount = 0
+    private var testingLifecycleEvents: [String] = []
+    var lifecycleEventsForTesting: [String] { testingLifecycleEvents }
+    var sessionBeganCountForTesting: Int { testingSessionBeganCount }
+    var invalidateCountForTesting: Int { testingInvalidateCount }
+    func resetLifecycleEventsForTesting() {
+        testingLifecycleEvents.removeAll()
+    }
+    #endif
+
     public init() {
         localSessionGeneration = 1
         mailbox.beginSession(generation: localSessionGeneration)
     }
 
     public func beginSession(generation: UInt64) {
+        #if targetEnvironment(simulator)
+        testingSessionBeganCount += 1
+        testingLifecycleEvents.append("begin-\(generation)")
+        #endif
         mailboxStateLock.lock()
         mailbox.beginSession(generation: generation)
         localSessionGeneration = generation
@@ -926,6 +942,10 @@ public final class DecoderManager {
     }
 
     public func invalidate(waitForCompletion: Bool = true) {
+        #if targetEnvironment(simulator)
+        testingInvalidateCount += 1
+        testingLifecycleEvents.append("invalidate-begin")
+        #endif
         mailboxStateLock.lock()
         mailbox.invalidate()
         mailboxStateLock.unlock()
@@ -943,6 +963,9 @@ public final class DecoderManager {
             self.hasDecodedH264Idr = false
             self.parameterSetSessionGate.reset()
             self.h264ParameterSetSessionGate.reset()
+            #if targetEnvironment(simulator)
+            self.testingLifecycleEvents.append("invalidate-end")
+            #endif
         }
         // Invalidation of the mailbox above is immediate. FIFO ordering keeps
         // this old-session cleanup ahead of N+1's configuration/decode work.
