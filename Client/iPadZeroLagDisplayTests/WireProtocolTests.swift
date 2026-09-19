@@ -440,13 +440,17 @@ final class USBListenerLifetimeTests: XCTestCase {
     }
 
     func testUsbListenerOnlyBackgroundDoesNotRearmDecoder() throws {
+        let snapshot = manager.usbSessionSnapshot()
+        let listener = try XCTUnwrap(snapshot.listener)
         let invalidations = manager.decoderForTesting.invalidateCountForTesting
         let feedbacks = manager.videoFeedbackCountForTesting
 
         manager.applicationDidEnterBackground()
         manager.applicationDidBecomeActive()
 
-        XCTAssertNil(manager.usbSessionSnapshot().connection)
+        let current = manager.usbSessionSnapshot()
+        XCTAssertTrue(current.listener === listener)
+        XCTAssertNil(current.connection)
         XCTAssertEqual(
             manager.decoderForTesting.invalidateCountForTesting,
             invalidations)
