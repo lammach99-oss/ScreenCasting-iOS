@@ -30,6 +30,8 @@ public struct SettingsView: View {
     @State private var showForgetConfirmation = false
     @AppStorage(ClientPreferenceKeys.showPerformanceHUD)
     private var showPerformanceHUD: Bool = true
+    @AppStorage(ClientPreferenceKeys.gameModeEnabled)
+    private var gameModeEnabled: Bool = false
 
     // MARK: Body
 
@@ -49,8 +51,8 @@ public struct SettingsView: View {
 
                                 Divider().background(Color.white.opacity(0.12))
 
-                                if let capabilities = networkManager.displayCapabilities {
-                                    Text("Native 2388 x 1668 @ \(DisplayPreference.nativeRefreshHz) Hz source")
+                                if networkManager.displayCapabilities != nil {
+                                    Text("Source: Native 2388 x 1668 @ 120 Hz")
                                         .font(.system(size: 13, weight: .semibold))
                                         .foregroundColor(.white.opacity(0.85))
 
@@ -142,6 +144,32 @@ public struct SettingsView: View {
                                     .tint(Color(hex: "#0EA5E9"))
 
                                 Text("Shows FPS and frame receive timing while streaming.")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.white.opacity(0.55))
+                            }
+                        }
+
+                        settingsCard {
+                            VStack(alignment: .leading, spacing: 14) {
+                                Label(
+                                    "Performance",
+                                    systemImage: "gamecontroller.fill")
+                                    .font(.system(size: 15, weight: .bold))
+                                    .foregroundColor(.white)
+
+                                Divider()
+                                    .background(Color.white.opacity(0.12))
+
+                                Toggle(
+                                    "Game Mode",
+                                    isOn: $gameModeEnabled)
+                                    .tint(Color(hex: "#0EA5E9"))
+
+                                Text(
+                                    "Keeps local presentation at up to 120 Hz " +
+                                    "for maximum responsiveness. When off, " +
+                                    "presentation adapts between 60 and 120 Hz " +
+                                    "from touch and scroll activity.")
                                     .font(.system(size: 11))
                                     .foregroundColor(.white.opacity(0.55))
                             }

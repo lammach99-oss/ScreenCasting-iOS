@@ -14,6 +14,62 @@ enum ClientPresentationRatePolicy {
     }
 }
 
+enum PresentationCadenceState: String, Equatable {
+    case idle60
+    case active120
+}
+
+public enum PresentationCadenceMode: String, Equatable {
+    case adaptive
+    case game
+}
+
+struct PresentationCadencePolicy {
+    static let idleFPS = 60
+    static let activeFPS = 120
+    static let activeHoldSeconds: TimeInterval = 1.75
+
+    private(set) var lastInteractionAt: TimeInterval?
+
+    mutating func noteInteraction(now: TimeInterval) {
+        lastInteractionAt = now
+    }
+
+    mutating func reset() {
+        lastInteractionAt = nil
+    }
+
+    func state(now: TimeInterval) -> PresentationCadenceState {
+        guard let lastInteractionAt,
+              now - lastInteractionAt < Self.activeHoldSeconds else {
+            return .idle60
+        }
+        return .active120
+    }
+
+    func targetFPS(
+        now: TimeInterval,
+        maximumPanelFPS: Int,
+        mode: PresentationCadenceMode = .adaptive
+    ) -> Int {
+        let desiredFPS: Int
+        switch mode {
+        case .adaptive:
+            desiredFPS = state(now: now) == .active120
+                ? Self.activeFPS
+                : Self.idleFPS
+        case .game:
+            desiredFPS = Self.activeFPS
+        }
+        return min(desiredFPS, max(1, maximumPanelFPS))
+    }
+}
+
+enum PresentationActivityKind: String {
+    case touch
+    case scroll
+}
+
 enum VideoQualityDiagnostics {
     static let sampleInterval: UInt32 = 120
 
@@ -403,6 +459,11 @@ public class Renderer: NSObject, MTKViewDelegate {
     private var publishedContentViewport: VideoContentViewport?
     private var publishedGeometrySnapshot: RendererGeometrySnapshot?
     private var geometryPublishGate = RendererGeometryPublishGate()
+    private weak var metalView: MTKView?
+    private let maximumPanelFPS: Int
+    private var presentationCadencePolicy = PresentationCadencePolicy()
+    private var presentationCadenceMode: PresentationCadenceMode
+    private var configuredPresentationFPS: Int
 
     static func contentViewport(
         forDrawableSize drawableSize: CGSize,
@@ -416,26 +477,40 @@ public class Renderer: NSObject, MTKViewDelegate {
     private var lastDecodedFrameSize: CGSize?
     private let lock = NSLock()
 
-    public init?(metalView: MTKView) {
+    public init?(
+        metalView: MTKView,
+        presentationMode: PresentationCadenceMode = .adaptive
+    ) {
         guard let defaultDevice = MTLCreateSystemDefaultDevice(),
               let queue = defaultDevice.makeCommandQueue() else {
             return nil
         }
+        let maximumPanelFPS = UIScreen.main.maximumFramesPerSecond
+        let initialPresentationCadencePolicy = PresentationCadencePolicy()
+        let configuredPresentationFPS =
+            initialPresentationCadencePolicy.targetFPS(
+                now: CACurrentMediaTime(),
+                maximumPanelFPS: maximumPanelFPS,
+                mode: presentationMode)
         device = defaultDevice
         commandQueue = queue
+        self.metalView = metalView
+        self.maximumPanelFPS = maximumPanelFPS
+        presentationCadencePolicy = initialPresentationCadencePolicy
+        presentationCadenceMode = presentationMode
+        self.configuredPresentationFPS = configuredPresentationFPS
         metalView.device = defaultDevice
         super.init()
         metalView.delegate = self
-        let maximumPanelFPS = UIScreen.main.maximumFramesPerSecond
-        let configuredPresentationFPS =
-            ClientPresentationRatePolicy.preferredFramesPerSecond(
-                maximumFramesPerSecond: maximumPanelFPS)
         metalView.preferredFramesPerSecond = configuredPresentationFPS
         print(
             "[IPAD][PRESENTATION_RATE] " +
             "source_hz=\(ClientPresentationRatePolicy.sourceRefreshHz) " +
             "maximum_panel_fps=\(maximumPanelFPS) " +
-            "configured_present_fps=\(configuredPresentationFPS)")
+            "configured_present_fps=\(configuredPresentationFPS) " +
+            "mode=\(presentationMode.rawValue) " +
+            "state=\(presentationCadencePolicy.state(now: CACurrentMediaTime()).rawValue) " +
+            "reason=init")
         metalView.framebufferOnly = true
         metalView.clearColor = MTLClearColor(red: 0.05, green: 0.09, blue: 0.16, alpha: 1)
         setupTextureCache()
@@ -480,11 +555,79 @@ public class Renderer: NSObject, MTKViewDelegate {
         geometryPublishGate.reset()
         lastDecodedFrameSize = nil
         lock.unlock()
+        let resetCadence = { [weak self] in
+            guard let self else { return }
+            self.presentationCadencePolicy.reset()
+            self.applyPresentationCadence(
+                now: CACurrentMediaTime(),
+                reason: "session_reset")
+        }
+        if Thread.isMainThread {
+            resetCadence()
+        } else {
+            DispatchQueue.main.async(execute: resetCadence)
+        }
         if shouldResetContentViewport {
             DispatchQueue.main.async { [weak self] in
                 self?.onContentViewportChanged?(nil)
             }
         }
+    }
+
+    func notePresentationActivity(
+        _ activity: PresentationActivityKind,
+        now: TimeInterval = CACurrentMediaTime()
+    ) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        presentationCadencePolicy.noteInteraction(now: now)
+        applyPresentationCadence(now: now, reason: activity.rawValue)
+    }
+
+    func setPresentationMode(
+        _ mode: PresentationCadenceMode,
+        now: TimeInterval = CACurrentMediaTime()
+    ) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard mode != presentationCadenceMode else { return }
+
+        presentationCadenceMode = mode
+        applyPresentationCadence(
+            now: now,
+            reason: mode == .game ? "game_mode_on" : "game_mode_off",
+            forceLog: true)
+    }
+
+    private func reevaluatePresentationCadence(now: TimeInterval) {
+        applyPresentationCadence(now: now, reason: "idle_timeout")
+    }
+
+    private func applyPresentationCadence(
+        now: TimeInterval,
+        reason: String,
+        forceLog: Bool = false
+    ) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let targetFPS = presentationCadencePolicy.targetFPS(
+            now: now,
+            maximumPanelFPS: maximumPanelFPS,
+            mode: presentationCadenceMode)
+        let fpsChanged = targetFPS != configuredPresentationFPS
+
+        if fpsChanged {
+            metalView?.preferredFramesPerSecond = targetFPS
+            configuredPresentationFPS = targetFPS
+        }
+        guard fpsChanged || forceLog else { return }
+
+        let state = presentationCadencePolicy.state(now: now)
+        print(
+            "[IPAD][PRESENTATION_RATE] " +
+            "source_hz=\(ClientPresentationRatePolicy.sourceRefreshHz) " +
+            "maximum_panel_fps=\(maximumPanelFPS) " +
+            "configured_present_fps=\(targetFPS) " +
+            "mode=\(presentationCadenceMode.rawValue) " +
+            "state=\(state.rawValue) " +
+            "reason=\(reason)")
     }
 
     public func updateFrame(
@@ -661,6 +804,8 @@ public class Renderer: NSObject, MTKViewDelegate {
                 self.onFrameRendered?(
                     identity.sequence,
                     identity.generation)
+                self.reevaluatePresentationCadence(
+                    now: CACurrentMediaTime())
             }
         }
         commandBuffer.commit()

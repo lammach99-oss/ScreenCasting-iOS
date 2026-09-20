@@ -5,6 +5,7 @@ import UIKit
 
 enum ClientPreferenceKeys {
     static let showPerformanceHUD = "ScreenCasting.client.showPerformanceHUD"
+    static let gameModeEnabled = "ScreenCasting.client.gameModeEnabled.v1"
 }
 
 // MARK: - PIN Shake Modifier
@@ -271,6 +272,8 @@ public struct ContentView: View {
     // UI States
     @AppStorage(ClientPreferenceKeys.showPerformanceHUD)
     private var isHudVisible: Bool = true
+    @AppStorage(ClientPreferenceKeys.gameModeEnabled)
+    private var gameModeEnabled: Bool = false
     @State private var renderedContentViewport: VideoContentViewport?
     @State private var rendererGeometrySnapshot: RendererGeometrySnapshot?
     @State private var presentationGeometry: PresentationSurfaceGeometry?
@@ -458,6 +461,7 @@ public struct ContentView: View {
 
             ConnectedPresentationSurface(
                 networkManager: networkManager,
+                gameModeEnabled: gameModeEnabled,
                 onFrameRendered: {
                     streamManager.registerFrameRendered()
                 },
