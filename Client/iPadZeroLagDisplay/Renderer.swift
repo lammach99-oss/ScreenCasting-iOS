@@ -351,6 +351,32 @@ public struct RendererGeometrySnapshot: Equatable {
     }
 }
 
+struct RendererGeometryPublishKey: Equatable {
+    let decodedFrameSize: CGSize
+    let drawableSize: CGSize
+    let contentViewport: VideoContentViewport
+}
+
+struct RendererGeometryPublishGate {
+    private(set) var lastScheduledKey: RendererGeometryPublishKey?
+
+    mutating func shouldSchedule(
+        _ key: RendererGeometryPublishKey,
+        force: Bool = false
+    ) -> Bool {
+        if !force, lastScheduledKey == key {
+            return false
+        }
+
+        lastScheduledKey = key
+        return true
+    }
+
+    mutating func reset() {
+        lastScheduledKey = nil
+    }
+}
+
 public class Renderer: NSObject, MTKViewDelegate {
     public var onFrameRendered: ((UInt32, UInt64) -> Void)?
     public var onDrawableCommitted: ((UInt32, UInt64) -> Void)?
@@ -369,6 +395,7 @@ public class Renderer: NSObject, MTKViewDelegate {
     private var cadenceWindowStartedAt = CACurrentMediaTime()
     private var publishedContentViewport: VideoContentViewport?
     private var publishedGeometrySnapshot: RendererGeometrySnapshot?
+    private var geometryPublishGate = RendererGeometryPublishGate()
 
     static func contentViewport(
         forDrawableSize drawableSize: CGSize,
@@ -443,6 +470,7 @@ public class Renderer: NSObject, MTKViewDelegate {
         let shouldResetContentViewport = publishedContentViewport != nil
         publishedContentViewport = nil
         publishedGeometrySnapshot = nil
+        geometryPublishGate.reset()
         lastDecodedFrameSize = nil
         lock.unlock()
         if shouldResetContentViewport {
@@ -485,7 +513,8 @@ public class Renderer: NSObject, MTKViewDelegate {
             for: view,
             decodedFrameSize: decodedFrameSize,
             drawableSize: size,
-            contentViewport: contentViewport)
+            contentViewport: contentViewport,
+            force: true)
     }
 
     public func draw(in view: MTKView) {
@@ -684,8 +713,24 @@ public class Renderer: NSObject, MTKViewDelegate {
         for view: MTKView,
         decodedFrameSize: CGSize,
         drawableSize: CGSize,
-        contentViewport: VideoContentViewport
+        contentViewport: VideoContentViewport,
+        force: Bool = false
     ) {
+        let key = RendererGeometryPublishKey(
+            decodedFrameSize: decodedFrameSize,
+            drawableSize: drawableSize,
+            contentViewport: contentViewport)
+
+        lock.lock()
+        let shouldSchedule = geometryPublishGate.shouldSchedule(
+            key,
+            force: force)
+        lock.unlock()
+
+        guard shouldSchedule else {
+            return
+        }
+
         DispatchQueue.main.async { [weak self, weak view] in
             guard let self,
                   let view else {

@@ -485,3 +485,66 @@ final class RenderFreshnessTrackerTests: XCTestCase {
         XCTAssertEqual(tracker.acceptedSequence, 1)
     }
 }
+
+final class RendererGeometryPublishGateTests: XCTestCase {
+    private let baseKey = RendererGeometryPublishKey(
+        decodedFrameSize: CGSize(width: 2_388, height: 1_668),
+        drawableSize: CGSize(width: 2_388, height: 1_668),
+        contentViewport: VideoContentViewport(
+            rect: CGRect(x: 0, y: 0, width: 1, height: 1)))
+
+    func testUnchangedGeometryRequestSchedulesOnlyOnce() {
+        var gate = RendererGeometryPublishGate()
+
+        XCTAssertTrue(gate.shouldSchedule(baseKey))
+        for _ in 0..<120 {
+            XCTAssertFalse(gate.shouldSchedule(baseKey))
+        }
+    }
+
+    func testDrawableSizeChangeSchedulesGeometryPublication() {
+        var gate = RendererGeometryPublishGate()
+        let changed = RendererGeometryPublishKey(
+            decodedFrameSize: baseKey.decodedFrameSize,
+            drawableSize: CGSize(width: 1_668, height: 2_388),
+            contentViewport: baseKey.contentViewport)
+
+        XCTAssertTrue(gate.shouldSchedule(baseKey))
+        XCTAssertTrue(gate.shouldSchedule(changed))
+    }
+
+    func testVideoGeometryChangeSchedulesGeometryPublication() {
+        var gate = RendererGeometryPublishGate()
+        let changedDecodedSize = RendererGeometryPublishKey(
+            decodedFrameSize: CGSize(width: 1_668, height: 2_388),
+            drawableSize: baseKey.drawableSize,
+            contentViewport: baseKey.contentViewport)
+        let changedViewport = RendererGeometryPublishKey(
+            decodedFrameSize: changedDecodedSize.decodedFrameSize,
+            drawableSize: changedDecodedSize.drawableSize,
+            contentViewport: VideoContentViewport(
+                rect: CGRect(x: 0.1, y: 0, width: 0.8, height: 1)))
+
+        XCTAssertTrue(gate.shouldSchedule(baseKey))
+        XCTAssertTrue(gate.shouldSchedule(changedDecodedSize))
+        XCTAssertTrue(gate.shouldSchedule(changedViewport))
+    }
+
+    func testForcedLayoutPublicationSchedulesEvenForSameKey() {
+        var gate = RendererGeometryPublishGate()
+
+        XCTAssertTrue(gate.shouldSchedule(baseKey))
+        XCTAssertFalse(gate.shouldSchedule(baseKey))
+        XCTAssertTrue(gate.shouldSchedule(baseKey, force: true))
+        XCTAssertFalse(gate.shouldSchedule(baseKey))
+    }
+
+    func testGeometryPublishGateResetAllowsNewSessionPublication() {
+        var gate = RendererGeometryPublishGate()
+
+        XCTAssertTrue(gate.shouldSchedule(baseKey))
+        XCTAssertFalse(gate.shouldSchedule(baseKey))
+        gate.reset()
+        XCTAssertTrue(gate.shouldSchedule(baseKey))
+    }
+}
