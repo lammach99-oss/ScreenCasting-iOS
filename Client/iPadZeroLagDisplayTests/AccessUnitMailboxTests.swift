@@ -26,35 +26,95 @@ final class AccessUnitMailboxTests: XCTestCase {
 
     func testRecoveryWaitsForSuccessfulIDRCallback() {
         var requests = 0
+        var drops: [(UInt32, UInt64, AccessUnitDropReason)] = []
         let mailbox = AccessUnitMailbox(
             maximumAge: 1, clock: { 0 },
-            onRecoveryNeeded: { requests += 1 })
+            onRecoveryNeeded: { requests += 1 },
+            onDrop: { drops.append(($0, $1, $2)) })
         mailbox.beginSession(generation: 7)
         let idr = unwrap(mailbox.publish(simpleUnit(1, idr: true)))
         XCTAssertTrue(mailbox.waitingForIDR)
         XCTAssertNil(mailbox.publish(simpleUnit(2, idr: false)))
-        XCTAssertEqual(requests, 1)
+        XCTAssertEqual(mailbox.retainedOwnerCount, 2)
+        XCTAssertTrue(drops.isEmpty)
+        XCTAssertEqual(requests, 0)
         XCTAssertTrue(mailbox.waitingForIDR)
 
-        XCTAssertEqual(mailbox.complete(idr, succeeded: true).disposition, .deliver)
+        let completion = mailbox.complete(idr, succeeded: true)
         idr.unit.owner.release()
+        XCTAssertEqual(completion.disposition, .deliver)
+        XCTAssertEqual(completion.next?.unit.sequence, 2)
         XCTAssertFalse(mailbox.waitingForIDR)
+        let dependent = unwrap(completion.next)
+        XCTAssertEqual(
+            mailbox.complete(dependent, succeeded: true).disposition,
+            .deliver)
+        dependent.unit.owner.release()
         XCTAssertNotNil(mailbox.publish(simpleUnit(3, idr: false)))
         mailbox.invalidate()
     }
 
     func testFailedIDRRemainsWaitingAndRequestsOncePerEpisode() {
         var requests = 0
+        var drops: [(UInt32, UInt64, AccessUnitDropReason)] = []
         let mailbox = AccessUnitMailbox(
             maximumAge: 1, clock: { 0 },
-            onRecoveryNeeded: { requests += 1 })
+            onRecoveryNeeded: { requests += 1 },
+            onDrop: { drops.append(($0, $1, $2)) })
         mailbox.beginSession(generation: 1)
         let idr = unwrap(mailbox.publish(simpleUnit(10, idr: true)))
+        XCTAssertNil(mailbox.publish(simpleUnit(11, idr: false)))
+        XCTAssertEqual(mailbox.retainedOwnerCount, 2)
         XCTAssertEqual(mailbox.complete(idr, succeeded: false).disposition, .failed)
+        idr.unit.owner.release()
         XCTAssertTrue(mailbox.waitingForIDR)
         XCTAssertEqual(requests, 1)
-        XCTAssertNil(mailbox.publish(simpleUnit(11, idr: false)))
+        XCTAssertTrue(drops.contains {
+            $0.0 == 11 && $0.1 == 1 && $0.2 == .decodeFailed
+        })
+        XCTAssertNil(mailbox.publish(simpleUnit(12, idr: false)))
         XCTAssertEqual(requests, 1)
+        mailbox.invalidate()
+    }
+
+    func test120FpsPeriodicIDRKeepsFirstDependentAcrossCallbackOverlap() {
+        var drops: [(UInt32, UInt64, AccessUnitDropReason)] = []
+        var recoveryRequests = 0
+        var decoded = 0
+        let mailbox = AccessUnitMailbox(
+            maximumAge: 1,
+            clock: { 0 },
+            onRecoveryNeeded: { recoveryRequests += 1 },
+            onDrop: { drops.append(($0, $1, $2)) })
+        mailbox.beginSession(generation: 1)
+
+        for sequence in stride(from: UInt32(0), to: 120, by: 30) {
+            let idr = unwrap(mailbox.publish(simpleUnit(sequence, idr: true)))
+            XCTAssertNil(mailbox.publish(simpleUnit(sequence + 1, idr: false)))
+            XCTAssertEqual(mailbox.retainedOwnerCount, 2)
+
+            let idrCompletion = mailbox.complete(idr, succeeded: true)
+            idr.unit.owner.release()
+            decoded += 1
+            var dependent = unwrap(idrCompletion.next)
+            XCTAssertEqual(dependent.unit.sequence, sequence + 1)
+
+            for nextSequence in (sequence + 2)..<(sequence + 30) {
+                let completion = mailbox.complete(dependent, succeeded: true)
+                dependent.unit.owner.release()
+                decoded += 1
+                XCTAssertNil(completion.next)
+                dependent = unwrap(mailbox.publish(
+                    simpleUnit(nextSequence, idr: false)))
+            }
+            _ = mailbox.complete(dependent, succeeded: true)
+            dependent.unit.owner.release()
+            decoded += 1
+        }
+
+        XCTAssertEqual(decoded, 120)
+        XCTAssertTrue(drops.isEmpty)
+        XCTAssertEqual(recoveryRequests, 0)
         mailbox.invalidate()
     }
 

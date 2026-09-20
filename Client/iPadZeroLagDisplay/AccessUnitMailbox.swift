@@ -203,7 +203,8 @@ final class AccessUnitMailbox {
         lock.lock()
         if !accepting || unit.owner.count == 0 {
             releases.append((unit, accepting ? .invalid : .invalidated))
-        } else if waitingForIDRStorage && !unit.isIDR {
+        } else if waitingForIDRStorage && !unit.isIDR &&
+                    !canQueueDependentBehindIDRLocked() {
             releases.append((unit, .waitingForIDR))
             requestRecovery = requestRecoveryLocked()
         } else if inFlight == nil {
@@ -379,6 +380,10 @@ final class AccessUnitMailbox {
 
     private func enterRecoveryLocked() {
         waitingForIDRStorage = true
+    }
+
+    private func canQueueDependentBehindIDRLocked() -> Bool {
+        inFlight?.unit.isIDR == true && pending == nil
     }
 
     private func requestRecoveryLocked() -> Bool {
