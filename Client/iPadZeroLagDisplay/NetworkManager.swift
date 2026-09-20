@@ -79,6 +79,18 @@ enum WireMessageType: UInt8 {
     case settingsRejected = 32
     case forgetDevice = 33
     case forgetDeviceResult = 34
+    case presentationActivity = 35
+}
+
+enum HostPresentationActivity: UInt8 {
+    case scroll = 1
+
+    static func decode(_ payload: Data) -> HostPresentationActivity? {
+        guard payload.count == 1 else { return nil }
+        return HostPresentationActivity(rawValue: payload[0])
+    }
+
+    func encode() -> Data { Data([rawValue]) }
 }
 
 enum WireProtocol {
@@ -1325,6 +1337,8 @@ final class WireStreamParser {
             fixedLength = 17
         case .forgetDeviceResult:
             fixedLength = 2
+        case .presentationActivity:
+            fixedLength = 1
         case .clientCapabilities:
             fixedLength = ClientCapabilities.encodedSize
         case .transportOffer:
@@ -1550,6 +1564,7 @@ public class NetworkManager: ObservableObject {
     @Published public private(set) var effectiveAudioEnabled: Bool = true
     @Published public private(set) var settingsApplyStatus: String = ""
     @Published public private(set) var settingsGeneration: UInt64 = 0
+    var onPresentationActivity: ((HostPresentationActivity) -> Void)?
     private var nextSettingsRequestID: UInt32 = 1
     private var clientSettingsState = ClientSettingsStateModel(
         desired: .normalized(bitrateMbps: 20, audioEnabled: true))
@@ -3523,6 +3538,15 @@ public class NetworkManager: ObservableObject {
             }
             receiveDisplayConfigurationFailure(failure)
 
+        case .presentationActivity:
+            guard committedTransportGeneration == generation,
+                  let activity = HostPresentationActivity.decode(payload) else {
+                return
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.onPresentationActivity?(activity)
+            }
+
         case .video:
             guard committedTransportGeneration == generation else { return }
             if committedRealtimeMode == RealtimeTransportMode.wifiRTP {
@@ -3892,7 +3916,7 @@ public class NetworkManager: ObservableObject {
     private func publishClientCapabilities(modes: UInt8, udpPort: UInt16) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         let capabilities = ClientCapabilities(
-            version: 1,
+            version: 2,
             modes: modes,
             videoCodecs: VideoCodecCapabilities.hevc | VideoCodecCapabilities.h264,
             audioCodecs:

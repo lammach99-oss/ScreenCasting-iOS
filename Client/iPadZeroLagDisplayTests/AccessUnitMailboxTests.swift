@@ -372,6 +372,9 @@ final class RenderFreshnessTrackerTests: XCTestCase {
         counters.record(.commandCommitted)
         counters.record(.commandCompleted)
         counters.record(.renderFailure)
+        counters.record(.gameBuffered)
+        counters.record(.gameBufferOverwritten)
+        counters.record(.gameRePresented)
 
         XCTAssertEqual(
             counters.drain(),
@@ -384,7 +387,10 @@ final class RenderFreshnessTrackerTests: XCTestCase {
                 precommitSuperseded: 1,
                 commandCommitted: 1,
                 commandCompleted: 1,
-                renderFailures: 1))
+                renderFailures: 1,
+                gameBuffered: 1,
+                gameBufferOverwritten: 1,
+                gameRePresented: 1))
         XCTAssertEqual(counters.drain(), .zero)
     }
 
@@ -485,6 +491,94 @@ final class RenderFreshnessTrackerTests: XCTestCase {
         XCTAssertNil(tracker.presentedSequence)
         XCTAssertEqual(tracker.offer(2, generation: 20), .staleSession)
         XCTAssertEqual(tracker.acceptedSequence, 1)
+    }
+}
+
+final class GamePresentationHandoffTests: XCTestCase {
+    private let a = RenderFrameIdentity(generation: 7, sequence: 1)
+    private let b = RenderFrameIdentity(generation: 7, sequence: 2)
+    private let c = RenderFrameIdentity(generation: 7, sequence: 3)
+
+    func testSecondFrameBecomesLookAheadWithoutReplacingReady() {
+        var handoff = GamePresentationHandoff()
+
+        XCTAssertEqual(handoff.offer(a), .buffered)
+        XCTAssertEqual(handoff.offer(b), .buffered)
+        XCTAssertEqual(handoff.ready, a)
+        XCTAssertEqual(handoff.lookAhead, b)
+    }
+
+    func testTakeShiftsLookAheadIntoReady() {
+        var handoff = GamePresentationHandoff()
+        _ = handoff.offer(a)
+        _ = handoff.offer(b)
+
+        XCTAssertEqual(handoff.take(currentGeneration: 7), .fresh(a))
+        XCTAssertEqual(handoff.ready, b)
+        XCTAssertNil(handoff.lookAhead)
+    }
+
+    func testThirdFrameOverwritesOnlyLookAhead() {
+        var handoff = GamePresentationHandoff()
+        _ = handoff.offer(a)
+        _ = handoff.offer(b)
+
+        XCTAssertEqual(handoff.offer(c), .overwroteLookAhead)
+        XCTAssertEqual(handoff.ready, a)
+        XCTAssertEqual(handoff.lookAhead, c)
+    }
+
+    func testResetClearsReadyLookAheadAndRepeatFallback() {
+        var handoff = GamePresentationHandoff()
+        _ = handoff.offer(a)
+        _ = handoff.offer(b)
+        handoff.markPresented(a, currentGeneration: 7)
+
+        handoff.reset()
+
+        XCTAssertNil(handoff.ready)
+        XCTAssertNil(handoff.lookAhead)
+        XCTAssertNil(handoff.lastPresented)
+    }
+
+    func testRepeatFallbackIsUsedOnlyWhenReadyIsEmpty() {
+        var handoff = GamePresentationHandoff()
+        handoff.markPresented(a, currentGeneration: 7)
+        _ = handoff.offer(b)
+
+        XCTAssertEqual(handoff.take(currentGeneration: 7), .fresh(b))
+        XCTAssertEqual(handoff.take(currentGeneration: 7), .repeated(a))
+    }
+
+    func testTakenGameFrameRemainsCurrentAfterNewerFrameIsAccepted() {
+        var freshness = RenderFreshnessTracker()
+        freshness.beginSession(generation: 7)
+        _ = freshness.offer(a.sequence, generation: 7)
+        let taken = freshness.takePending()!
+        _ = freshness.offer(b.sequence, generation: 7)
+
+        XCTAssertEqual(freshness.commitDecision(for: taken), .superseded)
+        XCTAssertTrue(freshness.isCurrent(taken))
+    }
+
+    func testStaleGenerationNeverUsesRepeatFallback() {
+        var handoff = GamePresentationHandoff()
+        handoff.markPresented(a, currentGeneration: 7)
+
+        XCTAssertEqual(handoff.take(currentGeneration: 8), .none)
+    }
+
+    func testOneHundredOfferTakeCyclesNeverExceedTwoPendingFrames() {
+        var handoff = GamePresentationHandoff()
+
+        for sequence in UInt32(1)...100 {
+            _ = handoff.offer(
+                RenderFrameIdentity(generation: 7, sequence: sequence))
+            XCTAssertLessThanOrEqual(handoff.pendingCount, 2)
+            if sequence.isMultiple(of: 2) {
+                _ = handoff.take(currentGeneration: 7)
+            }
+        }
     }
 }
 

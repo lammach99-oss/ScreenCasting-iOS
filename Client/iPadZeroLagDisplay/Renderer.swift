@@ -68,6 +68,7 @@ struct PresentationCadencePolicy {
 enum PresentationActivityKind: String {
     case touch
     case scroll
+    case hostScroll = "host_scroll"
 }
 
 enum VideoQualityDiagnostics {
@@ -154,6 +155,9 @@ enum RenderCadenceStage {
     case commandCommitted
     case commandCompleted
     case renderFailure
+    case gameBuffered
+    case gameBufferOverwritten
+    case gameRePresented
 }
 
 struct RenderCadenceSnapshot: Equatable {
@@ -166,7 +170,10 @@ struct RenderCadenceSnapshot: Equatable {
         precommitSuperseded: 0,
         commandCommitted: 0,
         commandCompleted: 0,
-        renderFailures: 0)
+        renderFailures: 0,
+        gameBuffered: 0,
+        gameBufferOverwritten: 0,
+        gameRePresented: 0)
 
     let offered: UInt64
     let pendingReplaced: UInt64
@@ -177,6 +184,9 @@ struct RenderCadenceSnapshot: Equatable {
     let commandCommitted: UInt64
     let commandCompleted: UInt64
     let renderFailures: UInt64
+    let gameBuffered: UInt64
+    let gameBufferOverwritten: UInt64
+    let gameRePresented: UInt64
 }
 
 struct RenderCadenceCounters {
@@ -189,6 +199,9 @@ struct RenderCadenceCounters {
     private var commandCommitted: UInt64 = 0
     private var commandCompleted: UInt64 = 0
     private var renderFailures: UInt64 = 0
+    private var gameBuffered: UInt64 = 0
+    private var gameBufferOverwritten: UInt64 = 0
+    private var gameRePresented: UInt64 = 0
 
     mutating func record(_ stage: RenderCadenceStage) {
         switch stage {
@@ -210,6 +223,12 @@ struct RenderCadenceCounters {
             commandCompleted += 1
         case .renderFailure:
             renderFailures += 1
+        case .gameBuffered:
+            gameBuffered += 1
+        case .gameBufferOverwritten:
+            gameBufferOverwritten += 1
+        case .gameRePresented:
+            gameRePresented += 1
         }
     }
 
@@ -223,9 +242,77 @@ struct RenderCadenceCounters {
             precommitSuperseded: precommitSuperseded,
             commandCommitted: commandCommitted,
             commandCompleted: commandCompleted,
-            renderFailures: renderFailures)
+            renderFailures: renderFailures,
+            gameBuffered: gameBuffered,
+            gameBufferOverwritten: gameBufferOverwritten,
+            gameRePresented: gameRePresented)
         self = RenderCadenceCounters()
         return result
+    }
+}
+
+enum GamePresentationOfferResult: Equatable {
+    case buffered
+    case overwroteLookAhead
+}
+
+enum GamePresentationSelection: Equatable {
+    case fresh(RenderFrameIdentity)
+    case repeated(RenderFrameIdentity)
+    case none
+}
+
+struct GamePresentationHandoff {
+    private(set) var ready: RenderFrameIdentity?
+    private(set) var lookAhead: RenderFrameIdentity?
+    private(set) var lastPresented: RenderFrameIdentity?
+
+    var pendingCount: Int {
+        (ready == nil ? 0 : 1) + (lookAhead == nil ? 0 : 1)
+    }
+
+    mutating func offer(
+        _ identity: RenderFrameIdentity
+    ) -> GamePresentationOfferResult {
+        if ready == nil {
+            ready = identity
+            return .buffered
+        }
+        if lookAhead == nil {
+            lookAhead = identity
+            return .buffered
+        }
+        lookAhead = identity
+        return .overwroteLookAhead
+    }
+
+    mutating func take(currentGeneration: UInt64) -> GamePresentationSelection {
+        if let ready, ready.generation == currentGeneration {
+            self.ready = lookAhead
+            lookAhead = nil
+            return .fresh(ready)
+        }
+        ready = nil
+        lookAhead = nil
+        guard let lastPresented,
+              lastPresented.generation == currentGeneration else {
+            return .none
+        }
+        return .repeated(lastPresented)
+    }
+
+    mutating func markPresented(
+        _ identity: RenderFrameIdentity,
+        currentGeneration: UInt64
+    ) {
+        guard identity.generation == currentGeneration else { return }
+        lastPresented = identity
+    }
+
+    mutating func reset() {
+        ready = nil
+        lookAhead = nil
+        lastPresented = nil
     }
 }
 
@@ -441,6 +528,17 @@ struct RendererGeometryPublishGate {
 }
 
 public class Renderer: NSObject, MTKViewDelegate {
+    private struct GameFrame {
+        let pixelBuffer: CVPixelBuffer
+        let identity: RenderFrameIdentity
+    }
+
+    private enum DrawKind: Equatable {
+        case adaptive
+        case gameFresh
+        case gameRepeated
+    }
+
     public var onFrameRendered: ((UInt32, UInt64) -> Void)?
     public var onDrawableCommitted: ((UInt32, UInt64) -> Void)?
     public var onFrameDropped: ((UInt32, UInt64) -> Void)?
@@ -453,6 +551,10 @@ public class Renderer: NSObject, MTKViewDelegate {
     private var textureCache: CVMetalTextureCache?
     private var aspectRatioBuffer: MTLBuffer?
     private var currentPixelBuffer: CVPixelBuffer?
+    private var gameHandoff = GamePresentationHandoff()
+    private var gameReadyFrame: GameFrame?
+    private var gameLookAheadFrame: GameFrame?
+    private var gameLastPresentedFrame: GameFrame?
     private var freshness = RenderFreshnessTracker()
     private var cadenceCounters = RenderCadenceCounters()
     private var cadenceWindowStartedAt = CACurrentMediaTime()
@@ -546,6 +648,10 @@ public class Renderer: NSObject, MTKViewDelegate {
     public func beginSession(generation: UInt64) {
         lock.lock()
         currentPixelBuffer = nil
+        gameHandoff.reset()
+        gameReadyFrame = nil
+        gameLookAheadFrame = nil
+        gameLastPresentedFrame = nil
         freshness.beginSession(generation: generation)
         cadenceCounters = RenderCadenceCounters()
         cadenceWindowStartedAt = CACurrentMediaTime()
@@ -560,7 +666,8 @@ public class Renderer: NSObject, MTKViewDelegate {
             self.presentationCadencePolicy.reset()
             self.applyPresentationCadence(
                 now: CACurrentMediaTime(),
-                reason: "session_reset")
+                reason: "session_reset",
+                forceLog: true)
         }
         if Thread.isMainThread {
             resetCadence()
@@ -588,9 +695,35 @@ public class Renderer: NSObject, MTKViewDelegate {
         now: TimeInterval = CACurrentMediaTime()
     ) {
         dispatchPrecondition(condition: .onQueue(.main))
-        guard mode != presentationCadenceMode else { return }
-
+        lock.lock()
+        guard mode != presentationCadenceMode else {
+            lock.unlock()
+            return
+        }
         presentationCadenceMode = mode
+        gameHandoff.reset()
+        gameReadyFrame = nil
+        gameLookAheadFrame = nil
+        gameLastPresentedFrame = nil
+        var transferredGeneration: UInt64?
+        if mode == .game,
+           let pixelBuffer = currentPixelBuffer,
+           let identity = freshness.takePending() {
+            _ = gameHandoff.offer(identity)
+            gameReadyFrame = GameFrame(
+                pixelBuffer: pixelBuffer,
+                identity: identity)
+            transferredGeneration = identity.generation
+        } else {
+            _ = freshness.takePending()
+        }
+        currentPixelBuffer = nil
+        lock.unlock()
+        if let transferredGeneration {
+            recordCadence(
+                .gameBuffered,
+                generation: transferredGeneration)
+        }
         applyPresentationCadence(
             now: now,
             reason: mode == .game ? "game_mode_on" : "game_mode_off",
@@ -607,10 +740,13 @@ public class Renderer: NSObject, MTKViewDelegate {
         forceLog: Bool = false
     ) {
         dispatchPrecondition(condition: .onQueue(.main))
+        lock.lock()
+        let mode = presentationCadenceMode
+        lock.unlock()
         let targetFPS = presentationCadencePolicy.targetFPS(
             now: now,
             maximumPanelFPS: maximumPanelFPS,
-            mode: presentationCadenceMode)
+            mode: mode)
         let fpsChanged = targetFPS != configuredPresentationFPS
 
         if fpsChanged {
@@ -620,14 +756,16 @@ public class Renderer: NSObject, MTKViewDelegate {
         guard fpsChanged || forceLog else { return }
 
         let state = presentationCadencePolicy.state(now: now)
-        print(
+        let line =
             "[IPAD][PRESENTATION_RATE] " +
             "source_hz=\(ClientPresentationRatePolicy.sourceRefreshHz) " +
             "maximum_panel_fps=\(maximumPanelFPS) " +
             "configured_present_fps=\(targetFPS) " +
-            "mode=\(presentationCadenceMode.rawValue) " +
+            "mode=\(mode.rawValue) " +
             "state=\(state.rawValue) " +
-            "reason=\(reason)")
+            "reason=\(reason)"
+        print(line)
+        diagnosticSink?(line)
     }
 
     public func updateFrame(
@@ -638,12 +776,28 @@ public class Renderer: NSObject, MTKViewDelegate {
         recordCadence(.offered, generation: generation)
         var dropped: UInt32?
         var replacedPending = false
+        var gameOffer: GamePresentationOfferResult?
         lock.lock()
         let decision = freshness.offer(sequence, generation: generation)
         switch decision {
         case .accepted(let replaced):
-            currentPixelBuffer = pixelBuffer
-            replacedPending = replaced != nil
+            if presentationCadenceMode == .game,
+               let identity = freshness.takePending() {
+                let frame = GameFrame(
+                    pixelBuffer: pixelBuffer,
+                    identity: identity)
+                gameOffer = gameHandoff.offer(identity)
+                if gameReadyFrame == nil {
+                    gameReadyFrame = frame
+                } else if gameLookAheadFrame == nil {
+                    gameLookAheadFrame = frame
+                } else {
+                    gameLookAheadFrame = frame
+                }
+            } else {
+                currentPixelBuffer = pixelBuffer
+                replacedPending = replaced != nil
+            }
         case .rejected, .staleSession:
             break
         }
@@ -652,6 +806,13 @@ public class Renderer: NSObject, MTKViewDelegate {
         if replacedPending {
             recordCadence(
                 .pendingReplaced,
+                generation: generation)
+        }
+        if let gameOffer {
+            recordCadence(
+                gameOffer == .buffered
+                    ? .gameBuffered
+                    : .gameBufferOverwritten,
                 generation: generation)
         }
         if let dropped { onFrameDropped?(dropped, generation) }
@@ -677,20 +838,53 @@ public class Renderer: NSObject, MTKViewDelegate {
     public func draw(in view: MTKView) {
         recordCadence(.drawCallback)
         lock.lock()
-        guard let pixelBuffer = currentPixelBuffer,
-              let identity = freshness.takePending() else {
+        let drawSelection: (GameFrame, DrawKind)?
+        if presentationCadenceMode == .game,
+           let generation = freshness.sessionGeneration {
+            switch gameHandoff.take(currentGeneration: generation) {
+            case .fresh(let identity):
+                guard let frame = gameReadyFrame,
+                      frame.identity == identity else {
+                    drawSelection = nil
+                    break
+                }
+                gameReadyFrame = gameLookAheadFrame
+                gameLookAheadFrame = nil
+                drawSelection = (frame, .gameFresh)
+            case .repeated(let identity):
+                if let frame = gameLastPresentedFrame,
+                   frame.identity == identity {
+                    drawSelection = (frame, .gameRepeated)
+                } else {
+                    drawSelection = nil
+                }
+            case .none:
+                drawSelection = nil
+            }
+        } else if let pixelBuffer = currentPixelBuffer,
+                  let identity = freshness.takePending() {
+            currentPixelBuffer = nil
+            drawSelection = (
+                GameFrame(pixelBuffer: pixelBuffer, identity: identity),
+                .adaptive)
+        } else {
+            drawSelection = nil
+        }
+        guard let (selectedFrame, drawKind) = drawSelection else {
             lock.unlock()
             recordCadence(.drawNoPending)
             return
         }
-        currentPixelBuffer = nil
         lock.unlock()
+        let pixelBuffer = selectedFrame.pixelBuffer
+        let identity = selectedFrame.identity
+        let reportsFrameDrop = drawKind != .gameRepeated
 
         guard let textureCache,
               let pipelineState,
               let drawable = view.currentDrawable,
               let renderPassDescriptor = view.currentRenderPassDescriptor else {
-            abandon(identity)
+            abandon(identity, reportFrameDrop: reportsFrameDrop)
             return
         }
         recordCadence(.drawableAcquired, generation: identity.generation)
@@ -703,7 +897,7 @@ public class Renderer: NSObject, MTKViewDelegate {
         lock.unlock()
         guard CVPixelBufferGetPixelFormatType(pixelBuffer) == DecoderOutputBufferAttributes.pixelFormat else {
             print("[Renderer] Metal presentation rejected: pixelFormat=\(CVPixelBufferGetPixelFormatType(pixelBuffer)) expected=\(DecoderOutputBufferAttributes.pixelFormat)")
-            abandon(identity)
+            abandon(identity, reportFrameDrop: reportsFrameDrop)
             return
         }
         var yTextureRef: CVMetalTexture?
@@ -722,7 +916,7 @@ public class Renderer: NSObject, MTKViewDelegate {
               let yTexture = CVMetalTextureGetTexture(yTextureRef),
               let uvTexture = CVMetalTextureGetTexture(uvTextureRef) else {
             print("[Renderer] CVMetalTextureCacheCreateTextureFromImage failed: yStatus=\(yStatus) uvStatus=\(uvStatus) size=\(width)x\(height) pixelFormat=\(CVPixelBufferGetPixelFormatType(pixelBuffer))")
-            abandon(identity)
+            abandon(identity, reportFrameDrop: reportsFrameDrop)
             return
         }
         VideoQualityDiagnostics.log(
@@ -742,14 +936,14 @@ public class Renderer: NSObject, MTKViewDelegate {
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeRenderCommandEncoder(
                 descriptor: renderPassDescriptor) else {
-            abandon(identity)
+            abandon(identity, reportFrameDrop: reportsFrameDrop)
             return
         }
 
         guard let contentViewport = Self.contentViewport(
             forDrawableSize: view.drawableSize,
             videoSize: decodedFrameSize) else {
-            abandon(identity)
+            abandon(identity, reportFrameDrop: reportsFrameDrop)
             return
         }
         VideoQualityDiagnostics.log(
@@ -777,7 +971,9 @@ public class Renderer: NSObject, MTKViewDelegate {
         encoder.endEncoding()
 
         lock.lock()
-        let commitDecision = freshness.commitDecision(for: identity)
+        let commitDecision = drawKind == .adaptive
+            ? freshness.commitDecision(for: identity)
+            : (freshness.isCurrent(identity) ? .commit : .superseded)
         lock.unlock()
         guard commitDecision == .commit else {
             recordCadence(
@@ -797,20 +993,41 @@ public class Renderer: NSObject, MTKViewDelegate {
                 .commandCompleted,
                 generation: identity.generation)
             self.lock.lock()
-            let isCurrent = self.freshness.markPresented(identity)
+            let isCurrent: Bool
+            if drawKind == .gameRepeated {
+                isCurrent = self.freshness.isCurrent(identity)
+            } else {
+                isCurrent = self.freshness.markPresented(identity)
+                if isCurrent, drawKind == .gameFresh,
+                   let generation = self.freshness.sessionGeneration {
+                    self.gameHandoff.markPresented(
+                        identity,
+                        currentGeneration: generation)
+                    self.gameLastPresentedFrame = selectedFrame
+                }
+            }
             self.lock.unlock()
             guard isCurrent else { return }
+            if drawKind == .gameRepeated {
+                self.recordCadence(
+                    .gameRePresented,
+                    generation: identity.generation)
+            }
             DispatchQueue.main.async {
-                self.onFrameRendered?(
-                    identity.sequence,
-                    identity.generation)
+                if drawKind != .gameRepeated {
+                    self.onFrameRendered?(
+                        identity.sequence,
+                        identity.generation)
+                }
                 self.reevaluatePresentationCadence(
                     now: CACurrentMediaTime())
             }
         }
         commandBuffer.commit()
         recordCadence(.commandCommitted, generation: identity.generation)
-        onDrawableCommitted?(identity.sequence, identity.generation)
+        if drawKind != .gameRepeated {
+            onDrawableCommitted?(identity.sequence, identity.generation)
+        }
     }
 
     private func recordCadence(
@@ -842,7 +1059,9 @@ public class Renderer: NSObject, MTKViewDelegate {
                 "draw_callback_fps=%.1f " +
                 "draw_no_pending=%.1f drawable_acquired_fps=%.1f " +
                 "precommit_superseded_per_s=%.1f command_commit_fps=%.1f " +
-                "command_complete_fps=%.1f render_failure_per_s=%.1f",
+                "command_complete_fps=%.1f render_failure_per_s=%.1f " +
+                "game_buffered_per_s=%.1f game_buffer_overwrite_per_s=%.1f " +
+                "game_represent_per_s=%.1f",
             reportGeneration,
             elapsed,
             rate(snapshot.offered),
@@ -853,7 +1072,10 @@ public class Renderer: NSObject, MTKViewDelegate {
             rate(snapshot.precommitSuperseded),
             rate(snapshot.commandCommitted),
             rate(snapshot.commandCompleted),
-            rate(snapshot.renderFailures))
+            rate(snapshot.renderFailures),
+            rate(snapshot.gameBuffered),
+            rate(snapshot.gameBufferOverwritten),
+            rate(snapshot.gameRePresented))
         print(line)
         diagnosticSink?(line)
     }
@@ -915,7 +1137,10 @@ public class Renderer: NSObject, MTKViewDelegate {
         }
     }
 
-    private func abandon(_ identity: RenderFrameIdentity) {
+    private func abandon(
+        _ identity: RenderFrameIdentity,
+        reportFrameDrop: Bool = true
+    ) {
         lock.lock()
         let isCurrent = freshness.isCurrent(identity)
         lock.unlock()
@@ -923,7 +1148,9 @@ public class Renderer: NSObject, MTKViewDelegate {
             recordCadence(
                 .renderFailure,
                 generation: identity.generation)
-            onFrameDropped?(identity.sequence, identity.generation)
+            if reportFrameDrop {
+                onFrameDropped?(identity.sequence, identity.generation)
+            }
         }
     }
 }

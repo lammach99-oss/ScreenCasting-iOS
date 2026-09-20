@@ -111,7 +111,7 @@ struct ClientCapabilities: Equatable {
     }
 
     private var isValid: Bool {
-        guard version == 1,
+        guard (version == 1 || version == 2),
               modes != RealtimeTransportMode.none,
               modes & RealtimeTransportMode.legacyTLS != 0,
               modes & ~RealtimeTransportMode.knownMask == 0,

@@ -320,6 +320,10 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         coordinator.onGeometrySnapshotChanged = onGeometrySnapshotChanged
         coordinator.onPresentationGeometryChanged = onPresentationGeometryChanged
         coordinator.onTouchBoundsChanged = onTouchBoundsChanged
+        networkManager.onPresentationActivity = { [weak coordinator] activity in
+            guard activity == .scroll else { return }
+            coordinator?.renderer?.notePresentationActivity(.hostScroll)
+        }
 
         container.onGeometryChanged = { [weak coordinator] geometry in
             coordinator?.onPresentationGeometryChanged?(geometry)

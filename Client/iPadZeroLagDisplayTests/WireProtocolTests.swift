@@ -897,7 +897,7 @@ final class WireProtocolTests: XCTestCase {
 
     func testClientCapabilitiesMatchManagedFixture() {
         let capabilities = ClientCapabilities(
-            version: 1,
+            version: 2,
             modes: RealtimeTransportMode.legacyTLS |
                 RealtimeTransportMode.wifiRTP |
                 RealtimeTransportMode.usbSplitTLS,
@@ -912,8 +912,21 @@ final class WireProtocolTests: XCTestCase {
 
         XCTAssertEqual(
             encoded,
-            Data([1, 7, 1, 3, 0xB0, 0x04, 50, 0, 0, 0xC0, 0, 0]))
+            Data([2, 7, 1, 3, 0xB0, 0x04, 50, 0, 0, 0xC0, 0, 0]))
         XCTAssertEqual(ClientCapabilities.decode(encoded), capabilities)
+    }
+
+    func testClientCapabilitiesVersionOneRemainsDecodable() {
+        let legacy = Data([1, 1, 1, 1, 0xB0, 0x04, 50, 0, 0, 0, 0, 0])
+
+        XCTAssertEqual(ClientCapabilities.decode(legacy)?.version, 1)
+        XCTAssertEqual(legacy.count, ClientCapabilities.encodedSize)
+    }
+
+    func testClientCapabilitiesRejectUnknownFutureVersion() {
+        let future = Data([3, 1, 1, 1, 0xB0, 0x04, 50, 0, 0, 0, 0, 0])
+
+        XCTAssertNil(ClientCapabilities.decode(future))
     }
 
     func testClientCapabilitiesRejectEveryTruncatedLength() {
@@ -1073,7 +1086,49 @@ final class WireProtocolTests: XCTestCase {
         XCTAssertEqual(WireMessageType.transportCommit.rawValue, 12)
         XCTAssertEqual(WireMessageType.usbLaneBind.rawValue, 13)
         XCTAssertEqual(WireMessageType.usbLaneBindResult.rawValue, 14)
+        XCTAssertEqual(WireMessageType.presentationActivity.rawValue, 35)
+        XCTAssertEqual(HostPresentationActivity.scroll.rawValue, 1)
         XCTAssertEqual(WireProtocol.realtimeNegotiationSupportedFlag, 0x8000)
+    }
+
+    func testPresentationActivityPayloadIsOneByteAndRejectsUnknownValues() {
+        XCTAssertEqual(HostPresentationActivity.scroll.encode(), Data([1]))
+        XCTAssertEqual(
+            HostPresentationActivity.decode(Data([1])),
+            .scroll)
+        XCTAssertNil(HostPresentationActivity.decode(Data()))
+        XCTAssertNil(HostPresentationActivity.decode(Data([1, 0])))
+        XCTAssertNil(HostPresentationActivity.decode(Data([2])))
+    }
+
+    func testMalformedPresentationActivityLengthIsDrainedAndSessionContinues() {
+        let parser = WireStreamParser(generation: 4)
+        let malformed = makeMessage(
+            type: .presentationActivity,
+            flags: 0,
+            payload: Data([1, 0]),
+            sequence: 8)
+        let following = makeMessage(
+            type: .video,
+            flags: 1,
+            payload: Data([0, 0, 0, 1, 0x26]),
+            sequence: 9)
+        var discarded: [UInt32] = []
+        var received: [UInt32] = []
+
+        parser.consume(malformed + following, generation: 4) { event in
+            switch event {
+            case .discardedFixedControl(let header):
+                discarded.append(header.sequence)
+            case .message(let message):
+                received.append(message.header.sequence)
+            case .failure(let error):
+                XCTFail("unexpected parser failure: \(error)")
+            }
+        }
+
+        XCTAssertEqual(discarded, [8])
+        XCTAssertEqual(received, [9])
     }
 
     func testUSBIdentityResourceDecodesWhitespaceWrappedPKCS12() {
