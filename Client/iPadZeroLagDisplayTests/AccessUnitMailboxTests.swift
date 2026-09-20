@@ -364,6 +364,7 @@ final class RenderFreshnessTrackerTests: XCTestCase {
 
         counters.record(.offered)
         counters.record(.offered)
+        counters.record(.pendingReplaced)
         counters.record(.drawCallback)
         counters.record(.drawNoPending)
         counters.record(.drawableAcquired)
@@ -376,6 +377,7 @@ final class RenderFreshnessTrackerTests: XCTestCase {
             counters.drain(),
             RenderCadenceSnapshot(
                 offered: 2,
+                pendingReplaced: 1,
                 drawCallbacks: 1,
                 drawNoPending: 1,
                 drawableAcquired: 1,

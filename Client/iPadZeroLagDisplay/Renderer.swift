@@ -90,6 +90,7 @@ struct RenderFrameIdentity: Equatable {
 
 enum RenderCadenceStage {
     case offered
+    case pendingReplaced
     case drawCallback
     case drawNoPending
     case drawableAcquired
@@ -102,6 +103,7 @@ enum RenderCadenceStage {
 struct RenderCadenceSnapshot: Equatable {
     static let zero = RenderCadenceSnapshot(
         offered: 0,
+        pendingReplaced: 0,
         drawCallbacks: 0,
         drawNoPending: 0,
         drawableAcquired: 0,
@@ -111,6 +113,7 @@ struct RenderCadenceSnapshot: Equatable {
         renderFailures: 0)
 
     let offered: UInt64
+    let pendingReplaced: UInt64
     let drawCallbacks: UInt64
     let drawNoPending: UInt64
     let drawableAcquired: UInt64
@@ -122,6 +125,7 @@ struct RenderCadenceSnapshot: Equatable {
 
 struct RenderCadenceCounters {
     private var offered: UInt64 = 0
+    private var pendingReplaced: UInt64 = 0
     private var drawCallbacks: UInt64 = 0
     private var drawNoPending: UInt64 = 0
     private var drawableAcquired: UInt64 = 0
@@ -134,6 +138,8 @@ struct RenderCadenceCounters {
         switch stage {
         case .offered:
             offered += 1
+        case .pendingReplaced:
+            pendingReplaced += 1
         case .drawCallback:
             drawCallbacks += 1
         case .drawNoPending:
@@ -154,6 +160,7 @@ struct RenderCadenceCounters {
     mutating func drain() -> RenderCadenceSnapshot {
         let result = RenderCadenceSnapshot(
             offered: offered,
+            pendingReplaced: pendingReplaced,
             drawCallbacks: drawCallbacks,
             drawNoPending: drawNoPending,
             drawableAcquired: drawableAcquired,
@@ -487,16 +494,23 @@ public class Renderer: NSObject, MTKViewDelegate {
     ) {
         recordCadence(.offered, generation: generation)
         var dropped: UInt32?
+        var replacedPending = false
         lock.lock()
         let decision = freshness.offer(sequence, generation: generation)
         switch decision {
-        case .accepted:
+        case .accepted(let replaced):
             currentPixelBuffer = pixelBuffer
+            replacedPending = replaced != nil
         case .rejected, .staleSession:
             break
         }
         dropped = decision.telemetryDropSequence(for: sequence)
         lock.unlock()
+        if replacedPending {
+            recordCadence(
+                .pendingReplaced,
+                generation: generation)
+        }
         if let dropped { onFrameDropped?(dropped, generation) }
     }
 
@@ -679,13 +693,15 @@ public class Renderer: NSObject, MTKViewDelegate {
         let line = String(
             format:
                 "[IPAD][RENDER_CADENCE] generation=%llu interval_s=%.3f " +
-                "offered_fps=%.1f draw_callback_fps=%.1f " +
+                "offered_fps=%.1f pending_replaced_per_s=%.1f " +
+                "draw_callback_fps=%.1f " +
                 "draw_no_pending=%.1f drawable_acquired_fps=%.1f " +
                 "precommit_superseded_per_s=%.1f command_commit_fps=%.1f " +
                 "command_complete_fps=%.1f render_failure_per_s=%.1f",
             reportGeneration,
             elapsed,
             rate(snapshot.offered),
+            rate(snapshot.pendingReplaced),
             rate(snapshot.drawCallbacks),
             rate(snapshot.drawNoPending),
             rate(snapshot.drawableAcquired),
