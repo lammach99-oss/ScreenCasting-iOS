@@ -88,6 +88,84 @@ struct RenderFrameIdentity: Equatable {
     let sequence: UInt32
 }
 
+enum RenderCadenceStage {
+    case offered
+    case drawCallback
+    case drawNoPending
+    case drawableAcquired
+    case precommitSuperseded
+    case commandCommitted
+    case commandCompleted
+    case renderFailure
+}
+
+struct RenderCadenceSnapshot: Equatable {
+    static let zero = RenderCadenceSnapshot(
+        offered: 0,
+        drawCallbacks: 0,
+        drawNoPending: 0,
+        drawableAcquired: 0,
+        precommitSuperseded: 0,
+        commandCommitted: 0,
+        commandCompleted: 0,
+        renderFailures: 0)
+
+    let offered: UInt64
+    let drawCallbacks: UInt64
+    let drawNoPending: UInt64
+    let drawableAcquired: UInt64
+    let precommitSuperseded: UInt64
+    let commandCommitted: UInt64
+    let commandCompleted: UInt64
+    let renderFailures: UInt64
+}
+
+struct RenderCadenceCounters {
+    private var offered: UInt64 = 0
+    private var drawCallbacks: UInt64 = 0
+    private var drawNoPending: UInt64 = 0
+    private var drawableAcquired: UInt64 = 0
+    private var precommitSuperseded: UInt64 = 0
+    private var commandCommitted: UInt64 = 0
+    private var commandCompleted: UInt64 = 0
+    private var renderFailures: UInt64 = 0
+
+    mutating func record(_ stage: RenderCadenceStage) {
+        switch stage {
+        case .offered:
+            offered += 1
+        case .drawCallback:
+            drawCallbacks += 1
+        case .drawNoPending:
+            drawNoPending += 1
+        case .drawableAcquired:
+            drawableAcquired += 1
+        case .precommitSuperseded:
+            precommitSuperseded += 1
+        case .commandCommitted:
+            commandCommitted += 1
+        case .commandCompleted:
+            commandCompleted += 1
+        case .renderFailure:
+            renderFailures += 1
+        }
+    }
+
+    mutating func drain() -> RenderCadenceSnapshot {
+        let result = RenderCadenceSnapshot(
+            offered: offered,
+            drawCallbacks: drawCallbacks,
+            drawNoPending: drawNoPending,
+            drawableAcquired: drawableAcquired,
+            precommitSuperseded: precommitSuperseded,
+            commandCommitted: commandCommitted,
+            commandCompleted: commandCompleted,
+            renderFailures: renderFailures)
+        self = RenderCadenceCounters()
+        return result
+    }
+}
+
 /// Persistent, wrap-safe sequence watermarks scoped to one wire session.
 struct RenderFreshnessTracker {
     private(set) var sessionGeneration: UInt64?
@@ -287,6 +365,8 @@ public class Renderer: NSObject, MTKViewDelegate {
     private var aspectRatioBuffer: MTLBuffer?
     private var currentPixelBuffer: CVPixelBuffer?
     private var freshness = RenderFreshnessTracker()
+    private var cadenceCounters = RenderCadenceCounters()
+    private var cadenceWindowStartedAt = CACurrentMediaTime()
     private var publishedContentViewport: VideoContentViewport?
     private var publishedGeometrySnapshot: RendererGeometrySnapshot?
 
@@ -358,6 +438,8 @@ public class Renderer: NSObject, MTKViewDelegate {
         lock.lock()
         currentPixelBuffer = nil
         freshness.beginSession(generation: generation)
+        cadenceCounters = RenderCadenceCounters()
+        cadenceWindowStartedAt = CACurrentMediaTime()
         let shouldResetContentViewport = publishedContentViewport != nil
         publishedContentViewport = nil
         publishedGeometrySnapshot = nil
@@ -375,6 +457,7 @@ public class Renderer: NSObject, MTKViewDelegate {
         sequence: UInt32,
         generation: UInt64
     ) {
+        recordCadence(.offered, generation: generation)
         var dropped: UInt32?
         lock.lock()
         let decision = freshness.offer(sequence, generation: generation)
@@ -406,10 +489,12 @@ public class Renderer: NSObject, MTKViewDelegate {
     }
 
     public func draw(in view: MTKView) {
+        recordCadence(.drawCallback)
         lock.lock()
         guard let pixelBuffer = currentPixelBuffer,
               let identity = freshness.takePending() else {
             lock.unlock()
+            recordCadence(.drawNoPending)
             return
         }
         currentPixelBuffer = nil
@@ -422,6 +507,7 @@ public class Renderer: NSObject, MTKViewDelegate {
             abandon(identity)
             return
         }
+        recordCadence(.drawableAcquired, generation: identity.generation)
 
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
@@ -508,6 +594,9 @@ public class Renderer: NSObject, MTKViewDelegate {
         let commitDecision = freshness.commitDecision(for: identity)
         lock.unlock()
         guard commitDecision == .commit else {
+            recordCadence(
+                .precommitSuperseded,
+                generation: identity.generation)
             return
         }
 
@@ -518,6 +607,9 @@ public class Renderer: NSObject, MTKViewDelegate {
             _ = uvTextureRef
             _ = retainedPixelBuffer
             guard let self else { return }
+            self.recordCadence(
+                .commandCompleted,
+                generation: identity.generation)
             self.lock.lock()
             let isCurrent = self.freshness.markPresented(identity)
             self.lock.unlock()
@@ -529,7 +621,51 @@ public class Renderer: NSObject, MTKViewDelegate {
             }
         }
         commandBuffer.commit()
+        recordCadence(.commandCommitted, generation: identity.generation)
         onDrawableCommitted?(identity.sequence, identity.generation)
+    }
+
+    private func recordCadence(
+        _ stage: RenderCadenceStage,
+        generation: UInt64? = nil
+    ) {
+        let now = CACurrentMediaTime()
+        var report: (RenderCadenceSnapshot, TimeInterval, UInt64)?
+        lock.lock()
+        cadenceCounters.record(stage)
+        let elapsed = now - cadenceWindowStartedAt
+        if elapsed >= 1.0 {
+            report = (
+                cadenceCounters.drain(),
+                elapsed,
+                generation ?? freshness.sessionGeneration ?? 0)
+            cadenceWindowStartedAt = now
+        }
+        lock.unlock()
+
+        guard let (snapshot, elapsed, reportGeneration) = report else {
+            return
+        }
+        let rate: (UInt64) -> Double = { Double($0) / elapsed }
+        let line = String(
+            format:
+                "[IPAD][RENDER_CADENCE] generation=%llu interval_s=%.3f " +
+                "offered_fps=%.1f draw_callback_fps=%.1f " +
+                "draw_no_pending=%.1f drawable_acquired_fps=%.1f " +
+                "precommit_superseded_per_s=%.1f command_commit_fps=%.1f " +
+                "command_complete_fps=%.1f render_failure_per_s=%.1f",
+            reportGeneration,
+            elapsed,
+            rate(snapshot.offered),
+            rate(snapshot.drawCallbacks),
+            rate(snapshot.drawNoPending),
+            rate(snapshot.drawableAcquired),
+            rate(snapshot.precommitSuperseded),
+            rate(snapshot.commandCommitted),
+            rate(snapshot.commandCompleted),
+            rate(snapshot.renderFailures))
+        print(line)
+        diagnosticSink?(line)
     }
 
     private func publishContentViewport(_ contentViewport: VideoContentViewport) {
@@ -578,6 +714,9 @@ public class Renderer: NSObject, MTKViewDelegate {
         let isCurrent = freshness.isCurrent(identity)
         lock.unlock()
         if isCurrent {
+            recordCadence(
+                .renderFailure,
+                generation: identity.generation)
             onFrameDropped?(identity.sequence, identity.generation)
         }
     }

@@ -359,6 +359,33 @@ private final class ReleaseCounter {
 }
 
 final class RenderFreshnessTrackerTests: XCTestCase {
+    func testRenderCadenceCountersCaptureAndResetEveryStage() {
+        var counters = RenderCadenceCounters()
+
+        counters.record(.offered)
+        counters.record(.offered)
+        counters.record(.drawCallback)
+        counters.record(.drawNoPending)
+        counters.record(.drawableAcquired)
+        counters.record(.precommitSuperseded)
+        counters.record(.commandCommitted)
+        counters.record(.commandCompleted)
+        counters.record(.renderFailure)
+
+        XCTAssertEqual(
+            counters.drain(),
+            RenderCadenceSnapshot(
+                offered: 2,
+                drawCallbacks: 1,
+                drawNoPending: 1,
+                drawableAcquired: 1,
+                precommitSuperseded: 1,
+                commandCommitted: 1,
+                commandCompleted: 1,
+                renderFailures: 1))
+        XCTAssertEqual(counters.drain(), .zero)
+    }
+
     func testPendingReplacementIsNotTelemetryDrop() {
         var tracker = RenderFreshnessTracker()
         tracker.beginSession(generation: 1)
