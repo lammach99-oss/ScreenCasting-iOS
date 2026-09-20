@@ -144,9 +144,16 @@ final class AccessUnitMailboxTests: XCTestCase {
         XCTAssertTrue(mailbox.waitingForIDR)
         XCTAssertNil(mailbox.publish(simpleUnit(5, idr: false)))
         let candidate = unwrap(completion.next)
-        XCTAssertEqual(mailbox.complete(candidate, succeeded: true).disposition, .deliver)
+        let candidateCompletion = mailbox.complete(candidate, succeeded: true)
+        XCTAssertEqual(candidateCompletion.disposition, .deliver)
         candidate.unit.owner.release()
         XCTAssertFalse(mailbox.waitingForIDR)
+        let dependent = unwrap(candidateCompletion.next)
+        XCTAssertEqual(dependent.unit.sequence, 5)
+        XCTAssertEqual(
+            mailbox.complete(dependent, succeeded: true).disposition,
+            .deliver)
+        dependent.unit.owner.release()
         XCTAssertNotNil(mailbox.publish(simpleUnit(6, idr: false)))
         mailbox.invalidate()
     }
