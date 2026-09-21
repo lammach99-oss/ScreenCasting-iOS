@@ -166,10 +166,10 @@ public struct SettingsView: View {
                                     .tint(Color(hex: "#0EA5E9"))
 
                                 Text(
-                                    "Keeps local presentation at up to 120 Hz " +
-                                    "for maximum responsiveness. When off, " +
-                                    "presentation adapts between 60 and 120 Hz " +
-                                    "from touch and scroll activity.")
+                                    "Off uses Office mode with a fixed 60 FPS " +
+                                    "stream and local presentation. On requests " +
+                                    "the full 120 FPS stream and up-to-120-Hz " +
+                                    "local presentation.")
                                     .font(.system(size: 11))
                                     .foregroundColor(.white.opacity(0.55))
                             }

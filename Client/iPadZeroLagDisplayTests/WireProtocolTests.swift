@@ -1087,26 +1087,28 @@ final class WireProtocolTests: XCTestCase {
         XCTAssertEqual(WireMessageType.usbLaneBind.rawValue, 13)
         XCTAssertEqual(WireMessageType.usbLaneBindResult.rawValue, 14)
         XCTAssertEqual(WireMessageType.presentationActivity.rawValue, 35)
-        XCTAssertEqual(HostPresentationActivity.scroll.rawValue, 1)
+        XCTAssertEqual(WireMessageType.pipelineMode.rawValue, 36)
+        XCTAssertEqual(PipelineMode.office.rawValue, 0)
+        XCTAssertEqual(PipelineMode.game.rawValue, 1)
         XCTAssertEqual(WireProtocol.realtimeNegotiationSupportedFlag, 0x8000)
     }
 
-    func testPresentationActivityPayloadIsOneByteAndRejectsUnknownValues() {
-        XCTAssertEqual(HostPresentationActivity.scroll.encode(), Data([1]))
-        XCTAssertEqual(
-            HostPresentationActivity.decode(Data([1])),
-            .scroll)
-        XCTAssertNil(HostPresentationActivity.decode(Data()))
-        XCTAssertNil(HostPresentationActivity.decode(Data([1, 0])))
-        XCTAssertNil(HostPresentationActivity.decode(Data([2])))
+    func testPipelineModePayloadIsOneByteAndRejectsUnknownValues() {
+        XCTAssertEqual(PipelineMode.office.encode(), Data([0]))
+        XCTAssertEqual(PipelineMode.game.encode(), Data([1]))
+        XCTAssertEqual(PipelineMode.decode(Data([0])), .office)
+        XCTAssertEqual(PipelineMode.decode(Data([1])), .game)
+        XCTAssertNil(PipelineMode.decode(Data()))
+        XCTAssertNil(PipelineMode.decode(Data([0, 0])))
+        XCTAssertNil(PipelineMode.decode(Data([2])))
     }
 
-    func testMalformedPresentationActivityLengthIsDrainedAndSessionContinues() {
+    func testMalformedPipelineModeLengthIsDrainedAndSessionContinues() {
         let parser = WireStreamParser(generation: 4)
         let malformed = makeMessage(
-            type: .presentationActivity,
+            type: .pipelineMode,
             flags: 0,
-            payload: Data([1, 0]),
+            payload: Data([0, 0]),
             sequence: 8)
         let following = makeMessage(
             type: .video,

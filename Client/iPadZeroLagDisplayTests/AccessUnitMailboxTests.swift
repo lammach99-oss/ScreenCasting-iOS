@@ -646,153 +646,66 @@ final class RendererGeometryPublishGateTests: XCTestCase {
 }
 
 final class PresentationCadencePolicyTests: XCTestCase {
-    func test120HzPanelDefaultsToIdle60() {
+    func testOfficeOn120HzPanelIs60() {
         let policy = PresentationCadencePolicy()
 
-        XCTAssertEqual(policy.state(now: 10), .idle60)
-        XCTAssertEqual(policy.targetFPS(now: 10, maximumPanelFPS: 120), 60)
+        XCTAssertEqual(
+            policy.targetFPS(maximumPanelFPS: 120, mode: .office),
+            60)
     }
 
-    func test60HzPanelAlwaysCapsAt60() {
-        var policy = PresentationCadencePolicy()
+    func testOfficeRemains60AcrossRepeatedEvaluations() {
+        let policy = PresentationCadencePolicy()
 
-        XCTAssertEqual(policy.targetFPS(now: 0, maximumPanelFPS: 60), 60)
-        policy.noteInteraction(now: 1)
-        XCTAssertEqual(policy.targetFPS(now: 1, maximumPanelFPS: 60), 60)
-        XCTAssertEqual(policy.targetFPS(now: 2, maximumPanelFPS: 60), 60)
-        XCTAssertEqual(policy.targetFPS(now: 2.75, maximumPanelFPS: 60), 60)
-    }
-
-    func testInteractionImmediatelyPromotes120HzPanel() {
-        var policy = PresentationCadencePolicy()
-
-        XCTAssertEqual(policy.targetFPS(now: 10, maximumPanelFPS: 120), 60)
-        policy.noteInteraction(now: 10)
-        XCTAssertEqual(policy.state(now: 10), .active120)
-        XCTAssertEqual(policy.targetFPS(now: 10, maximumPanelFPS: 120), 120)
-    }
-
-    func testRepeatedInteractionRefreshesActiveHold() {
-        var policy = PresentationCadencePolicy()
-
-        policy.noteInteraction(now: 0)
-        XCTAssertEqual(policy.targetFPS(now: 1.5, maximumPanelFPS: 120), 120)
-        policy.noteInteraction(now: 1.5)
-        XCTAssertEqual(policy.targetFPS(now: 2.9, maximumPanelFPS: 120), 120)
-        XCTAssertEqual(policy.targetFPS(now: 3.25, maximumPanelFPS: 120), 60)
-    }
-
-    func testIdleTimeoutDemotesTo60() {
-        var policy = PresentationCadencePolicy()
-
-        policy.noteInteraction(now: 20)
-        XCTAssertEqual(policy.state(now: 21.749), .active120)
-        XCTAssertEqual(policy.state(now: 21.75), .idle60)
-        XCTAssertEqual(policy.targetFPS(now: 21.75, maximumPanelFPS: 120), 60)
-    }
-
-    func testNewInteractionAfterIdleReturnsTo120() {
-        var policy = PresentationCadencePolicy()
-
-        policy.noteInteraction(now: 0)
-        XCTAssertEqual(policy.targetFPS(now: 1.75, maximumPanelFPS: 120), 60)
-        policy.noteInteraction(now: 2)
-        XCTAssertEqual(policy.targetFPS(now: 2, maximumPanelFPS: 120), 120)
-    }
-
-    func testRepeatedAdaptiveTransitionsDoNotAccumulateState() {
-        var policy = PresentationCadencePolicy()
-
-        for cycle in 0..<100 {
-            let start = TimeInterval(cycle) * 4
-            XCTAssertEqual(policy.targetFPS(now: start, maximumPanelFPS: 120), 60)
-            policy.noteInteraction(now: start)
-            XCTAssertEqual(policy.targetFPS(now: start, maximumPanelFPS: 120), 120)
-            XCTAssertEqual(policy.targetFPS(now: start + 1.75, maximumPanelFPS: 120), 60)
+        for _ in 0..<100 {
+            XCTAssertEqual(
+                policy.targetFPS(maximumPanelFPS: 120, mode: .office),
+                60)
         }
     }
 
-    func testPanelCapabilityCapsActiveTarget() {
-        var policy = PresentationCadencePolicy()
-        policy.noteInteraction(now: 0)
-
-        XCTAssertEqual(policy.targetFPS(now: 0, maximumPanelFPS: 60), 60)
-        XCTAssertEqual(policy.targetFPS(now: 0, maximumPanelFPS: 120), 120)
-        XCTAssertEqual(policy.targetFPS(now: 0, maximumPanelFPS: 144), 120)
-    }
-
-    func testGameModeForces120WithoutInteractionOn120HzPanel() {
-        let policy = PresentationCadencePolicy()
-
-        XCTAssertEqual(policy.state(now: 100), .idle60)
-        XCTAssertEqual(
-            policy.targetFPS(
-                now: 100,
-                maximumPanelFPS: 120,
-                mode: .game),
-            120)
-    }
-
-    func testGameModeStillCapsAt60On60HzPanel() {
+    func testOfficeOn60HzPanelIs60() {
         let policy = PresentationCadencePolicy()
 
         XCTAssertEqual(
-            policy.targetFPS(
-                now: 100,
-                maximumPanelFPS: 60,
-                mode: .game),
+            policy.targetFPS(maximumPanelFPS: 60, mode: .office),
             60)
     }
 
-    func testGameModeCapsAt120OnHigherRefreshPanel() {
+    func testGameOn120HzPanelIs120() {
         let policy = PresentationCadencePolicy()
 
         XCTAssertEqual(
-            policy.targetFPS(
-                now: 100,
-                maximumPanelFPS: 144,
-                mode: .game),
+            policy.targetFPS(maximumPanelFPS: 120, mode: .game),
             120)
     }
 
-    func testReturningFromGameModeUsesRecentAdaptiveInteraction() {
-        var policy = PresentationCadencePolicy()
-        policy.noteInteraction(now: 10)
-
-        XCTAssertEqual(
-            policy.targetFPS(
-                now: 10.5,
-                maximumPanelFPS: 120,
-                mode: .game),
-            120)
-        XCTAssertEqual(
-            policy.targetFPS(
-                now: 10.5,
-                maximumPanelFPS: 120,
-                mode: .adaptive),
-            120)
-        XCTAssertEqual(
-            policy.targetFPS(
-                now: 11.75,
-                maximumPanelFPS: 120,
-                mode: .adaptive),
-            60)
-    }
-
-    func testReturningFromGameModeWithoutInteractionReturnsTo60() {
+    func testGameOn60HzPanelIs60() {
         let policy = PresentationCadencePolicy()
 
         XCTAssertEqual(
-            policy.targetFPS(
-                now: 100,
-                maximumPanelFPS: 120,
-                mode: .game),
-            120)
-        XCTAssertEqual(
-            policy.targetFPS(
-                now: 100,
-                maximumPanelFPS: 120,
-                mode: .adaptive),
+            policy.targetFPS(maximumPanelFPS: 60, mode: .game),
             60)
+    }
+
+    func testGameOnHigherRefreshPanelCapsAt120() {
+        let policy = PresentationCadencePolicy()
+
+        XCTAssertEqual(
+            policy.targetFPS(maximumPanelFPS: 144, mode: .game),
+            120)
+    }
+
+    func testRepeatedOfficeGameEvaluationsDoNotAccumulateState() {
+        let policy = PresentationCadencePolicy()
+
+        for _ in 0..<100 {
+            XCTAssertEqual(
+                policy.targetFPS(maximumPanelFPS: 120, mode: .office),
+                60)
+            XCTAssertEqual(
+                policy.targetFPS(maximumPanelFPS: 120, mode: .game),
+                120)
+        }
     }
 }

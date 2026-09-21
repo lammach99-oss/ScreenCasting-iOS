@@ -315,7 +315,13 @@ public struct ContentView: View {
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
             discoveryManager.startBrowsing()
+            networkManager.setDesiredPipelineMode(
+                gameModeEnabled ? .game : .office)
             networkManager.applicationDidBecomeActive()
+        }
+        .onChange(of: gameModeEnabled) { _, enabled in
+            networkManager.setDesiredPipelineMode(
+                enabled ? .game : .office)
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false

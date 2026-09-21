@@ -2,23 +2,6 @@ import SwiftUI
 import MetalKit
 import UIKit
 
-final class PresentationScrollActivityObserver: NSObject {
-    private let onScroll: () -> Void
-
-    init(onScroll: @escaping () -> Void) {
-        self.onScroll = onScroll
-    }
-
-    @objc func handleScrollActivity(_ recognizer: UIPanGestureRecognizer) {
-        switch recognizer.state {
-        case .began, .changed:
-            onScroll()
-        default:
-            break
-        }
-    }
-}
-
 /// Resolves the size that both UIKit presentation surfaces receive from their
 /// shared SwiftUI container. An incomplete proposal must stay incomplete: the
 /// old 10-point fallback from `replacingUnspecifiedDimensions()` could shrink a
@@ -312,7 +295,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         createRenderer: Bool
     ) {
         let presentationMode: PresentationCadenceMode =
-            gameModeEnabled ? .game : .adaptive
+            gameModeEnabled ? .game : .office
         coordinator.renderer?.setPresentationMode(presentationMode)
 
         coordinator.onFrameRendered = onFrameRendered
@@ -320,11 +303,6 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         coordinator.onGeometrySnapshotChanged = onGeometrySnapshotChanged
         coordinator.onPresentationGeometryChanged = onPresentationGeometryChanged
         coordinator.onTouchBoundsChanged = onTouchBoundsChanged
-        networkManager.onPresentationActivity = { [weak coordinator] activity in
-            guard activity == .scroll else { return }
-            coordinator?.renderer?.notePresentationActivity(.hostScroll)
-        }
-
         container.onGeometryChanged = { [weak coordinator] geometry in
             coordinator?.onPresentationGeometryChanged?(geometry)
         }
@@ -333,10 +311,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         let touchView = container.touchView
         touchView.onPencilInput = onPencilInput
         let sendTouchEvent = onSendTouchEvent
-        touchView.onSendTouchEvent = { [weak coordinator] type, x, y, pressure in
-            if type == .down || type == .move {
-                coordinator?.renderer?.notePresentationActivity(.touch)
-            }
+        touchView.onSendTouchEvent = { type, x, y, pressure in
             sendTouchEvent?(type, x, y, pressure)
         }
         touchView.inputGeometryContext = coordinator.inputGeometryContext
@@ -364,23 +339,6 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
 
         coordinator.renderer = renderer
         coordinator.touchView = touchView
-        let scrollActivityObserver = PresentationScrollActivityObserver {
-            [weak renderer] in
-            renderer?.notePresentationActivity(.scroll)
-        }
-        let scrollActivityRecognizer = UIPanGestureRecognizer(
-            target: scrollActivityObserver,
-            action: #selector(
-                PresentationScrollActivityObserver.handleScrollActivity(_:)))
-        scrollActivityRecognizer.allowedScrollTypesMask = [
-            .continuous,
-            .discrete,
-        ]
-        scrollActivityRecognizer.cancelsTouchesInView = false
-        scrollActivityRecognizer.delaysTouchesBegan = false
-        scrollActivityRecognizer.delaysTouchesEnded = false
-        touchView.addGestureRecognizer(scrollActivityRecognizer)
-        coordinator.scrollActivityObserver = scrollActivityObserver
         renderer.diagnosticSink = { [weak networkManager] line in
             networkManager?.recordDiagnosticLine(line)
         }
@@ -439,7 +397,6 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         var onGeometrySnapshotChanged: ((RendererGeometrySnapshot) -> Void)?
         var onPresentationGeometryChanged: ((PresentationSurfaceGeometry) -> Void)?
         var onTouchBoundsChanged: ((CGRect) -> Void)?
-        var scrollActivityObserver: PresentationScrollActivityObserver?
     }
 }
 

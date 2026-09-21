@@ -14,61 +14,22 @@ enum ClientPresentationRatePolicy {
     }
 }
 
-enum PresentationCadenceState: String, Equatable {
-    case idle60
-    case active120
-}
-
 public enum PresentationCadenceMode: String, Equatable {
-    case adaptive
+    case office
     case game
 }
 
 struct PresentationCadencePolicy {
-    static let idleFPS = 60
-    static let activeFPS = 120
-    static let activeHoldSeconds: TimeInterval = 1.75
-
-    private(set) var lastInteractionAt: TimeInterval?
-
-    mutating func noteInteraction(now: TimeInterval) {
-        lastInteractionAt = now
-    }
-
-    mutating func reset() {
-        lastInteractionAt = nil
-    }
-
-    func state(now: TimeInterval) -> PresentationCadenceState {
-        guard let lastInteractionAt,
-              now - lastInteractionAt < Self.activeHoldSeconds else {
-            return .idle60
-        }
-        return .active120
-    }
+    static let officeFPS = 60
+    static let gameFPS = 120
 
     func targetFPS(
-        now: TimeInterval,
         maximumPanelFPS: Int,
-        mode: PresentationCadenceMode = .adaptive
+        mode: PresentationCadenceMode = .office
     ) -> Int {
-        let desiredFPS: Int
-        switch mode {
-        case .adaptive:
-            desiredFPS = state(now: now) == .active120
-                ? Self.activeFPS
-                : Self.idleFPS
-        case .game:
-            desiredFPS = Self.activeFPS
-        }
+        let desiredFPS = mode == .game ? Self.gameFPS : Self.officeFPS
         return min(desiredFPS, max(1, maximumPanelFPS))
     }
-}
-
-enum PresentationActivityKind: String {
-    case touch
-    case scroll
-    case hostScroll = "host_scroll"
 }
 
 enum VideoQualityDiagnostics {
@@ -534,7 +495,7 @@ public class Renderer: NSObject, MTKViewDelegate {
     }
 
     private enum DrawKind: Equatable {
-        case adaptive
+        case office
         case gameFresh
         case gameRepeated
     }
@@ -581,7 +542,7 @@ public class Renderer: NSObject, MTKViewDelegate {
 
     public init?(
         metalView: MTKView,
-        presentationMode: PresentationCadenceMode = .adaptive
+        presentationMode: PresentationCadenceMode = .office
     ) {
         guard let defaultDevice = MTLCreateSystemDefaultDevice(),
               let queue = defaultDevice.makeCommandQueue() else {
@@ -591,7 +552,6 @@ public class Renderer: NSObject, MTKViewDelegate {
         let initialPresentationCadencePolicy = PresentationCadencePolicy()
         let configuredPresentationFPS =
             initialPresentationCadencePolicy.targetFPS(
-                now: CACurrentMediaTime(),
                 maximumPanelFPS: maximumPanelFPS,
                 mode: presentationMode)
         device = defaultDevice
@@ -607,11 +567,9 @@ public class Renderer: NSObject, MTKViewDelegate {
         metalView.preferredFramesPerSecond = configuredPresentationFPS
         print(
             "[IPAD][PRESENTATION_RATE] " +
-            "source_hz=\(ClientPresentationRatePolicy.sourceRefreshHz) " +
             "maximum_panel_fps=\(maximumPanelFPS) " +
             "configured_present_fps=\(configuredPresentationFPS) " +
             "mode=\(presentationMode.rawValue) " +
-            "state=\(presentationCadencePolicy.state(now: CACurrentMediaTime()).rawValue) " +
             "reason=init")
         metalView.framebufferOnly = true
         metalView.clearColor = MTLClearColor(red: 0.05, green: 0.09, blue: 0.16, alpha: 1)
@@ -663,9 +621,7 @@ public class Renderer: NSObject, MTKViewDelegate {
         lock.unlock()
         let resetCadence = { [weak self] in
             guard let self else { return }
-            self.presentationCadencePolicy.reset()
             self.applyPresentationCadence(
-                now: CACurrentMediaTime(),
                 reason: "session_reset",
                 forceLog: true)
         }
@@ -681,18 +637,8 @@ public class Renderer: NSObject, MTKViewDelegate {
         }
     }
 
-    func notePresentationActivity(
-        _ activity: PresentationActivityKind,
-        now: TimeInterval = CACurrentMediaTime()
-    ) {
-        dispatchPrecondition(condition: .onQueue(.main))
-        presentationCadencePolicy.noteInteraction(now: now)
-        applyPresentationCadence(now: now, reason: activity.rawValue)
-    }
-
     func setPresentationMode(
-        _ mode: PresentationCadenceMode,
-        now: TimeInterval = CACurrentMediaTime()
+        _ mode: PresentationCadenceMode
     ) {
         dispatchPrecondition(condition: .onQueue(.main))
         lock.lock()
@@ -725,17 +671,11 @@ public class Renderer: NSObject, MTKViewDelegate {
                 generation: transferredGeneration)
         }
         applyPresentationCadence(
-            now: now,
             reason: mode == .game ? "game_mode_on" : "game_mode_off",
             forceLog: true)
     }
 
-    private func reevaluatePresentationCadence(now: TimeInterval) {
-        applyPresentationCadence(now: now, reason: "idle_timeout")
-    }
-
     private func applyPresentationCadence(
-        now: TimeInterval,
         reason: String,
         forceLog: Bool = false
     ) {
@@ -744,7 +684,6 @@ public class Renderer: NSObject, MTKViewDelegate {
         let mode = presentationCadenceMode
         lock.unlock()
         let targetFPS = presentationCadencePolicy.targetFPS(
-            now: now,
             maximumPanelFPS: maximumPanelFPS,
             mode: mode)
         let fpsChanged = targetFPS != configuredPresentationFPS
@@ -755,14 +694,11 @@ public class Renderer: NSObject, MTKViewDelegate {
         }
         guard fpsChanged || forceLog else { return }
 
-        let state = presentationCadencePolicy.state(now: now)
         let line =
             "[IPAD][PRESENTATION_RATE] " +
-            "source_hz=\(ClientPresentationRatePolicy.sourceRefreshHz) " +
             "maximum_panel_fps=\(maximumPanelFPS) " +
             "configured_present_fps=\(targetFPS) " +
             "mode=\(mode.rawValue) " +
-            "state=\(state.rawValue) " +
             "reason=\(reason)"
         print(line)
         diagnosticSink?(line)
@@ -866,7 +802,7 @@ public class Renderer: NSObject, MTKViewDelegate {
             currentPixelBuffer = nil
             drawSelection = (
                 GameFrame(pixelBuffer: pixelBuffer, identity: identity),
-                .adaptive)
+                .office)
         } else {
             drawSelection = nil
         }
@@ -971,7 +907,7 @@ public class Renderer: NSObject, MTKViewDelegate {
         encoder.endEncoding()
 
         lock.lock()
-        let commitDecision = drawKind == .adaptive
+        let commitDecision = drawKind == .office
             ? freshness.commitDecision(for: identity)
             : (freshness.isCurrent(identity) ? .commit : .superseded)
         lock.unlock()
@@ -1019,8 +955,6 @@ public class Renderer: NSObject, MTKViewDelegate {
                         identity.sequence,
                         identity.generation)
                 }
-                self.reevaluatePresentationCadence(
-                    now: CACurrentMediaTime())
             }
         }
         commandBuffer.commit()

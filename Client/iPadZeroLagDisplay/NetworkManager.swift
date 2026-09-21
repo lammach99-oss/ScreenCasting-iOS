@@ -80,14 +80,16 @@ enum WireMessageType: UInt8 {
     case forgetDevice = 33
     case forgetDeviceResult = 34
     case presentationActivity = 35
+    case pipelineMode = 36
 }
 
-enum HostPresentationActivity: UInt8 {
-    case scroll = 1
+public enum PipelineMode: UInt8 {
+    case office = 0
+    case game = 1
 
-    static func decode(_ payload: Data) -> HostPresentationActivity? {
+    static func decode(_ payload: Data) -> PipelineMode? {
         guard payload.count == 1 else { return nil }
-        return HostPresentationActivity(rawValue: payload[0])
+        return PipelineMode(rawValue: payload[0])
     }
 
     func encode() -> Data { Data([rawValue]) }
@@ -1337,7 +1339,7 @@ final class WireStreamParser {
             fixedLength = 17
         case .forgetDeviceResult:
             fixedLength = 2
-        case .presentationActivity:
+        case .presentationActivity, .pipelineMode:
             fixedLength = 1
         case .clientCapabilities:
             fixedLength = ClientCapabilities.encodedSize
@@ -1564,7 +1566,6 @@ public class NetworkManager: ObservableObject {
     @Published public private(set) var effectiveAudioEnabled: Bool = true
     @Published public private(set) var settingsApplyStatus: String = ""
     @Published public private(set) var settingsGeneration: UInt64 = 0
-    var onPresentationActivity: ((HostPresentationActivity) -> Void)?
     private var nextSettingsRequestID: UInt32 = 1
     private var clientSettingsState = ClientSettingsStateModel(
         desired: .normalized(bitrateMbps: 20, audioEnabled: true))
@@ -1749,6 +1750,7 @@ public class NetworkManager: ObservableObject {
     private var nextClientPingNonce: UInt64 = 1
     private var pendingClientPings: [UInt64: TimeInterval] = [:]
     private var activeDisplayCapabilities: DisplayCapabilities?
+    private var desiredPipelineMode: PipelineMode = .office
     private var activeDisplayPreference = DisplayPreference.defaultValue
     private var displayRequestGate = DisplayRequestGate()
     private var pendingDisplayPreference: DisplayPreference?
@@ -1824,6 +1826,16 @@ public class NetworkManager: ObservableObject {
     }
 
     // MARK: - Public API
+
+    public func setDesiredPipelineMode(_ mode: PipelineMode) {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.desiredPipelineMode = mode
+            guard self.wireAuthenticatedGeneration ==
+                    self.connectionGeneration else { return }
+            self.sendDesiredPipelineMode(reason: "user_preference")
+        }
+    }
 
     /// Connect to the Windows host over TLS using an NWEndpoint directly (e.g. from Bonjour discovery).
     /// - Parameter endpoint: The resolved NWEndpoint (service endpoint or hostPort)
@@ -3539,13 +3551,10 @@ public class NetworkManager: ObservableObject {
             receiveDisplayConfigurationFailure(failure)
 
         case .presentationActivity:
-            guard committedTransportGeneration == generation,
-                  let activity = HostPresentationActivity.decode(payload) else {
-                return
-            }
-            DispatchQueue.main.async { [weak self] in
-                self?.onPresentationActivity?(activity)
-            }
+            return
+
+        case .pipelineMode:
+            return
 
         case .video:
             guard committedTransportGeneration == generation else { return }
@@ -3943,9 +3952,21 @@ public class NetworkManager: ObservableObject {
             self?.displayConfigurationFailureMessage = nil
         }
         guard let orientation = observedInterfaceOrientation else { return }
+        sendDesiredPipelineMode(reason: "initial_display_configuration")
         requestDisplayConfiguration(
             preference: reconciledPreference,
             interfaceOrientation: orientation)
+    }
+
+    private func sendDesiredPipelineMode(reason: String) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard wireAuthenticatedGeneration == connectionGeneration else { return }
+        sendWireMessage(
+            type: .pipelineMode,
+            payload: desiredPipelineMode.encode(),
+            sequence: 0)
+        recordDiagnosticLine(
+            "[IPAD][PIPELINE_MODE] mode=\(desiredPipelineMode) reason=\(reason)")
     }
 
     private func requestDisplayConfiguration(
