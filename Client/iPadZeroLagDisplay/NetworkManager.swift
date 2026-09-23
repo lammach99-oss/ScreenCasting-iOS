@@ -1908,6 +1908,7 @@ public class NetworkManager: ObservableObject {
     public func applicationDidBecomeActive() {
         networkQueue.async { [weak self] in
             guard let self else { return }
+            let wasForegroundActive = self.isForegroundActive
             self.isForegroundActive = true
             self.wifiBackgroundDisconnectWorkItem?.cancel()
             self.wifiBackgroundDisconnectWorkItem = nil
@@ -1931,6 +1932,32 @@ public class NetworkManager: ObservableObject {
                     "[USB_MEDIA_RECOVERY] generation=\(generation) " +
                     "action=decoder_rearmed recovery_requested=true")
                 return
+            }
+
+            if !wasForegroundActive,
+               self.isCurrentCommittedWifiRtpStreamingSessionOnQueue() {
+                let generation = self.connectionGeneration
+                let begin = "[WIFI_MEDIA_RECOVERY] generation=\(generation) " +
+                    "action=decoder_invalidate_begin"
+                print(begin)
+                self.recordDiagnosticLine(begin)
+                self.decoder.invalidate(waitForCompletion: true)
+                if self.isCurrentCommittedWifiRtpStreamingSessionOnQueue(
+                    generation: generation) {
+                    self.decoder.beginSession(generation: generation)
+                    self.wifiMediaReceiver.requestImmediateRecoveryFeedback(
+                        generation: generation)
+                    self.sendClientPingIfDue()
+                    let complete = "[WIFI_MEDIA_RECOVERY] generation=\(generation) " +
+                        "action=decoder_rearmed recovery_requested=true"
+                    print(complete)
+                    self.recordDiagnosticLine(complete)
+                    return
+                }
+                let stale = "[WIFI_MEDIA_RECOVERY] scheduled_generation=\(generation) " +
+                    "current_generation=\(self.connectionGeneration) action=skip_stale"
+                print(stale)
+                self.recordDiagnosticLine(stale)
             }
 
             if !self.usbListenerExplicitlyStarted,
@@ -3878,6 +3905,25 @@ public class NetworkManager: ObservableObject {
         return true
     }
 
+    private func isCurrentCommittedWifiRtpStreamingSessionOnQueue(
+        generation: UInt64? = nil
+    ) -> Bool {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard activeTransportKind == .wifi,
+              !usbListenerExplicitlyStarted,
+              connection != nil,
+              transportState == .streaming,
+              wireAuthenticatedGeneration == connectionGeneration,
+              committedTransportGeneration == connectionGeneration,
+              committedRealtimeMode == RealtimeTransportMode.wifiRTP else {
+            return false
+        }
+        if let generation {
+            return generation == connectionGeneration
+        }
+        return true
+    }
+
     private func consumeUsbForegroundDecoderRearmIfEligibleOnQueue()
         -> UInt64? {
         dispatchPrecondition(condition: .onQueue(networkQueue))
@@ -4429,6 +4475,24 @@ public class NetworkManager: ObservableObject {
     var networkQueueForTesting: DispatchQueue { networkQueue }
     var networkQueueKeyForTesting: DispatchSpecificKey<Bool> { networkQueueKey }
     var decoderForTesting: DecoderManager { decoder }
+
+    func simulateCommittedWifiSessionForTesting(
+        mode: UInt8 = RealtimeTransportMode.wifiRTP
+    ) -> (connection: NWConnection, generation: UInt64) {
+        networkQueue.sync {
+            let peer = NWConnection(host: "127.0.0.1", port: 27015, using: .tcp)
+            let generation = connectionGenerationClock.advance()
+            connection?.cancel()
+            connection = peer
+            wireAuthenticatedGeneration = generation
+            committedTransportGeneration = generation
+            committedRealtimeMode = mode
+            lastClientPingSentAt = .greatestFiniteMagnitude
+            decoder.beginSession(generation: generation)
+            setState(.streaming)
+            return (peer, generation)
+        }
+    }
 
     func stopForTesting() {
         networkQueue.sync { self.stopOnQueue() }

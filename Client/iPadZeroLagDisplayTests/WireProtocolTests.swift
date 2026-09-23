@@ -570,6 +570,116 @@ final class USBListenerLifetimeTests: XCTestCase {
     }
 }
 
+final class WifiForegroundDecoderRecoveryTests: XCTestCase {
+    private var manager: NetworkManager!
+
+    override func setUp() {
+        super.setUp()
+        manager = NetworkManager()
+    }
+
+    override func tearDown() {
+        manager.stopForTesting()
+        manager = nil
+        super.tearDown()
+    }
+
+    func testControlCenterRearmsPreservedWifiRtpDecoderOnce() {
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+        let begins = manager.decoderForTesting.sessionBeganCountForTesting
+        manager.decoderForTesting.resetLifecycleEventsForTesting()
+
+        manager.applicationWillResignActive()
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+
+        if case .cancelled = session.connection.state {
+            XCTFail("Wi-Fi control connection was cancelled on foreground")
+        }
+        XCTAssertEqual(manager.decoderForTesting.currentSessionGeneration,
+                       session.generation)
+        XCTAssertEqual(manager.decoderForTesting.invalidateCountForTesting,
+                       invalidations + 1)
+        XCTAssertEqual(manager.decoderForTesting.sessionBeganCountForTesting,
+                       begins + 1)
+        XCTAssertEqual(manager.decoderForTesting.lifecycleEventsForTesting,
+                       ["invalidate-begin", "invalidate-end", "begin-\(session.generation)"])
+    }
+
+    func testDuplicateActiveDoesNotRearmWifiDecoderAgain() {
+        _ = manager.simulateCommittedWifiSessionForTesting()
+        manager.applicationWillResignActive()
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+        let begins = manager.decoderForTesting.sessionBeganCountForTesting
+
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+
+        XCTAssertEqual(manager.decoderForTesting.invalidateCountForTesting,
+                       invalidations)
+        XCTAssertEqual(manager.decoderForTesting.sessionBeganCountForTesting,
+                       begins)
+    }
+
+    func testShortBackgroundRearmsSamePreservedWifiGeneration() {
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+        let begins = manager.decoderForTesting.sessionBeganCountForTesting
+
+        manager.applicationDidEnterBackground()
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+
+        if case .cancelled = session.connection.state {
+            XCTFail("Wi-Fi control connection was cancelled inside background grace")
+        }
+        XCTAssertEqual(manager.decoderForTesting.currentSessionGeneration,
+                       session.generation)
+        XCTAssertEqual(manager.decoderForTesting.invalidateCountForTesting,
+                       invalidations + 1)
+        XCTAssertEqual(manager.decoderForTesting.sessionBeganCountForTesting,
+                       begins + 1)
+    }
+
+    func testReplacementWifiGenerationCannotRearmStaleSession() {
+        let retired = manager.simulateCommittedWifiSessionForTesting()
+        manager.applicationWillResignActive()
+        let current = manager.simulateCommittedWifiSessionForTesting()
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+        let begins = manager.decoderForTesting.sessionBeganCountForTesting
+        manager.decoderForTesting.resetLifecycleEventsForTesting()
+
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+
+        XCTAssertGreaterThan(current.generation, retired.generation)
+        XCTAssertEqual(manager.decoderForTesting.currentSessionGeneration,
+                       current.generation)
+        XCTAssertEqual(manager.decoderForTesting.invalidateCountForTesting,
+                       invalidations + 1)
+        XCTAssertEqual(manager.decoderForTesting.sessionBeganCountForTesting,
+                       begins + 1)
+        XCTAssertEqual(manager.decoderForTesting.lifecycleEventsForTesting,
+                       ["invalidate-begin", "invalidate-end", "begin-\(current.generation)"])
+    }
+
+    func testLegacyWifiSessionDoesNotForceRtpDecoderRearm() {
+        _ = manager.simulateCommittedWifiSessionForTesting(
+            mode: RealtimeTransportMode.legacyTLS)
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+
+        manager.applicationWillResignActive()
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+
+        XCTAssertEqual(manager.decoderForTesting.invalidateCountForTesting,
+                       invalidations)
+    }
+}
+
 final class ControlChannelWriterTests: XCTestCase {
     func testNetworkManagerReportsMissingControlConnectionAsNotConnected() {
         let manager = NetworkManager()
