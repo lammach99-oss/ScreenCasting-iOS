@@ -2867,12 +2867,7 @@ public class NetworkManager: ObservableObject {
                         reason: "failed: \(error)")
                     return
                 }
-                self.controlChannelWriter.cancel()
-                self.committedTransportGeneration = nil
-                self.advertisedClientCapabilities = nil
-                self.clearPendingTransportOffer()
-                self.usbScdpConnection = nil
-                self.connection = nil
+                self.teardownCurrentSession()
                 if self.usbListener != nil {
                     self.setState(.listening)
                 } else {
@@ -2889,15 +2884,11 @@ public class NetworkManager: ObservableObject {
                         reason: "cancelled")
                     return
                 }
-                self.controlChannelWriter.cancel()
-                self.committedTransportGeneration = nil
-                self.advertisedClientCapabilities = nil
-                self.clearPendingTransportOffer()
-                self.usbScdpConnection = nil
-                self.connection = nil
+                let wasIdle = self.transportState == .idle
+                self.teardownCurrentSession()
                 if self.usbListener != nil {
                     self.setState(.listening)
-                } else if self.transportState != .idle {
+                } else if !wasIdle {
                     self.setState(.disconnected(reason: "Connection cancelled."))
                     self.scheduleAutoReconnect(reset: false)
                 }
@@ -4476,6 +4467,15 @@ public class NetworkManager: ObservableObject {
     var networkQueueKeyForTesting: DispatchSpecificKey<Bool> { networkQueueKey }
     var decoderForTesting: DecoderManager { decoder }
 
+    func wifiSessionSnapshotForTesting() -> (
+        connection: NWConnection?, generation: UInt64,
+        committedGeneration: UInt64?
+    ) {
+        networkQueue.sync {
+            (connection, connectionGeneration, committedTransportGeneration)
+        }
+    }
+
     func simulateCommittedWifiSessionForTesting(
         mode: UInt8 = RealtimeTransportMode.wifiRTP
     ) -> (connection: NWConnection, generation: UInt64) {
@@ -4484,6 +4484,7 @@ public class NetworkManager: ObservableObject {
             let generation = connectionGenerationClock.advance()
             connection?.cancel()
             connection = peer
+            setupStateHandler(for: peer)
             wireAuthenticatedGeneration = generation
             committedTransportGeneration = generation
             committedRealtimeMode = mode

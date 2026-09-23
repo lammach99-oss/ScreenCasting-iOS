@@ -277,6 +277,50 @@ struct GamePresentationHandoff {
     }
 }
 
+enum OfficePresentationOfferResult: Equatable {
+    case buffered
+    case overwroteLookAhead
+}
+
+struct OfficePresentationHandoff {
+    private(set) var ready: RenderFrameIdentity?
+    private(set) var lookAhead: RenderFrameIdentity?
+
+    var pendingCount: Int {
+        (ready == nil ? 0 : 1) + (lookAhead == nil ? 0 : 1)
+    }
+
+    mutating func offer(
+        _ identity: RenderFrameIdentity
+    ) -> OfficePresentationOfferResult {
+        if ready == nil {
+            ready = identity
+            return .buffered
+        }
+        if lookAhead == nil {
+            lookAhead = identity
+            return .buffered
+        }
+        lookAhead = identity
+        return .overwroteLookAhead
+    }
+
+    mutating func take(currentGeneration: UInt64) -> RenderFrameIdentity? {
+        guard let ready, ready.generation == currentGeneration else {
+            reset()
+            return nil
+        }
+        self.ready = lookAhead
+        lookAhead = nil
+        return ready
+    }
+
+    mutating func reset() {
+        ready = nil
+        lookAhead = nil
+    }
+}
+
 /// Persistent, wrap-safe sequence watermarks scoped to one wire session.
 struct RenderFreshnessTracker {
     private(set) var sessionGeneration: UInt64?
@@ -489,6 +533,11 @@ struct RendererGeometryPublishGate {
 }
 
 public class Renderer: NSObject, MTKViewDelegate {
+    private struct OfficeFrame {
+        let pixelBuffer: CVPixelBuffer
+        let identity: RenderFrameIdentity
+    }
+
     private struct GameFrame {
         let pixelBuffer: CVPixelBuffer
         let identity: RenderFrameIdentity
@@ -511,7 +560,9 @@ public class Renderer: NSObject, MTKViewDelegate {
     private var pipelineState: MTLRenderPipelineState?
     private var textureCache: CVMetalTextureCache?
     private var aspectRatioBuffer: MTLBuffer?
-    private var currentPixelBuffer: CVPixelBuffer?
+    private var officeHandoff = OfficePresentationHandoff()
+    private var officeReadyFrame: OfficeFrame?
+    private var officeLookAheadFrame: OfficeFrame?
     private var gameHandoff = GamePresentationHandoff()
     private var gameReadyFrame: GameFrame?
     private var gameLookAheadFrame: GameFrame?
@@ -605,7 +656,9 @@ public class Renderer: NSObject, MTKViewDelegate {
 
     public func beginSession(generation: UInt64) {
         lock.lock()
-        currentPixelBuffer = nil
+        officeHandoff.reset()
+        officeReadyFrame = nil
+        officeLookAheadFrame = nil
         gameHandoff.reset()
         gameReadyFrame = nil
         gameLookAheadFrame = nil
@@ -653,17 +706,19 @@ public class Renderer: NSObject, MTKViewDelegate {
         gameLastPresentedFrame = nil
         var transferredGeneration: UInt64?
         if mode == .game,
-           let pixelBuffer = currentPixelBuffer,
-           let identity = freshness.takePending() {
+           let frame = officeLookAheadFrame ?? officeReadyFrame,
+           freshness.isCurrent(frame.identity) {
+            let identity = frame.identity
             _ = gameHandoff.offer(identity)
             gameReadyFrame = GameFrame(
-                pixelBuffer: pixelBuffer,
+                pixelBuffer: frame.pixelBuffer,
                 identity: identity)
             transferredGeneration = identity.generation
-        } else {
-            _ = freshness.takePending()
         }
-        currentPixelBuffer = nil
+        officeHandoff.reset()
+        officeReadyFrame = nil
+        officeLookAheadFrame = nil
+        _ = freshness.takePending()
         lock.unlock()
         if let transferredGeneration {
             recordCadence(
@@ -716,7 +771,7 @@ public class Renderer: NSObject, MTKViewDelegate {
         lock.lock()
         let decision = freshness.offer(sequence, generation: generation)
         switch decision {
-        case .accepted(let replaced):
+        case .accepted:
             if presentationCadenceMode == .game,
                let identity = freshness.takePending() {
                 let frame = GameFrame(
@@ -730,9 +785,18 @@ public class Renderer: NSObject, MTKViewDelegate {
                 } else {
                     gameLookAheadFrame = frame
                 }
-            } else {
-                currentPixelBuffer = pixelBuffer
-                replacedPending = replaced != nil
+            } else if presentationCadenceMode == .office,
+                      let identity = freshness.takePending() {
+                let result = officeHandoff.offer(identity)
+                let frame = OfficeFrame(
+                    pixelBuffer: pixelBuffer,
+                    identity: identity)
+                if officeReadyFrame == nil {
+                    officeReadyFrame = frame
+                } else {
+                    officeLookAheadFrame = frame
+                }
+                replacedPending = result == .overwroteLookAhead
             }
         case .rejected, .staleSession:
             break
@@ -797,13 +861,22 @@ public class Renderer: NSObject, MTKViewDelegate {
             case .none:
                 drawSelection = nil
             }
-        } else if let pixelBuffer = currentPixelBuffer,
-                  let identity = freshness.takePending() {
-            currentPixelBuffer = nil
+        } else if presentationCadenceMode == .office,
+                  let generation = freshness.sessionGeneration,
+                  let identity = officeHandoff.take(currentGeneration: generation),
+                  let frame = officeReadyFrame,
+                  frame.identity == identity {
+            officeReadyFrame = officeLookAheadFrame
+            officeLookAheadFrame = nil
             drawSelection = (
-                GameFrame(pixelBuffer: pixelBuffer, identity: identity),
+                GameFrame(pixelBuffer: frame.pixelBuffer, identity: identity),
                 .office)
         } else {
+            if presentationCadenceMode == .office,
+               officeHandoff.pendingCount == 0 {
+                officeReadyFrame = nil
+                officeLookAheadFrame = nil
+            }
             drawSelection = nil
         }
         guard let (selectedFrame, drawKind) = drawSelection else {
@@ -907,9 +980,8 @@ public class Renderer: NSObject, MTKViewDelegate {
         encoder.endEncoding()
 
         lock.lock()
-        let commitDecision = drawKind == .office
-            ? freshness.commitDecision(for: identity)
-            : (freshness.isCurrent(identity) ? .commit : .superseded)
+        let commitDecision: RenderCommitDecision =
+            freshness.isCurrent(identity) ? .commit : .superseded
         lock.unlock()
         guard commitDecision == .commit else {
             recordCadence(

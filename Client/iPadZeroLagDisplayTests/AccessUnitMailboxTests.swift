@@ -582,6 +582,91 @@ final class GamePresentationHandoffTests: XCTestCase {
     }
 }
 
+final class OfficePresentationHandoffTests: XCTestCase {
+    private let a = RenderFrameIdentity(generation: 7, sequence: 1)
+    private let b = RenderFrameIdentity(generation: 7, sequence: 2)
+    private let c = RenderFrameIdentity(generation: 7, sequence: 3)
+
+    func testSecondFrameBecomesLookAhead() {
+        var handoff = OfficePresentationHandoff()
+        XCTAssertEqual(handoff.offer(a), .buffered)
+        XCTAssertEqual(handoff.offer(b), .buffered)
+        XCTAssertEqual(handoff.ready, a)
+        XCTAssertEqual(handoff.lookAhead, b)
+        XCTAssertEqual(handoff.pendingCount, 2)
+    }
+
+    func testTakePromotesLookAheadAndDoesNotRepeat() {
+        var handoff = OfficePresentationHandoff()
+        _ = handoff.offer(a)
+        _ = handoff.offer(b)
+
+        XCTAssertEqual(handoff.take(currentGeneration: 7), a)
+        XCTAssertEqual(handoff.ready, b)
+        XCTAssertNil(handoff.lookAhead)
+        XCTAssertEqual(handoff.take(currentGeneration: 7), b)
+        XCTAssertNil(handoff.take(currentGeneration: 7))
+    }
+
+    func testThirdFrameOverwritesOnlyLookAhead() {
+        var handoff = OfficePresentationHandoff()
+        _ = handoff.offer(a)
+        _ = handoff.offer(b)
+
+        XCTAssertEqual(handoff.offer(c), .overwroteLookAhead)
+        XCTAssertEqual(handoff.ready, a)
+        XCTAssertEqual(handoff.lookAhead, c)
+        XCTAssertEqual(handoff.pendingCount, 2)
+    }
+
+    func testStaleGenerationClearsBothSlots() {
+        var handoff = OfficePresentationHandoff()
+        _ = handoff.offer(a)
+        _ = handoff.offer(b)
+
+        XCTAssertNil(handoff.take(currentGeneration: 8))
+        XCTAssertEqual(handoff.pendingCount, 0)
+    }
+
+    func testResetClearsPendingFrames() {
+        var handoff = OfficePresentationHandoff()
+        _ = handoff.offer(a)
+        _ = handoff.offer(b)
+        handoff.reset()
+
+        XCTAssertNil(handoff.take(currentGeneration: 7))
+        XCTAssertEqual(handoff.pendingCount, 0)
+    }
+
+    func testSelectedOfficeFrameSurvivesNewerSameGenerationOffer() {
+        var freshness = RenderFreshnessTracker()
+        var handoff = OfficePresentationHandoff()
+        freshness.beginSession(generation: 7)
+        _ = freshness.offer(a.sequence, generation: 7)
+        _ = handoff.offer(freshness.takePending()!)
+        let selected = handoff.take(currentGeneration: 7)!
+        _ = freshness.offer(b.sequence, generation: 7)
+        _ = handoff.offer(freshness.takePending()!)
+
+        XCTAssertEqual(freshness.commitDecision(for: selected), .superseded)
+        XCTAssertTrue(freshness.isCurrent(selected))
+        freshness.beginSession(generation: 8)
+        XCTAssertFalse(freshness.isCurrent(selected))
+    }
+
+    func testOneHundredCyclesStayWithinTwoPendingFrames() {
+        var handoff = OfficePresentationHandoff()
+        for sequence in UInt32(1)...100 {
+            _ = handoff.offer(RenderFrameIdentity(
+                generation: 7, sequence: sequence))
+            XCTAssertLessThanOrEqual(handoff.pendingCount, 2)
+            if sequence.isMultiple(of: 2) {
+                _ = handoff.take(currentGeneration: 7)
+            }
+        }
+    }
+}
+
 final class RendererGeometryPublishGateTests: XCTestCase {
     private let baseKey = RendererGeometryPublishKey(
         decodedFrameSize: CGSize(width: 2_388, height: 1_668),

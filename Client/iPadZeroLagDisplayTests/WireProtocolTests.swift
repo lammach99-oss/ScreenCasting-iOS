@@ -680,6 +680,87 @@ final class WifiForegroundDecoderRecoveryTests: XCTestCase {
     }
 }
 
+final class WifiTerminalDecoderRetirementTests: XCTestCase {
+    private var manager: NetworkManager!
+
+    override func setUp() {
+        super.setUp()
+        manager = NetworkManager()
+    }
+
+    override func tearDown() {
+        manager.stopForTesting()
+        manager = nil
+        super.tearDown()
+    }
+
+    private func deliver(_ state: NWConnection.State, to connection: NWConnection) {
+        let callback = connection.stateUpdateHandler
+        XCTAssertNotNil(callback)
+        manager.networkQueueForTesting.sync { callback?(state) }
+    }
+
+    func testFailedWifiConnectionRetiresDecoderBeforeReconnect() {
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+
+        deliver(.failed(.posix(.ECONNRESET)), to: session.connection)
+
+        let retired = manager.wifiSessionSnapshotForTesting()
+        XCTAssertNil(retired.connection)
+        XCTAssertNil(retired.committedGeneration)
+        XCTAssertGreaterThan(retired.generation, session.generation)
+        XCTAssertEqual(manager.decoderForTesting.invalidateCountForTesting,
+                       invalidations + 1)
+    }
+
+    func testCancelledWifiConnectionRetiresDecoderExactlyOnce() {
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+
+        deliver(.cancelled, to: session.connection)
+        deliver(.cancelled, to: session.connection)
+
+        let retired = manager.wifiSessionSnapshotForTesting()
+        XCTAssertNil(retired.connection)
+        XCTAssertNil(retired.committedGeneration)
+        XCTAssertGreaterThan(retired.generation, session.generation)
+        XCTAssertEqual(manager.decoderForTesting.invalidateCountForTesting,
+                       invalidations + 1)
+    }
+
+    func testReplacementWifiDecoderBeginsAfterTerminalInvalidation() {
+        let retired = manager.simulateCommittedWifiSessionForTesting()
+        manager.decoderForTesting.resetLifecycleEventsForTesting()
+
+        deliver(.failed(.posix(.ECONNRESET)), to: retired.connection)
+        let replacement = manager.simulateCommittedWifiSessionForTesting()
+
+        XCTAssertGreaterThan(replacement.generation, retired.generation)
+        XCTAssertEqual(manager.decoderForTesting.currentSessionGeneration,
+                       replacement.generation)
+        XCTAssertEqual(manager.decoderForTesting.lifecycleEventsForTesting,
+                       ["invalidate-begin", "invalidate-end",
+                        "begin-\(replacement.generation)"])
+    }
+
+    func testExplicitStopIgnoresLateCancelledCallback() {
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        manager.stopForTesting()
+        let stopped = manager.wifiSessionSnapshotForTesting()
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+
+        deliver(.cancelled, to: session.connection)
+
+        let afterCallback = manager.wifiSessionSnapshotForTesting()
+        XCTAssertEqual(afterCallback.generation, stopped.generation)
+        XCTAssertNil(afterCallback.connection)
+        XCTAssertNil(afterCallback.committedGeneration)
+        XCTAssertEqual(manager.decoderForTesting.invalidateCountForTesting,
+                       invalidations)
+    }
+}
+
 final class ControlChannelWriterTests: XCTestCase {
     func testNetworkManagerReportsMissingControlConnectionAsNotConnected() {
         let manager = NetworkManager()
