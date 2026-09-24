@@ -789,6 +789,135 @@ final class WifiShortBackgroundSameSessionTests: XCTestCase {
         return session
     }
 
+    private func inactiveSession() -> (connection: NWConnection, generation: UInt64) {
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        manager.applicationWillResignActive()
+        manager.networkQueueForTesting.sync { }
+        return session
+    }
+
+    func testInactiveWaitingPreservesCommittedSessionBeforeBackground() {
+        let session = inactiveSession()
+        deliver(.waiting(.posix(.ENETDOWN)), to: session.connection)
+        let snap = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(snap.connection === session.connection)
+        XCTAssertEqual(snap.generation, session.generation)
+        XCTAssertEqual(snap.authenticatedGeneration, session.generation)
+        XCTAssertEqual(snap.committedGeneration, session.generation)
+        XCTAssertEqual(snap.realtimeMode, RealtimeTransportMode.wifiRTP)
+        XCTAssertEqual(snap.waitingGeneration, session.generation)
+        XCTAssertEqual(snap.inactiveTransitionGeneration, session.generation)
+        XCTAssertFalse(snap.graceActive)
+    }
+
+    func testInactiveSendErrorPreservesCommittedSessionBeforeBackground() {
+        let session = inactiveSession()
+        manager.simulateWifiControlSendErrorForTesting(
+            generation: session.generation, connection: session.connection)
+        let snap = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(snap.connection === session.connection)
+        XCTAssertEqual(snap.generation, session.generation)
+        XCTAssertEqual(snap.authenticatedGeneration, session.generation)
+        XCTAssertEqual(snap.committedGeneration, session.generation)
+        XCTAssertEqual(snap.inactiveTransitionGeneration, session.generation)
+        XCTAssertFalse(snap.graceActive)
+    }
+
+    func testInactiveReceiveErrorPreservesCommittedSessionBeforeBackground() {
+        let session = inactiveSession()
+        manager.simulateWifiControlReceiveErrorForTesting(
+            generation: session.generation, connection: session.connection)
+        let snap = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(snap.connection === session.connection)
+        XCTAssertEqual(snap.generation, session.generation)
+        XCTAssertEqual(snap.authenticatedGeneration, session.generation)
+        XCTAssertEqual(snap.committedGeneration, session.generation)
+        XCTAssertNil(snap.receiveActiveGeneration)
+        XCTAssertEqual(snap.inactiveTransitionGeneration, session.generation)
+        XCTAssertFalse(snap.graceActive)
+    }
+
+    func testInactiveWaitingHandsOwnershipToExistingBackgroundGrace() {
+        let session = inactiveSession()
+        deliver(.waiting(.posix(.ENETDOWN)), to: session.connection)
+        manager.applicationDidEnterBackground()
+        manager.networkQueueForTesting.sync { }
+        let snap = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(snap.connection === session.connection)
+        XCTAssertEqual(snap.generation, session.generation)
+        XCTAssertEqual(snap.authenticatedGeneration, session.generation)
+        XCTAssertEqual(snap.committedGeneration, session.generation)
+        XCTAssertEqual(snap.waitingGeneration, session.generation)
+        XCTAssertNil(snap.inactiveTransitionGeneration)
+        XCTAssertTrue(snap.graceActive)
+    }
+
+    func testInactiveReceiveErrorHandsOwnershipToExistingBackgroundGrace() {
+        let session = inactiveSession()
+        manager.simulateWifiControlReceiveErrorForTesting(
+            generation: session.generation, connection: session.connection)
+        manager.applicationDidEnterBackground()
+        manager.networkQueueForTesting.sync { }
+        let snap = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(snap.connection === session.connection)
+        XCTAssertEqual(snap.generation, session.generation)
+        XCTAssertEqual(snap.authenticatedGeneration, session.generation)
+        XCTAssertEqual(snap.committedGeneration, session.generation)
+        XCTAssertNil(snap.inactiveTransitionGeneration)
+        XCTAssertTrue(snap.graceActive)
+        XCTAssertNil(snap.receiveActiveGeneration)
+    }
+
+    func testInactiveWaitingThenActiveWithoutBackgroundUsesTerminalFallback() {
+        let session = inactiveSession()
+        deliver(.waiting(.posix(.ENETDOWN)), to: session.connection)
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+        let snap = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertNil(snap.connection)
+        XCTAssertNil(snap.inactiveTransitionGeneration)
+        XCTAssertFalse(snap.graceActive)
+        XCTAssertGreaterThan(snap.generation, session.generation)
+    }
+
+    func testInactiveReadyThenActiveResumesSameGeneration() {
+        let session = inactiveSession()
+        let before = manager.wifiLifecycleSnapshotForTesting()
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+        let after = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(after.connection === session.connection)
+        XCTAssertEqual(after.generation, session.generation)
+        XCTAssertEqual(after.committedGeneration, session.generation)
+        XCTAssertNil(after.inactiveTransitionGeneration)
+        XCTAssertEqual(after.writerBegins, before.writerBegins)
+        XCTAssertEqual(after.clientHelloCount, before.clientHelloCount)
+        XCTAssertEqual(manager.decoderForTesting.invalidateCountForTesting, invalidations + 1)
+    }
+
+    func testInactiveMarkerCannotPreserveStaleGeneration() {
+        let old = inactiveSession()
+        let replacement = manager.simulateCommittedWifiSessionForTesting()
+        deliver(.waiting(.posix(.ENETDOWN)), to: old.connection)
+        let snap = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(snap.connection === replacement.connection)
+        XCTAssertEqual(snap.committedGeneration, replacement.generation)
+        XCTAssertNil(snap.inactiveTransitionGeneration)
+    }
+
+    func testUsbStartClearsInactiveWifiTransitionOwnership() {
+        _ = inactiveSession()
+        manager.startListening(port: 0)
+        manager.networkQueueForTesting.sync { }
+        manager.applicationWillResignActive()
+        manager.networkQueueForTesting.sync { }
+        let snap = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertNil(snap.inactiveTransitionGeneration)
+        XCTAssertFalse(snap.graceActive)
+        XCTAssertTrue(manager.usbSessionSnapshot().listenerIntent)
+    }
+
     func testBackgroundWaitingPreservesCommittedSession() {
         let session = manager.simulateCommittedWifiSessionForTesting()
         let invalidations = manager.decoderForTesting.invalidateCountForTesting

@@ -1593,6 +1593,7 @@ public class NetworkManager: ObservableObject {
     private var reconnectAttempt = 0
     private var reconnectWorkItem: DispatchWorkItem?
     private var wifiBackgroundDisconnectWorkItem: DispatchWorkItem?
+    private var wifiLifecycleTransitionGeneration: UInt64?
     private var wifiWaitingGeneration: UInt64?
     private var connectionTimeoutWorkItem: DispatchWorkItem?
     private var usbListener: NWListener?
@@ -1863,6 +1864,7 @@ public class NetworkManager: ObservableObject {
         reconnectEnabled = true
         guard transportState == .idle || isDisconnectedOnQueue else { return }
 
+        wifiLifecycleTransitionGeneration = nil
         wifiWaitingGeneration = nil
         _ = connectionGenerationClock.advance()
         #if targetEnvironment(simulator)
@@ -1923,6 +1925,21 @@ public class NetworkManager: ObservableObject {
             guard let self else { return }
             let wasForegroundActive = self.isForegroundActive
             self.isForegroundActive = true
+            let inactiveGeneration = self.wifiLifecycleTransitionGeneration
+            self.wifiLifecycleTransitionGeneration = nil
+            if inactiveGeneration == self.connectionGeneration,
+               self.wifiBackgroundDisconnectWorkItem == nil,
+               self.isCurrentCommittedWifiRtpStreamingSessionOnQueue(),
+               let currentConnection = self.connection,
+               !self.isWifiConnectionReadyOnQueue(
+                   currentConnection, generation: self.connectionGeneration) {
+                self.recordWifiLifecycleDiagnostic(
+                    "generation=\(self.connectionGeneration) event=foreground " +
+                    "action=terminal_fallback reason=inactive_without_grace")
+                self.handleStreamError(
+                    "Wi-Fi connection remained unavailable after inactive transition.")
+                return
+            }
             if self.isCurrentCommittedWifiRtpStreamingSessionOnQueue(),
                self.wifiBackgroundDisconnectWorkItem != nil,
                let currentConnection = self.connection,
@@ -1996,6 +2013,14 @@ public class NetworkManager: ObservableObject {
             self.isForegroundActive = false
             self.reconnectWorkItem?.cancel()
             self.reconnectWorkItem = nil
+            if self.isCurrentCommittedWifiRtpStreamingSessionOnQueue() {
+                self.wifiLifecycleTransitionGeneration = self.connectionGeneration
+                self.recordWifiLifecycleDiagnostic(
+                    "generation=\(self.connectionGeneration) event=inactive " +
+                    "action=arm_transition_preservation")
+            } else {
+                self.wifiLifecycleTransitionGeneration = nil
+            }
             print("[IPAD][APP_LIFECYCLE] state=inactive action=preserve_session")
         }
     }
@@ -2010,6 +2035,7 @@ public class NetworkManager: ObservableObject {
             self.wifiBackgroundDisconnectWorkItem = nil
 
             guard !self.usbListenerExplicitlyStarted else {
+                self.wifiLifecycleTransitionGeneration = nil
                 if self.isCurrentCommittedUsbStreamingSessionOnQueue() {
                     self.pendingUsbForegroundDecoderRearmGeneration =
                         self.connectionGeneration
@@ -2026,6 +2052,7 @@ public class NetworkManager: ObservableObject {
             }
 
             guard let currentConnection = self.connection else {
+                self.wifiLifecycleTransitionGeneration = nil
                 print("[IPAD][APP_LIFECYCLE] state=background transport=wifi connection=none")
                 return
             }
@@ -2057,6 +2084,12 @@ public class NetworkManager: ObservableObject {
             self.networkQueue.asyncAfter(
                 deadline: .now() + Self.wifiBackgroundDisconnectGrace,
                 execute: work)
+            if self.wifiLifecycleTransitionGeneration == generation {
+                self.wifiLifecycleTransitionGeneration = nil
+                self.recordWifiLifecycleDiagnostic(
+                    "generation=\(generation) event=background " +
+                    "action=handoff_to_grace")
+            }
             print(
                 "[IPAD][APP_LIFECYCLE] state=background transport=wifi " +
                 "action=graceful_preserve grace_s=\(Self.wifiBackgroundDisconnectGrace)")
@@ -2410,6 +2443,7 @@ public class NetworkManager: ObservableObject {
         reconnectWorkItem = nil
         wifiBackgroundDisconnectWorkItem?.cancel()
         wifiBackgroundDisconnectWorkItem = nil
+        wifiLifecycleTransitionGeneration = nil
         wifiWaitingGeneration = nil
         pendingUsbForegroundDecoderRearmGeneration = nil
         #if targetEnvironment(simulator)
@@ -2847,7 +2881,8 @@ public class NetworkManager: ObservableObject {
                     self.wifiWaitingGeneration = generation
                     self.recordWifiLifecycleDiagnostic(
                         "generation=\(generation) event=waiting " +
-                        "action=preserve_same_session grace_active=true")
+                        "action=preserve_same_session " +
+                        "grace_active=\(self.wifiBackgroundDisconnectWorkItem != nil)")
                     return
                 }
                 self.handleStreamError(
@@ -4020,7 +4055,8 @@ public class NetworkManager: ObservableObject {
         connection expectedConnection: NWConnection
     ) -> Bool {
         dispatchPrecondition(condition: .onQueue(networkQueue))
-        return wifiBackgroundDisconnectWorkItem != nil &&
+        return (wifiBackgroundDisconnectWorkItem != nil ||
+                wifiLifecycleTransitionGeneration == generation) &&
             connection === expectedConnection &&
             isCurrentCommittedWifiRtpStreamingSessionOnQueue(
                 generation: generation)
@@ -4600,6 +4636,7 @@ public class NetworkManager: ObservableObject {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         wifiBackgroundDisconnectWorkItem?.cancel()
         wifiBackgroundDisconnectWorkItem = nil
+        wifiLifecycleTransitionGeneration = nil
         wifiWaitingGeneration = nil
         pendingUsbForegroundDecoderRearmGeneration = nil
         connectionTimeoutWorkItem?.cancel()
@@ -4669,6 +4706,7 @@ public class NetworkManager: ObservableObject {
         connection: NWConnection?, generation: UInt64,
         authenticatedGeneration: UInt64?, committedGeneration: UInt64?,
         realtimeMode: UInt8?, waitingGeneration: UInt64?,
+        inactiveTransitionGeneration: UInt64?,
         graceActive: Bool, receiveActiveGeneration: UInt64?,
         initialReceiveStarts: Int, writerBegins: Int,
         clientHelloCount: Int, pingAttempts: Int
@@ -4676,7 +4714,8 @@ public class NetworkManager: ObservableObject {
         networkQueue.sync {
             (connection, connectionGeneration, wireAuthenticatedGeneration,
              committedTransportGeneration, committedRealtimeMode,
-             wifiWaitingGeneration, wifiBackgroundDisconnectWorkItem != nil,
+             wifiWaitingGeneration, wifiLifecycleTransitionGeneration,
+             wifiBackgroundDisconnectWorkItem != nil,
              wireReceiveActiveGeneration, testingInitialReceiveStarts,
              testingWriterBegins, testingClientHelloCount, testingPingAttempts)
         }
@@ -4717,6 +4756,7 @@ public class NetworkManager: ObservableObject {
             connection?.cancel()
             wifiBackgroundDisconnectWorkItem?.cancel()
             wifiBackgroundDisconnectWorkItem = nil
+            wifiLifecycleTransitionGeneration = nil
             wifiWaitingGeneration = nil
             connection = peer
             setupStateHandler(for: peer)
