@@ -761,6 +761,180 @@ final class WifiTerminalDecoderRetirementTests: XCTestCase {
     }
 }
 
+final class WifiShortBackgroundSameSessionTests: XCTestCase {
+    private var manager: NetworkManager!
+
+    override func setUp() {
+        super.setUp()
+        manager = NetworkManager()
+    }
+
+    override func tearDown() {
+        manager.stopForTesting()
+        manager = nil
+        super.tearDown()
+    }
+
+    private func deliver(_ state: NWConnection.State, to connection: NWConnection) {
+        let callback = connection.stateUpdateHandler
+        XCTAssertNotNil(callback)
+        manager.networkQueueForTesting.sync { callback?(state) }
+    }
+
+    private func backgroundWaiting() -> (connection: NWConnection, generation: UInt64) {
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        manager.applicationDidEnterBackground()
+        manager.networkQueueForTesting.sync { }
+        deliver(.waiting(.posix(.ENETDOWN)), to: session.connection)
+        return session
+    }
+
+    func testBackgroundWaitingPreservesCommittedSession() {
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+        manager.applicationDidEnterBackground()
+        manager.networkQueueForTesting.sync { }
+
+        deliver(.waiting(.posix(.ENETDOWN)), to: session.connection)
+
+        let snap = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(snap.connection === session.connection)
+        XCTAssertEqual(snap.generation, session.generation)
+        XCTAssertEqual(snap.authenticatedGeneration, session.generation)
+        XCTAssertEqual(snap.committedGeneration, session.generation)
+        XCTAssertEqual(snap.realtimeMode, RealtimeTransportMode.wifiRTP)
+        XCTAssertEqual(snap.waitingGeneration, session.generation)
+        XCTAssertTrue(snap.graceActive)
+        XCTAssertEqual(manager.decoderForTesting.invalidateCountForTesting, invalidations)
+    }
+
+    func testForegroundWhileWaitingKeepsOriginalGraceAndDefersResume() {
+        let session = backgroundWaiting()
+        let before = manager.wifiLifecycleSnapshotForTesting()
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+
+        let after = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(after.connection === session.connection)
+        XCTAssertEqual(after.generation, session.generation)
+        XCTAssertEqual(after.waitingGeneration, session.generation)
+        XCTAssertTrue(after.graceActive)
+        XCTAssertEqual(after.pingAttempts, before.pingAttempts)
+        XCTAssertEqual(after.clientHelloCount, before.clientHelloCount)
+        XCTAssertEqual(manager.decoderForTesting.invalidateCountForTesting, invalidations)
+    }
+
+    func testSameReadyResumesWithoutReplayingInitialHandshake() {
+        let session = backgroundWaiting()
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+        let before = manager.wifiLifecycleSnapshotForTesting()
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+        let begins = manager.decoderForTesting.sessionBeganCountForTesting
+
+        deliver(.ready, to: session.connection)
+
+        let after = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(after.connection === session.connection)
+        XCTAssertEqual(after.generation, session.generation)
+        XCTAssertEqual(after.authenticatedGeneration, session.generation)
+        XCTAssertEqual(after.committedGeneration, session.generation)
+        XCTAssertEqual(after.realtimeMode, RealtimeTransportMode.wifiRTP)
+        XCTAssertNil(after.waitingGeneration)
+        XCTAssertFalse(after.graceActive)
+        XCTAssertEqual(after.initialReceiveStarts, before.initialReceiveStarts)
+        XCTAssertEqual(after.writerBegins, before.writerBegins)
+        XCTAssertEqual(after.clientHelloCount, before.clientHelloCount)
+        XCTAssertEqual(after.pingAttempts, before.pingAttempts + 1)
+        XCTAssertEqual(manager.decoderForTesting.invalidateCountForTesting, invalidations + 1)
+        XCTAssertEqual(manager.decoderForTesting.sessionBeganCountForTesting, begins + 1)
+    }
+
+    func testTransientReceiveErrorResumesWithoutResettingCommit() {
+        let session = backgroundWaiting()
+        manager.simulateWifiControlReceiveErrorForTesting(
+            generation: session.generation, connection: session.connection)
+        let stopped = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertNil(stopped.receiveActiveGeneration)
+        XCTAssertEqual(stopped.authenticatedGeneration, session.generation)
+        XCTAssertEqual(stopped.committedGeneration, session.generation)
+
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+        deliver(.ready, to: session.connection)
+
+        let resumed = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertEqual(resumed.receiveActiveGeneration, session.generation)
+        XCTAssertEqual(resumed.authenticatedGeneration, session.generation)
+        XCTAssertEqual(resumed.committedGeneration, session.generation)
+        XCTAssertEqual(resumed.realtimeMode, RealtimeTransportMode.wifiRTP)
+        XCTAssertEqual(resumed.initialReceiveStarts, stopped.initialReceiveStarts)
+    }
+
+    func testTransientSendErrorDuringGracePreservesSession() {
+        let session = backgroundWaiting()
+        manager.simulateWifiControlSendErrorForTesting(
+            generation: session.generation, connection: session.connection)
+        let snap = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(snap.connection === session.connection)
+        XCTAssertEqual(snap.committedGeneration, session.generation)
+        XCTAssertTrue(snap.graceActive)
+    }
+
+    func testOriginalGraceExpiresEvenAfterForegroundWhileWaiting() {
+        let session = backgroundWaiting()
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+
+        manager.expireWifiBackgroundGraceForTesting()
+
+        let snap = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertNil(snap.connection)
+        XCTAssertNil(snap.committedGeneration)
+        XCTAssertGreaterThan(snap.generation, session.generation)
+    }
+
+    func testBackgroundGraceStillRetiresLongBackgroundSession() {
+        let session = backgroundWaiting()
+        manager.expireWifiBackgroundGraceForTesting()
+        let snap = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertNil(snap.connection)
+        XCTAssertGreaterThan(snap.generation, session.generation)
+    }
+
+    func testTerminalFailureAndCancellationStillRetire() {
+        let terminalStates: [NWConnection.State] = [
+            .failed(.posix(.ECONNRESET)), .cancelled
+        ]
+        for state in terminalStates {
+            let session = backgroundWaiting()
+            deliver(state, to: session.connection)
+            let snap = manager.wifiLifecycleSnapshotForTesting()
+            XCTAssertNil(snap.connection)
+            XCTAssertGreaterThan(snap.generation, session.generation)
+        }
+    }
+
+    func testStaleWaitingCallbackCannotMutateReplacement() {
+        let old = backgroundWaiting()
+        let replacement = manager.simulateCommittedWifiSessionForTesting()
+        deliver(.waiting(.posix(.ENETDOWN)), to: old.connection)
+        let snap = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(snap.connection === replacement.connection)
+        XCTAssertEqual(snap.generation, replacement.generation)
+        XCTAssertNotEqual(snap.waitingGeneration, old.generation)
+    }
+
+    func testUsbIsExcludedFromWifiGracePolicy() {
+        XCTAssertFalse(WifiLifecyclePolicy.shouldTearDownAfterGrace(
+            isForegroundActive: false, isUSB: true,
+            scheduledGeneration: 7, currentGeneration: 7,
+            hasSameConnection: true, isWaiting: true))
+    }
+}
+
 final class ControlChannelWriterTests: XCTestCase {
     func testNetworkManagerReportsMissingControlConnectionAsNotConnected() {
         let manager = NetworkManager()

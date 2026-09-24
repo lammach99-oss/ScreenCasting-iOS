@@ -290,9 +290,10 @@ enum WifiLifecyclePolicy {
         isUSB: Bool,
         scheduledGeneration: UInt64,
         currentGeneration: UInt64,
-        hasSameConnection: Bool
+        hasSameConnection: Bool,
+        isWaiting: Bool = false
     ) -> Bool {
-        !isForegroundActive && !isUSB &&
+        (!isForegroundActive || isWaiting) && !isUSB &&
             scheduledGeneration == currentGeneration && hasSameConnection
     }
 }
@@ -1592,6 +1593,7 @@ public class NetworkManager: ObservableObject {
     private var reconnectAttempt = 0
     private var reconnectWorkItem: DispatchWorkItem?
     private var wifiBackgroundDisconnectWorkItem: DispatchWorkItem?
+    private var wifiWaitingGeneration: UInt64?
     private var connectionTimeoutWorkItem: DispatchWorkItem?
     private var usbListener: NWListener?
     private var usbListenerExplicitlyStarted = false
@@ -1648,6 +1650,13 @@ public class NetworkManager: ObservableObject {
         generation: connectionGeneration,
         queue: networkQueue)
     private var wireReceiveActiveGeneration: UInt64?
+    #if targetEnvironment(simulator)
+    private var testingSimulatedWifiSession = false
+    private var testingInitialReceiveStarts = 0
+    private var testingWriterBegins = 0
+    private var testingClientHelloCount = 0
+    private var testingPingAttempts = 0
+    #endif
     private var wireAuthenticatedGeneration: UInt64?
     private var committedTransportGeneration: UInt64?
     private var pendingTransportOffer: TransportOffer?
@@ -1854,7 +1863,11 @@ public class NetworkManager: ObservableObject {
         reconnectEnabled = true
         guard transportState == .idle || isDisconnectedOnQueue else { return }
 
+        wifiWaitingGeneration = nil
         _ = connectionGenerationClock.advance()
+        #if targetEnvironment(simulator)
+        testingSimulatedWifiSession = false
+        #endif
         // Settings generations are scoped to the Host credential/session.
         // After Forget Host (or a fresh pairing), the Host may legitimately
         // start again at generation zero; retaining the old value would cause
@@ -1910,6 +1923,16 @@ public class NetworkManager: ObservableObject {
             guard let self else { return }
             let wasForegroundActive = self.isForegroundActive
             self.isForegroundActive = true
+            if self.isCurrentCommittedWifiRtpStreamingSessionOnQueue(),
+               self.wifiBackgroundDisconnectWorkItem != nil,
+               let currentConnection = self.connection,
+               !self.isWifiConnectionReadyOnQueue(
+                   currentConnection, generation: self.connectionGeneration) {
+                self.recordWifiLifecycleDiagnostic(
+                    "generation=\(self.connectionGeneration) event=foreground " +
+                    "nw_state=waiting action=defer_same_session_resume")
+                return
+            }
             self.wifiBackgroundDisconnectWorkItem?.cancel()
             self.wifiBackgroundDisconnectWorkItem = nil
             RecentWifiResumeStore.clear()
@@ -1935,29 +1958,13 @@ public class NetworkManager: ObservableObject {
             }
 
             if !wasForegroundActive,
-               self.isCurrentCommittedWifiRtpStreamingSessionOnQueue() {
-                let generation = self.connectionGeneration
-                let begin = "[WIFI_MEDIA_RECOVERY] generation=\(generation) " +
-                    "action=decoder_invalidate_begin"
-                print(begin)
-                self.recordDiagnosticLine(begin)
-                self.decoder.invalidate(waitForCompletion: true)
-                if self.isCurrentCommittedWifiRtpStreamingSessionOnQueue(
-                    generation: generation) {
-                    self.decoder.beginSession(generation: generation)
-                    self.wifiMediaReceiver.requestImmediateRecoveryFeedback(
-                        generation: generation)
-                    self.sendClientPingIfDue()
-                    let complete = "[WIFI_MEDIA_RECOVERY] generation=\(generation) " +
-                        "action=decoder_rearmed recovery_requested=true"
-                    print(complete)
-                    self.recordDiagnosticLine(complete)
+               self.isCurrentCommittedWifiRtpStreamingSessionOnQueue(),
+               let currentConnection = self.connection {
+                if self.resumeCommittedWifiSessionOnQueue(
+                    connection: currentConnection,
+                    generation: self.connectionGeneration) {
                     return
                 }
-                let stale = "[WIFI_MEDIA_RECOVERY] scheduled_generation=\(generation) " +
-                    "current_generation=\(self.connectionGeneration) action=skip_stale"
-                print(stale)
-                self.recordDiagnosticLine(stale)
             }
 
             if !self.usbListenerExplicitlyStarted,
@@ -2033,12 +2040,16 @@ public class NetworkManager: ObservableObject {
                         isUSB: self.usbListenerExplicitlyStarted,
                         scheduledGeneration: generation,
                         currentGeneration: self.connectionGeneration,
-                        hasSameConnection: self.connection === currentConnection) else {
+                        hasSameConnection: self.connection === currentConnection,
+                        isWaiting: !self.isWifiConnectionReadyOnQueue(
+                            currentConnection, generation: generation)) else {
                     return
                 }
-                print(
-                    "[IPAD][APP_LIFECYCLE] state=background action=teardown_after_grace " +
-                    "generation=\(generation)")
+                self.recordWifiLifecycleDiagnostic(
+                    "generation=\(generation) event=grace_expired " +
+                    "foreground=\(self.isForegroundActive) " +
+                    "waiting=\(self.wifiWaitingGeneration == generation) " +
+                    "action=terminal_fallback")
                 self.handleStreamError(
                     "Application remained backgrounded; reconnecting on resume.")
             }
@@ -2399,7 +2410,11 @@ public class NetworkManager: ObservableObject {
         reconnectWorkItem = nil
         wifiBackgroundDisconnectWorkItem?.cancel()
         wifiBackgroundDisconnectWorkItem = nil
+        wifiWaitingGeneration = nil
         pendingUsbForegroundDecoderRearmGeneration = nil
+        #if targetEnvironment(simulator)
+        testingSimulatedWifiSession = false
+        #endif
         RecentWifiResumeStore.clear()
         let stoppedGeneration = connectionGenerationClock.advance()
         listenerGeneration &+= 1
@@ -2827,14 +2842,30 @@ public class NetworkManager: ObservableObject {
                 print("[IPAD][NW_STATE] preparing")
             case .waiting(let error):
                 print("[IPAD][NW_STATE] waiting error=\(error)")
-                // NWConnection remains non-nil while it is waiting. Route the
-                // transition through the normal generation-safe teardown so
-                // the bounded reconnect attempt can create a fresh socket.
+                if self.shouldPreserveTransientWifiControlError(
+                    generation: generation, connection: connection) {
+                    self.wifiWaitingGeneration = generation
+                    self.recordWifiLifecycleDiagnostic(
+                        "generation=\(generation) event=waiting " +
+                        "action=preserve_same_session grace_active=true")
+                    return
+                }
                 self.handleStreamError(
                     "Waiting for Windows host: \(error.localizedDescription)")
             case .ready:
                 self.connectionTimeoutWorkItem?.cancel()
                 print("[IPAD][NW_STATE] ready TLS_VERIFY_COMPLETE accepted")
+                if self.isCurrentCommittedWifiRtpStreamingSessionOnQueue(
+                    generation: generation) {
+                    let wasWaiting = self.wifiWaitingGeneration == generation
+                    self.wifiWaitingGeneration = nil
+                    if self.isForegroundActive,
+                       (wasWaiting || self.wifiBackgroundDisconnectWorkItem != nil) {
+                        _ = self.resumeCommittedWifiSessionOnQueue(
+                            connection: connection, generation: generation)
+                    }
+                    return
+                }
                 let telemetryKind: StreamingTransportKind =
                     self.activeTransportKind == .usb ? .usbTypeC : .wifi
                 self.transportTelemetry.setSessionContext(TransportTelemetryContext(
@@ -2843,6 +2874,9 @@ public class NetworkManager: ObservableObject {
                         ? "localhost_scdp"
                         : "network_framework",
                     connectionGeneration: generation))
+                #if targetEnvironment(simulator)
+                self.testingWriterBegins += 1
+                #endif
                 self.controlChannelWriter.begin(generation: generation)
                 if self.activeTransportKind == .wifi {
                     self.startWireReceiveLoop(generation: generation)
@@ -2903,6 +2937,9 @@ public class NetworkManager: ObservableObject {
 
     private func sendTrustedClientHello(generation: UInt64) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        #if targetEnvironment(simulator)
+        testingClientHelloCount += 1
+        #endif
         guard generation == connectionGeneration,
               let fingerprint = verifiedHostFingerprint else {
             handleStreamError("TLS host identity was unavailable after verification.")
@@ -3269,6 +3306,9 @@ public class NetworkManager: ObservableObject {
     /// Windows host echoes this exact 16-byte payload as a Pong.
     private func sendClientPingIfDue() {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        #if targetEnvironment(simulator)
+        testingPingAttempts += 1
+        #endif
         let now = ProcessInfo.processInfo.systemUptime
         guard now - lastClientPingSentAt >= 1 else { return }
         lastClientPingSentAt = now
@@ -3320,6 +3360,9 @@ public class NetworkManager: ObservableObject {
         completion: @escaping (NWError?) -> Void = { _ in }
     ) {
         guard payload.count <= WireProtocol.maxPayloadSize else { return }
+        let sendGeneration = connectionGeneration
+        let sendConnection = connection
+        let sendTransport = activeTransportKind
         var message = Data(count: WireProtocol.headerSize)
         message.withUnsafeMutableBytes { bytes in
             bytes.storeBytes(of: WireProtocol.magic.littleEndian, toByteOffset: 0, as: UInt32.self)
@@ -3334,9 +3377,36 @@ public class NetworkManager: ObservableObject {
             message,
             telemetry: type == .videoFeedback,
             completion: { [weak self] error in
-                if let error { self?.handleStreamError("Control send error: \(error)") }
+                if let error {
+                    self?.handleControlSendError(
+                        error, generation: sendGeneration,
+                        connection: sendConnection,
+                        transport: sendTransport)
+                }
                 completion(error)
             })
+    }
+
+    private func handleControlSendError(
+        _ error: NWError,
+        generation: UInt64,
+        connection sentConnection: NWConnection?,
+        transport: ActiveTransportKind
+    ) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        if transport == .wifi {
+            guard generation == connectionGeneration,
+                  connection === sentConnection else { return }
+            if let sentConnection,
+               shouldPreserveTransientWifiControlError(
+                   generation: generation, connection: sentConnection) {
+                recordWifiLifecycleDiagnostic(
+                    "generation=\(generation) event=control_send_error " +
+                    "action=preserve_transient")
+                return
+            }
+        }
+        handleStreamError("Control send error: \(error)")
     }
 
     private func enqueueControlData(
@@ -3364,6 +3434,9 @@ public class NetworkManager: ObservableObject {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard generation == connectionGeneration, connection != nil else { return }
         guard wireReceiveActiveGeneration != generation else { return }
+        #if targetEnvironment(simulator)
+        testingInitialReceiveStarts += 1
+        #endif
         wireReceiveActiveGeneration = generation
         wireAuthenticatedGeneration = nil
         committedTransportGeneration = nil
@@ -3389,7 +3462,8 @@ public class NetworkManager: ObservableObject {
                   self.connection === connection,
                   self.wireReceiveActiveGeneration == generation else { return }
             if let error {
-                self.handleStreamError("SCST receive error: \(error.localizedDescription)")
+                self.handleWireReceiveError(
+                    error, generation: generation, connection: connection)
                 return
             }
 
@@ -3410,6 +3484,26 @@ public class NetworkManager: ObservableObject {
             }
             self.receiveWireChunk(generation: generation)
         }
+    }
+
+    private func handleWireReceiveError(
+        _ error: NWError,
+        generation: UInt64,
+        connection receivedConnection: NWConnection
+    ) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard generation == connectionGeneration,
+              connection === receivedConnection,
+              wireReceiveActiveGeneration == generation else { return }
+        if shouldPreserveTransientWifiControlError(
+            generation: generation, connection: receivedConnection) {
+            wireReceiveActiveGeneration = nil
+            recordWifiLifecycleDiagnostic(
+                "generation=\(generation) event=control_receive_error " +
+                "action=preserve_transient_receive_stopped")
+            return
+        }
+        handleStreamError("SCST receive error: \(error.localizedDescription)")
     }
 
     private func handleWireParserEvent(_ event: WireParserEvent, generation: UInt64) {
@@ -3915,6 +4009,98 @@ public class NetworkManager: ObservableObject {
         return true
     }
 
+    private func recordWifiLifecycleDiagnostic(_ details: String) {
+        let line = "[IPAD][WIFI_LIFECYCLE] " + details
+        print(line)
+        recordDiagnosticLine(line)
+    }
+
+    private func shouldPreserveTransientWifiControlError(
+        generation: UInt64,
+        connection expectedConnection: NWConnection
+    ) -> Bool {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        return wifiBackgroundDisconnectWorkItem != nil &&
+            connection === expectedConnection &&
+            isCurrentCommittedWifiRtpStreamingSessionOnQueue(
+                generation: generation)
+    }
+
+    private func isWifiConnectionReadyOnQueue(
+        _ expectedConnection: NWConnection,
+        generation: UInt64
+    ) -> Bool {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard connection === expectedConnection,
+              generation == connectionGeneration,
+              wifiWaitingGeneration != generation else { return false }
+        #if targetEnvironment(simulator)
+        if testingSimulatedWifiSession { return true }
+        #endif
+        if case .ready = expectedConnection.state { return true }
+        return false
+    }
+
+    private func resumeCommittedWireReceiveLoopIfNeeded(
+        connection expectedConnection: NWConnection,
+        generation: UInt64
+    ) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard wifiWaitingGeneration == nil,
+              connection === expectedConnection,
+              isCurrentCommittedWifiRtpStreamingSessionOnQueue(
+                generation: generation),
+              wireReceiveActiveGeneration != generation else { return }
+        wireReceiveActiveGeneration = generation
+        #if targetEnvironment(simulator)
+        if testingSimulatedWifiSession { return }
+        #endif
+        receiveWireChunk(generation: generation)
+    }
+
+    @discardableResult
+    private func resumeCommittedWifiSessionOnQueue(
+        connection expectedConnection: NWConnection,
+        generation: UInt64
+    ) -> Bool {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard isForegroundActive,
+              connection === expectedConnection,
+              isWifiConnectionReadyOnQueue(
+                  expectedConnection, generation: generation),
+              isCurrentCommittedWifiRtpStreamingSessionOnQueue(
+                generation: generation) else { return false }
+        wifiBackgroundDisconnectWorkItem?.cancel()
+        wifiBackgroundDisconnectWorkItem = nil
+        resumeCommittedWireReceiveLoopIfNeeded(
+            connection: expectedConnection, generation: generation)
+        let begin = "[WIFI_MEDIA_RECOVERY] generation=\(generation) " +
+            "action=decoder_invalidate_begin"
+        print(begin)
+        recordDiagnosticLine(begin)
+        decoder.invalidate(waitForCompletion: true)
+        guard connection === expectedConnection,
+              isCurrentCommittedWifiRtpStreamingSessionOnQueue(
+                generation: generation) else {
+            let stale = "[WIFI_MEDIA_RECOVERY] scheduled_generation=\(generation) " +
+                "current_generation=\(connectionGeneration) action=skip_stale"
+            print(stale)
+            recordDiagnosticLine(stale)
+            return false
+        }
+        decoder.beginSession(generation: generation)
+        wifiMediaReceiver.requestImmediateRecoveryFeedback(generation: generation)
+        sendClientPingIfDue()
+        let complete = "[WIFI_MEDIA_RECOVERY] generation=\(generation) " +
+            "action=decoder_rearmed recovery_requested=true"
+        print(complete)
+        recordDiagnosticLine(complete)
+        recordWifiLifecycleDiagnostic(
+            "generation=\(generation) event=ready " +
+            "action=resume_committed_same_session client_hello_sent=false")
+        return true
+    }
+
     private func consumeUsbForegroundDecoderRearmIfEligibleOnQueue()
         -> UInt64? {
         dispatchPrecondition(condition: .onQueue(networkQueue))
@@ -4412,6 +4598,9 @@ public class NetworkManager: ObservableObject {
 
     private func teardownCurrentSession() {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        wifiBackgroundDisconnectWorkItem?.cancel()
+        wifiBackgroundDisconnectWorkItem = nil
+        wifiWaitingGeneration = nil
         pendingUsbForegroundDecoderRearmGeneration = nil
         connectionTimeoutWorkItem?.cancel()
         connectionTimeoutWorkItem = nil
@@ -4476,6 +4665,49 @@ public class NetworkManager: ObservableObject {
         }
     }
 
+    func wifiLifecycleSnapshotForTesting() -> (
+        connection: NWConnection?, generation: UInt64,
+        authenticatedGeneration: UInt64?, committedGeneration: UInt64?,
+        realtimeMode: UInt8?, waitingGeneration: UInt64?,
+        graceActive: Bool, receiveActiveGeneration: UInt64?,
+        initialReceiveStarts: Int, writerBegins: Int,
+        clientHelloCount: Int, pingAttempts: Int
+    ) {
+        networkQueue.sync {
+            (connection, connectionGeneration, wireAuthenticatedGeneration,
+             committedTransportGeneration, committedRealtimeMode,
+             wifiWaitingGeneration, wifiBackgroundDisconnectWorkItem != nil,
+             wireReceiveActiveGeneration, testingInitialReceiveStarts,
+             testingWriterBegins, testingClientHelloCount, testingPingAttempts)
+        }
+    }
+
+    func simulateWifiControlSendErrorForTesting(
+        generation: UInt64, connection expectedConnection: NWConnection
+    ) {
+        networkQueue.sync {
+            handleControlSendError(
+                .posix(.ENETDOWN), generation: generation,
+                connection: expectedConnection, transport: .wifi)
+        }
+    }
+
+    func simulateWifiControlReceiveErrorForTesting(
+        generation: UInt64, connection expectedConnection: NWConnection
+    ) {
+        networkQueue.sync {
+            handleWireReceiveError(
+                .posix(.ENETDOWN), generation: generation,
+                connection: expectedConnection)
+        }
+    }
+
+    func expireWifiBackgroundGraceForTesting() {
+        networkQueue.sync {
+            wifiBackgroundDisconnectWorkItem?.perform()
+        }
+    }
+
     func simulateCommittedWifiSessionForTesting(
         mode: UInt8 = RealtimeTransportMode.wifiRTP
     ) -> (connection: NWConnection, generation: UInt64) {
@@ -4483,8 +4715,13 @@ public class NetworkManager: ObservableObject {
             let peer = NWConnection(host: "127.0.0.1", port: 27015, using: .tcp)
             let generation = connectionGenerationClock.advance()
             connection?.cancel()
+            wifiBackgroundDisconnectWorkItem?.cancel()
+            wifiBackgroundDisconnectWorkItem = nil
+            wifiWaitingGeneration = nil
             connection = peer
             setupStateHandler(for: peer)
+            testingSimulatedWifiSession = true
+            wireReceiveActiveGeneration = generation
             wireAuthenticatedGeneration = generation
             committedTransportGeneration = generation
             committedRealtimeMode = mode
