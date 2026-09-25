@@ -25,6 +25,7 @@ enum HevcReassemblyOutcome: Equatable {
 
 final class HevcRtpReassembler {
     private static let maximumPendingOutcomes = 3
+    private static let maximumBufferedFrames = 6
 
     private struct Frame {
         let timestamp: UInt32
@@ -92,7 +93,8 @@ final class HevcRtpReassembler {
         }
 
         expireFrames(at: arrivalTime)
-        if frames[packet.timestamp] == nil && frames.count == 2 {
+        if frames[packet.timestamp] == nil &&
+           frames.count >= Self.maximumBufferedFrames {
             if let oldest = frames.values.min(by: {
                 $0.firstArrival < $1.firstArrival
             }) {

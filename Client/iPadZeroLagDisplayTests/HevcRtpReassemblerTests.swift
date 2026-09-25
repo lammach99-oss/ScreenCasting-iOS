@@ -49,7 +49,7 @@ final class HevcRtpReassemblerTests: XCTestCase {
         XCTAssertEqual(reassembler.allocatedFrameCount, 0)
     }
 
-    func testAuthenticationDuplicateMissingExpiryAndTwoFrameBound() {
+    func testAuthenticationDuplicateMissingExpiryAndDeadlineBound() {
         let payload = nal(type: 32, count: 20, fill: 1)
         let one = packet(
             sequence: UInt16.max,
@@ -95,9 +95,111 @@ final class HevcRtpReassemblerTests: XCTestCase {
                 arrivalTime: Double(timestamp) / 1_000,
                 rttP95Ms: 4)
         }
-        XCTAssertEqual(reassembler.allocatedFrameCount, 2)
+        XCTAssertEqual(reassembler.allocatedFrameCount, 3)
         XCTAssertFalse(reassembler.expire(at: 0.020).isEmpty)
         XCTAssertEqual(reassembler.allocatedFrameCount, 0)
+    }
+
+    func testPartialPFrameCompletesAfterOtherFramesArriveBeforeDeadline() {
+        let payload = nal(type: 1, count: 20, fill: 1)
+        let reassembler = HevcRtpReassembler(
+            mtu: 1_200, initialExpectedSequence: 10)
+        for (sequence, timestamp, arrival, marker) in [
+            (10, 1, 0.0, false), (12, 1, 0.001, true),
+            (13, 2, 0.008, true), (14, 3, 0.016, true),
+            (15, 4, 0.024, true)
+        ] {
+            _ = reassembler.consume(
+                packet(sequence: UInt16(sequence), timestamp: UInt32(timestamp),
+                       frame: UInt32(timestamp), capture: 0,
+                       marker: marker, payload: payload),
+                authentication: .authenticated, arrivalTime: arrival,
+                rttP95Ms: 20)
+        }
+        XCTAssertEqual(reassembler.allocatedFrameCount, 4)
+        let outcome = reassembler.consume(
+            packet(sequence: 11, timestamp: 1, frame: 1, capture: 0,
+                   marker: false, payload: payload),
+            authentication: .authenticated, arrivalTime: 0.030,
+            rttP95Ms: 20)
+        let outcomes = [outcome] + reassembler.expire(at: 0.031)
+        XCTAssertTrue(outcomes.contains(.completed(
+            accessUnit: canonical(payload, payload, payload),
+            frameSequence: 1, captureTime90k: 0)))
+        XCTAssertFalse(outcomes.contains(.sequenceAnchorLost(expectedSequence: 10)))
+    }
+
+    func testPartialFrameExpiresAtItsActualDeadline() {
+        let payload = nal(type: 1, count: 20, fill: 1)
+        let reassembler = HevcRtpReassembler(
+            mtu: 1_200, initialExpectedSequence: 10)
+        for index in 0..<4 {
+            _ = reassembler.consume(
+                packet(sequence: UInt16(10 + index),
+                       timestamp: UInt32(index + 1),
+                       frame: UInt32(index + 1), capture: 0,
+                       marker: false, payload: payload),
+                authentication: .authenticated,
+                arrivalTime: Double(index) * 0.008,
+                rttP95Ms: 20)
+        }
+        XCTAssertEqual(reassembler.allocatedFrameCount, 4)
+        XCTAssertTrue(reassembler.expire(at: 0.034).isEmpty)
+        XCTAssertEqual(reassembler.allocatedFrameCount, 4)
+        XCTAssertTrue(reassembler.expire(at: 0.035).contains(
+            .expired(frameSequence: 1)))
+        XCTAssertEqual(reassembler.allocatedFrameCount, 3)
+    }
+
+    func testIDRSurvivesOtherFramesUntilFiftyMillisecondDeadline() {
+        let idr = nal(type: 19, count: 20, fill: 1)
+        let payload = nal(type: 1, count: 20, fill: 2)
+        let reassembler = HevcRtpReassembler(
+            mtu: 1_200, initialExpectedSequence: 10)
+        _ = reassembler.consume(
+            packet(sequence: 10, timestamp: 1, frame: 1, capture: 0,
+                   marker: false, payload: idr),
+            authentication: .authenticated, arrivalTime: 0,
+            rttP95Ms: 20)
+        for index in 1...5 {
+            _ = reassembler.consume(
+                packet(sequence: UInt16(10 + index),
+                       timestamp: UInt32(index + 1),
+                       frame: UInt32(index + 1), capture: 0,
+                       marker: false, payload: payload),
+                authentication: .authenticated,
+                arrivalTime: Double(index) * 0.008,
+                rttP95Ms: 20)
+        }
+        XCTAssertEqual(reassembler.allocatedFrameCount, 6)
+        XCTAssertFalse(reassembler.expire(at: 0.049).contains(
+            .expired(frameSequence: 1)))
+        XCTAssertTrue(reassembler.expire(at: 0.050).contains(
+            .expired(frameSequence: 1)))
+    }
+
+    func testCapacityEvictsOldestOnlyAfterDeadlineExpiry() {
+        let payload = nal(type: 1, count: 20, fill: 1)
+        let reassembler = HevcRtpReassembler(
+            mtu: 1_200, initialExpectedSequence: 10)
+        for index in 0..<8 {
+            _ = reassembler.consume(
+                packet(sequence: UInt16(10 + index),
+                       timestamp: UInt32(index + 1),
+                       frame: UInt32(index + 1), capture: 0,
+                       marker: false, payload: payload),
+                authentication: .authenticated,
+                arrivalTime: Double(index) * 0.001,
+                rttP95Ms: 20)
+            XCTAssertLessThanOrEqual(reassembler.allocatedFrameCount, 6)
+        }
+        XCTAssertEqual(reassembler.allocatedFrameCount, 6)
+        _ = reassembler.consume(
+            packet(sequence: 30, timestamp: 30, frame: 30, capture: 0,
+                   marker: false, payload: payload),
+            authentication: .authenticated, arrivalTime: 0.036,
+            rttP95Ms: 20)
+        XCTAssertLessThanOrEqual(reassembler.allocatedFrameCount, 6)
     }
 
     func testDeadlineFormulaIsExact() {
@@ -112,7 +214,7 @@ final class HevcRtpReassemblerTests: XCTestCase {
             0.050)
     }
 
-    func testMarkerFirstCompletesWhenLeadingFragmentArrives() {
+    func testMarkerFirstMissingLeadingNalExpiresWithoutSuffix() {
         let idr = nal(type: 19, count: 40, fill: 3)
         let first = idr.subdata(in: 2..<20)
         let last = idr.subdata(in: 20..<idr.count)
@@ -138,13 +240,10 @@ final class HevcRtpReassemblerTests: XCTestCase {
                 authentication: .authenticated,
                 arrivalTime: 0.001,
                 rttP95Ms: 1),
-            .completed(
-                accessUnit: canonical(idr),
-                frameSequence: 8,
-                captureTime90k: 0))
+            .accepted)
         XCTAssertEqual(
             reassembler.expire(at: 0.051),
-            [])
+            [.expired(frameSequence: 8)])
     }
 
     func testInitialSingleNalAndFuOnlyInOrderDoNotStall() {
@@ -275,8 +374,7 @@ final class HevcRtpReassemblerTests: XCTestCase {
                     authentication: .authenticated,
                     arrivalTime: 0.002,
                     rttP95Ms: 1),
-                .sequenceAnchorLost(expectedSequence: 10))
-            XCTAssertEqual(reassembler.drainOutcome(), .malformed)
+                .malformed)
         }
     }
 
@@ -303,8 +401,7 @@ final class HevcRtpReassemblerTests: XCTestCase {
                     authentication: .authenticated,
                     arrivalTime: 0.002,
                     rttP95Ms: 1),
-                .sequenceAnchorLost(expectedSequence: 10))
-            XCTAssertEqual(reassembler.drainOutcome(), .malformed)
+                .malformed)
         }
         do {
             let (reassembler, idr) = anchoredReassembler()
@@ -337,8 +434,7 @@ final class HevcRtpReassemblerTests: XCTestCase {
                     authentication: .authenticated,
                     arrivalTime: 0.003,
                     rttP95Ms: 1),
-                .sequenceAnchorLost(expectedSequence: 10))
-            XCTAssertEqual(reassembler.drainOutcome(), .malformed)
+                .malformed)
         }
     }
 
@@ -430,9 +526,13 @@ final class HevcRtpReassemblerTests: XCTestCase {
                 authentication: .authenticated,
                 arrivalTime: 0.002,
                 rttP95Ms: 1),
-            .sequenceAnchorLost(expectedSequence: 10))
-        XCTAssertEqual(receiver.drainOutcome(), .malformed)
-        XCTAssertNil(receiver.drainOutcome())
+            .malformed)
+        XCTAssertEqual(
+            receiver.drainOutcome(),
+            .completed(
+                accessUnit: canonical(valid),
+                frameSequence: 2,
+                captureTime90k: 2))
         XCTAssertLessThanOrEqual(receiver.pendingOutcomeCount, 2)
     }
 
@@ -469,8 +569,7 @@ final class HevcRtpReassemblerTests: XCTestCase {
                 authentication: .authenticated,
                 arrivalTime: 0.020,
                 rttP95Ms: 0),
-            .sequenceAnchorLost(expectedSequence: 10))
-        XCTAssertEqual(receiver.drainOutcome(), .expired(frameSequence: 1))
+            .expired(frameSequence: 1))
         XCTAssertEqual(receiver.drainOutcome(), .duplicate)
         XCTAssertLessThanOrEqual(receiver.pendingOutcomeCount, 2)
     }
