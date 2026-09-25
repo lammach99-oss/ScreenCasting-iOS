@@ -461,11 +461,12 @@ struct WifiFeedbackWindow {
     private(set) var highest: UInt16?
     private(set) var bitmap: UInt64 = 0
 
-    mutating func observe(_ sequence: UInt16) {
+    @discardableResult
+    mutating func observe(_ sequence: UInt16) -> Bool {
         guard let current = highest else {
             highest = sequence
             bitmap = 0
-            return
+            return false
         }
         let forward = UInt16(truncatingIfNeeded: sequence &- current)
         if forward != 0 && forward < 0x8000 {
@@ -476,12 +477,13 @@ struct WifiFeedbackWindow {
                 bitmap |= UInt64(1) << UInt64(forward - 1)
             }
             highest = sequence
-            return
+            return forward > 1
         }
         let back = UInt16(truncatingIfNeeded: current &- sequence)
         if back >= 1 && back <= 64 {
             bitmap |= UInt64(1) << UInt64(back - 1)
         }
+        return false
     }
 }
 
@@ -805,6 +807,9 @@ final class WifiMediaReceiver {
     private var startCompletionDelivered = false
     private var feedbackTimer: DispatchSourceTimer?
     private var feedbackWindow = WifiFeedbackWindow()
+    #if targetEnvironment(simulator)
+    private(set) var immediateGapFeedbackCountForTesting = 0
+    #endif
     private var feedbackSequence: UInt16 = 1
     private var lastCompletedFrame: UInt32 = 0
     private var hasCompletedFrame = false
@@ -991,10 +996,10 @@ final class WifiMediaReceiver {
                     }
                 },
                 decoder: decoder,
-                packetObserver: {
-                    [weak self] sequence, timestamp, _, arrival in
-                    guard let self else { return }
-                    self.feedbackWindow.observe(sequence)
+                 packetObserver: {
+                     [weak self] sequence, timestamp, _, arrival in
+                     guard let self else { return }
+                     self.observeMediaPacketSequence(sequence, generation: generation)
                     let transit = arrival * 90_000 - Double(timestamp)
                     if let previous = self.lastTransit90k {
                         self.jitter90k +=
@@ -1095,6 +1100,25 @@ final class WifiMediaReceiver {
         guard activeGeneration == generation else { return }
         inputWriter.enqueue(touch, generation: generation)
     }
+
+    private func observeMediaPacketSequence(_ sequence: UInt16, generation: UInt64) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard feedbackWindow.observe(sequence),
+              activeGeneration == generation,
+              !dependencyBreakActive else { return }
+        #if targetEnvironment(simulator)
+        immediateGapFeedbackCountForTesting += 1
+        #endif
+        sendFeedback(immediate: true)
+    }
+
+    #if targetEnvironment(simulator)
+    func simulateActivePacketSequenceForTesting(_ sequence: UInt16, generation: UInt64) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        activeGeneration = generation
+        observeMediaPacketSequence(sequence, generation: generation)
+    }
+    #endif
 
     func requestImmediateRecoveryFeedback(generation: UInt64) {
         dispatchPrecondition(condition: .onQueue(networkQueue))

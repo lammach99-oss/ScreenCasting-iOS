@@ -33,6 +33,55 @@ final class UsbSplitCommitGateTests: XCTestCase {
         XCTAssertEqual(window.bitmap, 1)
     }
 
+    func testFeedbackWindowReportsOnlyNewForwardGap() {
+        var window = WifiFeedbackWindow()
+        XCTAssertFalse(window.observe(100))
+        XCTAssertFalse(window.observe(101))
+        XCTAssertTrue(window.observe(103))
+        XCTAssertEqual(window.bitmap, 0b110)
+        XCTAssertFalse(window.observe(104))
+        XCTAssertFalse(window.observe(102))
+        XCTAssertEqual(window.bitmap, 0b1111)
+        XCTAssertFalse(window.observe(102))
+    }
+
+    func testFeedbackWindowWrapAdjacencyDoesNotReportGap() {
+        var window = WifiFeedbackWindow()
+        XCTAssertFalse(window.observe(UInt16.max))
+        XCTAssertFalse(window.observe(0))
+        XCTAssertEqual(window.bitmap, 1)
+    }
+
+    func testFeedbackWindowLargeJumpReportsOneBoundedGap() {
+        var window = WifiFeedbackWindow()
+        XCTAssertFalse(window.observe(100))
+        XCTAssertTrue(window.observe(165))
+        XCTAssertEqual(window.bitmap, 0)
+        XCTAssertFalse(window.observe(166))
+        XCTAssertFalse(window.observe(164))
+        XCTAssertEqual(window.bitmap, 0b11)
+    }
+
+    func testAuthenticatedForwardGapRequestsImmediateFeedbackBeforeExpiry() {
+        let queue = DispatchQueue(label: "test.wifi.feedback.gap")
+        let receiver = WifiMediaReceiver(
+            networkQueue: queue,
+            decoder: { _, _, _, _ in },
+            audioConsumer: { _, _, _, _ in },
+            onProbeAuthenticated: { _, _ in },
+            onCommittedFailure: { _, _ in })
+        queue.sync {
+            receiver.simulateActivePacketSequenceForTesting(100, generation: 7)
+            receiver.simulateActivePacketSequenceForTesting(101, generation: 7)
+            XCTAssertEqual(receiver.immediateGapFeedbackCountForTesting, 0)
+            receiver.simulateActivePacketSequenceForTesting(103, generation: 7)
+            XCTAssertEqual(receiver.immediateGapFeedbackCountForTesting, 1)
+            receiver.simulateActivePacketSequenceForTesting(104, generation: 7)
+            receiver.simulateActivePacketSequenceForTesting(102, generation: 7)
+            XCTAssertEqual(receiver.immediateGapFeedbackCountForTesting, 1)
+        }
+    }
+
     func testWifiSecurityDropsClassifyWithoutUnboundedDetail() {
         var counters = WifiSecurityDropCounters()
         counters.recordCryptoFailure(
