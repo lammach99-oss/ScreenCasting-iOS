@@ -67,6 +67,14 @@ final class HevcRtpReassembler {
         reevaluateBufferedFrames()
     }
 
+    func prepareForFreshIDRAnchor() {
+        frames.removeAll()
+        pendingOutcomes.removeAll()
+        expectedNextSequence = nil
+        maySelfAnchor = true
+        requiresIDRAnchor = true
+    }
+
     func drainOutcome() -> HevcReassemblyOutcome? {
         guard !pendingOutcomes.isEmpty else { return nil }
         return pendingOutcomes.removeFirst()

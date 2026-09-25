@@ -4125,7 +4125,7 @@ public class NetworkManager: ObservableObject {
             return false
         }
         decoder.beginSession(generation: generation)
-        wifiMediaReceiver.requestImmediateRecoveryFeedback(generation: generation)
+        wifiMediaReceiver.reanchorForPreservedSessionRecovery(generation: generation)
         sendClientPingIfDue()
         let complete = "[WIFI_MEDIA_RECOVERY] generation=\(generation) " +
             "action=decoder_rearmed recovery_requested=true"
@@ -4692,6 +4692,7 @@ public class NetworkManager: ObservableObject {
     var networkQueueForTesting: DispatchQueue { networkQueue }
     var networkQueueKeyForTesting: DispatchSpecificKey<Bool> { networkQueueKey }
     var decoderForTesting: DecoderManager { decoder }
+    var wifiMediaReceiverForTesting: WifiMediaReceiver { wifiMediaReceiver }
 
     func wifiSessionSnapshotForTesting() -> (
         connection: NWConnection?, generation: UInt64,

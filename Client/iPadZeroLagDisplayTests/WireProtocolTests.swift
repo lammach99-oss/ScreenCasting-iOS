@@ -693,6 +693,62 @@ final class WifiForegroundDecoderRecoveryTests: XCTestCase {
                        begins + 1)
     }
 
+    func testPreservedForegroundReanchorsOnlyCurrentMediaGeneration() {
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        manager.networkQueueForTesting.sync {
+            manager.wifiMediaReceiverForTesting
+                .simulateActivePacketSequenceForTesting(
+                    100, generation: session.generation)
+            manager.wifiMediaReceiverForTesting
+                .simulateActivePacketSequenceForTesting(
+                    102, generation: session.generation)
+        }
+        let before = manager.wifiLifecycleSnapshotForTesting()
+        manager.applicationDidEnterBackground()
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+        let after = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(after.connection === session.connection)
+        XCTAssertEqual(after.generation, session.generation)
+        XCTAssertEqual(after.authenticatedGeneration, session.generation)
+        XCTAssertEqual(after.committedGeneration, session.generation)
+        XCTAssertEqual(after.initialReceiveStarts, before.initialReceiveStarts)
+        XCTAssertEqual(after.writerBegins, before.writerBegins)
+        XCTAssertEqual(after.clientHelloCount, before.clientHelloCount)
+        manager.networkQueueForTesting.sync {
+            let receiver = manager.wifiMediaReceiverForTesting
+            XCTAssertEqual(receiver.lifecycleReanchorCountForTesting, 1)
+            XCTAssertNil(receiver.feedbackWindowForTesting.highest)
+            XCTAssertTrue(receiver.dependencyBreakActiveForTesting)
+            receiver.reanchorForPreservedSessionRecovery(
+                generation: session.generation - 1)
+            XCTAssertEqual(receiver.lifecycleReanchorCountForTesting, 1)
+        }
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync {
+            XCTAssertEqual(manager.wifiMediaReceiverForTesting
+                .lifecycleReanchorCountForTesting, 1)
+        }
+    }
+
+    func testGenericDecoderRecoveryDoesNotReanchorRtpHistory() {
+        let queue = DispatchQueue(label: "test.wifi.generic.recovery")
+        let receiver = WifiMediaReceiver(
+            networkQueue: queue,
+            decoder: { _, _, _, _ in },
+            audioConsumer: { _, _, _, _ in },
+            onProbeAuthenticated: { _, _ in },
+            onCommittedFailure: { _, _ in })
+        queue.sync {
+            receiver.simulateActivePacketSequenceForTesting(
+                100, generation: 7)
+            receiver.requestImmediateRecoveryFeedback(generation: 7)
+            XCTAssertEqual(receiver.lifecycleReanchorCountForTesting, 0)
+            XCTAssertEqual(receiver.feedbackWindowForTesting.highest, 100)
+            XCTAssertTrue(receiver.dependencyBreakActiveForTesting)
+        }
+    }
+
     func testReplacementWifiGenerationCannotRearmStaleSession() {
         let retired = manager.simulateCommittedWifiSessionForTesting()
         manager.applicationWillResignActive()

@@ -379,6 +379,10 @@ final class WifiAuthenticatedMediaProcessor {
         reassembler.allocatedFrameCount
     }
 
+    func prepareForFreshIDRAnchor() {
+        reassembler.prepareForFreshIDRAnchor()
+    }
+
     func consume(_ protectedPacket: Data, arrivalTime: TimeInterval) {
         var packet = protectedPacket
         guard unprotect(&packet) else {
@@ -809,6 +813,9 @@ final class WifiMediaReceiver {
     private var feedbackWindow = WifiFeedbackWindow()
     #if targetEnvironment(simulator)
     private(set) var immediateGapFeedbackCountForTesting = 0
+    private(set) var lifecycleReanchorCountForTesting = 0
+    var feedbackWindowForTesting: WifiFeedbackWindow { feedbackWindow }
+    var dependencyBreakActiveForTesting: Bool { dependencyBreakActive }
     #endif
     private var feedbackSequence: UInt16 = 1
     private var lastCompletedFrame: UInt32 = 0
@@ -1131,6 +1138,17 @@ final class WifiMediaReceiver {
             sendFeedback(immediate: true)
             return
         }
+        beginRecoveryEpisode()
+    }
+
+    func reanchorForPreservedSessionRecovery(generation: UInt64) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard activeGeneration == generation else { return }
+        mediaProcessor?.prepareForFreshIDRAnchor()
+        feedbackWindow = WifiFeedbackWindow()
+        #if targetEnvironment(simulator)
+        lifecycleReanchorCountForTesting += 1
+        #endif
         beginRecoveryEpisode()
     }
 

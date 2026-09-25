@@ -576,6 +576,49 @@ final class HevcRtpReassemblerTests: XCTestCase {
         XCTAssertLessThanOrEqual(receiver.pendingOutcomeCount, 2)
     }
 
+    func testIntentionalFreshIDRReanchorClearsOldStateWithoutSyntheticLoss() {
+        let payload = nal(type: 1, count: 20, fill: 1)
+        let idr = nal(type: 19, count: 20, fill: 2)
+        let reassembler = HevcRtpReassembler(
+            mtu: 1_200, initialExpectedSequence: 100)
+        for (sequence, arrival) in [(100, 0.0), (101, 0.001),
+                                    (102, 0.020)] {
+            _ = reassembler.consume(
+                packet(sequence: UInt16(sequence),
+                       timestamp: UInt32(sequence),
+                       frame: UInt32(sequence), capture: 0,
+                       marker: false, payload: payload),
+                authentication: .authenticated,
+                arrivalTime: arrival, rttP95Ms: 0)
+        }
+        XCTAssertGreaterThan(reassembler.pendingOutcomeCount, 0)
+        reassembler.prepareForFreshIDRAnchor()
+        XCTAssertEqual(reassembler.allocatedFrameCount, 0)
+        XCTAssertEqual(reassembler.pendingOutcomeCount, 0)
+        XCTAssertNil(reassembler.drainOutcome())
+
+        XCTAssertEqual(reassembler.consume(
+            packet(sequence: 500, timestamp: 500, frame: 500,
+                   capture: 0, marker: true, payload: payload),
+            authentication: .authenticated,
+            arrivalTime: 0.021, rttP95Ms: 0), .accepted)
+        XCTAssertEqual(reassembler.consume(
+            packet(sequence: 510, timestamp: 510, frame: 510,
+                   capture: 0, marker: true, payload: idr),
+            authentication: .authenticated,
+            arrivalTime: 0.022, rttP95Ms: 0),
+            .completed(accessUnit: canonical(idr),
+                       frameSequence: 510, captureTime90k: 0))
+        XCTAssertEqual(reassembler.consume(
+            packet(sequence: 511, timestamp: 511, frame: 511,
+                   capture: 0, marker: true, payload: payload),
+            authentication: .authenticated,
+            arrivalTime: 0.023, rttP95Ms: 0),
+            .completed(accessUnit: canonical(payload),
+                       frameSequence: 511, captureTime90k: 0))
+        XCTAssertNil(reassembler.drainOutcome())
+    }
+
     func testWholeFrameLossReanchorsOnlyOnFreshIDRBeforeSequenceWrap() {
         let receiver = HevcRtpReassembler(
             mtu: 1_200,
