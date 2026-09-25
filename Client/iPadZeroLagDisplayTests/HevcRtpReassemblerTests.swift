@@ -106,8 +106,8 @@ final class HevcRtpReassemblerTests: XCTestCase {
             mtu: 1_200, initialExpectedSequence: 10)
         for (sequence, timestamp, arrival, marker) in [
             (10, 1, 0.0, false), (12, 1, 0.001, true),
-            (13, 2, 0.008, true), (14, 3, 0.016, true),
-            (15, 4, 0.024, true)
+            (13, 2, 0.008, false), (14, 3, 0.016, false),
+            (15, 4, 0.024, false)
         ] {
             _ = reassembler.consume(
                 packet(sequence: UInt16(sequence), timestamp: UInt32(timestamp),
