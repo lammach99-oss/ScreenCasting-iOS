@@ -50,7 +50,7 @@ final class HevcRtpReassemblerTests: XCTestCase {
     }
 
     func testAuthenticationDuplicateMissingExpiryAndDeadlineBound() {
-        let payload = nal(type: 32, count: 20, fill: 1)
+        let payload = nal(type: 1, count: 20, fill: 1)
         let one = packet(
             sequence: UInt16.max,
             timestamp: UInt32.max,
@@ -542,10 +542,10 @@ final class HevcRtpReassemblerTests: XCTestCase {
         let receiver = HevcRtpReassembler(
             mtu: 1_200,
             initialExpectedSequence: 10)
-        let vpsPacket = packet(
+        let pFramePacket = packet(
             sequence: 10, timestamp: 1, frame: 1, capture: 0,
             marker: false,
-            payload: nal(type: 32, count: 20, fill: 1))
+            payload: nal(type: 1, count: 20, fill: 1))
         let idrPacket = packet(
             sequence: 20, timestamp: 2, frame: 2, capture: 0,
             marker: false,
@@ -555,7 +555,7 @@ final class HevcRtpReassemblerTests: XCTestCase {
                 start: true,
                 end: false))
         _ = receiver.consume(
-            vpsPacket,
+            pFramePacket,
             authentication: .authenticated,
             arrivalTime: 0,
             rttP95Ms: 0)
