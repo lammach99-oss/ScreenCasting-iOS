@@ -1187,6 +1187,60 @@ final class WifiShortBackgroundSameSessionTests: XCTestCase {
         XCTAssertTrue(snap.graceActive)
     }
 
+    func testTerminalSendErrorDuringInactiveRetiresSession() {
+        let session = inactiveSession()
+        manager.simulateWifiControlSendErrorForTesting(
+            .posix(.ECONNRESET), generation: session.generation,
+            connection: session.connection)
+
+        let snap = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertNil(snap.connection)
+        XCTAssertNil(snap.committedGeneration)
+        XCTAssertGreaterThan(snap.generation, session.generation)
+    }
+
+    func testTerminalReceiveErrorDuringGraceRetiresSession() {
+        let session = backgroundWaiting()
+        manager.simulateWifiControlReceiveErrorForTesting(
+            .posix(.EPIPE), generation: session.generation,
+            connection: session.connection)
+
+        let snap = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertNil(snap.connection)
+        XCTAssertNil(snap.committedGeneration)
+        XCTAssertGreaterThan(snap.generation, session.generation)
+    }
+
+    func testTerminalWaitingErrorDuringInactiveRetiresSession() {
+        let session = inactiveSession()
+        deliver(.waiting(.posix(.ECONNRESET)), to: session.connection)
+
+        let snap = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertNil(snap.connection)
+        XCTAssertNil(snap.committedGeneration)
+        XCTAssertGreaterThan(snap.generation, session.generation)
+    }
+
+    func testWaitingOwnerIncludesExactConnectionIdentity() {
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        let staleConnection = NWConnection(
+            host: "127.0.0.1", port: 27015, using: .tcp)
+        manager.setWifiWaitingOwnerForTesting(
+            generation: session.generation, connection: staleConnection)
+
+        XCTAssertTrue(manager.isWifiConnectionReadyForTesting(
+            connection: session.connection, generation: session.generation))
+    }
+
+    func testActualReadyStateWinsExactWaitingOwner() {
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        manager.setWifiWaitingOwnerForTesting(
+            generation: session.generation, connection: session.connection)
+
+        XCTAssertTrue(manager.isWifiConnectionReadyForTesting(
+            connection: session.connection, generation: session.generation))
+    }
+
     func testOriginalGraceExpiresEvenAfterForegroundWhileWaiting() {
         let session = backgroundWaiting()
         manager.applicationDidBecomeActive()
