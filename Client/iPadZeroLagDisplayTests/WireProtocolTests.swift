@@ -1232,13 +1232,12 @@ final class WifiShortBackgroundSameSessionTests: XCTestCase {
             connection: session.connection, generation: session.generation))
     }
 
-    func testActualReadyStateWinsExactWaitingOwner() {
-        let session = manager.simulateCommittedWifiSessionForTesting()
-        manager.setWifiWaitingOwnerForTesting(
-            generation: session.generation, connection: session.connection)
-
-        XCTAssertTrue(manager.isWifiConnectionReadyForTesting(
-            connection: session.connection, generation: session.generation))
+    func testActualReadyStateWinsStaleWaitingBookkeeping() {
+        XCTAssertTrue(WifiConnectionReadinessPolicy.isReady(
+            actualReady: true, waitingOwned: true))
+        XCTAssertFalse(WifiConnectionReadinessPolicy.isReady(
+            actualReady: false, waitingOwned: true,
+            simulatedReady: true))
     }
 
     func testOriginalGraceExpiresEvenAfterForegroundWhileWaiting() {

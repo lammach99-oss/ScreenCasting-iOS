@@ -4091,13 +4091,24 @@ public class NetworkManager: ObservableObject {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard connection === expectedConnection,
               generation == connectionGeneration else { return false }
-        if case .ready = expectedConnection.state { return true }
+        let actualReady: Bool
+        if case .ready = expectedConnection.state {
+            actualReady = true
+        } else {
+            actualReady = false
+        }
+        let waitingOwned = wifiWaitingOwner?.owns(
+            expectedConnection, generation: generation) == true
         #if targetEnvironment(simulator)
-        if testingSimulatedWifiSession { return true }
+        return WifiConnectionReadinessPolicy.isReady(
+            actualReady: actualReady,
+            waitingOwned: waitingOwned,
+            simulatedReady: testingSimulatedWifiSession)
+        #else
+        return WifiConnectionReadinessPolicy.isReady(
+            actualReady: actualReady,
+            waitingOwned: waitingOwned)
         #endif
-        if wifiWaitingOwner?.owns(
-            expectedConnection, generation: generation) == true { return false }
-        return false
     }
 
     private func resumeCommittedWireReceiveLoopIfNeeded(
@@ -4927,5 +4938,16 @@ public class NetworkManager: ObservableObject {
 private extension Float {
     func clamped(_ lo: Float, _ hi: Float) -> Float {
         Swift.min(Swift.max(self, lo), hi)
+    }
+}
+enum WifiConnectionReadinessPolicy {
+    static func isReady(
+        actualReady: Bool,
+        waitingOwned: Bool,
+        simulatedReady: Bool = false
+    ) -> Bool {
+        if actualReady { return true }
+        if waitingOwned { return false }
+        return simulatedReady
     }
 }
