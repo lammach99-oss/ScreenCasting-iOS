@@ -411,8 +411,8 @@ final class WifiTransportNegotiationTests: XCTestCase {
         let pps = Data([34 << 1, 1])
         let idr = Data([19 << 1, 1])
         for (sequence, payload, marker) in [
-            (100, vps, false), (101, sps, false),
-            (102, pps, false), (103, idr, true)
+            (101, sps, false), (102, pps, false),
+            (103, idr, true)
         ] {
             processor.consume(
                 makeMediaPacket(
@@ -420,6 +420,12 @@ final class WifiTransportNegotiationTests: XCTestCase {
                     frameSequence: 10, marker: marker, payload: payload),
                 arrivalTime: Double(sequence - 100) * 0.001)
         }
+        XCTAssertTrue(decoded.isEmpty)
+        processor.consume(
+            makeMediaPacket(
+                sequence: 100, timestamp: 10,
+                frameSequence: 10, marker: false, payload: vps),
+            arrivalTime: 0.004)
         XCTAssertEqual(decoded, [canonical(vps, sps, pps, idr)])
     }
 
