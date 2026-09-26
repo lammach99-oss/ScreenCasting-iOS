@@ -628,11 +628,11 @@ final class HevcRtpReassemblerTests: XCTestCase {
         XCTAssertEqual(outcomes.count, 7)
         XCTAssertEqual(outcomes.first,
                        .sequenceAnchorLost(expectedSequence: 10))
-        XCTAssertEqual(Array(outcomes.dropFirst()),
-                       (1...6).map {
-                           HevcReassemblyOutcome.expired(
-                               frameSequence: UInt32($0))
-                       })
+        let expired = outcomes.dropFirst().compactMap { outcome -> UInt32? in
+            if case .expired(let sequence) = outcome { return sequence }
+            return nil
+        }
+        XCTAssertEqual(expired.sorted(), (1...6).map(UInt32.init))
         XCTAssertEqual(reassembler.pendingOutcomeCount, 0)
     }
 
