@@ -398,6 +398,31 @@ final class WifiTransportNegotiationTests: XCTestCase {
         XCTAssertEqual(decoded, [1, 2, 3, 4, 5, 6])
     }
 
+    func testFreshRecoveryProcessorDeliversConfigurationAndIDR() {
+        var decoded: [Data] = []
+        let processor = WifiAuthenticatedMediaProcessor(
+            mtu: 1_200,
+            initialSequence: 1,
+            unprotect: { _ in true },
+            decoder: { data, _, _, _ in decoded.append(data) })
+        processor.prepareForFreshIDRAnchor()
+        let vps = Data([32 << 1, 1])
+        let sps = Data([33 << 1, 1])
+        let pps = Data([34 << 1, 1])
+        let idr = Data([19 << 1, 1])
+        for (sequence, payload, marker) in [
+            (100, vps, false), (101, sps, false),
+            (102, pps, false), (103, idr, true)
+        ] {
+            processor.consume(
+                makeMediaPacket(
+                    sequence: UInt16(sequence), timestamp: 10,
+                    frameSequence: 10, marker: marker, payload: payload),
+                arrivalTime: Double(sequence - 100) * 0.001)
+        }
+        XCTAssertEqual(decoded, [canonical(vps, sps, pps, idr)])
+    }
+
     private func makeSingleNalPacket(sequence: UInt16) -> Data {
         makeMediaPacket(
             sequence: sequence,
@@ -429,6 +454,19 @@ final class WifiTransportNegotiationTests: XCTestCase {
             RtpPacketView.headerLength..<packet.count,
             with: payload)
         return packet
+    }
+
+    private func canonical(_ nals: Data...) -> Data {
+        var result = Data()
+        for nal in nals {
+            let count = UInt32(nal.count)
+            result.append(UInt8(truncatingIfNeeded: count >> 24))
+            result.append(UInt8(truncatingIfNeeded: count >> 16))
+            result.append(UInt8(truncatingIfNeeded: count >> 8))
+            result.append(UInt8(truncatingIfNeeded: count))
+            result.append(nal)
+        }
+        return result
     }
 
     private func storeBE16(_ value: UInt16, in data: inout Data, at offset: Int) {

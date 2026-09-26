@@ -114,7 +114,8 @@ final class HevcRtpReassembler {
         }
 
         if frames[packet.timestamp] == nil {
-            let idr = Self.isIDR(packet.payload)
+            let randomAccess = Self.isRandomAccessConfiguration(
+                packet.payload)
             frames[packet.timestamp] = Frame(
                 timestamp: packet.timestamp,
                 frameSequence: packet.frameSequence,
@@ -122,7 +123,7 @@ final class HevcRtpReassembler {
                 firstArrival: arrivalTime,
                 deadline: arrivalTime + ReassemblyDeadline.interval(
                     rttP95Ms: rttP95Ms,
-                    isIDR: idr))
+                    isIDR: randomAccess))
         }
         guard var frame = frames[packet.timestamp] else {
             enqueue(.malformed)
@@ -138,7 +139,7 @@ final class HevcRtpReassembler {
             enqueue(.duplicate)
             return priorOutcome ?? drainOutcome()!
         }
-        if Self.isIDR(packet.payload) {
+        if Self.isRandomAccessConfiguration(packet.payload) {
             frame.deadline = max(
                 frame.deadline,
                 frame.firstArrival + 0.050)
@@ -156,13 +157,15 @@ final class HevcRtpReassembler {
         frames[packet.timestamp] = frame
 
         if maySelfAnchor {
-            let canAnchor = requiresIDRAnchor
-                ? Self.isIDR(packet.payload) &&
-                    Self.isNalBoundary(packet.payload)
-                : !packet.marker && Self.isNalBoundary(packet.payload)
-            if canAnchor {
+            if requiresIDRAnchor,
+               let anchor = Self.recoveryAnchorSequence(in: frame) {
                 maySelfAnchor = false
                 requiresIDRAnchor = false
+                expectedNextSequence = anchor
+            } else if !requiresIDRAnchor,
+                      !packet.marker,
+                      Self.isNalBoundary(packet.payload) {
+                maySelfAnchor = false
                 expectedNextSequence = packet.sequence
             }
         }
@@ -363,12 +366,48 @@ final class HevcRtpReassembler {
         output.append(nal)
     }
 
-    private static func isIDR(_ payload: Data) -> Bool {
+    private static func nalType(_ payload: Data) -> UInt8? {
+        guard payload.count >= 2 else { return nil }
         let type = (payload[0] >> 1) & 0x3F
-        let nalType = type == 49 && payload.count >= 3
-            ? payload[2] & 0x3F
-            : type
+        if type == 49 {
+            guard payload.count >= 3 else { return nil }
+            return payload[2] & 0x3F
+        }
+        return type
+    }
+
+    private static func isIDR(_ payload: Data) -> Bool {
+        guard let nalType = nalType(payload) else { return false }
         return nalType == 19 || nalType == 20 || nalType == 21
+    }
+
+    private static func isRandomAccessConfiguration(_ payload: Data) -> Bool {
+        guard isNalBoundary(payload),
+              let type = nalType(payload) else { return false }
+        return type == 32 || type == 33 || type == 34 ||
+            type == 19 || type == 20 || type == 21
+    }
+
+    private static func recoveryAnchorSequence(in frame: Frame) -> UInt16? {
+        let idrBoundaries = frame.packets.values.filter {
+            isIDR($0.payload) && isNalBoundary($0.payload)
+        }
+        for idr in idrBoundaries {
+            let prefix = frame.packets.values.filter {
+                UInt16(truncatingIfNeeded: idr.sequence &- $0.sequence) < 0x8000
+            }
+            guard let first = prefix.max(by: {
+                UInt16(truncatingIfNeeded: idr.sequence &- $0.sequence) <
+                    UInt16(truncatingIfNeeded: idr.sequence &- $1.sequence)
+            }), isNalBoundary(first.payload) else { continue }
+            var sequence = first.sequence
+            for _ in 0..<prefix.count {
+                guard frame.packets[sequence] != nil else { break }
+                if sequence == idr.sequence { return first.sequence }
+                sequence &+= 1
+            }
+        }
+        return nil
     }
 
     private static func isNalBoundary(_ payload: Data) -> Bool {

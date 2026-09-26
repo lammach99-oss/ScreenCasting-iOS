@@ -679,6 +679,80 @@ final class HevcRtpReassemblerTests: XCTestCase {
         XCTAssertNil(reassembler.drainOutcome())
     }
 
+    func testFreshRecoveryRetainsVpsSpsPpsBeforeIDR() {
+        let vps = nal(type: 32, count: 20, fill: 1)
+        let sps = nal(type: 33, count: 20, fill: 2)
+        let pps = nal(type: 34, count: 20, fill: 3)
+        let idr = nal(type: 19, count: 20, fill: 4)
+        let reassembler = HevcRtpReassembler(mtu: 1_200)
+        reassembler.prepareForFreshIDRAnchor()
+        var outcome: HevcReassemblyOutcome = .accepted
+        for (sequence, payload, marker) in [
+            (100, vps, false), (101, sps, false),
+            (102, pps, false), (103, idr, true)
+        ] {
+            outcome = reassembler.consume(
+                packet(sequence: UInt16(sequence), timestamp: 10,
+                       frame: 10, capture: 0, marker: marker,
+                       payload: payload),
+                authentication: .authenticated,
+                arrivalTime: Double(sequence - 100) * 0.001,
+                rttP95Ms: 4)
+        }
+        XCTAssertEqual(outcome,
+            .completed(accessUnit: canonical(vps, sps, pps, idr),
+                       frameSequence: 10, captureTime90k: 0))
+    }
+
+    func testFreshRecoveryWaitsForKnownParameterSetGap() {
+        let vps = nal(type: 32, count: 20, fill: 1)
+        let sps = nal(type: 33, count: 20, fill: 2)
+        let pps = nal(type: 34, count: 20, fill: 3)
+        let idr = nal(type: 19, count: 20, fill: 4)
+        let reassembler = HevcRtpReassembler(mtu: 1_200)
+        reassembler.prepareForFreshIDRAnchor()
+        for (sequence, payload, marker) in [
+            (100, vps, false), (102, pps, false), (103, idr, true)
+        ] {
+            XCTAssertEqual(reassembler.consume(
+                packet(sequence: UInt16(sequence), timestamp: 10,
+                       frame: 10, capture: 0, marker: marker,
+                       payload: payload),
+                authentication: .authenticated,
+                arrivalTime: Double(sequence - 100) * 0.001,
+                rttP95Ms: 4), .accepted)
+        }
+        XCTAssertEqual(reassembler.allocatedFrameCount, 1)
+        XCTAssertEqual(reassembler.consume(
+            packet(sequence: 101, timestamp: 10, frame: 10,
+                   capture: 0, marker: false, payload: sps),
+            authentication: .authenticated,
+            arrivalTime: 0.004, rttP95Ms: 4),
+            .completed(accessUnit: canonical(vps, sps, pps, idr),
+                       frameSequence: 10, captureTime90k: 0))
+    }
+
+    func testVpsAndVpsFuStartUseRandomAccessDeadline() {
+        let vps = nal(type: 32, count: 40, fill: 1)
+        for payload in [
+            vps,
+            fu(vps, bytes: vps.subdata(in: 2..<20),
+               start: true, end: false)
+        ] {
+            let reassembler = HevcRtpReassembler(mtu: 1_200)
+            reassembler.prepareForFreshIDRAnchor()
+            XCTAssertEqual(reassembler.consume(
+                packet(sequence: 100, timestamp: 10, frame: 10,
+                       capture: 0, marker: false, payload: payload),
+                authentication: .authenticated,
+                arrivalTime: 0, rttP95Ms: 0), .accepted)
+            XCTAssertFalse(reassembler.expire(at: 0.035).contains(
+                .expired(frameSequence: 10)))
+            XCTAssertTrue(reassembler.expire(at: 0.050).contains(
+                .expired(frameSequence: 10)))
+        }
+    }
+
     func testWholeFrameLossReanchorsOnlyOnFreshIDRBeforeSequenceWrap() {
         let receiver = HevcRtpReassembler(
             mtu: 1_200,
