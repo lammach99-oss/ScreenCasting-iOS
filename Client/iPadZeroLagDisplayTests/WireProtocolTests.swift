@@ -3,20 +3,22 @@ import Network
 @testable import iPadCasting
 
 final class UsbSplitCommitGateTests: XCTestCase {
-    func testFeedbackWindowStartsEmptyAndTracksLossAndReordering() {
+    func testFeedbackWindowUnknownHistoryIsNotLoss() {
         var window = WifiFeedbackWindow()
+        XCTAssertNil(window.highest)
+        XCTAssertEqual(window.bitmap, UInt64.max)
         window.observe(100)
         XCTAssertEqual(window.highest, 100)
-        XCTAssertEqual(window.bitmap, 0)
+        XCTAssertEqual(window.bitmap, UInt64.max)
 
+        window.observe(101)
         window.observe(103)
         XCTAssertEqual(window.highest, 103)
-        XCTAssertEqual(window.bitmap, 0b100)
+        XCTAssertEqual(window.bitmap, UInt64.max & ~UInt64(1))
+        XCTAssertEqual((~window.bitmap).nonzeroBitCount, 1)
 
         window.observe(102)
-        XCTAssertEqual(window.bitmap, 0b101)
-        window.observe(101)
-        XCTAssertEqual(window.bitmap, 0b111)
+        XCTAssertEqual(window.bitmap, UInt64.max)
     }
 
     func testFeedbackWindowWrapAndLargeJumpResetAreBounded() {
@@ -30,7 +32,29 @@ final class UsbSplitCommitGateTests: XCTestCase {
         XCTAssertEqual(window.highest, 65)
         XCTAssertEqual(window.bitmap, 0)
         window.observe(64)
-        XCTAssertEqual(window.bitmap, 1)
+        XCTAssertEqual(window.bitmap, UInt64.max)
+    }
+
+    func testUnknownHistorySerializesAsAllReceivedBits() {
+        let packet = WifiFeedbackCodec.packet(
+            sequence: 1,
+            ssrc: 2,
+            window: WifiFeedbackWindow(),
+            lastCompleted: 0,
+            telemetry: WifiFeedbackTelemetry(
+                lastDecoded: 0, lastPresented: 0, jitterMs: 0,
+                rttP95Ms: 0, queueAgeP95Ms: 0, decodeP95Ms: 0),
+            smoothedRttMs: 0,
+            expiredFrames: 0,
+            immediate: false,
+            dependencyBreak: false,
+            recoveryCompleted: false,
+            rttToken: 0,
+            rttSentNanoseconds: 0,
+            frameIntervalMs: 1000.0 / 120,
+            recoveryEpisode: 0)
+        XCTAssertEqual(Array(packet[20..<28]),
+                       Array(repeating: UInt8.max, count: 8))
     }
 
     func testFeedbackWindowReportsOnlyNewForwardGap() {
@@ -38,10 +62,10 @@ final class UsbSplitCommitGateTests: XCTestCase {
         XCTAssertFalse(window.observe(100))
         XCTAssertFalse(window.observe(101))
         XCTAssertTrue(window.observe(103))
-        XCTAssertEqual(window.bitmap, 0b110)
+        XCTAssertEqual(window.bitmap, UInt64.max & ~UInt64(1))
         XCTAssertFalse(window.observe(104))
         XCTAssertFalse(window.observe(102))
-        XCTAssertEqual(window.bitmap, 0b1111)
+        XCTAssertEqual(window.bitmap, UInt64.max)
         XCTAssertFalse(window.observe(102))
     }
 
@@ -49,7 +73,7 @@ final class UsbSplitCommitGateTests: XCTestCase {
         var window = WifiFeedbackWindow()
         XCTAssertFalse(window.observe(UInt16.max))
         XCTAssertFalse(window.observe(0))
-        XCTAssertEqual(window.bitmap, 1)
+        XCTAssertEqual(window.bitmap, UInt64.max)
     }
 
     func testFeedbackWindowLargeJumpReportsOneBoundedGap() {
@@ -79,6 +103,52 @@ final class UsbSplitCommitGateTests: XCTestCase {
             receiver.simulateActivePacketSequenceForTesting(104, generation: 7)
             receiver.simulateActivePacketSequenceForTesting(102, generation: 7)
             XCTAssertEqual(receiver.immediateGapFeedbackCountForTesting, 1)
+        }
+    }
+
+    func testForwardGapStillRequestsImmediateFeedbackDuringRecovery() {
+        let queue = DispatchQueue(label: "test.wifi.feedback.recovery.gap")
+        let receiver = WifiMediaReceiver(
+            networkQueue: queue,
+            decoder: { _, _, _, _ in },
+            audioConsumer: { _, _, _, _ in },
+            onProbeAuthenticated: { _, _ in },
+            onCommittedFailure: { _, _ in })
+        queue.sync {
+            receiver.simulateActivePacketSequenceForTesting(100, generation: 7)
+            receiver.requestImmediateRecoveryFeedback(generation: 7)
+            let episode = receiver.recoveryEpisodeForTesting
+            receiver.simulateActivePacketSequenceForTesting(103, generation: 7)
+            XCTAssertEqual(receiver.immediateGapFeedbackCountForTesting, 1)
+            XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode)
+        }
+    }
+
+    func testStalledRecoveryRetriesOnceAtBoundedTimerTick() {
+        let queue = DispatchQueue(label: "test.wifi.feedback.recovery.timer")
+        let receiver = WifiMediaReceiver(
+            networkQueue: queue,
+            decoder: { _, _, _, _ in },
+            audioConsumer: { _, _, _, _ in },
+            onProbeAuthenticated: { _, _ in },
+            onCommittedFailure: { _, _ in })
+        queue.sync {
+            receiver.simulateActivePacketSequenceForTesting(100, generation: 7)
+            receiver.beginRecoveryEpisodeForTesting(at: 10)
+            let episode = receiver.recoveryEpisodeForTesting
+            receiver.feedbackTimerTickForTesting(at: 10.050)
+            receiver.feedbackTimerTickForTesting(at: 10.099)
+            XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode)
+            receiver.feedbackTimerTickForTesting(at: 10.125)
+            XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode + 1)
+            receiver.simulatePendingRecoveryCandidateForTesting(sequence: 5)
+            receiver.feedbackTimerTickForTesting(at: 10.300)
+            XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode + 1)
+            receiver.decoderDidComplete(sequence: 5, generation: 7,
+                                        succeeded: true)
+            XCTAssertNil(receiver.recoveryEpisodeStartedAtForTesting)
+            receiver.feedbackTimerTickForTesting(at: 10.500)
+            XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode + 1)
         }
     }
 

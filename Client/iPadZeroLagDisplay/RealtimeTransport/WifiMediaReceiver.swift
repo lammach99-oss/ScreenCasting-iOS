@@ -463,13 +463,13 @@ final class WifiAuthenticatedMediaProcessor {
 
 struct WifiFeedbackWindow {
     private(set) var highest: UInt16?
-    private(set) var bitmap: UInt64 = 0
+    private(set) var bitmap: UInt64 = .max
 
     @discardableResult
     mutating func observe(_ sequence: UInt16) -> Bool {
         guard let current = highest else {
             highest = sequence
-            bitmap = 0
+            bitmap = .max
             return false
         }
         let forward = UInt16(truncatingIfNeeded: sequence &- current)
@@ -772,6 +772,7 @@ struct WifiCommitGate {
 }
 
 final class WifiMediaReceiver {
+    private static let recoveryEpisodeRetryInterval: TimeInterval = 0.100
     typealias Decoder = WifiAuthenticatedMediaProcessor.Decoder
     typealias FramePacketObserver = (
         UInt64, UInt32, Bool, Bool, Int, TimeInterval
@@ -816,6 +817,19 @@ final class WifiMediaReceiver {
     private(set) var lifecycleReanchorCountForTesting = 0
     var feedbackWindowForTesting: WifiFeedbackWindow { feedbackWindow }
     var dependencyBreakActiveForTesting: Bool { dependencyBreakActive }
+    var recoveryEpisodeForTesting: UInt32 { recoveryEpisode }
+    var recoveryEpisodeStartedAtForTesting: TimeInterval? {
+        recoveryEpisodeStartedAt
+    }
+    func beginRecoveryEpisodeForTesting(at now: TimeInterval) {
+        beginRecoveryEpisode(startedAt: now)
+    }
+    func feedbackTimerTickForTesting(at now: TimeInterval) {
+        handleFeedbackTimerTick(now: now)
+    }
+    func simulatePendingRecoveryCandidateForTesting(sequence: UInt32) {
+        pendingRecoveryIdr = (sequence, recoveryEpisode)
+    }
     #endif
     private var feedbackSequence: UInt16 = 1
     private var lastCompletedFrame: UInt32 = 0
@@ -828,6 +842,7 @@ final class WifiMediaReceiver {
     private var dependencyBreakActive = false
     private var recoveryCompletedPending = false
     private var recoveryEpisode: UInt32 = 0
+    private var recoveryEpisodeStartedAt: TimeInterval?
     private var recoveryFloorFrame: UInt32 = 0
     private var recoveryFloorSet = false
     private var pendingRecoveryIdr: (
@@ -948,6 +963,7 @@ final class WifiMediaReceiver {
         guard listenerGeneration == generation,
               offer.mode == RealtimeTransportMode.wifiRTP,
               offer.hostUDPPort != 0 else { return false }
+        recoveryEpisodeStartedAt = nil
         do {
             let request = try SrtpSession(
                 key: offer.feedbackKey,
@@ -1111,8 +1127,7 @@ final class WifiMediaReceiver {
     private func observeMediaPacketSequence(_ sequence: UInt16, generation: UInt64) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard feedbackWindow.observe(sequence),
-              activeGeneration == generation,
-              !dependencyBreakActive else { return }
+              activeGeneration == generation else { return }
         #if targetEnvironment(simulator)
         immediateGapFeedbackCountForTesting += 1
         #endif
@@ -1169,11 +1184,14 @@ final class WifiMediaReceiver {
             return
         }
         dependencyBreakActive = false
+        recoveryEpisodeStartedAt = nil
         recoveryCompletedPending = true
         sendFeedback(immediate: true)
     }
 
-    private func beginRecoveryEpisode() {
+    private func beginRecoveryEpisode(
+        startedAt: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) {
         recoveryCompletedPending = false
         recoveryEpisode &+= 1
         if recoveryEpisode == 0 { recoveryEpisode = 1 }
@@ -1181,6 +1199,7 @@ final class WifiMediaReceiver {
         recoveryFloorSet = hasCompletedFrame
         pendingRecoveryIdr = nil
         dependencyBreakActive = true
+        recoveryEpisodeStartedAt = startedAt
         sendFeedback(immediate: true)
     }
 
@@ -1212,6 +1231,7 @@ final class WifiMediaReceiver {
         dependencyBreakActive = false
         recoveryCompletedPending = false
         recoveryEpisode = 0
+        recoveryEpisodeStartedAt = nil
         recoveryFloorFrame = 0
         recoveryFloorSet = false
         pendingRecoveryIdr = nil
@@ -1405,10 +1425,22 @@ final class WifiMediaReceiver {
         timer.schedule(deadline: .now() + .milliseconds(50),
                        repeating: .milliseconds(50))
         timer.setEventHandler { [weak self] in
-            self?.sendFeedback(immediate: false)
+            self?.handleFeedbackTimerTick(
+                now: ProcessInfo.processInfo.systemUptime)
         }
         timer.resume()
         feedbackTimer = timer
+    }
+
+    private func handleFeedbackTimerTick(now: TimeInterval) {
+        if dependencyBreakActive,
+           pendingRecoveryIdr == nil,
+           let startedAt = recoveryEpisodeStartedAt,
+           now - startedAt >= Self.recoveryEpisodeRetryInterval {
+            beginRecoveryEpisode(startedAt: now)
+            return
+        }
+        sendFeedback(immediate: false)
     }
 
     private func sendFeedback(immediate: Bool) {
