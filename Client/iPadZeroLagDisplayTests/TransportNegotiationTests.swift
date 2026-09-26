@@ -196,6 +196,126 @@ final class WifiTransportNegotiationTests: XCTestCase {
         XCTAssertFalse(gate.register(3).accepted)
     }
 
+    func testFeedbackFailureRetainsEvidenceAndAdvancesSequence() {
+        var ledger = WifiFeedbackSendLedger()
+        ledger.recordExpiredFrame()
+        ledger.recordExpiredFrame()
+        ledger.markRecoveryCompleted()
+
+        let failed = ledger.prepare(sentNanoseconds: 10)
+        XCTAssertEqual(failed.sequence, 1)
+        XCTAssertEqual(failed.expiredFrames, 2)
+        XCTAssertTrue(failed.recoveryCompleted)
+        ledger.didProtect(failed)
+        ledger.complete(failed, succeeded: false)
+
+        XCTAssertEqual(ledger.pendingExpiredFrames, 2)
+        XCTAssertTrue(ledger.recoveryCompletedPending)
+        XCTAssertEqual(ledger.pendingRttCount, 0)
+        XCTAssertEqual(ledger.prepare(sentNanoseconds: 20).sequence, 2)
+    }
+
+    func testFeedbackSuccessClearsOnlyItsExpirySnapshot() {
+        var ledger = WifiFeedbackSendLedger()
+        ledger.recordExpiredFrame()
+        ledger.recordExpiredFrame()
+        let sent = ledger.prepare(sentNanoseconds: 10)
+        ledger.didProtect(sent)
+        ledger.recordExpiredFrame()
+
+        ledger.complete(sent, succeeded: true)
+
+        XCTAssertEqual(ledger.pendingExpiredFrames, 1)
+        XCTAssertEqual(ledger.pendingRttCount, 1)
+    }
+
+    func testEarlyRttEchoDoesNotPreventSuccessfulAccounting() {
+        var ledger = WifiFeedbackSendLedger()
+        ledger.recordExpiredFrame()
+        let sent = ledger.prepare(sentNanoseconds: 10)
+        ledger.didProtect(sent)
+        XCTAssertEqual(
+            ledger.consumeRtt(token: sent.token, sentNanoseconds: 10),
+            10)
+
+        ledger.complete(sent, succeeded: true)
+
+        XCTAssertEqual(ledger.pendingExpiredFrames, 0)
+    }
+
+    func testRecoveryCompletionClearsOnlyAfterSuccessfulFeedback() {
+        var ledger = WifiFeedbackSendLedger()
+        ledger.markRecoveryCompleted()
+        let failed = ledger.prepare(sentNanoseconds: 10)
+        ledger.didProtect(failed)
+        ledger.complete(failed, succeeded: false)
+        XCTAssertTrue(ledger.recoveryCompletedPending)
+
+        let sent = ledger.prepare(sentNanoseconds: 20)
+        ledger.didProtect(sent)
+        ledger.complete(sent, succeeded: true)
+        XCTAssertFalse(ledger.recoveryCompletedPending)
+    }
+
+    func testWifiNetworkErrorPolicyIsFailClosed() {
+        for code: POSIXErrorCode in [
+            .ENETDOWN, .ENETUNREACH, .EHOSTUNREACH,
+            .EAGAIN, .ENOBUFS, .EADDRNOTAVAIL
+        ] {
+            XCTAssertEqual(
+                WifiNetworkErrorPolicy.disposition(for: .posix(code)),
+                .transient)
+        }
+        for code: POSIXErrorCode in [
+            .ECONNRESET, .ECONNABORTED, .ENOTCONN,
+            .EPIPE, .ECONNREFUSED, .ETIMEDOUT
+        ] {
+            XCTAssertEqual(
+                WifiNetworkErrorPolicy.disposition(for: .posix(code)),
+                .terminal)
+        }
+        XCTAssertEqual(
+            WifiNetworkErrorPolicy.disposition(for: .tls(-9806)),
+            .terminal)
+    }
+
+    func testHealthyCommittedLaneRejectsReplacementCandidate() {
+        var gate = WifiProbeCandidateGate<Int>(limit: 2)
+        XCTAssertTrue(gate.register(1).accepted)
+        XCTAssertNotNil(gate.authenticate(1))
+        XCTAssertTrue(gate.committedHealthy)
+        XCTAssertFalse(gate.register(2).accepted)
+    }
+
+    func testWaitingCommittedLaneRequiresAuthenticatedReplacement() {
+        var gate = WifiProbeCandidateGate<Int>(limit: 2)
+        XCTAssertTrue(gate.register(1).accepted)
+        XCTAssertNotNil(gate.authenticate(1))
+        XCTAssertTrue(gate.markCommittedWaiting(1))
+        XCTAssertFalse(gate.committedHealthy)
+        XCTAssertTrue(gate.register(2).accepted)
+        XCTAssertEqual(gate.committed, 1)
+
+        XCTAssertNotNil(gate.authenticate(2))
+        XCTAssertEqual(gate.committed, 2)
+        XCTAssertTrue(gate.committedHealthy)
+        XCTAssertFalse(gate.retireCommitted(1))
+        XCTAssertEqual(gate.committed, 2)
+    }
+
+    func testCommittedRecoveryClosesReplacementWindow() {
+        var gate = WifiProbeCandidateGate<Int>(limit: 2)
+        XCTAssertTrue(gate.register(1).accepted)
+        XCTAssertNotNil(gate.authenticate(1))
+        XCTAssertTrue(gate.markCommittedWaiting(1))
+        XCTAssertTrue(gate.register(2).accepted)
+
+        XCTAssertEqual(gate.committedRecovered(1), [2])
+        XCTAssertTrue(gate.committedHealthy)
+        XCTAssertFalse(gate.register(3).accepted)
+        XCTAssertNil(gate.authenticate(2))
+    }
+
     func testProbeAcceptanceReplacesLegacyTimerWithCommitDeadline() throws {
         let sessionID = try XCTUnwrap(
             SessionID(hex: "00112233445566778899aabbccddeeff"))
