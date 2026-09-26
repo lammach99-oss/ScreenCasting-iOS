@@ -364,6 +364,40 @@ final class WifiTransportNegotiationTests: XCTestCase {
         XCTAssertTrue(outcomes.contains(.expired(frameSequence: 1)))
     }
 
+    func testRecoveredSixFrameBurstReachesDecoderInOrder() {
+        var decoded: [UInt32] = []
+        let processor = WifiAuthenticatedMediaProcessor(
+            mtu: 1_200,
+            initialSequence: 10,
+            unprotect: { _ in true },
+            decoder: { _, sequence, _, _ in decoded.append(sequence) },
+            rttP95Provider: { 20 })
+        let payload = Data([0x02, 0x01])
+        for sequence in [10, 12] {
+            processor.consume(
+                makeMediaPacket(
+                    sequence: UInt16(sequence), timestamp: 1,
+                    frameSequence: 1, marker: sequence == 12,
+                    payload: payload),
+                arrivalTime: 0)
+        }
+        for frame in 2...6 {
+            processor.consume(
+                makeMediaPacket(
+                    sequence: UInt16(frame + 11),
+                    timestamp: UInt32(frame),
+                    frameSequence: UInt32(frame), marker: true,
+                    payload: payload),
+                arrivalTime: Double(frame) * 0.001)
+        }
+        processor.consume(
+            makeMediaPacket(
+                sequence: 11, timestamp: 1, frameSequence: 1,
+                marker: false, payload: payload),
+            arrivalTime: 0.010)
+        XCTAssertEqual(decoded, [1, 2, 3, 4, 5, 6])
+    }
+
     private func makeSingleNalPacket(sequence: UInt16) -> Data {
         makeMediaPacket(
             sequence: sequence,

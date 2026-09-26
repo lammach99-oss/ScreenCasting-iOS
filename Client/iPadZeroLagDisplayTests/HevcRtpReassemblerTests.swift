@@ -576,6 +576,66 @@ final class HevcRtpReassemblerTests: XCTestCase {
         XCTAssertLessThanOrEqual(receiver.pendingOutcomeCount, 2)
     }
 
+    func testSixBufferedFramesCompleteInOrderAfterMissingPacket() {
+        let payload = nal(type: 1, count: 20, fill: 1)
+        let reassembler = HevcRtpReassembler(
+            mtu: 1_200, initialExpectedSequence: 10)
+        for sequence in [10, 12] {
+            _ = reassembler.consume(
+                packet(sequence: UInt16(sequence), timestamp: 1,
+                       frame: 1, capture: 0, marker: sequence == 12,
+                       payload: payload),
+                authentication: .authenticated, arrivalTime: 0,
+                rttP95Ms: 20)
+        }
+        for frame in 2...6 {
+            _ = reassembler.consume(
+                packet(sequence: UInt16(frame + 11),
+                       timestamp: UInt32(frame), frame: UInt32(frame),
+                       capture: 0, marker: true, payload: payload),
+                authentication: .authenticated,
+                arrivalTime: Double(frame) * 0.001,
+                rttP95Ms: 20)
+        }
+        XCTAssertEqual(reassembler.allocatedFrameCount, 6)
+        var outcomes = [reassembler.consume(
+            packet(sequence: 11, timestamp: 1, frame: 1,
+                   capture: 0, marker: false, payload: payload),
+            authentication: .authenticated, arrivalTime: 0.010,
+            rttP95Ms: 20)]
+        while let next = reassembler.drainOutcome() { outcomes.append(next) }
+        let completed = outcomes.compactMap { outcome -> UInt32? in
+            if case .completed(_, let sequence, _) = outcome { return sequence }
+            return nil
+        }
+        XCTAssertEqual(completed, [1, 2, 3, 4, 5, 6])
+        XCTAssertEqual(reassembler.pendingOutcomeCount, 0)
+    }
+
+    func testSixFrameExpiryRetainsAnchorLossAndEveryExpiry() {
+        let payload = nal(type: 1, count: 20, fill: 1)
+        let reassembler = HevcRtpReassembler(
+            mtu: 1_200, initialExpectedSequence: 10)
+        for frame in 1...6 {
+            _ = reassembler.consume(
+                packet(sequence: UInt16(frame + 9),
+                       timestamp: UInt32(frame), frame: UInt32(frame),
+                       capture: 0, marker: false, payload: payload),
+                authentication: .authenticated, arrivalTime: 0,
+                rttP95Ms: 0)
+        }
+        let outcomes = reassembler.expire(at: 0.012)
+        XCTAssertEqual(outcomes.count, 7)
+        XCTAssertEqual(outcomes.first,
+                       .sequenceAnchorLost(expectedSequence: 10))
+        XCTAssertEqual(Array(outcomes.dropFirst()),
+                       (1...6).map {
+                           HevcReassemblyOutcome.expired(
+                               frameSequence: UInt32($0))
+                       })
+        XCTAssertEqual(reassembler.pendingOutcomeCount, 0)
+    }
+
     func testIntentionalFreshIDRReanchorClearsOldStateWithoutSyntheticLoss() {
         let payload = nal(type: 1, count: 20, fill: 1)
         let idr = nal(type: 19, count: 20, fill: 2)

@@ -24,8 +24,8 @@ enum HevcReassemblyOutcome: Equatable {
 }
 
 final class HevcRtpReassembler {
-    private static let maximumPendingOutcomes = 3
     private static let maximumBufferedFrames = 6
+    private static let maximumPendingOutcomes = maximumBufferedFrames + 1
 
     private struct Frame {
         let timestamp: UInt32
