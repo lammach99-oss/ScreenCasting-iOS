@@ -765,6 +765,11 @@ final class WifiForegroundDecoderRecoveryTests: XCTestCase {
 
     func testRapidSecondPreservedResumeCoalescesUntilRecoveryCompletes() {
         let session = manager.simulateCommittedWifiSessionForTesting()
+        manager.networkQueueForTesting.sync {
+            manager.wifiMediaReceiverForTesting
+                .simulateActivePacketSequenceForTesting(
+                    100, generation: session.generation)
+        }
 
         manager.applicationDidEnterBackground()
         manager.applicationDidBecomeActive()
@@ -793,6 +798,11 @@ final class WifiForegroundDecoderRecoveryTests: XCTestCase {
 
     func testSuccessfulRecoveryAllowsLaterPreservedResume() {
         let session = manager.simulateCommittedWifiSessionForTesting()
+        manager.networkQueueForTesting.sync {
+            manager.wifiMediaReceiverForTesting
+                .simulateActivePacketSequenceForTesting(
+                    100, generation: session.generation)
+        }
         manager.applicationDidEnterBackground()
         manager.applicationDidBecomeActive()
         manager.networkQueueForTesting.sync { }
