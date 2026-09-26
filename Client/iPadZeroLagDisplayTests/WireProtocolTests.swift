@@ -26,13 +26,13 @@ final class UsbSplitCommitGateTests: XCTestCase {
         window.observe(UInt16.max)
         window.observe(0)
         XCTAssertEqual(window.highest, 0)
-        XCTAssertEqual(window.bitmap, 1)
+        XCTAssertEqual(window.bitmap, UInt64.max)
 
         window.observe(65)
         XCTAssertEqual(window.highest, 65)
         XCTAssertEqual(window.bitmap, 0)
         window.observe(64)
-        XCTAssertEqual(window.bitmap, UInt64.max)
+        XCTAssertEqual(window.bitmap, 1)
     }
 
     func testUnknownHistorySerializesAsAllReceivedBits() {
