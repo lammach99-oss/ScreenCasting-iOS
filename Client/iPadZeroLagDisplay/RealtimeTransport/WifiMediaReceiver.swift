@@ -6,6 +6,31 @@ enum WifiMediaReceiverError: Error {
     case listenerFailed
     case invalidPort
     case invalidOffer
+    case connectionCancelled
+}
+
+enum WifiNetworkErrorDisposition: Equatable {
+    case transient
+    case terminal
+}
+
+enum WifiNetworkErrorPolicy {
+    static func disposition(for error: NWError) -> WifiNetworkErrorDisposition {
+        switch error {
+        case .posix(let code):
+            switch code {
+            case .ENETDOWN, .ENETUNREACH, .EHOSTUNREACH,
+                 .EAGAIN, .ENOBUFS, .EADDRNOTAVAIL:
+                return .transient
+            default:
+                return .terminal
+            }
+        case .tls, .dns:
+            return .terminal
+        @unknown default:
+            return .terminal
+        }
+    }
 }
 
 enum WifiTransportTiming {
@@ -650,6 +675,7 @@ struct WifiProbeCandidateGate<Source: Hashable> {
     private let limit: Int
     private var order: [Source] = []
     private(set) var committed: Source?
+    private(set) var committedHealthy = false
 
     init(limit: Int = 2) {
         precondition(limit > 0)
@@ -657,7 +683,9 @@ struct WifiProbeCandidateGate<Source: Hashable> {
     }
 
     mutating func register(_ source: Source) -> (accepted: Bool, evicted: Source?) {
-        guard committed == nil else { return (false, nil) }
+        guard committed == nil || !committedHealthy else {
+            return (false, nil)
+        }
         if order.contains(source) { return (true, nil) }
         var evicted: Source?
         if order.count == limit {
@@ -672,16 +700,137 @@ struct WifiProbeCandidateGate<Source: Hashable> {
     }
 
     mutating func authenticate(_ source: Source) -> [Source]? {
-        guard committed == nil, order.contains(source) else { return nil }
+        guard (committed == nil || !committedHealthy),
+              order.contains(source) else { return nil }
         let abandoned = order.filter { $0 != source }
         order.removeAll()
         committed = source
+        committedHealthy = true
         return abandoned
+    }
+
+    mutating func markCommittedWaiting(_ source: Source) -> Bool {
+        guard committed == source else { return false }
+        committedHealthy = false
+        return true
+    }
+
+    mutating func committedRecovered(_ source: Source) -> [Source]? {
+        guard committed == source else { return nil }
+        let abandoned = order
+        order.removeAll()
+        committedHealthy = true
+        return abandoned
+    }
+
+    mutating func retireCommitted(_ source: Source) -> Bool {
+        guard committed == source else { return false }
+        committed = nil
+        committedHealthy = false
+        return true
     }
 
     mutating func reset() {
         order.removeAll()
         committed = nil
+        committedHealthy = false
+    }
+}
+
+struct WifiFeedbackSendSnapshot: Equatable {
+    let sequence: UInt16
+    let token: UInt32
+    let sentNanoseconds: UInt64
+    let expiredFrames: UInt16
+    let expiredThrough: UInt64
+    let recoveryCompletionVersion: UInt64?
+
+    var recoveryCompleted: Bool { recoveryCompletionVersion != nil }
+}
+
+struct WifiFeedbackSendLedger {
+    private(set) var sequence: UInt16 = 1
+    private var nextToken: UInt32 = 1
+    private var expiredObserved: UInt64 = 0
+    private var expiredAcknowledged: UInt64 = 0
+    private var recoveryCompletionVersion: UInt64 = 0
+    private(set) var recoveryCompletedPending = false
+    private var pendingSends: Set<UInt32> = []
+    private var pendingRtt: [UInt32: UInt64] = [:]
+
+    var pendingExpiredFrames: UInt64 {
+        expiredObserved >= expiredAcknowledged
+            ? expiredObserved - expiredAcknowledged
+            : 0
+    }
+
+    var pendingRttCount: Int { pendingRtt.count }
+
+    mutating func recordExpiredFrame() {
+        if expiredObserved < UInt64.max {
+            expiredObserved += 1
+        }
+    }
+
+    mutating func markRecoveryCompleted() {
+        recoveryCompletionVersion &+= 1
+        recoveryCompletedPending = true
+    }
+
+    mutating func beginRecoveryEpisode() {
+        recoveryCompletedPending = false
+    }
+
+    mutating func prepare(sentNanoseconds: UInt64) -> WifiFeedbackSendSnapshot {
+        if pendingRtt.count >= 64,
+           let oldest = pendingRtt.min(by: { $0.value < $1.value })?.key {
+            pendingRtt.removeValue(forKey: oldest)
+        }
+        let reported = UInt16(clamping: pendingExpiredFrames)
+        return WifiFeedbackSendSnapshot(
+            sequence: sequence,
+            token: nextToken,
+            sentNanoseconds: sentNanoseconds,
+            expiredFrames: reported,
+            expiredThrough: expiredAcknowledged + UInt64(reported),
+            recoveryCompletionVersion: recoveryCompletedPending
+                ? recoveryCompletionVersion
+                : nil)
+    }
+
+    mutating func didProtect(_ snapshot: WifiFeedbackSendSnapshot) {
+        precondition(snapshot.sequence == sequence && snapshot.token == nextToken)
+        sequence &+= 1
+        nextToken &+= 1
+        pendingSends.insert(snapshot.token)
+        pendingRtt[snapshot.token] = snapshot.sentNanoseconds
+    }
+
+    mutating func complete(
+        _ snapshot: WifiFeedbackSendSnapshot,
+        succeeded: Bool
+    ) {
+        guard pendingSends.remove(snapshot.token) != nil else { return }
+        if !succeeded {
+            pendingRtt.removeValue(forKey: snapshot.token)
+            return
+        }
+        expiredAcknowledged = max(
+            expiredAcknowledged,
+            min(snapshot.expiredThrough, expiredObserved))
+        if recoveryCompletedPending,
+           snapshot.recoveryCompletionVersion == recoveryCompletionVersion {
+            recoveryCompletedPending = false
+        }
+    }
+
+    mutating func consumeRtt(token: UInt32, sentNanoseconds: UInt64) -> UInt64? {
+        guard pendingRtt[token] == sentNanoseconds else { return nil }
+        return pendingRtt.removeValue(forKey: token)
+    }
+
+    mutating func reset() {
+        self = WifiFeedbackSendLedger()
     }
 }
 
@@ -808,6 +957,8 @@ final class WifiMediaReceiver {
     private var inputSrtp: SrtpSession?
     private var mediaProcessor: WifiAuthenticatedMediaProcessor?
     private var endpointCommitted = false
+    private var committedFailureSource: ObjectIdentifier?
+    private var transientMediaErrorCount: UInt64 = 0
     private var expectedHostPort: UInt16?
     private var startCompletionDelivered = false
     private var feedbackTimer: DispatchSourceTimer?
@@ -831,16 +982,14 @@ final class WifiMediaReceiver {
         pendingRecoveryIdr = (sequence, recoveryEpisode)
     }
     #endif
-    private var feedbackSequence: UInt16 = 1
+    private var feedbackLedger = WifiFeedbackSendLedger()
     private var lastCompletedFrame: UInt32 = 0
     private var hasCompletedFrame = false
-    private var expiredFrames: UInt16 = 0
     private var lastTransit90k: Double?
     private var jitter90k: Double = 0
     private var lastFrameTimestamp: UInt32?
     private var frameIntervalMs: Double = 1000.0 / 120.0
     private var dependencyBreakActive = false
-    private var recoveryCompletedPending = false
     private var recoveryEpisode: UInt32 = 0
     private var recoveryEpisodeStartedAt: TimeInterval?
     private var recoveryFloorFrame: UInt32 = 0
@@ -849,8 +998,6 @@ final class WifiMediaReceiver {
         sequence: UInt32,
         episode: UInt32
     )?
-    private var nextRttToken: UInt32 = 1
-    private var pendingRtt: [UInt32: UInt64] = [:]
     private var rttSamplesMs: [UInt16] = []
     private var smoothedRttMs: Double?
     private(set) var securityDropCounters = WifiSecurityDropCounters()
@@ -1061,7 +1208,7 @@ final class WifiMediaReceiver {
                                 self.recoveryEpisode)
                         }
                     case .expired:
-                        self.expiredFrames &+= 1
+                        self.feedbackLedger.recordExpiredFrame()
                         if !self.dependencyBreakActive {
                             self.sendFeedback(immediate: true)
                         }
@@ -1185,14 +1332,14 @@ final class WifiMediaReceiver {
         }
         dependencyBreakActive = false
         recoveryEpisodeStartedAt = nil
-        recoveryCompletedPending = true
+        feedbackLedger.markRecoveryCompleted()
         sendFeedback(immediate: true)
     }
 
     private func beginRecoveryEpisode(
         startedAt: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) {
-        recoveryCompletedPending = false
+        feedbackLedger.beginRecoveryEpisode()
         recoveryEpisode &+= 1
         if recoveryEpisode == 0 { recoveryEpisode = 1 }
         recoveryFloorFrame = lastCompletedFrame
@@ -1220,27 +1367,25 @@ final class WifiMediaReceiver {
         feedbackTimer?.cancel()
         feedbackTimer = nil
         feedbackWindow = WifiFeedbackWindow()
-        feedbackSequence = 1
         lastCompletedFrame = 0
         hasCompletedFrame = false
-        expiredFrames = 0
         lastTransit90k = nil
         jitter90k = 0
         lastFrameTimestamp = nil
         frameIntervalMs = 1000.0 / 120.0
         dependencyBreakActive = false
-        recoveryCompletedPending = false
         recoveryEpisode = 0
         recoveryEpisodeStartedAt = nil
         recoveryFloorFrame = 0
         recoveryFloorSet = false
         pendingRecoveryIdr = nil
-        nextRttToken = 1
-        pendingRtt.removeAll(keepingCapacity: false)
+        feedbackLedger.reset()
         rttSamplesMs.removeAll(keepingCapacity: false)
         smoothedRttMs = nil
         securityDropCounters = WifiSecurityDropCounters()
         endpointCommitted = false
+        committedFailureSource = nil
+        transientMediaErrorCount = 0
         expectedHostPort = nil
         provisionalConnections.values.forEach { $0.cancel() }
         provisionalConnections.removeAll()
@@ -1275,9 +1420,65 @@ final class WifiMediaReceiver {
             provisionalConnections.removeValue(forKey: evicted)?.cancel()
         }
         provisionalConnections[source] = candidate
-        candidate.stateUpdateHandler = { _ in }
+        candidate.stateUpdateHandler = { [weak self, weak candidate] state in
+            guard let self, let candidate else { return }
+            self.networkQueue.async {
+                self.handleConnectionState(
+                    state,
+                    connection: candidate,
+                    generation: generation)
+            }
+        }
         candidate.start(queue: networkQueue)
         receive(on: candidate, generation: generation)
+    }
+
+    private func handleConnectionState(
+        _ state: NWConnection.State,
+        connection: NWConnection,
+        generation: UInt64
+    ) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        let source = ObjectIdentifier(connection)
+        guard listenerGeneration == generation,
+              self.connection === connection ||
+                provisionalConnections[source] === connection else { return }
+        let committed = self.connection === connection &&
+            activeGeneration == generation
+        switch state {
+        case .ready:
+            guard committed,
+                  let abandoned = candidateGate.committedRecovered(source)
+            else { return }
+            transientMediaErrorCount = 0
+            for other in abandoned {
+                provisionalConnections.removeValue(forKey: other)?.cancel()
+            }
+        case .waiting:
+            if committed {
+                _ = candidateGate.markCommittedWaiting(source)
+            }
+        case .failed(let error):
+            if committed {
+                failCommittedConnection(
+                    connection,
+                    generation: generation,
+                    error: error)
+            } else {
+                rejectProvisional(connection)
+            }
+        case .cancelled:
+            if committed {
+                failCommittedConnection(
+                    connection,
+                    generation: generation,
+                    error: WifiMediaReceiverError.connectionCancelled)
+            } else {
+                rejectProvisional(connection)
+            }
+        default:
+            break
+        }
     }
 
     private func receive(on connection: NWConnection, generation: UInt64) {
@@ -1298,20 +1499,15 @@ final class WifiMediaReceiver {
                     self.provisionalConnections[source] === connection
                 if error == nil && stillOwned {
                     self.receive(on: connection, generation: generation)
-                } else {
-                    let committedFailure =
-                        error != nil &&
-                        self.connection === connection &&
-                        self.activeGeneration == generation
-                    connection.cancel()
-                    self.provisionalConnections.removeValue(
-                        forKey: source)
-                    self.candidateGate.reject(source)
-                    if self.connection === connection {
-                        self.connection = nil
-                    }
-                    if committedFailure, let error {
-                        self.onCommittedFailure(generation, error)
+                } else if let error {
+                    if self.connection === connection &&
+                        self.activeGeneration == generation {
+                        self.failCommittedConnection(
+                            connection,
+                            generation: generation,
+                            error: error)
+                    } else {
+                        self.rejectProvisional(connection)
                     }
                 }
             }
@@ -1324,11 +1520,10 @@ final class WifiMediaReceiver {
         generation: UInt64
     ) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
-        if !endpointCommitted {
+        let source = ObjectIdentifier(connection)
+        if provisionalConnections[source] === connection {
             var packet = datagram
-            let source = ObjectIdentifier(connection)
-            guard provisionalConnections[source] === connection,
-                  let probeRequestSrtp,
+            guard let probeRequestSrtp,
                   let probeAcknowledgementSrtp,
                   let sessionID else { return }
             do {
@@ -1353,6 +1548,7 @@ final class WifiMediaReceiver {
                 let protectedLength = try probeAcknowledgementSrtp.protectRtp(
                     &acknowledgement,
                     plaintextLength: WifiProbeCodec.plaintextLength)
+                let replacedConnection = self.connection
                 guard let abandoned = candidateGate.authenticate(source) else {
                     rejectProvisional(connection)
                     return
@@ -1363,6 +1559,12 @@ final class WifiMediaReceiver {
                 provisionalConnections.removeValue(forKey: source)
                 self.connection = connection
                 endpointCommitted = true
+                committedFailureSource = nil
+                transientMediaErrorCount = 0
+                if let replacedConnection,
+                   replacedConnection !== connection {
+                    replacedConnection.cancel()
+                }
                 onProbeAuthenticated(generation, sessionID)
                 connection.send(
                     content: Data(acknowledgement.prefix(protectedLength)),
@@ -1444,7 +1646,7 @@ final class WifiMediaReceiver {
     }
 
     private func sendFeedback(immediate: Bool) {
-        guard activeGeneration != nil,
+        guard let generation = activeGeneration,
               let connection,
               let feedbackSrtp,
               let sessionID else { return }
@@ -1462,27 +1664,22 @@ final class WifiMediaReceiver {
             rttP95Ms: max(sourceTelemetry.rttP95Ms, measuredRtt),
             queueAgeP95Ms: sourceTelemetry.queueAgeP95Ms,
             decodeP95Ms: sourceTelemetry.decodeP95Ms)
-        let token = nextRttToken
-        nextRttToken &+= 1
         let sentNanoseconds = UInt64(
             ProcessInfo.processInfo.systemUptime * 1_000_000_000)
-        if pendingRtt.count >= 64,
-           let oldest = pendingRtt.min(by: { $0.value < $1.value })?.key {
-            pendingRtt.removeValue(forKey: oldest)
-        }
-        pendingRtt[token] = sentNanoseconds
+        let snapshot = feedbackLedger.prepare(
+            sentNanoseconds: sentNanoseconds)
         var packet = WifiFeedbackCodec.packet(
-            sequence: feedbackSequence,
+            sequence: snapshot.sequence,
             ssrc: ssrc,
             window: feedbackWindow,
             lastCompleted: lastCompletedFrame,
             telemetry: telemetry,
             smoothedRttMs: measuredSmoothedRtt,
-            expiredFrames: expiredFrames,
+            expiredFrames: snapshot.expiredFrames,
             immediate: immediate,
             dependencyBreak: dependencyBreakActive,
-            recoveryCompleted: recoveryCompletedPending,
-            rttToken: token,
+            recoveryCompleted: snapshot.recoveryCompleted,
+            rttToken: snapshot.token,
             rttSentNanoseconds: sentNanoseconds,
             frameIntervalMs: frameIntervalMs,
             recoveryEpisode: recoveryEpisode)
@@ -1490,16 +1687,36 @@ final class WifiMediaReceiver {
             let length = try feedbackSrtp.protectRtp(
                 &packet,
                 plaintextLength: WifiFeedbackCodec.plaintextLength)
-            feedbackSequence &+= 1
-            expiredFrames = 0
+            feedbackLedger.didProtect(snapshot)
             connection.send(
                 content: Data(packet.prefix(length)),
-                completion: .contentProcessed { _ in })
+                completion: .contentProcessed { [weak self, weak connection] error in
+                    guard let self, let connection else { return }
+                    self.networkQueue.async {
+                        guard self.activeGeneration == generation,
+                              self.connection === connection else { return }
+                        self.feedbackLedger.complete(
+                            snapshot,
+                            succeeded: error == nil)
+                        guard let error else { return }
+                        if WifiNetworkErrorPolicy.disposition(for: error) ==
+                            .transient {
+                            let source = ObjectIdentifier(connection)
+                            _ = self.candidateGate.markCommittedWaiting(source)
+                            self.recordTransientMediaError(error)
+                        } else {
+                            self.failCommittedConnection(
+                                connection,
+                                generation: generation,
+                                error: error)
+                        }
+                    }
+                })
         } catch {
-            pendingRtt.removeValue(forKey: token)
-            if let generation = activeGeneration {
-                onCommittedFailure(generation, error)
-            }
+            failCommittedConnection(
+                connection,
+                generation: generation,
+                error: error)
         }
     }
 
@@ -1516,8 +1733,9 @@ final class WifiMediaReceiver {
             guard let echo = WifiFeedbackEchoCodec.parse(
                     packet,
                     expectedSsrc: expectedSsrc),
-                  let sent = pendingRtt.removeValue(forKey: echo.token),
-                  sent == echo.sentNanoseconds else { return }
+                  let sent = feedbackLedger.consumeRtt(
+                    token: echo.token,
+                    sentNanoseconds: echo.sentNanoseconds) else { return }
             let now = UInt64(
                 ProcessInfo.processInfo.systemUptime * 1_000_000_000)
             guard now >= sent else { return }
@@ -1563,5 +1781,32 @@ final class WifiMediaReceiver {
         candidateGate.reject(source)
         provisionalConnections.removeValue(forKey: source)
         candidate.cancel()
+    }
+
+    private func recordTransientMediaError(_ error: NWError) {
+        transientMediaErrorCount &+= 1
+        if transientMediaErrorCount == 1 ||
+            transientMediaErrorCount.nonzeroBitCount == 1 {
+            print(
+                "[WIFI_MEDIA_LANE] action=preserve_transient_error " +
+                "count=\(transientMediaErrorCount) error=\(error)")
+        }
+    }
+
+    private func failCommittedConnection(
+        _ failed: NWConnection,
+        generation: UInt64,
+        error: Error
+    ) {
+        let source = ObjectIdentifier(failed)
+        guard activeGeneration == generation,
+              connection === failed,
+              committedFailureSource != source,
+              candidateGate.retireCommitted(source) else { return }
+        committedFailureSource = source
+        connection = nil
+        endpointCommitted = false
+        failed.cancel()
+        onCommittedFailure(generation, error)
     }
 }
