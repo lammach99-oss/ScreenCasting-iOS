@@ -992,6 +992,7 @@ final class WifiMediaReceiver {
     private var dependencyBreakActive = false
     private var recoveryEpisode: UInt32 = 0
     private var recoveryEpisodeStartedAt: TimeInterval?
+    private var preservedSessionRecoveryGeneration: UInt64?
     private var recoveryFloorFrame: UInt32 = 0
     private var recoveryFloorSet = false
     private var pendingRecoveryIdr: (
@@ -1306,6 +1307,7 @@ final class WifiMediaReceiver {
     func reanchorForPreservedSessionRecovery(generation: UInt64) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard activeGeneration == generation else { return }
+        preservedSessionRecoveryGeneration = generation
         mediaProcessor?.prepareForFreshIDRAnchor()
         feedbackWindow = WifiFeedbackWindow()
         #if targetEnvironment(simulator)
@@ -1329,6 +1331,9 @@ final class WifiMediaReceiver {
         guard succeeded else {
             beginRecoveryEpisode()
             return
+        }
+        if preservedSessionRecoveryGeneration == generation {
+            preservedSessionRecoveryGeneration = nil
         }
         dependencyBreakActive = false
         recoveryEpisodeStartedAt = nil
@@ -1356,6 +1361,7 @@ final class WifiMediaReceiver {
         connection?.cancel()
         connection = nil
         activeGeneration = nil
+        preservedSessionRecoveryGeneration = nil
         sessionID = nil
         probeRequestSrtp = nil
         probeAcknowledgementSrtp = nil
@@ -1431,6 +1437,12 @@ final class WifiMediaReceiver {
         }
         candidate.start(queue: networkQueue)
         receive(on: candidate, generation: generation)
+    }
+
+    func isPreservedSessionRecoveryPending(generation: UInt64) -> Bool {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        return activeGeneration == generation &&
+            preservedSessionRecoveryGeneration == generation
     }
 
     private func handleConnectionState(

@@ -763,6 +763,60 @@ final class WifiForegroundDecoderRecoveryTests: XCTestCase {
                        begins + 1)
     }
 
+    func testRapidSecondPreservedResumeCoalescesUntilRecoveryCompletes() {
+        let session = manager.simulateCommittedWifiSessionForTesting()
+
+        manager.applicationDidEnterBackground()
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+        let begins = manager.decoderForTesting.sessionBeganCountForTesting
+        let reanchors = manager.networkQueueForTesting.sync {
+            manager.wifiMediaReceiverForTesting.lifecycleReanchorCountForTesting
+        }
+
+        manager.applicationDidEnterBackground()
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+
+        XCTAssertEqual(manager.decoderForTesting.invalidateCountForTesting,
+                       invalidations)
+        XCTAssertEqual(manager.decoderForTesting.sessionBeganCountForTesting,
+                       begins)
+        manager.networkQueueForTesting.sync {
+            XCTAssertTrue(manager.wifiMediaReceiverForTesting
+                .isPreservedSessionRecoveryPending(generation: session.generation))
+            XCTAssertEqual(manager.wifiMediaReceiverForTesting
+                .lifecycleReanchorCountForTesting, reanchors)
+        }
+    }
+
+    func testSuccessfulRecoveryAllowsLaterPreservedResume() {
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        manager.applicationDidEnterBackground()
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+        let begins = manager.decoderForTesting.sessionBeganCountForTesting
+
+        manager.networkQueueForTesting.sync {
+            let receiver = manager.wifiMediaReceiverForTesting
+            receiver.simulatePendingRecoveryCandidateForTesting(sequence: 77)
+            receiver.decoderDidComplete(
+                sequence: 77, generation: session.generation, succeeded: true)
+            XCTAssertFalse(receiver.isPreservedSessionRecoveryPending(
+                generation: session.generation))
+        }
+
+        manager.applicationDidEnterBackground()
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+        XCTAssertEqual(manager.decoderForTesting.invalidateCountForTesting,
+                       invalidations + 1)
+        XCTAssertEqual(manager.decoderForTesting.sessionBeganCountForTesting,
+                       begins + 1)
+    }
+
     func testPreservedForegroundReanchorsOnlyCurrentMediaGeneration() {
         let session = manager.simulateCommittedWifiSessionForTesting()
         manager.networkQueueForTesting.sync {

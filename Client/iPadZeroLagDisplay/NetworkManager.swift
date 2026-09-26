@@ -4145,6 +4145,14 @@ public class NetworkManager: ObservableObject {
         wifiBackgroundDisconnectWorkItem = nil
         resumeCommittedWireReceiveLoopIfNeeded(
             connection: expectedConnection, generation: generation)
+        if wifiMediaReceiver.isPreservedSessionRecoveryPending(
+            generation: generation) {
+            sendClientPingIfDue()
+            recordWifiLifecycleDiagnostic(
+                "generation=\(generation) event=ready " +
+                "action=coalesce_existing_recovery client_hello_sent=false")
+            return true
+        }
         let begin = "[WIFI_MEDIA_RECOVERY] generation=\(generation) " +
             "action=decoder_invalidate_begin"
         print(begin)
