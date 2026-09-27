@@ -947,6 +947,7 @@ final class WifiMediaReceiver {
     private let telemetryProvider: () -> WifiFeedbackTelemetry
     private let framePacketObserver: FramePacketObserver?
     private let timedOutcomeObserver: TimedOutcomeObserver?
+    private let rttObserver: ((Double) -> Void)?
     private var listener: NWListener?
     private var connection: NWConnection?
     private var provisionalConnections: [ObjectIdentifier: NWConnection] = [:]
@@ -1048,6 +1049,7 @@ final class WifiMediaReceiver {
         framePacketObserver: FramePacketObserver? = nil,
         timedOutcomeObserver: TimedOutcomeObserver? = nil,
         securityDropObserver: ((WifiSecurityDropCounters) -> Void)? = nil,
+        rttObserver: ((Double) -> Void)? = nil,
         telemetryProvider: @escaping () -> WifiFeedbackTelemetry = {
             .zero
         }
@@ -1060,6 +1062,7 @@ final class WifiMediaReceiver {
         self.securityDropObserver = securityDropObserver
         self.framePacketObserver = framePacketObserver
         self.timedOutcomeObserver = timedOutcomeObserver
+        self.rttObserver = rttObserver
         self.telemetryProvider = telemetryProvider
     }
 
@@ -1763,13 +1766,7 @@ final class WifiMediaReceiver {
             guard now >= sent else { return }
             let milliseconds = UInt16(clamping: Int(
                 (now - sent + 500_000) / 1_000_000))
-            rttSamplesMs.append(milliseconds)
-            smoothedRttMs = smoothedRttMs.map {
-                $0 * 0.875 + Double(milliseconds) * 0.125
-            } ?? Double(milliseconds)
-            if rttSamplesMs.count > 64 {
-                rttSamplesMs.removeFirst(rttSamplesMs.count - 64)
-            }
+            recordAcceptedRttSample(milliseconds: milliseconds)
         } catch {
             securityDropCounters.recordCryptoFailure(error)
             return
@@ -1804,6 +1801,23 @@ final class WifiMediaReceiver {
         provisionalConnections.removeValue(forKey: source)
         candidate.cancel()
     }
+
+    private func recordAcceptedRttSample(milliseconds: UInt16) {
+        rttSamplesMs.append(milliseconds)
+        smoothedRttMs = smoothedRttMs.map {
+            $0 * 0.875 + Double(milliseconds) * 0.125
+        } ?? Double(milliseconds)
+        if rttSamplesMs.count > 64 {
+            rttSamplesMs.removeFirst(rttSamplesMs.count - 64)
+        }
+        rttObserver?(Double(milliseconds))
+    }
+
+    #if targetEnvironment(simulator)
+    func recordAcceptedRttSampleForTesting(milliseconds: UInt16) {
+        recordAcceptedRttSample(milliseconds: milliseconds)
+    }
+    #endif
 
     private func recordTransientMediaError(_ error: NWError) {
         transientMediaErrorCount &+= 1

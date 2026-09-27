@@ -627,6 +627,14 @@ final class TransportTelemetry {
             sequence: sequence)
         lock.lock()
         let state = packetStages.removeValue(forKey: key)
+        if stage == .reassemblyCompleted, let state {
+            let receiveDurationMs = max(
+                0,
+                (state.lastArrival - state.firstArrival) * 1_000.0)
+            receive.add(receiveDurationMs)
+            exportReceive.add(receiveDurationMs)
+            sessionReceive.add(receiveDurationMs)
+        }
         let dimensions = frameDimensions[key] ?? makeDimensionsLocked(
             sequence: sequence,
             isIDR: state?.isIDR ?? false,
@@ -801,6 +809,12 @@ final class TransportTelemetry {
         lock.lock()
         recordRttLocked(durationMs: durationMs)
         lock.unlock()
+    }
+
+    func summaryCountsForTesting() -> (rtt: Int, receive: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (sessionRtt.count, sessionReceive.count)
     }
 
     func recordAuthenticatedRtt(

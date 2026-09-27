@@ -2,6 +2,60 @@ import XCTest
 @testable import iPadCasting
 
 final class TransportTelemetryTests: XCTestCase {
+    func testWifiCompletedFrameRecordsOneReceiveSample() {
+        let telemetry = TransportTelemetry()
+        telemetry.recordWifiPacket(
+            sequence: 7, marker: false, isIDR: false, bytes: 600,
+            arrivalTime: 1.000, generation: 3)
+        telemetry.recordWifiPacket(
+            sequence: 7, marker: true, isIDR: false, bytes: 400,
+            arrivalTime: 1.004, generation: 3)
+        telemetry.recordWifiReassembly(
+            outcome: .completed(
+                accessUnit: Data([1]), frameSequence: 7, captureTime90k: 1),
+            observedAt: 1.005,
+            generation: 3)
+
+        let counts = telemetry.summaryCountsForTesting()
+        XCTAssertEqual(counts.receive, 1)
+        XCTAssertEqual(telemetry.frameReceivePercentilesMs().p50, 4)
+    }
+
+    func testWifiExpiredFrameDoesNotRecordSuccessfulReceive() {
+        let telemetry = TransportTelemetry()
+        telemetry.recordWifiPacket(
+            sequence: 8, marker: false, isIDR: false, bytes: 600,
+            arrivalTime: 2.000, generation: 3)
+        telemetry.recordWifiPacket(
+            sequence: 8, marker: true, isIDR: false, bytes: 400,
+            arrivalTime: 2.006, generation: 3)
+        telemetry.recordWifiReassembly(
+            outcome: .expired(frameSequence: 8),
+            observedAt: 2.040,
+            generation: 3)
+
+        XCTAssertEqual(telemetry.summaryCountsForTesting().receive, 0)
+    }
+
+    func testWifiAuthenticatedFeedbackRttReachesTelemetryOnce() {
+        let telemetry = TransportTelemetry()
+        let queue = DispatchQueue(label: "test.wifi.rtt.telemetry")
+        let receiver = WifiMediaReceiver(
+            networkQueue: queue,
+            decoder: { _, _, _, _ in },
+            audioConsumer: { _, _, _, _ in },
+            onProbeAuthenticated: { _, _ in },
+            onCommittedFailure: { _, _ in },
+            rttObserver: { telemetry.recordRtt(durationMs: $0) })
+
+        queue.sync {
+            receiver.recordAcceptedRttSampleForTesting(milliseconds: 5)
+        }
+
+        XCTAssertEqual(telemetry.summaryCountsForTesting().rtt, 1)
+        XCTAssertEqual(telemetry.makeFeedback().2, 5)
+    }
+
     func testWifiSecurityDropSnapshotIsOperationallyVisible() {
         let telemetry = TransportTelemetry()
         var counters = WifiSecurityDropCounters()

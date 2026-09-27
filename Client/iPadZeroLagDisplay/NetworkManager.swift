@@ -1724,6 +1724,9 @@ public class NetworkManager: ObservableObject {
         securityDropObserver: { [weak self] counters in
             self?.transportTelemetry.recordWifiSecurityDrops(counters)
         },
+        rttObserver: { [weak self] durationMs in
+            self?.transportTelemetry.recordRtt(durationMs: durationMs)
+        },
         telemetryProvider: { [weak self] in
             guard let self else { return .zero }
             let feedback = self.transportTelemetry.makeFeedback()
