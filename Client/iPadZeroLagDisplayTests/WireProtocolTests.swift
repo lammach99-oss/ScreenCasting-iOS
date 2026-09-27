@@ -450,6 +450,8 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
         XCTAssertEqual(pointerActions(drag.pencilBegan(timestamp: 0.03)), [.leftUp])
         XCTAssertTrue(drag.begin(id: 3, point: .zero, timestamp: 0.04).isEmpty)
         drag.pencilEnded(timestamp: 0.05)
+        XCTAssertTrue(drag.end(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.25).isEmpty)
+        XCTAssertTrue(drag.end(id: 2, point: .zero, timestamp: 0.26).isEmpty)
         XCTAssertTrue(drag.end(id: 3, point: .zero, timestamp: 0.3).isEmpty)
         drag.begin(id: 4, point: .zero, timestamp: 0.31)
         XCTAssertEqual(pointerActions(drag.end(id: 4, point: .zero, timestamp: 0.4)), [.leftClick])
