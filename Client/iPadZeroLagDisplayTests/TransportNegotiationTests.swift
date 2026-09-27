@@ -64,6 +64,29 @@ final class Display120HzSourceTests: XCTestCase {
     }
 }
 
+final class RealtimeAudioTimerPolicyTests: XCTestCase {
+    func testAudioDisabledNeverOwnsRealtimePlayoutTimer() {
+        XCTAssertFalse(RealtimeAudioTimerPolicy.shouldRun(
+            mode: RealtimeTransportMode.wifiRTP,
+            audioEnabled: false))
+        XCTAssertFalse(RealtimeAudioTimerPolicy.shouldRun(
+            mode: RealtimeTransportMode.usbSplitTLS,
+            audioEnabled: false))
+    }
+
+    func testAudioEnabledRunsOnlyForRealtimeAudioTransports() {
+        XCTAssertTrue(RealtimeAudioTimerPolicy.shouldRun(
+            mode: RealtimeTransportMode.wifiRTP,
+            audioEnabled: true))
+        XCTAssertTrue(RealtimeAudioTimerPolicy.shouldRun(
+            mode: RealtimeTransportMode.usbSplitTLS,
+            audioEnabled: true))
+        XCTAssertFalse(RealtimeAudioTimerPolicy.shouldRun(
+            mode: RealtimeTransportMode.legacyTLS,
+            audioEnabled: true))
+    }
+}
+
 final class WifiTransportNegotiationTests: XCTestCase {
     func testKnownHostIdentityMustMatchPinnedCertificate() {
         let fingerprint = String(repeating: "AB", count: 32)

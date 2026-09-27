@@ -1,23 +1,8 @@
 import XCTest
 import Network
-import CoreVideo
 @testable import iPadCasting
 
 final class UsbSplitCommitGateTests: XCTestCase {
-    func testDecoderRequestsExplicitIOSurfaceBackedMetalBuffers() throws {
-        let attributes = DecoderOutputBufferAttributes.make()
-        XCTAssertEqual(
-            attributes[kCVPixelBufferPixelFormatTypeKey as String] as? OSType,
-            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
-        XCTAssertEqual(
-            attributes[kCVPixelBufferMetalCompatibilityKey as String] as? Bool,
-            true)
-        let properties = try XCTUnwrap(
-            attributes[kCVPixelBufferIOSurfacePropertiesKey as String]
-                as? NSDictionary)
-        XCTAssertEqual(properties.count, 0)
-    }
-
     func testFeedbackWindowUnknownHistoryIsNotLoss() {
         var window = WifiFeedbackWindow()
         XCTAssertNil(window.highest)

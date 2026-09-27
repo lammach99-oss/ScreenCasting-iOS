@@ -3134,6 +3134,7 @@ public class NetworkManager: ObservableObject {
     ) {
         guard let state = TrustedSettingsState.decode(payload),
               state.generation >= clientSettingsState.generation else { return }
+        let previousAudioEnabled = clientSettingsState.effective.audioEnabled
         let bitrateMbps = Double(state.bitrateBps) / 1_000_000
         let effective = ClientStreamSettingsPreference.normalized(
             bitrateMbps: bitrateMbps,
@@ -3141,6 +3142,14 @@ public class NetworkManager: ObservableObject {
         clientSettingsState.receiveHostState(
             effective,
             generation: state.generation)
+        if previousAudioEnabled != state.audioEnabled,
+           let committedGeneration = committedTransportGeneration,
+           let committedMode = committedRealtimeMode {
+            reconcileRealtimeAudioPlayback(
+                generation: committedGeneration,
+                mode: committedMode,
+                audioEnabled: state.audioEnabled)
+        }
         let resolvedOutcome: ClientSettingsApplyOutcome
         if case .rejected = outcome {
             resolvedOutcome = .rejected(state.rejectionReason)
@@ -4407,16 +4416,10 @@ public class NetworkManager: ObservableObject {
         wifiLegacyFallbackGeneration = nil
         wifiLegacyFallbackRequestGeneration = nil
         decoder.beginSession(generation: generation)
-        if mode == RealtimeTransportMode.wifiRTP {
-            AudioManager.shared.beginRealtimeSession(
-                generation: generation,
-                profile: .wifi)
-        } else if mode == RealtimeTransportMode.usbSplitTLS &&
-                    audioEnabled {
-            AudioManager.shared.beginRealtimeSession(
-                generation: generation,
-                profile: .usb)
-        }
+        reconcileRealtimeAudioPlayback(
+            generation: generation,
+            mode: mode,
+            audioEnabled: audioEnabled)
         setState(.streaming)
         startVideoReceiveLoop(generation: generation)
         if activeTransportKind == .usb {
@@ -4710,6 +4713,27 @@ public class NetworkManager: ObservableObject {
         usbLaneConnections.removeAll()
         wifiMediaReceiver.cancel()
         stopTelemetryTimer()
+    }
+
+    private func reconcileRealtimeAudioPlayback(
+        generation: UInt64,
+        mode: UInt8,
+        audioEnabled: Bool
+    ) {
+        guard generation == connectionGeneration,
+              committedTransportGeneration == generation,
+              committedRealtimeMode == mode else { return }
+        guard RealtimeAudioTimerPolicy.shouldRun(
+            mode: mode,
+            audioEnabled: audioEnabled) else {
+            if !audioEnabled {
+                AudioManager.shared.reset()
+            }
+            return
+        }
+        AudioManager.shared.beginRealtimeSession(
+            generation: generation,
+            profile: mode == RealtimeTransportMode.wifiRTP ? .wifi : .usb)
     }
 
     // MARK: - Private: Thread-Safe State Transition

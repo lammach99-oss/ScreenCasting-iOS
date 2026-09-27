@@ -1,6 +1,14 @@
 import Foundation
 import AVFoundation
 
+enum RealtimeAudioTimerPolicy {
+    static func shouldRun(mode: UInt8, audioEnabled: Bool) -> Bool {
+        audioEnabled &&
+            (mode == RealtimeTransportMode.wifiRTP ||
+             mode == RealtimeTransportMode.usbSplitTLS)
+    }
+}
+
 // MARK: - AudioManager
 
 /// Singleton that receives raw 16-bit / 48 kHz / Stereo PCM from the
