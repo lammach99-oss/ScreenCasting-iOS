@@ -2368,7 +2368,8 @@ public class NetworkManager: ObservableObject {
             self.sendWireMessage(
                 type: .pointerInput,
                 payload: command.encode(),
-                sequence: 0)
+                sequence: 0,
+                movement: command.action == .move)
         }
     }
 
@@ -3496,6 +3497,7 @@ public class NetworkManager: ObservableObject {
         payload: Data,
         sequence: UInt32,
         flags: UInt16 = 0,
+        movement: Bool = false,
         completion: @escaping (NWError?) -> Void = { _ in }
     ) {
         guard payload.count <= WireProtocol.maxPayloadSize else { return }
@@ -3515,6 +3517,7 @@ public class NetworkManager: ObservableObject {
         enqueueControlData(
             message,
             telemetry: type == .videoFeedback,
+            movement: movement,
             completion: { [weak self] error in
                 if let error {
                     self?.handleControlSendError(
