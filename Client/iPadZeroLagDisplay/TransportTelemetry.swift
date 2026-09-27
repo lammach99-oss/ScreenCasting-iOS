@@ -811,11 +811,13 @@ final class TransportTelemetry {
         lock.unlock()
     }
 
+    #if targetEnvironment(simulator)
     func summaryCountsForTesting() -> (rtt: Int, receive: Int) {
         lock.lock()
         defer { lock.unlock() }
         return (sessionRtt.count, sessionReceive.count)
     }
+    #endif
 
     func recordAuthenticatedRtt(
         durationMs: Double,
