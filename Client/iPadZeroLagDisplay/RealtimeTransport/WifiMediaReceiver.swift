@@ -824,6 +824,11 @@ struct WifiFeedbackSendLedger {
         }
     }
 
+    mutating func abandon(_ snapshot: WifiFeedbackSendSnapshot) {
+        guard pendingSends.remove(snapshot.token) != nil else { return }
+        pendingRtt.removeValue(forKey: snapshot.token)
+    }
+
     mutating func consumeRtt(token: UInt32, sentNanoseconds: UInt64) -> UInt64? {
         guard pendingRtt[token] == sentNanoseconds else { return nil }
         return pendingRtt.removeValue(forKey: token)
@@ -1700,25 +1705,30 @@ final class WifiMediaReceiver {
                 &packet,
                 plaintextLength: WifiFeedbackCodec.plaintextLength)
             feedbackLedger.didProtect(snapshot)
+            let sendConnectionID = ObjectIdentifier(connection)
             connection.send(
                 content: Data(packet.prefix(length)),
-                completion: .contentProcessed { [weak self, weak connection] error in
-                    guard let self, let connection else { return }
+                completion: .contentProcessed { [weak self] error in
+                    guard let self else { return }
                     self.networkQueue.async {
-                        guard self.activeGeneration == generation,
-                              self.connection === connection else { return }
+                        guard self.activeGeneration == generation else { return }
+                        guard let current = self.connection,
+                              ObjectIdentifier(current) == sendConnectionID else {
+                            self.feedbackLedger.abandon(snapshot)
+                            return
+                        }
                         self.feedbackLedger.complete(
                             snapshot,
                             succeeded: error == nil)
                         guard let error else { return }
                         if WifiNetworkErrorPolicy.disposition(for: error) ==
                             .transient {
-                            let source = ObjectIdentifier(connection)
+                            let source = ObjectIdentifier(current)
                             _ = self.candidateGate.markCommittedWaiting(source)
                             self.recordTransientMediaError(error)
                         } else {
                             self.failCommittedConnection(
-                                connection,
+                                current,
                                 generation: generation,
                                 error: error)
                         }

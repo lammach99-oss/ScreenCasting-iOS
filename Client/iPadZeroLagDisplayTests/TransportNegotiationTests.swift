@@ -257,6 +257,50 @@ final class WifiTransportNegotiationTests: XCTestCase {
         XCTAssertFalse(ledger.recoveryCompletedPending)
     }
 
+    func testAbandonedFeedbackSendRetiresBookkeepingWithoutAcknowledgingEvidence() {
+        var ledger = WifiFeedbackSendLedger()
+        ledger.recordExpiredFrame()
+        ledger.recordExpiredFrame()
+        ledger.markRecoveryCompleted()
+
+        let stale = ledger.prepare(sentNanoseconds: 10)
+        XCTAssertEqual(stale.expiredFrames, 2)
+        XCTAssertTrue(stale.recoveryCompleted)
+        ledger.didProtect(stale)
+        XCTAssertEqual(ledger.pendingRttCount, 1)
+
+        ledger.abandon(stale)
+
+        XCTAssertEqual(ledger.pendingRttCount, 0)
+        XCTAssertEqual(ledger.pendingExpiredFrames, 2)
+        XCTAssertTrue(ledger.recoveryCompletedPending)
+    }
+
+    func testAbandonedFeedbackSendIsIdempotentAndReplacementRereportsEvidence() {
+        var ledger = WifiFeedbackSendLedger()
+        ledger.recordExpiredFrame()
+        ledger.recordExpiredFrame()
+        ledger.markRecoveryCompleted()
+
+        let stale = ledger.prepare(sentNanoseconds: 10)
+        ledger.didProtect(stale)
+        ledger.abandon(stale)
+        ledger.complete(stale, succeeded: true)
+
+        XCTAssertEqual(ledger.pendingExpiredFrames, 2)
+        XCTAssertTrue(ledger.recoveryCompletedPending)
+        let replacement = ledger.prepare(sentNanoseconds: 20)
+        XCTAssertEqual(replacement.sequence, stale.sequence + 1)
+        XCTAssertEqual(replacement.token, stale.token + 1)
+        XCTAssertEqual(replacement.expiredFrames, 2)
+        XCTAssertTrue(replacement.recoveryCompleted)
+
+        ledger.didProtect(replacement)
+        ledger.complete(replacement, succeeded: true)
+        XCTAssertEqual(ledger.pendingExpiredFrames, 0)
+        XCTAssertFalse(ledger.recoveryCompletedPending)
+    }
+
     func testWifiNetworkErrorPolicyIsFailClosed() {
         for code: POSIXErrorCode in [
             .ENETDOWN, .ENETUNREACH, .EHOSTUNREACH,
