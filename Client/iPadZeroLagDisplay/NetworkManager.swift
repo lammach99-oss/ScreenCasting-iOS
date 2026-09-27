@@ -3807,6 +3807,9 @@ public class NetworkManager: ObservableObject {
         case .pipelineMode:
             return
 
+        case .pointerInput:
+            return
+
         case .video:
             guard committedTransportGeneration == generation else { return }
             if committedRealtimeMode == RealtimeTransportMode.wifiRTP {
