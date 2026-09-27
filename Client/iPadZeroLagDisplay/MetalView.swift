@@ -233,6 +233,8 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     var onTouchBoundsChanged: ((CGRect) -> Void)?
     var onPencilInput: ((PencilPacket) -> Void)?
     var onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)?
+    var onPointerInput: ((PointerInputCommand) -> Void)?
+    var onOpenSettings: (() -> Void)?
 
     public init(
         networkManager: NetworkManager,
@@ -243,7 +245,9 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         onPresentationGeometryChanged: ((PresentationSurfaceGeometry) -> Void)? = nil,
         onTouchBoundsChanged: ((CGRect) -> Void)? = nil,
         onPencilInput: ((PencilPacket) -> Void)? = nil,
-        onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)? = nil
+        onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)? = nil,
+        onPointerInput: ((PointerInputCommand) -> Void)? = nil,
+        onOpenSettings: (() -> Void)? = nil
     ) {
         self.networkManager = networkManager
         self.gameModeEnabled = gameModeEnabled
@@ -254,6 +258,8 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         self.onTouchBoundsChanged = onTouchBoundsChanged
         self.onPencilInput = onPencilInput
         self.onSendTouchEvent = onSendTouchEvent
+        self.onPointerInput = onPointerInput
+        self.onOpenSettings = onOpenSettings
     }
 
     public func makeCoordinator() -> Coordinator {
@@ -314,6 +320,8 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         touchView.onSendTouchEvent = { type, x, y, pressure in
             sendTouchEvent?(type, x, y, pressure)
         }
+        touchView.onPointerInput = onPointerInput
+        touchView.onOpenSettings = onOpenSettings
         touchView.inputGeometryContext = coordinator.inputGeometryContext
         touchView.diagnosticSink = { [weak networkManager] line in
             networkManager?.recordDiagnosticLine(line)

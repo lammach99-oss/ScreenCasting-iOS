@@ -494,17 +494,16 @@ public struct ContentView: View {
                         x: x,
                         y: y,
                         pressure: pressure)
+                },
+                onPointerInput: { command in
+                    networkManager.sendPointerInput(command)
+                },
+                onOpenSettings: {
+                    isSettingsPresented = true
                 })
                 .frame(width: frame.width, height: frame.height)
                 .offset(x: frame.minX, y: frame.minY)
                 .allowsHitTesting(true)
-                // A single touch remains remote input. Only a deliberate
-                // double tap presents local stream controls.
-                .simultaneousGesture(
-                    TapGesture(count: 2)
-                        .onEnded {
-                            isSettingsPresented = true
-                        })
                 // This container has the committed drawable size. Publish
                 // it as an orientation source so capabilities-first startup
                 // cannot miss the initial portrait request.

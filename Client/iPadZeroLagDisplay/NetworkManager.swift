@@ -81,6 +81,60 @@ enum WireMessageType: UInt8 {
     case forgetDeviceResult = 34
     case presentationActivity = 35
     case pipelineMode = 36
+    case pointerInput = 37
+}
+
+public enum PointerInputAction: UInt8, CaseIterable {
+    case move = 0
+    case leftClick = 1
+    case leftDown = 2
+    case leftUp = 3
+    case rightClick = 4
+    case verticalWheel = 5
+}
+
+public struct PointerInputCommand: Equatable {
+    static let version: UInt8 = 1
+    static let encodedSize = 8
+
+    public let action: PointerInputAction
+    public let x: UInt16
+    public let y: UInt16
+    public let value: Int16
+
+    public init(action: PointerInputAction, x: UInt16, y: UInt16, value: Int16 = 0) {
+        self.action = action
+        self.x = x
+        self.y = y
+        self.value = value
+    }
+
+    func encode() -> Data {
+        var payload = Data(count: Self.encodedSize)
+        payload.withUnsafeMutableBytes { bytes in
+            bytes.storeBytes(of: Self.version, toByteOffset: 0, as: UInt8.self)
+            bytes.storeBytes(of: action.rawValue, toByteOffset: 1, as: UInt8.self)
+            bytes.storeBytes(of: x.littleEndian, toByteOffset: 2, as: UInt16.self)
+            bytes.storeBytes(of: y.littleEndian, toByteOffset: 4, as: UInt16.self)
+            bytes.storeBytes(of: value.littleEndian, toByteOffset: 6, as: Int16.self)
+        }
+        return payload
+    }
+
+    static func decode(_ payload: Data) -> PointerInputCommand? {
+        guard payload.count == encodedSize,
+              payload[0] == version,
+              let action = PointerInputAction(rawValue: payload[1]) else {
+            return nil
+        }
+        return payload.withUnsafeBytes { bytes in
+            PointerInputCommand(
+                action: action,
+                x: UInt16(littleEndian: bytes.loadUnaligned(fromByteOffset: 2, as: UInt16.self)),
+                y: UInt16(littleEndian: bytes.loadUnaligned(fromByteOffset: 4, as: UInt16.self)),
+                value: Int16(littleEndian: bytes.loadUnaligned(fromByteOffset: 6, as: Int16.self)))
+        }
+    }
 }
 
 public enum PipelineMode: UInt8 {
@@ -1342,6 +1396,8 @@ final class WireStreamParser {
             fixedLength = 2
         case .presentationActivity, .pipelineMode:
             fixedLength = 1
+        case .pointerInput:
+            fixedLength = PointerInputCommand.encodedSize
         case .clientCapabilities:
             fixedLength = ClientCapabilities.encodedSize
         case .transportOffer:
@@ -2298,6 +2354,22 @@ public class NetworkManager: ObservableObject {
         let y        = UInt16(clamping: Int((normY.clamped(0, 1) * 65535).rounded()))
         let pressure = UInt8 (clamping: Int((pressure01.clamped(0, 1) * 255).rounded()))
         sendTouchEvent(type: type, x: x, y: y, pressure: pressure)
+    }
+
+    public func sendPointerInput(_ command: PointerInputCommand) {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            let generation = self.connectionGeneration
+            guard self.transportState == .streaming,
+                  self.committedTransportGeneration == generation,
+                  !self.displayRequestGate.isInputSuppressed else {
+                return
+            }
+            self.sendWireMessage(
+                type: .pointerInput,
+                payload: command.encode(),
+                sequence: 0)
+        }
     }
 
     // MARK: - Public API: Bitrate Control Sender

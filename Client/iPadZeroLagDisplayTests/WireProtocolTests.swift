@@ -314,6 +314,167 @@ final class UsbSplitCommitGateTests: XCTestCase {
     }
 }
 
+final class DirectTouchGestureStateMachineTests: XCTestCase {
+    private func pointerActions(
+        _ outputs: [DirectTouchGestureOutput]
+    ) -> [PointerInputAction] {
+        outputs.compactMap {
+            if case .pointer(let action, _, _) = $0 { return action }
+            return nil
+        }
+    }
+
+    func testSingleAndDoubleTapProduceClicksWithoutSettings() {
+        var machine = DirectTouchGestureStateMachine()
+        XCTAssertTrue(machine.begin(id: 1, point: .zero, timestamp: 0).isEmpty)
+        XCTAssertEqual(
+            pointerActions(machine.end(id: 1, point: CGPoint(x: 2, y: 2), timestamp: 0.1)),
+            [.leftClick])
+        XCTAssertTrue(machine.begin(id: 2, point: .zero, timestamp: 0.15).isEmpty)
+        let second = machine.end(id: 2, point: .zero, timestamp: 0.25)
+        XCTAssertEqual(pointerActions(second), [.leftClick])
+        XCTAssertFalse(second.contains(.openSettings))
+    }
+
+    func testOneFingerScrollUsesAnchorAndWheelWhileTinyMotionRemainsTap() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: CGPoint(x: 10, y: 10), timestamp: 0)
+        let classified = machine.move(
+            id: 1, point: CGPoint(x: 10, y: 23), timestamp: 0.05)
+        XCTAssertEqual(pointerActions(classified), [.move])
+        let scrolled = machine.move(
+            id: 1, point: CGPoint(x: 10, y: 46), timestamp: 0.1)
+        XCTAssertEqual(pointerActions(scrolled), [.verticalWheel])
+        XCTAssertTrue(machine.end(id: 1, point: CGPoint(x: 10, y: 46), timestamp: 0.15).isEmpty)
+
+        machine.begin(id: 2, point: .zero, timestamp: 1)
+        machine.move(id: 2, point: CGPoint(x: 4, y: 4), timestamp: 1.05)
+        XCTAssertEqual(
+            pointerActions(machine.end(id: 2, point: CGPoint(x: 4, y: 4), timestamp: 1.1)),
+            [.leftClick])
+    }
+
+    func testTwoFingerRightClickUsesPrimaryAndSecondaryNeverMovesPointer() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: CGPoint(x: 40, y: 50), timestamp: 0)
+        machine.begin(id: 2, point: CGPoint(x: 100, y: 100), timestamp: 0.05)
+        XCTAssertTrue(machine.move(
+            id: 2, point: CGPoint(x: 150, y: 150), timestamp: 0.08).isEmpty)
+        let output = machine.end(
+            id: 2, point: CGPoint(x: 150, y: 150), timestamp: 0.1)
+        XCTAssertEqual(pointerActions(output), [.rightClick])
+        guard case .pointer(_, let point, _) = output.first else {
+            return XCTFail("right click missing")
+        }
+        XCTAssertEqual(point, CGPoint(x: 40, y: 50))
+        XCTAssertTrue(machine.end(id: 1, point: CGPoint(x: 40, y: 50), timestamp: 0.2).isEmpty)
+    }
+
+    func testTwoFingerDragOwnsOneDownMovesPrimaryAndReleasesOnEitherFinger() {
+        for releasedID: UInt64 in [1, 2] {
+            var machine = DirectTouchGestureStateMachine()
+            machine.begin(id: 1, point: .zero, timestamp: 0)
+            machine.begin(id: 2, point: CGPoint(x: 50, y: 50), timestamp: 0.02)
+            XCTAssertEqual(
+                pointerActions(machine.move(
+                    id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.04)),
+                [.leftDown])
+            XCTAssertTrue(machine.move(
+                id: 2, point: CGPoint(x: 90, y: 90), timestamp: 0.05).isEmpty)
+            XCTAssertEqual(
+                pointerActions(machine.move(
+                    id: 1, point: CGPoint(x: 12, y: 0), timestamp: 0.06)),
+                [.move])
+            XCTAssertEqual(
+                pointerActions(machine.end(
+                    id: releasedID,
+                    point: releasedID == 1 ? CGPoint(x: 12, y: 0) : CGPoint(x: 90, y: 90),
+                    timestamp: 0.08)),
+                [.leftUp])
+        }
+    }
+
+    func testSecondFingerDoesNotReclassifyActiveScroll() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        XCTAssertEqual(
+            pointerActions(machine.move(id: 1, point: CGPoint(x: 0, y: 13), timestamp: 0.02)),
+            [.move])
+        machine.begin(id: 2, point: CGPoint(x: 40, y: 40), timestamp: 0.03)
+        XCTAssertTrue(machine.move(
+            id: 2, point: CGPoint(x: 80, y: 80), timestamp: 0.04).isEmpty)
+        XCTAssertEqual(
+            pointerActions(machine.move(id: 1, point: CGPoint(x: 0, y: 40), timestamp: 0.05)),
+            [.verticalWheel])
+    }
+
+    func testThreeFingerTapOpensSettingsOnlyAndFailuresDoNothing() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        machine.begin(id: 2, point: CGPoint(x: 5, y: 0), timestamp: 0.03)
+        machine.begin(id: 3, point: CGPoint(x: 10, y: 0), timestamp: 0.06)
+        XCTAssertEqual(
+            machine.end(id: 1, point: .zero, timestamp: 0.12),
+            [.openSettings])
+
+        var moved = DirectTouchGestureStateMachine()
+        moved.begin(id: 1, point: .zero, timestamp: 0)
+        moved.begin(id: 2, point: .zero, timestamp: 0.02)
+        moved.begin(id: 3, point: .zero, timestamp: 0.04)
+        moved.move(id: 1, point: CGPoint(x: 20, y: 0), timestamp: 0.05)
+        XCTAssertTrue(moved.end(id: 1, point: CGPoint(x: 20, y: 0), timestamp: 0.1).isEmpty)
+    }
+
+    func testFourthFingerSuppressesUntilAllLift() {
+        var machine = DirectTouchGestureStateMachine()
+        for id in UInt64(1)...4 {
+            XCTAssertTrue(machine.begin(id: id, point: .zero, timestamp: Double(id) * 0.01).isEmpty)
+        }
+        for id in UInt64(1)...4 {
+            XCTAssertTrue(machine.end(id: id, point: .zero, timestamp: 0.1 + Double(id) * 0.01).isEmpty)
+        }
+        machine.begin(id: 5, point: .zero, timestamp: 1)
+        XCTAssertEqual(pointerActions(machine.end(id: 5, point: .zero, timestamp: 1.1)), [.leftClick])
+    }
+
+    func testPencilPreemptsPendingAndActiveDragThenGuardsPalms() {
+        var pending = DirectTouchGestureStateMachine()
+        pending.begin(id: 1, point: .zero, timestamp: 0)
+        XCTAssertTrue(pending.pencilBegan(timestamp: 0.02).isEmpty)
+        XCTAssertTrue(pending.end(id: 1, point: .zero, timestamp: 0.03).isEmpty)
+
+        var drag = DirectTouchGestureStateMachine()
+        drag.begin(id: 1, point: .zero, timestamp: 0)
+        drag.begin(id: 2, point: .zero, timestamp: 0.01)
+        drag.move(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.02)
+        XCTAssertEqual(pointerActions(drag.pencilBegan(timestamp: 0.03)), [.leftUp])
+        XCTAssertTrue(drag.begin(id: 3, point: .zero, timestamp: 0.04).isEmpty)
+        drag.pencilEnded(timestamp: 0.05)
+        XCTAssertTrue(drag.end(id: 3, point: .zero, timestamp: 0.3).isEmpty)
+        drag.begin(id: 4, point: .zero, timestamp: 0.31)
+        XCTAssertEqual(pointerActions(drag.end(id: 4, point: .zero, timestamp: 0.4)), [.leftClick])
+    }
+
+    func testCancellationNeverLeavesLogicalDragActive() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        machine.begin(id: 2, point: .zero, timestamp: 0.01)
+        machine.move(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.02)
+        XCTAssertEqual(
+            pointerActions(machine.end(
+                id: 1,
+                point: CGPoint(x: 7, y: 0),
+                timestamp: 0.03,
+                cancelled: true)),
+            [.leftUp])
+        XCTAssertTrue(machine.end(
+            id: 2,
+            point: .zero,
+            timestamp: 0.04,
+            cancelled: true).isEmpty)
+    }
+}
+
 final class USBListenerLifetimeTests: XCTestCase {
     private var manager: NetworkManager!
     private var peers: [NWConnection] = []
@@ -1874,6 +2035,7 @@ final class WireProtocolTests: XCTestCase {
         XCTAssertEqual(WireMessageType.usbLaneBindResult.rawValue, 14)
         XCTAssertEqual(WireMessageType.presentationActivity.rawValue, 35)
         XCTAssertEqual(WireMessageType.pipelineMode.rawValue, 36)
+        XCTAssertEqual(WireMessageType.pointerInput.rawValue, 37)
         XCTAssertEqual(PipelineMode.office.rawValue, 0)
         XCTAssertEqual(PipelineMode.game.rawValue, 1)
         XCTAssertEqual(WireProtocol.realtimeNegotiationSupportedFlag, 0x8000)
@@ -1887,6 +2049,65 @@ final class WireProtocolTests: XCTestCase {
         XCTAssertNil(PipelineMode.decode(Data()))
         XCTAssertNil(PipelineMode.decode(Data([0, 0])))
         XCTAssertNil(PipelineMode.decode(Data([2])))
+    }
+
+    func testPointerInputPayloadRoundTripsAllActionsAndRejectsInvalidValues() throws {
+        for action in PointerInputAction.allCases {
+            let value: Int16 = action == .verticalWheel ? -120 : 0
+            let command = PointerInputCommand(
+                action: action,
+                x: 1_234,
+                y: 54_321,
+                value: value)
+            let payload = command.encode()
+            XCTAssertEqual(payload.count, 8)
+            XCTAssertEqual(PointerInputCommand.decode(payload), command)
+        }
+
+        var unknownVersion = PointerInputCommand(
+            action: .move,
+            x: 1,
+            y: 2).encode()
+        unknownVersion[0] = 2
+        XCTAssertNil(PointerInputCommand.decode(unknownVersion))
+
+        var unknownAction = PointerInputCommand(
+            action: .move,
+            x: 1,
+            y: 2).encode()
+        unknownAction[1] = 0xFF
+        XCTAssertNil(PointerInputCommand.decode(unknownAction))
+        XCTAssertNil(PointerInputCommand.decode(Data(repeating: 0, count: 7)))
+    }
+
+    func testMalformedPointerInputLengthIsDrainedAndSessionContinues() {
+        let parser = WireStreamParser(generation: 4)
+        let malformed = makeMessage(
+            type: .pointerInput,
+            flags: 0,
+            payload: Data(repeating: 0, count: 7),
+            sequence: 8)
+        let following = makeMessage(
+            type: .video,
+            flags: 1,
+            payload: Data([0, 0, 0, 1, 0x26]),
+            sequence: 9)
+        var discarded: [UInt32] = []
+        var received: [UInt32] = []
+
+        parser.consume(malformed + following, generation: 4) { event in
+            switch event {
+            case .discardedFixedControl(let header):
+                discarded.append(header.sequence)
+            case .message(let message):
+                received.append(message.header.sequence)
+            case .failure(let error):
+                XCTFail("unexpected parser failure: \(error)")
+            }
+        }
+
+        XCTAssertEqual(discarded, [8])
+        XCTAssertEqual(received, [9])
     }
 
     func testMalformedPipelineModeLengthIsDrainedAndSessionContinues() {
