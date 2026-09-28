@@ -21,9 +21,14 @@ final class TransportTelemetryTests: XCTestCase {
         wait(for: [drained], timeout: 2)
 
         let feedback = telemetry.makeFeedback()
-        XCTAssertEqual(feedback.0, 11)
-        XCTAssertEqual(feedback.1, 11)
         XCTAssertEqual(feedback.2, 8)
+        XCTAssertNotEqual(
+            telemetry.feedbackValidityFlags() &
+                VideoFeedbackValidityFlags.frameReceive,
+            0)
+        XCTAssertNotEqual(
+            telemetry.feedbackValidityFlags() & VideoFeedbackValidityFlags.decode,
+            0)
         XCTAssertEqual(telemetry.hudSnapshot().frameReceiveMs, 4)
         XCTAssertEqual(telemetry.hudSnapshot().decodeMs, 6)
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
@@ -70,7 +75,7 @@ final class TransportTelemetryTests: XCTestCase {
         telemetry.stopLogging { stoppedAgain.fulfill() }
         wait(for: [stoppedAgain], timeout: 2)
         XCTAssertEqual(try Data(contentsOf: diagnosticURL).count, sizeAfterStop)
-        XCTAssertEqual(telemetry.makeFeedback().0, 41)
+        XCTAssertEqual(telemetry.hudSnapshot().frameReceiveMs, 3)
     }
 
     func testWifiCompletedFrameRecordsOneReceiveSample() {
