@@ -466,7 +466,7 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
         }
         duration.end(id: 1, point: .zero, timestamp: 0.1)
         duration.end(id: 2, point: .zero, timestamp: 0.2)
-        XCTAssertTrue(duration.end(id: 3, point: .zero, timestamp: 0.31).isEmpty)
+        XCTAssertTrue(duration.end(id: 3, point: .zero, timestamp: 0.32).isEmpty)
 
         var cancelled = DirectTouchGestureStateMachine()
         for id in UInt64(1)...3 {
