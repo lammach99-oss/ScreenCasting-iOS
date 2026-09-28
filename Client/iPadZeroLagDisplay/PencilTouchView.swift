@@ -118,12 +118,51 @@ enum DirectTouchGestureOutput: Equatable {
     case openSettings
 }
 
+struct PointerInputCoordinateState {
+    private(set) var lastValidPoint: CGPoint?
+
+    mutating func resolve(action: PointerInputAction, mappedPoint: CGPoint?) -> CGPoint? {
+        if let mappedPoint {
+            lastValidPoint = mappedPoint
+            return mappedPoint
+        }
+        guard action == .leftUp else { return nil }
+        defer { lastValidPoint = nil }
+        return lastValidPoint ?? .zero
+    }
+
+    mutating func clearAfterRelease(_ action: PointerInputAction) {
+        if action == .leftUp { lastValidPoint = nil }
+    }
+}
+
+struct LifetimeIdentityMap<Key: Hashable> {
+    private var nextID: UInt64 = 1
+    private var identities: [Key: UInt64] = [:]
+
+    mutating func begin(_ key: Key) -> UInt64 {
+        if let existing = identities[key] { return existing }
+        let allocated = nextID
+        nextID = nextID == .max ? 1 : nextID + 1
+        identities[key] = allocated
+        return allocated
+    }
+
+    func existing(_ key: Key) -> UInt64? { identities[key] }
+
+    @discardableResult
+    mutating func end(_ key: Key) -> UInt64? {
+        identities.removeValue(forKey: key)
+    }
+}
+
 struct DirectTouchGestureStateMachine {
     private struct Contact {
         let id: UInt64
         let beganAt: TimeInterval
         let start: CGPoint
         var point: CGPoint
+        var maxExcursion: CGFloat
     }
 
     private enum State {
@@ -132,7 +171,11 @@ struct DirectTouchGestureStateMachine {
         case scrolling(UInt64, lastY: CGFloat, wheelRemainder: CGFloat)
         case twoFinger(UInt64, UInt64, secondBeganAt: TimeInterval)
         case dragging(UInt64, UInt64)
-        case threeFinger(startedAt: TimeInterval)
+        case threeFinger(
+            startedAt: TimeInterval,
+            participants: Set<UInt64>,
+            completed: Set<UInt64>,
+            valid: Bool)
         case suppressed
         case pencilExclusive
         case palmGuard(until: TimeInterval)
@@ -174,7 +217,13 @@ struct DirectTouchGestureStateMachine {
             id: id,
             beganAt: timestamp,
             start: point,
-            point: point)
+            point: point,
+            maxExcursion: 0)
+        if case .threeFinger(_, _, let completed, _) = state,
+           !completed.isEmpty {
+            state = .suppressed
+            return []
+        }
         if contacts.count >= 4 {
             state = .suppressed
             return []
@@ -185,7 +234,11 @@ struct DirectTouchGestureStateMachine {
             let times = contacts.values.map(\.beganAt)
             if let first = times.min(), let last = times.max(),
                last - first <= threeFingerSync {
-                state = .threeFinger(startedAt: first)
+                state = .threeFinger(
+                    startedAt: first,
+                    participants: Set(contacts.keys),
+                    completed: [],
+                    valid: true)
             } else {
                 state = .suppressed
             }
@@ -213,6 +266,9 @@ struct DirectTouchGestureStateMachine {
         guard !ignoredContacts.contains(id),
               var contact = contacts[id] else { return [] }
         contact.point = point
+        contact.maxExcursion = max(
+            contact.maxExcursion,
+            distance(contact.start, point))
         contacts[id] = contact
 
         switch state {
@@ -233,9 +289,10 @@ struct DirectTouchGestureStateMachine {
                 lastY: point.y,
                 wheelRemainder: accumulated - used)
             guard steps != 0 else { return [] }
-            return (0..<abs(steps)).map { _ in
-                .pointer(.verticalWheel, point, steps > 0 ? -120 : 120)
-            }
+            return [.pointer(
+                .verticalWheel,
+                point,
+                Int16(clamping: -steps * 120))]
         case .twoFinger(let primary, let secondary, _) where primary == id:
             if distance(contact.start, point) >= dragMovement {
                 state = .dragging(primary, secondary)
@@ -243,12 +300,12 @@ struct DirectTouchGestureStateMachine {
             }
         case .dragging(let primary, _) where primary == id:
             return [.pointer(.move, point, 0)]
-        case .threeFinger:
-            if contacts.values.contains(where: {
-                distance($0.start, $0.point) > threeFingerMovement
-            }) {
-                state = .suppressed
-            }
+        case .threeFinger(let startedAt, let participants, let completed, let valid):
+            state = .threeFinger(
+                startedAt: startedAt,
+                participants: participants,
+                completed: completed,
+                valid: valid && contact.maxExcursion <= threeFingerMovement)
         default:
             break
         }
@@ -268,6 +325,9 @@ struct DirectTouchGestureStateMachine {
         }
         guard var contact = contacts[id] else { return [] }
         contact.point = point
+        contact.maxExcursion = max(
+            contact.maxExcursion,
+            distance(contact.start, point))
         contacts[id] = contact
         var outputs: [DirectTouchGestureOutput] = []
 
@@ -275,7 +335,7 @@ struct DirectTouchGestureStateMachine {
         case .oneFinger(let primary) where primary == id:
             if !cancelled,
                timestamp - contact.beganAt <= tapDuration,
-               distance(contact.start, point) <= tapMovement {
+               contact.maxExcursion <= tapMovement {
                 outputs.append(.pointer(.leftClick, point, 0))
             }
             state = .suppressed
@@ -286,7 +346,7 @@ struct DirectTouchGestureStateMachine {
                !cancelled,
                timestamp - secondBeganAt <= tapDuration,
                let primaryContact = contacts[primary],
-               distance(primaryContact.start, primaryContact.point) <= tapMovement {
+               primaryContact.maxExcursion <= tapMovement {
                 outputs.append(.pointer(.rightClick, primaryContact.point, 0))
             }
             state = .suppressed
@@ -294,16 +354,26 @@ struct DirectTouchGestureStateMachine {
             let finalPoint = contacts[primary]?.point ?? point
             outputs.append(.pointer(.leftUp, finalPoint, 0))
             state = .suppressed
-        case .threeFinger(let startedAt):
-            let validMovement = contacts.values.allSatisfy {
-                distance($0.start, $0.point) <= threeFingerMovement
+        case .threeFinger(
+            let startedAt,
+            let participants,
+            var completed,
+            let valid):
+            completed.insert(id)
+            let remainsValid = valid &&
+                !cancelled &&
+                timestamp - startedAt <= threeFingerDuration &&
+                contact.maxExcursion <= threeFingerMovement
+            if completed == participants {
+                if remainsValid { outputs.append(.openSettings) }
+                state = .suppressed
+            } else {
+                state = .threeFinger(
+                    startedAt: startedAt,
+                    participants: participants,
+                    completed: completed,
+                    valid: remainsValid)
             }
-            if !cancelled,
-               timestamp - startedAt <= threeFingerDuration,
-               validMovement {
-                outputs.append(.openSettings)
-            }
-            state = .suppressed
         default:
             break
         }
@@ -363,6 +433,8 @@ public class PencilUIKitView: UIView {
     private var lastReportedBounds: CGRect?
     private var inputGeometrySampler = InputGeometryDiagnosticSampler()
     private var directGesture = DirectTouchGestureStateMachine()
+    private var pointerCoordinateState = PointerInputCoordinateState()
+    private var directTouchIDs = LifetimeIdentityMap<ObjectIdentifier>()
 
     override public init(frame: CGRect) {
         super.init(frame: frame)
@@ -409,7 +481,8 @@ public class PencilUIKitView: UIView {
         let directTouches = touches.filter { $0.type == .direct }
             .sorted { lhs, rhs in
                 if lhs.timestamp != rhs.timestamp { return lhs.timestamp < rhs.timestamp }
-                return ObjectIdentifier(lhs).hashValue < ObjectIdentifier(rhs).hashValue
+                return UInt(bitPattern: Unmanaged.passUnretained(lhs).toOpaque()) <
+                    UInt(bitPattern: Unmanaged.passUnretained(rhs).toOpaque())
             }
 
         if let pencil = pencilTouches.first, flags == 1 {
@@ -423,7 +496,14 @@ public class PencilUIKitView: UIView {
         }
 
         for touch in directTouches {
-            let id = UInt64(bitPattern: Int64(ObjectIdentifier(touch).hashValue))
+            let key = ObjectIdentifier(touch)
+            let id: UInt64
+            if flags == 1 {
+                id = directTouchIDs.begin(key)
+            } else {
+                guard let existing = directTouchIDs.existing(key) else { continue }
+                id = existing
+            }
             let point = touch.location(in: self)
             let outputs: [DirectTouchGestureOutput]
             switch flags {
@@ -441,6 +521,7 @@ public class PencilUIKitView: UIView {
                     cancelled: cancelled)
             }
             emit(outputs)
+            if flags == 4 { directTouchIDs.end(key) }
         }
     }
 
@@ -450,18 +531,20 @@ public class PencilUIKitView: UIView {
             case .openSettings:
                 onOpenSettings?()
             case .pointer(let action, let point, let value):
-                guard bounds.width > 0,
-                      bounds.height > 0,
-                      let normalized = contentViewport?.normalizedPoint(
-                          for: point,
-                          in: bounds) else { continue }
-                let x = UInt16(clamping: Int((normalized.x * 65_535).rounded()))
-                let y = UInt16(clamping: Int((normalized.y * 65_535).rounded()))
+                let normalized = bounds.width > 0 && bounds.height > 0
+                    ? contentViewport?.normalizedPoint(for: point, in: bounds)
+                    : nil
+                guard let resolved = pointerCoordinateState.resolve(
+                    action: action,
+                    mappedPoint: normalized) else { continue }
+                let x = UInt16(clamping: Int((resolved.x * 65_535).rounded()))
+                let y = UInt16(clamping: Int((resolved.y * 65_535).rounded()))
                 onPointerInput?(PointerInputCommand(
                     action: action,
                     x: x,
                     y: y,
                     value: value))
+                pointerCoordinateState.clearAfterRelease(action)
             }
         }
     }

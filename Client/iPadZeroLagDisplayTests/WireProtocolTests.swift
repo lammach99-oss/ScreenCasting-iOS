@@ -354,6 +354,22 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
             [.leftClick])
     }
 
+    func testLargeScrollMoveEmitsOneAggregatedSignedWheelCommand() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        XCTAssertEqual(pointerActions(machine.move(
+            id: 1, point: CGPoint(x: 0, y: 13), timestamp: 0.01)), [.move])
+        let down = machine.move(
+            id: 1, point: CGPoint(x: 0, y: 181), timestamp: 0.02)
+        XCTAssertEqual(down.count, 1)
+        XCTAssertEqual(down, [.pointer(.verticalWheel, CGPoint(x: 0, y: 181), -960)])
+
+        let up = machine.move(
+            id: 1, point: CGPoint(x: 0, y: 13), timestamp: 0.03)
+        XCTAssertEqual(up.count, 1)
+        XCTAssertEqual(up, [.pointer(.verticalWheel, CGPoint(x: 0, y: 13), 960)])
+    }
+
     func testTwoFingerRightClickUsesPrimaryAndSecondaryNeverMovesPointer() {
         var machine = DirectTouchGestureStateMachine()
         machine.begin(id: 1, point: CGPoint(x: 40, y: 50), timestamp: 0)
@@ -413,8 +429,10 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
         machine.begin(id: 1, point: .zero, timestamp: 0)
         machine.begin(id: 2, point: CGPoint(x: 5, y: 0), timestamp: 0.03)
         machine.begin(id: 3, point: CGPoint(x: 10, y: 0), timestamp: 0.06)
+        XCTAssertTrue(machine.end(id: 1, point: .zero, timestamp: 0.12).isEmpty)
+        XCTAssertTrue(machine.end(id: 2, point: CGPoint(x: 5, y: 0), timestamp: 0.14).isEmpty)
         XCTAssertEqual(
-            machine.end(id: 1, point: .zero, timestamp: 0.12),
+            machine.end(id: 3, point: CGPoint(x: 10, y: 0), timestamp: 0.16),
             [.openSettings])
 
         var moved = DirectTouchGestureStateMachine()
@@ -423,6 +441,62 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
         moved.begin(id: 3, point: .zero, timestamp: 0.04)
         moved.move(id: 1, point: CGPoint(x: 20, y: 0), timestamp: 0.05)
         XCTAssertTrue(moved.end(id: 1, point: CGPoint(x: 20, y: 0), timestamp: 0.1).isEmpty)
+    }
+
+    func testTapAndRightClickUseMaximumExcursion() {
+        var tap = DirectTouchGestureStateMachine()
+        tap.begin(id: 1, point: .zero, timestamp: 0)
+        tap.move(id: 1, point: CGPoint(x: 11, y: 11), timestamp: 0.05)
+        tap.move(id: 1, point: .zero, timestamp: 0.1)
+        XCTAssertTrue(tap.end(id: 1, point: .zero, timestamp: 0.15).isEmpty)
+
+        var rightClick = DirectTouchGestureStateMachine()
+        rightClick.begin(id: 1, point: .zero, timestamp: 0)
+        rightClick.begin(id: 2, point: CGPoint(x: 40, y: 40), timestamp: 0.02)
+        rightClick.move(id: 1, point: CGPoint(x: 13, y: 0), timestamp: 0.04)
+        rightClick.move(id: 1, point: .zero, timestamp: 0.06)
+        XCTAssertFalse(pointerActions(rightClick.end(
+            id: 2, point: CGPoint(x: 40, y: 40), timestamp: 0.08)).contains(.rightClick))
+    }
+
+    func testThreeFingerFailureAndReplacementAreSuppressed() {
+        var duration = DirectTouchGestureStateMachine()
+        for id in UInt64(1)...3 {
+            duration.begin(id: id, point: .zero, timestamp: Double(id) * 0.01)
+        }
+        duration.end(id: 1, point: .zero, timestamp: 0.1)
+        duration.end(id: 2, point: .zero, timestamp: 0.2)
+        XCTAssertTrue(duration.end(id: 3, point: .zero, timestamp: 0.31).isEmpty)
+
+        var cancelled = DirectTouchGestureStateMachine()
+        for id in UInt64(1)...3 {
+            cancelled.begin(id: id, point: .zero, timestamp: Double(id) * 0.01)
+        }
+        cancelled.end(id: 1, point: .zero, timestamp: 0.1, cancelled: true)
+        cancelled.end(id: 2, point: .zero, timestamp: 0.12)
+        XCTAssertTrue(cancelled.end(id: 3, point: .zero, timestamp: 0.14).isEmpty)
+
+        var replacement = DirectTouchGestureStateMachine()
+        for id in UInt64(1)...3 {
+            replacement.begin(id: id, point: .zero, timestamp: Double(id) * 0.01)
+        }
+        replacement.end(id: 1, point: .zero, timestamp: 0.1)
+        replacement.begin(id: 4, point: .zero, timestamp: 0.11)
+        replacement.end(id: 2, point: .zero, timestamp: 0.12)
+        replacement.end(id: 3, point: .zero, timestamp: 0.13)
+        XCTAssertTrue(replacement.end(id: 4, point: .zero, timestamp: 0.14).isEmpty)
+    }
+
+    func testContactBegunDuringPalmGuardRemainsIgnoredForLifetime() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.pencilBegan(timestamp: 0)
+        machine.pencilEnded(timestamp: 0.01)
+        machine.begin(id: 1, point: .zero, timestamp: 0.1)
+        machine.move(id: 1, point: CGPoint(x: 20, y: 0), timestamp: 0.2)
+        XCTAssertTrue(machine.end(id: 1, point: .zero, timestamp: 0.3).isEmpty)
+        machine.begin(id: 2, point: .zero, timestamp: 0.31)
+        XCTAssertEqual(pointerActions(machine.end(
+            id: 2, point: .zero, timestamp: 0.4)), [.leftClick])
     }
 
     func testFourthFingerSuppressesUntilAllLift() {
@@ -474,6 +548,56 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
             point: .zero,
             timestamp: 0.04,
             cancelled: true).isEmpty)
+    }
+}
+
+final class PointerInputFailSafeReleaseTests: XCTestCase {
+    func testLeftUpUsesLastValidCoordinateOutsideViewportThenClearsIt() {
+        var state = PointerInputCoordinateState()
+        let valid = CGPoint(x: 0.25, y: 0.75)
+        XCTAssertEqual(state.resolve(action: .leftDown, mappedPoint: valid), valid)
+        XCTAssertEqual(state.resolve(action: .leftUp, mappedPoint: nil), valid)
+        XCTAssertNil(state.lastValidPoint)
+        XCTAssertEqual(state.resolve(action: .leftUp, mappedPoint: nil), .zero)
+    }
+
+    func testUnmappedPositionBearingActionsRemainRejected() {
+        var state = PointerInputCoordinateState()
+        for action: PointerInputAction in [
+            .move, .leftDown, .leftClick, .rightClick, .verticalWheel
+        ] {
+            XCTAssertNil(state.resolve(action: action, mappedPoint: nil))
+        }
+    }
+
+    func testDisplaySuppressionAllowsOnlyLeftUp() {
+        XCTAssertTrue(PointerInputDeliveryPolicy.maySend(
+            action: .leftUp, inputSuppressed: true))
+        for action: PointerInputAction in [
+            .move, .leftClick, .leftDown, .rightClick, .verticalWheel
+        ] {
+            XCTAssertFalse(PointerInputDeliveryPolicy.maySend(
+                action: action, inputSuppressed: true))
+        }
+    }
+}
+
+final class LifetimeIdentityMapTests: XCTestCase {
+    func testIdentityIsStableDistinctAndRetiredAtEnd() {
+        var identities = LifetimeIdentityMap<String>()
+        let first = identities.begin("first")
+        XCTAssertEqual(identities.begin("first"), first)
+        let second = identities.begin("second")
+        XCTAssertNotEqual(first, second)
+        XCTAssertEqual(identities.existing("first"), first)
+        XCTAssertEqual(identities.end("first"), first)
+        XCTAssertNil(identities.existing("first"))
+        XCTAssertNotEqual(identities.begin("first"), first)
+    }
+
+    func testMissingMidContactIdentityIsNotInvented() {
+        let identities = LifetimeIdentityMap<Int>()
+        XCTAssertNil(identities.existing(7))
     }
 }
 

@@ -2362,7 +2362,9 @@ public class NetworkManager: ObservableObject {
             let generation = self.connectionGeneration
             guard self.transportState == .streaming,
                   self.committedTransportGeneration == generation,
-                  !self.displayRequestGate.isInputSuppressed else {
+                  PointerInputDeliveryPolicy.maySend(
+                    action: command.action,
+                    inputSuppressed: self.displayRequestGate.isInputSuppressed) else {
                 return
             }
             self.sendWireMessage(
@@ -5062,5 +5064,11 @@ enum WifiConnectionReadinessPolicy {
         if actualReady { return true }
         if waitingOwned { return false }
         return simulatedReady
+    }
+}
+
+enum PointerInputDeliveryPolicy {
+    static func maySend(action: PointerInputAction, inputSuppressed: Bool) -> Bool {
+        !inputSuppressed || action == .leftUp
     }
 }
