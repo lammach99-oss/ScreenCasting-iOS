@@ -292,7 +292,7 @@ struct DirectTouchGestureStateMachine {
             return [.pointer(
                 .verticalWheel,
                 point,
-                Int16(clamping: -steps * 120))]
+                Int16(clamping: steps * 120))]
         case .twoFinger(let primary, let secondary, _) where primary == id:
             if distance(contact.start, point) >= dragMovement {
                 state = .dragging(primary, secondary)

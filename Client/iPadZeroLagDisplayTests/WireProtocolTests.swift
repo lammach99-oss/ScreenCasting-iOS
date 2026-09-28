@@ -362,12 +362,34 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
         let down = machine.move(
             id: 1, point: CGPoint(x: 0, y: 181), timestamp: 0.02)
         XCTAssertEqual(down.count, 1)
-        XCTAssertEqual(down, [.pointer(.verticalWheel, CGPoint(x: 0, y: 181), -960)])
+        XCTAssertEqual(down, [.pointer(.verticalWheel, CGPoint(x: 0, y: 181), 960)])
 
         let up = machine.move(
             id: 1, point: CGPoint(x: 0, y: 13), timestamp: 0.03)
         XCTAssertEqual(up.count, 1)
-        XCTAssertEqual(up, [.pointer(.verticalWheel, CGPoint(x: 0, y: 13), 960)])
+        XCTAssertEqual(up, [.pointer(.verticalWheel, CGPoint(x: 0, y: 13), -960)])
+    }
+
+    func testOneFingerScrollUsesIPadNaturalDirection() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+
+        XCTAssertEqual(pointerActions(machine.move(
+            id: 1,
+            point: CGPoint(x: 0, y: 13),
+            timestamp: 0.01)), [.move])
+        XCTAssertEqual(
+            machine.move(
+                id: 1,
+                point: CGPoint(x: 0, y: 34),
+                timestamp: 0.02),
+            [.pointer(.verticalWheel, CGPoint(x: 0, y: 34), 120)])
+        XCTAssertEqual(
+            machine.move(
+                id: 1,
+                point: CGPoint(x: 0, y: 13),
+                timestamp: 0.03),
+            [.pointer(.verticalWheel, CGPoint(x: 0, y: 13), -120)])
     }
 
     func testTwoFingerRightClickUsesPrimaryAndSecondaryNeverMovesPointer() {
