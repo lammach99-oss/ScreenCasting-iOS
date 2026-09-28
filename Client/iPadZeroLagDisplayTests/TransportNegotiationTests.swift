@@ -799,6 +799,62 @@ final class ClientPreferenceTests: XCTestCase {
         XCTAssertTrue(defaults.bool(forKey: ClientPreferenceKeys.showPerformanceHUD))
         defaults.removePersistentDomain(forName: suiteName)
     }
+
+    func testClientDebugLoggingPreferenceDefaultsOffAndPersists() throws {
+        let suiteName = "ScreenCasting.ClientDebugLoggingPreferenceTests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertFalse(ClientDebugLoggingPreference.load(defaults: defaults))
+        defaults.set(true, forKey: ClientPreferenceKeys.clientDebugLoggingEnabled)
+        XCTAssertTrue(ClientDebugLoggingPreference.load(defaults: defaults))
+        defaults.set(false, forKey: ClientPreferenceKeys.clientDebugLoggingEnabled)
+        XCTAssertFalse(ClientDebugLoggingPreference.load(defaults: defaults))
+    }
+
+    func testSessionLoggingStartRespectsPersistedPreference() throws {
+        let suiteName = "ScreenCasting.ClientDebugLoggingSessionStartTests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defaults.removePersistentDomain(forName: suiteName)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let disabledManager = NetworkManager(userDefaults: defaults)
+        let disabled = expectation(description: "disabled logging decision")
+        disabledManager.startPersistentTelemetryLoggingForTesting(
+            directoryURL: directory
+        ) { url in
+            XCTAssertNil(url)
+            disabled.fulfill()
+        }
+        wait(for: [disabled], timeout: 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+
+        defaults.set(true, forKey: ClientPreferenceKeys.clientDebugLoggingEnabled)
+        let enabledManager = NetworkManager(userDefaults: defaults)
+        let enabled = expectation(description: "enabled logging decision")
+        enabledManager.startPersistentTelemetryLoggingForTesting(
+            directoryURL: directory
+        ) { url in
+            XCTAssertNotNil(url)
+            enabled.fulfill()
+        }
+        wait(for: [enabled], timeout: 2)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: directory.path).count,
+            3)
+
+        let stopped = expectation(description: "enabled logging stopped")
+        enabledManager.stopPersistentTelemetryLoggingForTesting {
+            stopped.fulfill()
+        }
+        wait(for: [stopped], timeout: 2)
+    }
 }
 
 final class WifiReconnectTargetTests: XCTestCase {

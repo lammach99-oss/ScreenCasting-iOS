@@ -32,6 +32,8 @@ public struct SettingsView: View {
     private var showPerformanceHUD: Bool = true
     @AppStorage(ClientPreferenceKeys.gameModeEnabled)
     private var gameModeEnabled: Bool = false
+    @AppStorage(ClientPreferenceKeys.clientDebugLoggingEnabled)
+    private var clientDebugLoggingEnabled: Bool = false
 
     // MARK: Body
 
@@ -176,6 +178,28 @@ public struct SettingsView: View {
                         }
 
                         settingsCard {
+                            VStack(alignment: .leading, spacing: 14) {
+                                Label("Diagnostics", systemImage: "ladybug.fill")
+                                    .font(.system(size: 15, weight: .bold))
+                                    .foregroundColor(.white)
+
+                                Divider().background(Color.white.opacity(0.12))
+
+                                Toggle(
+                                    "Client Debug Logging",
+                                    isOn: $clientDebugLoggingEnabled)
+                                    .tint(Color(hex: "#0EA5E9"))
+
+                                Text(
+                                    "Writes detailed Client diagnostic and telemetry " +
+                                    "logs for troubleshooting. Keep this off during " +
+                                    "normal use to reduce log-file growth.")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.white.opacity(0.55))
+                            }
+                        }
+
+                        settingsCard {
                             VStack(alignment: .leading, spacing: 16) {
                                 Label("Bitrate Control", systemImage: "gauge.medium")
                                     .font(.system(size: 15, weight: .bold))
@@ -305,6 +329,9 @@ public struct SettingsView: View {
         }
         .onReceive(networkManager.$displayPreference) { _ in
             synchronizeDisplayDraft()
+        }
+        .onChange(of: clientDebugLoggingEnabled) { _, enabled in
+            networkManager.setClientDebugLoggingEnabled(enabled)
         }
         .onAppear {
             draftBitrate = networkManager.desiredBitrateMbps

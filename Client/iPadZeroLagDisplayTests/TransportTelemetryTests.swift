@@ -2,6 +2,77 @@ import XCTest
 @testable import iPadCasting
 
 final class TransportTelemetryTests: XCTestCase {
+    func testRuntimeTelemetryRemainsActiveWithoutPersistentLogging() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let telemetry = TransportTelemetry()
+
+        telemetry.recordPayloadReceived(sequence: 11, receiveDurationMs: 4)
+        telemetry.recordDecodeCallback(
+            sequence: 11,
+            generation: 0,
+            decodeStartedAt: ProcessInfo.processInfo.systemUptime,
+            durationMs: 6)
+        telemetry.recordRtt(durationMs: 8)
+        telemetry.recordDiagnosticLine("logging-disabled")
+        let drained = expectation(description: "disabled sink drained")
+        telemetry.stopLogging { drained.fulfill() }
+        wait(for: [drained], timeout: 2)
+
+        let feedback = telemetry.makeFeedback()
+        XCTAssertEqual(feedback.0, 11)
+        XCTAssertEqual(feedback.1, 11)
+        XCTAssertEqual(feedback.2, 8)
+        XCTAssertEqual(telemetry.hudSnapshot().frameReceiveMs, 4)
+        XCTAssertEqual(telemetry.hudSnapshot().decodeMs, 6)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    func testPersistentLoggingStartIsIdempotentAndStopPreservesRuntimeState() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let telemetry = TransportTelemetry()
+        telemetry.recordPayloadReceived(sequence: 41, receiveDurationMs: 3)
+
+        var firstURL: URL?
+        let firstStarted = expectation(description: "first logging start")
+        _ = telemetry.startLogging(directoryURL: directory) { url in
+            firstURL = url
+            firstStarted.fulfill()
+        }
+        wait(for: [firstStarted], timeout: 2)
+
+        var secondURL: URL?
+        let secondStarted = expectation(description: "idempotent logging start")
+        _ = telemetry.startLogging(directoryURL: directory) { url in
+            secondURL = url
+            secondStarted.fulfill()
+        }
+        wait(for: [secondStarted], timeout: 2)
+        XCTAssertEqual(firstURL, secondURL)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: directory.path).count,
+            3)
+
+        telemetry.recordDiagnosticLine("before-disable")
+        let stopped = expectation(description: "logging stopped")
+        telemetry.stopLogging { stopped.fulfill() }
+        wait(for: [stopped], timeout: 2)
+        let diagnosticURL = try XCTUnwrap(try FileManager.default
+            .contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .first { $0.lastPathComponent.hasPrefix("ScreenCasting-Diagnostics-") })
+        let sizeAfterStop = try Data(contentsOf: diagnosticURL).count
+
+        telemetry.recordDiagnosticLine("after-disable")
+        let stoppedAgain = expectation(description: "logging stop is idempotent")
+        telemetry.stopLogging { stoppedAgain.fulfill() }
+        wait(for: [stoppedAgain], timeout: 2)
+        XCTAssertEqual(try Data(contentsOf: diagnosticURL).count, sizeAfterStop)
+        XCTAssertEqual(telemetry.makeFeedback().0, 41)
+    }
+
     func testWifiCompletedFrameRecordsOneReceiveSample() {
         let telemetry = TransportTelemetry()
         telemetry.recordWifiPacket(

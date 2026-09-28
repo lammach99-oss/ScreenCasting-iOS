@@ -852,7 +852,12 @@ final class TransportTelemetry {
         lock.unlock()
     }
 
-    /// Enqueues a logging restart and returns its planned URL immediately.
+    func beginRuntimeSession() {
+        resetSessionMetrics()
+    }
+
+    /// Enqueues logging startup and returns its planned URL immediately.
+    /// Repeated startup while a sink is active reuses that sink.
     /// `completion` runs on the utility queue after both headers are created,
     /// or with `nil` after setup fails.
     /// FileHandle writes are synchronous on that queue and are not cancellable;
@@ -882,8 +887,10 @@ final class TransportTelemetry {
                 completion?(nil)
                 return
             }
-            self.finishLogging(reason: "restart")
-            self.resetSessionMetrics()
+            if let activeURL = self.exportFileURL {
+                completion?(activeURL)
+                return
+            }
             do {
                 try FileManager.default.createDirectory(
                     at: directory,

@@ -1823,6 +1823,7 @@ public class NetworkManager: ObservableObject {
     private var wifiLegacyFallbackGeneration: UInt64?
     private var wifiLegacyFallbackRequestGeneration: UInt64?
     private let transportTelemetry = TransportTelemetry()
+    private var clientDebugLoggingEnabled = false
     private var lastHudSnapshotPublishedAt: TimeInterval = 0
     private var lastClientPingSentAt: TimeInterval = 0
     private var nextClientPingNonce: UInt64 = 1
@@ -1847,8 +1848,10 @@ public class NetworkManager: ObservableObject {
     var videoFeedbackCountForTesting: Int { testingVideoFeedbackCount }
     #endif
 
-    public init() {
+    public init(userDefaults: UserDefaults = .standard) {
         networkQueue.setSpecific(key: networkQueueKey, value: true)
+        clientDebugLoggingEnabled = ClientDebugLoggingPreference.load(
+            defaults: userDefaults)
         let desired = ClientStreamSettingsStore.load()
         clientSettingsState = ClientSettingsStateModel(desired: desired)
         desiredBitrateMbps = desired.bitrateMbps
@@ -2373,6 +2376,32 @@ public class NetworkManager: ObservableObject {
                 sequence: 0,
                 movement: command.action == .move)
         }
+    }
+
+    public func setClientDebugLoggingEnabled(_ enabled: Bool) {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.clientDebugLoggingEnabled = enabled
+            if enabled {
+                guard self.transportState == .streaming else { return }
+                self.startPersistentTelemetryLoggingIfEnabled()
+            } else {
+                self.transportTelemetry.stopLogging()
+            }
+        }
+    }
+
+    private func startPersistentTelemetryLoggingIfEnabled(
+        directoryURL: URL? = nil,
+        completion: ((URL?) -> Void)? = nil
+    ) {
+        guard clientDebugLoggingEnabled else {
+            completion?(nil)
+            return
+        }
+        _ = transportTelemetry.startLogging(
+            directoryURL: directoryURL,
+            completion: completion)
     }
 
     // MARK: - Public API: Bitrate Control Sender
@@ -3377,7 +3406,8 @@ public class NetworkManager: ObservableObject {
         stopTelemetryTimer()
         pendingClientPings.removeAll(keepingCapacity: true)
         lastClientPingSentAt = 0
-        _ = transportTelemetry.startLogging()
+        transportTelemetry.beginRuntimeSession()
+        startPersistentTelemetryLoggingIfEnabled()
         if committedRealtimeMode == RealtimeTransportMode.wifiRTP {
             return
         }
@@ -3412,6 +3442,31 @@ public class NetworkManager: ObservableObject {
         pendingClientPings.removeAll(keepingCapacity: true)
         transportTelemetry.stopLogging()
     }
+
+    #if targetEnvironment(simulator)
+    func startPersistentTelemetryLoggingForTesting(
+        directoryURL: URL,
+        completion: @escaping (URL?) -> Void
+    ) {
+        networkQueue.async { [weak self] in
+            self?.startPersistentTelemetryLoggingIfEnabled(
+                directoryURL: directoryURL,
+                completion: completion)
+        }
+    }
+
+    func stopPersistentTelemetryLoggingForTesting(
+        completion: @escaping () -> Void
+    ) {
+        networkQueue.async { [weak self] in
+            guard let self else {
+                completion()
+                return
+            }
+            self.transportTelemetry.stopLogging(completion: completion)
+        }
+    }
+    #endif
 
     private func sendVideoFeedback() {
         guard wireAuthenticatedGeneration == connectionGeneration else { return }

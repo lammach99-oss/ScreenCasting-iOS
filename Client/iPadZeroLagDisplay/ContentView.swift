@@ -6,6 +6,15 @@ import UIKit
 enum ClientPreferenceKeys {
     static let showPerformanceHUD = "ScreenCasting.client.showPerformanceHUD"
     static let gameModeEnabled = "ScreenCasting.client.gameModeEnabled.v1"
+    static let clientDebugLoggingEnabled =
+        "ScreenCasting.client.debugLoggingEnabled.v1"
+}
+
+enum ClientDebugLoggingPreference {
+    static func load(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(
+            forKey: ClientPreferenceKeys.clientDebugLoggingEnabled) as? Bool ?? false
+    }
 }
 
 // MARK: - PIN Shake Modifier
