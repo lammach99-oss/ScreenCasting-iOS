@@ -191,7 +191,7 @@ struct DirectTouchGestureStateMachine {
     private let threeFingerDuration: TimeInterval = 0.300
     private let threeFingerMovement: CGFloat = 15
     private let palmGuardDuration: TimeInterval = 0.150
-    private let wheelPointsPerStep: CGFloat = 21
+    private let wheelPointsPerStep: CGFloat = 42
 
     mutating func begin(
         id: UInt64,

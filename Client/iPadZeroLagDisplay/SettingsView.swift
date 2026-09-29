@@ -28,6 +28,9 @@ public struct SettingsView: View {
     @State private var draftRefreshHz: UInt32 = DisplayPreference.defaultValue.refreshHz
     @State private var draftOrientationMode: DisplayOrientationMode = .automatic
     @State private var showForgetConfirmation = false
+    @State private var showDeleteLogsConfirmation = false
+    @State private var isDeletingClientLogs = false
+    @State private var clientLogDeletionMessage: String?
     @AppStorage(ClientPreferenceKeys.showPerformanceHUD)
     private var showPerformanceHUD: Bool = true
     @AppStorage(ClientPreferenceKeys.gameModeEnabled)
@@ -196,6 +199,30 @@ public struct SettingsView: View {
                                     "normal use to reduce log-file growth.")
                                     .font(.system(size: 11))
                                     .foregroundColor(.white.opacity(0.55))
+
+                                Divider().background(Color.white.opacity(0.12))
+
+                                Button(role: .destructive) {
+                                    showDeleteLogsConfirmation = true
+                                } label: {
+                                    Label(
+                                        isDeletingClientLogs
+                                            ? "Deleting Client Logs..."
+                                            : "Delete Client Logs",
+                                        systemImage: "trash.fill")
+                                        .font(.system(size: 14, weight: .semibold))
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 11)
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(.red)
+                                .disabled(isDeletingClientLogs)
+
+                                if let clientLogDeletionMessage {
+                                    Text(clientLogDeletionMessage)
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.white.opacity(0.65))
+                                }
                             }
                         }
 
@@ -351,6 +378,20 @@ public struct SettingsView: View {
         } message: {
             Text("The next connection will require the Host PIN again.")
         }
+        .confirmationDialog(
+            "Delete Client Logs?",
+            isPresented: $showDeleteLogsConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Delete Client Logs", role: .destructive) {
+                deleteClientLogs()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "Deletes saved Client diagnostic and telemetry logs. " +
+                "If Debug Logging is currently ON, the active logging session is kept.")
+        }
     }
 
     // MARK: - Private Helpers
@@ -375,6 +416,23 @@ public struct SettingsView: View {
         networkManager.setDesiredStreamSettings(
             bitrateMbps: draftBitrate,
             audioEnabled: draftAudioEnabled)
+    }
+
+    private func deleteClientLogs() {
+        isDeletingClientLogs = true
+        clientLogDeletionMessage = nil
+        networkManager.deleteClientDebugLogs { result in
+            isDeletingClientLogs = false
+            switch result {
+            case .success(let count):
+                clientLogDeletionMessage = count == 0
+                    ? "No old Client logs found."
+                    : "Deleted \(count) log files."
+            case .failure(let error):
+                clientLogDeletionMessage =
+                    "Unable to delete Client logs: \(error.localizedDescription)"
+            }
+        }
     }
 
     /// Returns a latency-based colour for the telemetry tiles (green → amber → red).

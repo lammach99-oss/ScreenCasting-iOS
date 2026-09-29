@@ -343,9 +343,9 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
             id: 1, point: CGPoint(x: 10, y: 23), timestamp: 0.05)
         XCTAssertEqual(pointerActions(classified), [.move])
         let scrolled = machine.move(
-            id: 1, point: CGPoint(x: 10, y: 46), timestamp: 0.1)
+            id: 1, point: CGPoint(x: 10, y: 65), timestamp: 0.1)
         XCTAssertEqual(pointerActions(scrolled), [.verticalWheel])
-        XCTAssertTrue(machine.end(id: 1, point: CGPoint(x: 10, y: 46), timestamp: 0.15).isEmpty)
+        XCTAssertTrue(machine.end(id: 1, point: CGPoint(x: 10, y: 65), timestamp: 0.15).isEmpty)
 
         machine.begin(id: 2, point: .zero, timestamp: 1)
         machine.move(id: 2, point: CGPoint(x: 4, y: 4), timestamp: 1.05)
@@ -360,9 +360,9 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
         XCTAssertEqual(pointerActions(machine.move(
             id: 1, point: CGPoint(x: 0, y: 13), timestamp: 0.01)), [.move])
         let down = machine.move(
-            id: 1, point: CGPoint(x: 0, y: 181), timestamp: 0.02)
+            id: 1, point: CGPoint(x: 0, y: 349), timestamp: 0.02)
         XCTAssertEqual(down.count, 1)
-        XCTAssertEqual(down, [.pointer(.verticalWheel, CGPoint(x: 0, y: 181), 960)])
+        XCTAssertEqual(down, [.pointer(.verticalWheel, CGPoint(x: 0, y: 349), 960)])
 
         let up = machine.move(
             id: 1, point: CGPoint(x: 0, y: 13), timestamp: 0.03)
@@ -378,17 +378,21 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
             id: 1,
             point: CGPoint(x: 0, y: 13),
             timestamp: 0.01)), [.move])
+        XCTAssertTrue(machine.move(
+            id: 1,
+            point: CGPoint(x: 0, y: 34),
+            timestamp: 0.02).isEmpty)
         XCTAssertEqual(
             machine.move(
                 id: 1,
-                point: CGPoint(x: 0, y: 34),
-                timestamp: 0.02),
-            [.pointer(.verticalWheel, CGPoint(x: 0, y: 34), 120)])
+                point: CGPoint(x: 0, y: 55),
+                timestamp: 0.03),
+            [.pointer(.verticalWheel, CGPoint(x: 0, y: 55), 120)])
         XCTAssertEqual(
             machine.move(
                 id: 1,
                 point: CGPoint(x: 0, y: 13),
-                timestamp: 0.03),
+                timestamp: 0.04),
             [.pointer(.verticalWheel, CGPoint(x: 0, y: 13), -120)])
     }
 

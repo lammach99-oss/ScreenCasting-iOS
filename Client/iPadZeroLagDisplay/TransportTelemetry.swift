@@ -317,6 +317,10 @@ final class SequenceLatencyReporter {
 }
 
 final class TransportTelemetry {
+    private enum PersistentLogError: Error {
+        case documentsDirectoryUnavailable
+    }
+
     struct SecurityDropSnapshot: Equatable {
         let authentication: UInt64
         let replay: UInt64
@@ -949,6 +953,56 @@ final class TransportTelemetry {
         }
     }
 
+    func deleteStoredLogs(
+        directoryURL: URL? = nil,
+        completion: @escaping (Result<Int, Error>) -> Void
+    ) {
+        let directory = directoryURL ?? FileManager.default.urls(
+            for: .documentDirectory,
+            in: .userDomainMask).first
+        fileQueue.async { [weak self] in
+            guard let self else {
+                completion(.success(0))
+                return
+            }
+            guard let directory else {
+                completion(.failure(
+                    PersistentLogError.documentsDirectoryUnavailable))
+                return
+            }
+            guard FileManager.default.fileExists(atPath: directory.path) else {
+                completion(.success(0))
+                return
+            }
+
+            let activeURLs = Set([
+                self.exportFileURL,
+                self.frameExportFileURL,
+                self.diagnosticExportFileURL
+            ].compactMap { $0?.standardizedFileURL })
+            do {
+                let urls = try FileManager.default.contentsOfDirectory(
+                    at: directory,
+                    includingPropertiesForKeys: [.isRegularFileKey],
+                    options: [.skipsHiddenFiles])
+                var deletedCount = 0
+                for url in urls where Self.isManagedPersistentLog(url) {
+                    let standardizedURL = url.standardizedFileURL
+                    guard !activeURLs.contains(standardizedURL),
+                          try standardizedURL.resourceValues(
+                            forKeys: [.isRegularFileKey]).isRegularFile == true else {
+                        continue
+                    }
+                    try FileManager.default.removeItem(at: standardizedURL)
+                    deletedCount += 1
+                }
+                completion(.success(deletedCount))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+    }
+
     /// Flushes the current interval without ending the session. The timer uses
     /// the same path; this explicit hook is also suitable for app-background
     /// lifecycle events where preserving the latest interval is desirable.
@@ -1104,6 +1158,16 @@ final class TransportTelemetry {
         frameExportFileURL = nil
         diagnosticExportFileURL = nil
         exportStartedAt = 0
+    }
+
+    private static func isManagedPersistentLog(_ url: URL) -> Bool {
+        let name = url.lastPathComponent
+        return (name.hasPrefix("ScreenCasting-Telemetry-") &&
+                url.pathExtension == "csv") ||
+               (name.hasPrefix("ScreenCasting-Frame-Telemetry-") &&
+                url.pathExtension == "csv") ||
+               (name.hasPrefix("ScreenCasting-Diagnostics-") &&
+                url.pathExtension == "log")
     }
 
     private func appendDiagnosticLine(_ line: String) {

@@ -2,6 +2,140 @@ import XCTest
 @testable import iPadCasting
 
 final class TransportTelemetryTests: XCTestCase {
+    func testDeleteStoredLogsRemovesOnlyManagedFiles() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let managed = [
+            "ScreenCasting-Telemetry-old.csv",
+            "ScreenCasting-Frame-Telemetry-old.csv",
+            "ScreenCasting-Diagnostics-old.log"
+        ]
+        let unrelated = ["unrelated.csv", "notes.log", "some-document.txt"]
+        for name in managed + unrelated {
+            try Data(name.utf8).write(to: directory.appendingPathComponent(name))
+        }
+
+        let telemetry = TransportTelemetry()
+        let deleted = expectation(description: "managed logs deleted")
+        telemetry.deleteStoredLogs(directoryURL: directory) { result in
+            XCTAssertEqual(try? result.get(), 3)
+            deleted.fulfill()
+        }
+        wait(for: [deleted], timeout: 2)
+
+        for name in managed {
+            XCTAssertFalse(FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent(name).path))
+        }
+        for name in unrelated {
+            XCTAssertTrue(FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent(name).path))
+        }
+    }
+
+    func testDeleteStoredLogsProtectsActiveTripletAndLoggingContinues() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let telemetry = TransportTelemetry()
+        let started = expectation(description: "logging started")
+        _ = telemetry.startLogging(directoryURL: directory) { url in
+            XCTAssertNotNil(url)
+            started.fulfill()
+        }
+        wait(for: [started], timeout: 2)
+        for name in [
+            "ScreenCasting-Telemetry-old.csv",
+            "ScreenCasting-Frame-Telemetry-old.csv",
+            "ScreenCasting-Diagnostics-old.log"
+        ] {
+            try Data(name.utf8).write(to: directory.appendingPathComponent(name))
+        }
+
+        let deleted = expectation(description: "old logs deleted")
+        telemetry.deleteStoredLogs(directoryURL: directory) { result in
+            XCTAssertEqual(try? result.get(), 3)
+            deleted.fulfill()
+        }
+        wait(for: [deleted], timeout: 2)
+        let activeFiles = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil)
+        XCTAssertEqual(activeFiles.count, 3)
+        let diagnosticURL = try XCTUnwrap(activeFiles.first {
+            $0.lastPathComponent.hasPrefix("ScreenCasting-Diagnostics-")
+        })
+
+        telemetry.recordDiagnosticLine("after-delete")
+        let stopped = expectation(description: "active logging stopped")
+        telemetry.stopLogging { stopped.fulfill() }
+        wait(for: [stopped], timeout: 2)
+        XCTAssertTrue(
+            try String(contentsOf: diagnosticURL, encoding: .utf8)
+                .contains("after-delete"))
+    }
+
+    func testDeleteStoredLogsRemovesCompletedLoggingSession() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let telemetry = TransportTelemetry()
+        let started = expectation(description: "logging started")
+        _ = telemetry.startLogging(directoryURL: directory) { _ in started.fulfill() }
+        wait(for: [started], timeout: 2)
+        let stopped = expectation(description: "logging stopped")
+        telemetry.stopLogging { stopped.fulfill() }
+        wait(for: [stopped], timeout: 2)
+
+        let deleted = expectation(description: "completed logs deleted")
+        telemetry.deleteStoredLogs(directoryURL: directory) { result in
+            XCTAssertEqual(try? result.get(), 3)
+            deleted.fulfill()
+        }
+        wait(for: [deleted], timeout: 2)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: directory.path),
+            [])
+    }
+
+    func testDeleteStoredLogsPreservesRuntimeTelemetry() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data().write(to: directory.appendingPathComponent(
+            "ScreenCasting-Telemetry-old.csv"))
+        let telemetry = TransportTelemetry()
+        telemetry.recordPayloadReceived(sequence: 9, receiveDurationMs: 4)
+        telemetry.recordDecodeCallback(
+            sequence: 9,
+            generation: 0,
+            decodeStartedAt: ProcessInfo.processInfo.systemUptime,
+            durationMs: 6)
+        telemetry.recordRtt(durationMs: 8)
+
+        let deleted = expectation(description: "stored logs deleted")
+        telemetry.deleteStoredLogs(directoryURL: directory) { result in
+            XCTAssertEqual(try? result.get(), 1)
+            deleted.fulfill()
+        }
+        wait(for: [deleted], timeout: 2)
+
+        XCTAssertEqual(telemetry.makeFeedback().2, 8)
+        XCTAssertEqual(telemetry.hudSnapshot().frameReceiveMs, 4)
+        XCTAssertEqual(telemetry.hudSnapshot().decodeMs, 6)
+        XCTAssertNotEqual(
+            telemetry.feedbackValidityFlags() &
+                VideoFeedbackValidityFlags.frameReceive,
+            0)
+    }
+
     func testRuntimeTelemetryRemainsActiveWithoutPersistentLogging() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

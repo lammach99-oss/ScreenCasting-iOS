@@ -2391,6 +2391,16 @@ public class NetworkManager: ObservableObject {
         }
     }
 
+    public func deleteClientDebugLogs(
+        completion: @escaping (Result<Int, Error>) -> Void
+    ) {
+        transportTelemetry.deleteStoredLogs { result in
+            DispatchQueue.main.async {
+                completion(result)
+            }
+        }
+    }
+
     private func startPersistentTelemetryLoggingIfEnabled(
         directoryURL: URL? = nil,
         completion: ((URL?) -> Void)? = nil
