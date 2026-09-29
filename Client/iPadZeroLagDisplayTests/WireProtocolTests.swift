@@ -446,7 +446,7 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
         XCTAssertTrue(machine.move(
             id: 2, point: CGPoint(x: 80, y: 80), timestamp: 0.04).isEmpty)
         XCTAssertEqual(
-            pointerActions(machine.move(id: 1, point: CGPoint(x: 0, y: 40), timestamp: 0.05)),
+            pointerActions(machine.move(id: 1, point: CGPoint(x: 0, y: 55), timestamp: 0.05)),
             [.verticalWheel])
     }
 
