@@ -169,6 +169,7 @@ struct DirectTouchGestureStateMachine {
         case idle
         case oneFinger(UInt64)
         case scrolling(UInt64, lastY: CGFloat, wheelRemainder: CGFloat)
+        case horizontalScrolling(UInt64, lastX: CGFloat, wheelRemainder: CGFloat)
         case twoFinger(UInt64, UInt64, secondBeganAt: TimeInterval)
         case dragging(UInt64, UInt64)
         case threeFinger(
@@ -192,6 +193,7 @@ struct DirectTouchGestureStateMachine {
     private let threeFingerMovement: CGFloat = 15
     private let palmGuardDuration: TimeInterval = 0.150
     private let wheelPointsPerStep: CGFloat = 42
+    private let wheelUnitsPerStep: CGFloat = 120
 
     mutating func begin(
         id: UInt64,
@@ -229,6 +231,7 @@ struct DirectTouchGestureStateMachine {
             return []
         }
         if case .scrolling = state { return [] }
+        if case .horizontalScrolling = state { return [] }
         if case .dragging = state { return [] }
         if contacts.count == 3 {
             let times = contacts.values.map(\.beganAt)
@@ -251,6 +254,8 @@ struct DirectTouchGestureStateMachine {
         case .oneFinger(let primary) where contacts.count == 2:
             state = .twoFinger(primary, id, secondBeganAt: timestamp)
         case .scrolling:
+            break
+        case .horizontalScrolling:
             break
         default:
             break
@@ -279,20 +284,39 @@ struct DirectTouchGestureStateMachine {
                 state = .scrolling(primary, lastY: point.y, wheelRemainder: 0)
                 return [.pointer(.move, contact.start, 0)]
             }
+            if abs(dx) >= 12 && abs(dy) < abs(dx) * 0.6 {
+                state = .horizontalScrolling(
+                    primary,
+                    lastX: point.x,
+                    wheelRemainder: 0)
+                return [.pointer(.move, contact.start, 0)]
+            }
         case .scrolling(let primary, let lastY, let remainder) where primary == id:
-            let accumulated = remainder + (point.y - lastY)
-            var steps = Int(accumulated / wheelPointsPerStep)
-            steps = max(-8, min(8, steps))
-            let used = CGFloat(steps) * wheelPointsPerStep
+            let result = proportionalWheelDelta(
+                fingerDelta: point.y - lastY,
+                wheelUnitRemainder: remainder,
+                invertDirection: false)
             state = .scrolling(
                 primary,
                 lastY: point.y,
-                wheelRemainder: accumulated - used)
-            guard steps != 0 else { return [] }
-            return [.pointer(
-                .verticalWheel,
-                point,
-                Int16(clamping: steps * 120))]
+                wheelRemainder: result.remainder)
+            guard let value = result.value else { return [] }
+            return [.pointer(.verticalWheel, point, value)]
+        case .horizontalScrolling(
+            let primary,
+            let lastX,
+            let remainder
+        ) where primary == id:
+            let result = proportionalWheelDelta(
+                fingerDelta: point.x - lastX,
+                wheelUnitRemainder: remainder,
+                invertDirection: true)
+            state = .horizontalScrolling(
+                primary,
+                lastX: point.x,
+                wheelRemainder: result.remainder)
+            guard let value = result.value else { return [] }
+            return [.pointer(.horizontalWheel, point, value)]
         case .twoFinger(let primary, let secondary, _) where primary == id:
             if distance(contact.start, point) >= dragMovement {
                 state = .dragging(primary, secondary)
@@ -340,6 +364,8 @@ struct DirectTouchGestureStateMachine {
             }
             state = .suppressed
         case .scrolling:
+            state = .suppressed
+        case .horizontalScrolling:
             state = .suppressed
         case .twoFinger(let primary, let secondary, let secondBeganAt):
             if id == secondary,
@@ -410,6 +436,24 @@ struct DirectTouchGestureStateMachine {
 
     private func distance(_ lhs: CGPoint, _ rhs: CGPoint) -> CGFloat {
         hypot(rhs.x - lhs.x, rhs.y - lhs.y)
+    }
+
+    private func proportionalWheelDelta(
+        fingerDelta: CGFloat,
+        wheelUnitRemainder: CGFloat,
+        invertDirection: Bool
+    ) -> (value: Int16?, remainder: CGFloat) {
+        let direction: CGFloat = invertDirection ? -1 : 1
+        let accumulatedUnits = wheelUnitRemainder +
+            direction * fingerDelta * wheelUnitsPerStep / wheelPointsPerStep
+        let unclampedUnits = Int(accumulatedUnits.rounded(.towardZero))
+        let emittedUnits = max(-960, min(960, unclampedUnits))
+        guard emittedUnits != 0 else {
+            return (nil, accumulatedUnits)
+        }
+        return (
+            Int16(emittedUnits),
+            accumulatedUnits - CGFloat(emittedUnits))
     }
 }
 

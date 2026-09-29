@@ -91,6 +91,7 @@ public enum PointerInputAction: UInt8, CaseIterable {
     case leftUp = 3
     case rightClick = 4
     case verticalWheel = 5
+    case horizontalWheel = 6
 }
 
 public struct PointerInputCommand: Equatable {

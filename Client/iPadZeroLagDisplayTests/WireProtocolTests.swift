@@ -324,6 +324,19 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
         }
     }
 
+    private func wheelValue(
+        _ outputs: [DirectTouchGestureOutput],
+        action: PointerInputAction
+    ) -> Int16? {
+        outputs.compactMap {
+            if case .pointer(let outputAction, _, let value) = $0,
+               outputAction == action {
+                return value
+            }
+            return nil
+        }.first
+    }
+
     func testSingleAndDoubleTapProduceClicksWithoutSettings() {
         var machine = DirectTouchGestureStateMachine()
         XCTAssertTrue(machine.begin(id: 1, point: .zero, timestamp: 0).isEmpty)
@@ -336,16 +349,16 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
         XCTAssertFalse(second.contains(.openSettings))
     }
 
-    func testOneFingerScrollUsesAnchorAndWheelWhileTinyMotionRemainsTap() {
+    func testOneFingerScrollUsesAnchorAndSmoothWheelWhileTinyMotionRemainsTap() {
         var machine = DirectTouchGestureStateMachine()
         machine.begin(id: 1, point: CGPoint(x: 10, y: 10), timestamp: 0)
         let classified = machine.move(
             id: 1, point: CGPoint(x: 10, y: 23), timestamp: 0.05)
         XCTAssertEqual(pointerActions(classified), [.move])
         let scrolled = machine.move(
-            id: 1, point: CGPoint(x: 10, y: 65), timestamp: 0.1)
-        XCTAssertEqual(pointerActions(scrolled), [.verticalWheel])
-        XCTAssertTrue(machine.end(id: 1, point: CGPoint(x: 10, y: 65), timestamp: 0.15).isEmpty)
+            id: 1, point: CGPoint(x: 10, y: 30), timestamp: 0.1)
+        XCTAssertEqual(scrolled, [.pointer(.verticalWheel, CGPoint(x: 10, y: 30), 20)])
+        XCTAssertTrue(machine.end(id: 1, point: CGPoint(x: 10, y: 30), timestamp: 0.15).isEmpty)
 
         machine.begin(id: 2, point: .zero, timestamp: 1)
         machine.move(id: 2, point: CGPoint(x: 4, y: 4), timestamp: 1.05)
@@ -370,30 +383,85 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
         XCTAssertEqual(up, [.pointer(.verticalWheel, CGPoint(x: 0, y: 13), -960)])
     }
 
-    func testOneFingerScrollUsesIPadNaturalDirection() {
-        var machine = DirectTouchGestureStateMachine()
-        machine.begin(id: 1, point: .zero, timestamp: 0)
+    func testSmoothVerticalWheelPreservesCalibrationDirectionAndFractionalDistance() {
+        let cases: [(CGFloat, Int16)] = [(7, 20), (21, 60), (42, 120), (-42, -120)]
+        for (distance, expected) in cases {
+            var machine = DirectTouchGestureStateMachine()
+            machine.begin(id: 1, point: .zero, timestamp: 0)
+            XCTAssertEqual(pointerActions(machine.move(
+                id: 1, point: CGPoint(x: 0, y: 13), timestamp: 0.01)), [.move])
+            XCTAssertEqual(
+                wheelValue(machine.move(
+                    id: 1,
+                    point: CGPoint(x: 0, y: 13 + distance),
+                    timestamp: 0.02), action: .verticalWheel),
+                expected)
+        }
 
-        XCTAssertEqual(pointerActions(machine.move(
-            id: 1,
-            point: CGPoint(x: 0, y: 13),
-            timestamp: 0.01)), [.move])
-        XCTAssertTrue(machine.move(
-            id: 1,
-            point: CGPoint(x: 0, y: 34),
-            timestamp: 0.02).isEmpty)
-        XCTAssertEqual(
-            machine.move(
+        var fractional = DirectTouchGestureStateMachine()
+        fractional.begin(id: 1, point: .zero, timestamp: 0)
+        fractional.move(id: 1, point: CGPoint(x: 0, y: 13), timestamp: 0.01)
+        let total = (1...7).reduce(Int16(0)) { sum, offset in
+            sum + (wheelValue(fractional.move(
                 id: 1,
-                point: CGPoint(x: 0, y: 55),
-                timestamp: 0.03),
-            [.pointer(.verticalWheel, CGPoint(x: 0, y: 55), 120)])
+                point: CGPoint(x: 0, y: 13 + CGFloat(offset)),
+                timestamp: 0.01 + Double(offset) * 0.01), action: .verticalWheel) ?? 0)
+        }
+        XCTAssertEqual(total, 20)
+    }
+
+    func testHorizontalScrollIsProportionalInvertedAndAxisLocked() {
+        var right = DirectTouchGestureStateMachine()
+        right.begin(id: 1, point: CGPoint(x: 100, y: 100), timestamp: 0)
+        XCTAssertEqual(pointerActions(right.move(
+            id: 1, point: CGPoint(x: 113, y: 100), timestamp: 0.01)), [.move])
         XCTAssertEqual(
-            machine.move(
+            wheelValue(right.move(
+                id: 1, point: CGPoint(x: 120, y: 100), timestamp: 0.02),
+                action: .horizontalWheel),
+            -20)
+        XCTAssertEqual(
+            wheelValue(right.move(
+                id: 1, point: CGPoint(x: 162, y: 100), timestamp: 0.03),
+                action: .horizontalWheel),
+            -120)
+        XCTAssertFalse(pointerActions(right.move(
+            id: 1, point: CGPoint(x: 162, y: 200), timestamp: 0.04)).contains(.verticalWheel))
+
+        var left = DirectTouchGestureStateMachine()
+        left.begin(id: 1, point: CGPoint(x: 100, y: 100), timestamp: 0)
+        left.move(id: 1, point: CGPoint(x: 87, y: 100), timestamp: 0.01)
+        XCTAssertEqual(
+            wheelValue(left.move(
+                id: 1, point: CGPoint(x: 45, y: 100), timestamp: 0.02),
+                action: .horizontalWheel),
+            120)
+
+        var vertical = DirectTouchGestureStateMachine()
+        vertical.begin(id: 1, point: .zero, timestamp: 0)
+        vertical.move(id: 1, point: CGPoint(x: 0, y: 13), timestamp: 0.01)
+        XCTAssertFalse(pointerActions(vertical.move(
+            id: 1, point: CGPoint(x: 100, y: 20), timestamp: 0.02)).contains(.horizontalWheel))
+    }
+
+    func testHorizontalWheelPreservesFractionalDistanceAndBoundsOnePacket() {
+        var fractional = DirectTouchGestureStateMachine()
+        fractional.begin(id: 1, point: .zero, timestamp: 0)
+        fractional.move(id: 1, point: CGPoint(x: 13, y: 0), timestamp: 0.01)
+        let total = (1...7).reduce(Int16(0)) { sum, offset in
+            sum + (wheelValue(fractional.move(
                 id: 1,
-                point: CGPoint(x: 0, y: 13),
-                timestamp: 0.04),
-            [.pointer(.verticalWheel, CGPoint(x: 0, y: 13), -120)])
+                point: CGPoint(x: 13 + CGFloat(offset), y: 0),
+                timestamp: 0.01 + Double(offset) * 0.01), action: .horizontalWheel) ?? 0)
+        }
+        XCTAssertEqual(total, -20)
+
+        var bounded = DirectTouchGestureStateMachine()
+        bounded.begin(id: 1, point: .zero, timestamp: 0)
+        bounded.move(id: 1, point: CGPoint(x: 13, y: 0), timestamp: 0.01)
+        let output = bounded.move(
+            id: 1, point: CGPoint(x: 349, y: 0), timestamp: 0.02)
+        XCTAssertEqual(output, [.pointer(.horizontalWheel, CGPoint(x: 349, y: 0), -960)])
     }
 
     func testTwoFingerRightClickUsesPrimaryAndSecondaryNeverMovesPointer() {
@@ -448,6 +516,20 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
         XCTAssertEqual(
             pointerActions(machine.move(id: 1, point: CGPoint(x: 0, y: 55), timestamp: 0.05)),
             [.verticalWheel])
+
+        var horizontal = DirectTouchGestureStateMachine()
+        horizontal.begin(id: 1, point: .zero, timestamp: 0)
+        XCTAssertEqual(
+            pointerActions(horizontal.move(
+                id: 1, point: CGPoint(x: 13, y: 0), timestamp: 0.02)),
+            [.move])
+        horizontal.begin(id: 2, point: CGPoint(x: 40, y: 40), timestamp: 0.03)
+        XCTAssertTrue(horizontal.move(
+            id: 2, point: CGPoint(x: 80, y: 80), timestamp: 0.04).isEmpty)
+        XCTAssertEqual(
+            pointerActions(horizontal.move(
+                id: 1, point: CGPoint(x: 55, y: 0), timestamp: 0.05)),
+            [.horizontalWheel])
     }
 
     func testThreeFingerTapOpensSettingsOnlyAndFailuresDoNothing() {
@@ -590,7 +672,7 @@ final class PointerInputFailSafeReleaseTests: XCTestCase {
     func testUnmappedPositionBearingActionsRemainRejected() {
         var state = PointerInputCoordinateState()
         for action: PointerInputAction in [
-            .move, .leftDown, .leftClick, .rightClick, .verticalWheel
+            .move, .leftDown, .leftClick, .rightClick, .verticalWheel, .horizontalWheel
         ] {
             XCTAssertNil(state.resolve(action: action, mappedPoint: nil))
         }
@@ -600,7 +682,7 @@ final class PointerInputFailSafeReleaseTests: XCTestCase {
         XCTAssertTrue(PointerInputDeliveryPolicy.maySend(
             action: .leftUp, inputSuppressed: true))
         for action: PointerInputAction in [
-            .move, .leftClick, .leftDown, .rightClick, .verticalWheel
+            .move, .leftClick, .leftDown, .rightClick, .verticalWheel, .horizontalWheel
         ] {
             XCTAssertFalse(PointerInputDeliveryPolicy.maySend(
                 action: action, inputSuppressed: true))
@@ -2204,8 +2286,15 @@ final class WireProtocolTests: XCTestCase {
     }
 
     func testPointerInputPayloadRoundTripsAllActionsAndRejectsInvalidValues() throws {
+        XCTAssertEqual(PointerInputAction.verticalWheel.rawValue, 5)
+        XCTAssertEqual(PointerInputAction.horizontalWheel.rawValue, 6)
         for action in PointerInputAction.allCases {
-            let value: Int16 = action == .verticalWheel ? -120 : 0
+            let value: Int16
+            switch action {
+            case .verticalWheel: value = 20
+            case .horizontalWheel: value = -60
+            default: value = 0
+            }
             let command = PointerInputCommand(
                 action: action,
                 x: 1_234,
