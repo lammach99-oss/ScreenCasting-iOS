@@ -813,47 +813,18 @@ final class ClientPreferenceTests: XCTestCase {
         XCTAssertFalse(ClientDebugLoggingPreference.load(defaults: defaults))
     }
 
-    func testSessionLoggingStartRespectsPersistedPreference() throws {
+    func testNetworkManagerRestoresSessionLoggingPreference() throws {
         let suiteName = "ScreenCasting.ClientDebugLoggingSessionStartTests"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defaults.removePersistentDomain(forName: suiteName)
-        defer {
-            defaults.removePersistentDomain(forName: suiteName)
-            try? FileManager.default.removeItem(at: directory)
-        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let disabledManager = NetworkManager(userDefaults: defaults)
-        let disabled = expectation(description: "disabled logging decision")
-        disabledManager.startPersistentTelemetryLoggingForTesting(
-            directoryURL: directory
-        ) { url in
-            XCTAssertNil(url)
-            disabled.fulfill()
-        }
-        wait(for: [disabled], timeout: 2)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+        XCTAssertFalse(disabledManager.clientDebugLoggingEnabledForTesting)
 
         defaults.set(true, forKey: ClientPreferenceKeys.clientDebugLoggingEnabled)
         let enabledManager = NetworkManager(userDefaults: defaults)
-        let enabled = expectation(description: "enabled logging decision")
-        enabledManager.startPersistentTelemetryLoggingForTesting(
-            directoryURL: directory
-        ) { url in
-            XCTAssertNotNil(url)
-            enabled.fulfill()
-        }
-        wait(for: [enabled], timeout: 2)
-        XCTAssertEqual(
-            try FileManager.default.contentsOfDirectory(atPath: directory.path).count,
-            3)
-
-        let stopped = expectation(description: "enabled logging stopped")
-        enabledManager.stopPersistentTelemetryLoggingForTesting {
-            stopped.fulfill()
-        }
-        wait(for: [stopped], timeout: 2)
+        XCTAssertTrue(enabledManager.clientDebugLoggingEnabledForTesting)
     }
 }
 

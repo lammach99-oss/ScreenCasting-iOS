@@ -3443,31 +3443,6 @@ public class NetworkManager: ObservableObject {
         transportTelemetry.stopLogging()
     }
 
-    #if targetEnvironment(simulator)
-    func startPersistentTelemetryLoggingForTesting(
-        directoryURL: URL,
-        completion: @escaping (URL?) -> Void
-    ) {
-        networkQueue.async { [weak self] in
-            self?.startPersistentTelemetryLoggingIfEnabled(
-                directoryURL: directoryURL,
-                completion: completion)
-        }
-    }
-
-    func stopPersistentTelemetryLoggingForTesting(
-        completion: @escaping () -> Void
-    ) {
-        networkQueue.async { [weak self] in
-            guard let self else {
-                completion()
-                return
-            }
-            self.transportTelemetry.stopLogging(completion: completion)
-        }
-    }
-    #endif
-
     private func sendVideoFeedback() {
         guard wireAuthenticatedGeneration == connectionGeneration else { return }
         #if targetEnvironment(simulator)
@@ -4882,6 +4857,10 @@ public class NetworkManager: ObservableObject {
     }
 
     #if targetEnvironment(simulator)
+    var clientDebugLoggingEnabledForTesting: Bool {
+        networkQueue.sync { clientDebugLoggingEnabled }
+    }
+
     // Read-only ownership snapshot for real Network.framework regression tests.
     struct USBSessionSnapshot {
         let listener: NWListener?
