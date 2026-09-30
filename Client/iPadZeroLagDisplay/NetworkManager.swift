@@ -83,6 +83,7 @@ enum WireMessageType: UInt8 {
     case pipelineMode = 36
     case pointerInput = 37
     case keyboardInput = 38
+    case clientPerformanceFeedback = 39
 }
 
 public enum KeyboardInputAction: UInt8, CaseIterable {
@@ -179,6 +180,64 @@ public enum PipelineMode: UInt8 {
     }
 
     func encode() -> Data { Data([rawValue]) }
+    var targetFps: UInt16 { self == .game ? 120 : 60 }
+}
+
+struct CommittedPipelineModeState {
+    private(set) var desired: PipelineMode = .office
+    private(set) var active: PipelineMode?
+    private var acknowledgedAt: TimeInterval?
+    mutating func request(_ mode: PipelineMode) { desired = mode; reset() }
+    mutating func acknowledge(_ mode: PipelineMode, at now: TimeInterval = CACurrentMediaTime()) -> Bool {
+        guard mode == desired else { return false }
+        active = mode
+        acknowledgedAt = now
+        return true
+    }
+    func readyForFeedback(at now: TimeInterval) -> Bool {
+        guard active == desired, let start = acknowledgedAt else { return false }
+        return now >= start + 2
+    }
+    mutating func reset() { active = nil; acknowledgedAt = nil }
+}
+
+struct ClientPerformanceFeedback: Equatable {
+    let mode: PipelineMode
+    let flags: UInt8
+    let generation: UInt64
+    let targetFps: UInt16
+    let decodedFpsX10: UInt16
+    let freshPresentedFpsX10: UInt16
+    let windowMs: UInt16
+    let droppedFrames: UInt32
+
+    func encode() -> Data {
+        var data = Data(count: 24)
+        data[0] = 1; data[1] = mode.rawValue; data[2] = flags
+        data.storeLittleEndian(generation, at: 4)
+        data.storeLittleEndian(targetFps, at: 12)
+        data.storeLittleEndian(decodedFpsX10, at: 14)
+        data.storeLittleEndian(freshPresentedFpsX10, at: 16)
+        data.storeLittleEndian(windowMs, at: 18)
+        data.storeLittleEndian(droppedFrames, at: 20)
+        return data
+    }
+
+    static func decode(_ data: Data) -> ClientPerformanceFeedback? {
+        guard data.count == 24, data[0] == 1, let mode = PipelineMode(rawValue: data[1]),
+              data[2] & ~3 == 0, data[3] == 0 else { return nil }
+        let result = ClientPerformanceFeedback(mode: mode, flags: data[2],
+            generation: data.loadLittleEndian(UInt64.self, at: 4),
+            targetFps: data.loadLittleEndian(UInt16.self, at: 12),
+            decodedFpsX10: data.loadLittleEndian(UInt16.self, at: 14),
+            freshPresentedFpsX10: data.loadLittleEndian(UInt16.self, at: 16),
+            windowMs: data.loadLittleEndian(UInt16.self, at: 18),
+            droppedFrames: data.loadLittleEndian(UInt32.self, at: 20))
+        guard result.generation != 0, result.targetFps == mode.targetFps,
+              (500...2500).contains(result.windowMs),
+              result.decodedFpsX10 <= 2400, result.freshPresentedFpsX10 <= 2400 else { return nil }
+        return result
+    }
 }
 
 enum WireProtocol {
@@ -1442,6 +1501,8 @@ final class WireStreamParser {
             fixedLength = 1
         case .keyboardInput:
             fixedLength = KeyboardInputCommand.encodedSize
+        case .clientPerformanceFeedback:
+            fixedLength = 24
         case .pointerInput:
             fixedLength = PointerInputCommand.encodedSize
         case .clientCapabilities:
@@ -1869,6 +1930,8 @@ public class NetworkManager: ObservableObject {
 
     // Telemetry timer: fires 2× per second while streaming.
     private var telemetryTimer: DispatchSourceTimer?
+    private var performanceFeedbackTimer: DispatchSourceTimer?
+    private var performanceFeedbackSequence: UInt32 = 0
     private var adaptiveTelemetryTimer: DispatchSourceTimer?
     private var committedRealtimeMode: UInt8?
     private var committedRealtimeSessionID: SessionID?
@@ -1884,6 +1947,7 @@ public class NetworkManager: ObservableObject {
     private var pendingClientPings: [UInt64: TimeInterval] = [:]
     private var activeDisplayCapabilities: DisplayCapabilities?
     private var desiredPipelineMode: PipelineMode = .office
+    private var committedPipelineMode = CommittedPipelineModeState()
     private var activeDisplayPreference = DisplayPreference.defaultValue
     private var displayRequestGate = DisplayRequestGate()
     private var pendingDisplayPreference: DisplayPreference?
@@ -1967,6 +2031,7 @@ public class NetworkManager: ObservableObject {
         networkQueue.async { [weak self] in
             guard let self else { return }
             self.desiredPipelineMode = mode
+            self.committedPipelineMode.request(mode)
             guard self.wireAuthenticatedGeneration ==
                     self.connectionGeneration else { return }
             self.sendDesiredPipelineMode(reason: "user_preference")
@@ -3506,6 +3571,18 @@ public class NetworkManager: ObservableObject {
         videoRxSampler.reset()
         lastHudSnapshotPublishedAt = 0
         transportTelemetry.beginRuntimeSession()
+        if committedPipelineMode.active != nil {
+            transportTelemetry.beginFreshFrameRate(generation: connectionGeneration)
+        }
+        let generation = connectionGeneration
+        let performanceTimer = DispatchSource.makeTimerSource(queue: networkQueue)
+        performanceTimer.schedule(deadline: .now() + 1, repeating: 1)
+        performanceTimer.setEventHandler { [weak self] in
+            guard let self, self.connectionGeneration == generation else { return }
+            self.sendPerformanceFeedback()
+        }
+        performanceTimer.resume()
+        performanceFeedbackTimer = performanceTimer
         startPersistentTelemetryLoggingIfEnabled()
         if committedRealtimeMode == RealtimeTransportMode.wifiRTP {
             return
@@ -3550,6 +3627,8 @@ public class NetworkManager: ObservableObject {
         }
 
         telemetryTimer?.cancel()
+        performanceFeedbackTimer?.cancel()
+        performanceFeedbackTimer = nil
         telemetryTimer = nil
         adaptiveTelemetryTimer?.cancel()
         adaptiveTelemetryTimer = nil
@@ -3586,6 +3665,26 @@ public class NetworkManager: ObservableObject {
             frameReceiveDurationMs: stages.receive,
             decodeLatencyMs: stages.decode)
         publishHudSnapshotIfDue()
+    }
+
+    private func sendPerformanceFeedback() {
+        guard wireAuthenticatedGeneration == connectionGeneration,
+              committedTransportGeneration == connectionGeneration,
+              let mode = committedPipelineMode.active,
+              mode == desiredPipelineMode,
+              let sample = transportTelemetry.freshFrameRateSample(generation: connectionGeneration),
+              sample.sampleWindowMs <= 2500,
+              committedPipelineMode.readyForFeedback(at: CACurrentMediaTime()) else { return }
+        func encoded(_ fps: Double) -> UInt16 {
+            UInt16(clamping: Int(min(2400, max(0, fps * 10)).rounded()))
+        }
+        performanceFeedbackSequence &+= 1
+        let feedback = ClientPerformanceFeedback(mode: mode, flags: sample.valid ? 3 : 0,
+            generation: connectionGeneration, targetFps: mode.targetFps,
+            decodedFpsX10: encoded(sample.decodedFps), freshPresentedFpsX10: encoded(sample.freshPresentedFps),
+            windowMs: sample.sampleWindowMs, droppedFrames: sample.droppedFrames)
+        sendWireMessage(type: .clientPerformanceFeedback, payload: feedback.encode(), sequence: performanceFeedbackSequence)
+        recordDiagnosticLine("[IPAD][FPS_FEEDBACK] generation=\(connectionGeneration) mode=\(mode) target_fps=\(mode.targetFps) decode_fps=\(sample.decodedFps) fresh_present_fps=\(sample.freshPresentedFps) window_ms=\(sample.sampleWindowMs)")
     }
 
     /// Measures a true local RTT for the CSV without comparing clocks. The
@@ -3968,6 +4067,14 @@ public class NetworkManager: ObservableObject {
             return
 
         case .pipelineMode:
+            guard wireAuthenticatedGeneration == generation,
+                  committedTransportGeneration == generation,
+                  let mode = PipelineMode.decode(payload),
+                  committedPipelineMode.acknowledge(mode) else { return }
+            transportTelemetry.beginFreshFrameRate(generation: generation)
+            return
+
+        case .clientPerformanceFeedback:
             return
 
         case .pointerInput, .keyboardInput:
@@ -4514,6 +4621,7 @@ public class NetworkManager: ObservableObject {
     private func sendDesiredPipelineMode(reason: String) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard wireAuthenticatedGeneration == connectionGeneration else { return }
+        committedPipelineMode.request(desiredPipelineMode)
         sendWireMessage(
             type: .pipelineMode,
             payload: desiredPipelineMode.encode(),
@@ -4613,6 +4721,7 @@ public class NetworkManager: ObservableObject {
 
     private func resetDisplaySession() {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        committedPipelineMode.reset()
         orientationDebounceWorkItem?.cancel()
         orientationDebounceWorkItem = nil
         activeDisplayCapabilities = nil

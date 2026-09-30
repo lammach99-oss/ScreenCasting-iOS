@@ -2,6 +2,84 @@ import XCTest
 @testable import iPadCasting
 
 final class TransportTelemetryTests: XCTestCase {
+    func testFreshRateWindowCountsUniqueFramesWithoutDisplayRepeats() throws {
+        var window = FreshFrameRateWindow()
+        window.begin(generation: 7, at: 10)
+        for sequence in UInt32(1)...120 {
+            window.recordDecode(sequence: sequence, generation: 7)
+            if sequence <= 80 {
+                window.recordPresentation(sequence: sequence, generation: 7)
+                window.recordPresentation(sequence: sequence, generation: 7)
+            }
+        }
+        XCTAssertNil(window.sample(generation: 7, at: 10.9))
+        let sample = try XCTUnwrap(window.sample(generation: 7, at: 11))
+        XCTAssertEqual(sample.decodedFps, 120)
+        XCTAssertEqual(sample.freshPresentedFps, 80)
+        XCTAssertNil(window.sample(generation: 7, at: 11))
+        window.begin(generation: 8, at: 12)
+        window.recordDecode(sequence: 121, generation: 7)
+        window.recordPresentation(sequence: 121, generation: 7)
+        let reset = try XCTUnwrap(window.sample(generation: 8, at: 13))
+        XCTAssertEqual(reset.decodedFps, 0)
+        XCTAssertEqual(reset.freshPresentedFps, 0)
+    }
+
+    func testFreshRateWindowHealthyWrapAndDropsAreBounded() throws {
+        var window = FreshFrameRateWindow()
+        window.begin(generation: 1, at: 0)
+        for i in UInt32(0)..<120 {
+            let sequence = UInt32.max &- 60 &+ i
+            window.recordDecode(sequence: sequence, generation: 1)
+            window.recordPresentation(sequence: sequence, generation: 1)
+        }
+        window.recordDrop(generation: 2)
+        window.recordDrop(generation: 1)
+        let sample = try XCTUnwrap(window.sample(generation: 1, at: 1))
+        XCTAssertEqual(sample.decodedFps, 120)
+        XCTAssertEqual(sample.freshPresentedFps, 120)
+        XCTAssertEqual(sample.droppedFrames, 1)
+        XCTAssertNil(window.sample(generation: 1, at: .infinity))
+    }
+
+    func testPerformanceFeedbackAndCommittedModeAuthority() throws {
+        XCTAssertEqual(WireMessageType.clientPerformanceFeedback.rawValue, 39)
+        let feedback = ClientPerformanceFeedback(mode: .game, flags: 3,
+            generation: 0x0102030405060708, targetFps: 120, decodedFpsX10: 1190,
+            freshPresentedFpsX10: 800, windowMs: 1000, droppedFrames: 7)
+        let bytes = feedback.encode()
+        XCTAssertEqual(bytes.count, 24)
+        XCTAssertEqual(bytes[4], 8)
+        XCTAssertEqual(ClientPerformanceFeedback.decode(bytes), feedback)
+        for offset in [0, 1, 2, 3] {
+            var bad = bytes
+            bad[offset] = 255
+            XCTAssertNil(ClientPerformanceFeedback.decode(bad))
+        }
+        var mode = CommittedPipelineModeState()
+        mode.request(.game)
+        XCTAssertNil(mode.active)
+        XCTAssertFalse(mode.acknowledge(.office))
+        XCTAssertTrue(mode.acknowledge(.game, at: 10))
+        XCTAssertEqual(mode.active?.targetFps, 120)
+        XCTAssertFalse(mode.readyForFeedback(at: 11.999))
+        XCTAssertTrue(mode.readyForFeedback(at: 12))
+        mode.request(.office)
+        XCTAssertNil(mode.active)
+        XCTAssertFalse(mode.acknowledge(.game))
+        XCTAssertTrue(mode.acknowledge(.office))
+        XCTAssertEqual(mode.active?.targetFps, 60)
+        mode.reset()
+        XCTAssertNil(mode.active)
+    }
+
+    func testGameRepeatsNeverInvokeFreshDrawableCallback() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/Renderer.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("if drawKind != .gameRepeated {\n            onDrawableCommitted?"))
+    }
+
     func testDeleteStoredLogsRemovesOnlyManagedFiles() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
