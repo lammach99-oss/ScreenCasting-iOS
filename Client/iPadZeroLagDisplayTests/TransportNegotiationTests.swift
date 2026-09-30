@@ -1608,3 +1608,22 @@ final class VideoThroughputV1Tests: XCTestCase {
         wait(for: [sampled], timeout: 2)
     }
 }
+
+final class AutoBitrateWireV1Tests: XCTestCase {
+    func testSettingsByte3AcceptsAutoAndKeeps24ByteLayout() {
+        var payload = Data(count: 24)
+        payload[0] = 1
+        payload[1] = 1
+        payload[3] = 1
+        var bitrate = UInt32(75_000_000).littleEndian
+        withUnsafeBytes(of: &bitrate) { payload.replaceSubrange(16..<20, with: $0) }
+        XCTAssertEqual(payload.count, 24)
+        XCTAssertEqual(TrustedSettingsState.decode(payload)?.bitrateBps, 75_000_000)
+        payload[3] = 0
+        XCTAssertNotNil(TrustedSettingsState.decode(payload))
+        for byte in UInt8(2)...UInt8(255) {
+            payload[3] = byte
+            XCTAssertNil(TrustedSettingsState.decode(payload))
+        }
+    }
+}

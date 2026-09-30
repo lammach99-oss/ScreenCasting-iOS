@@ -511,7 +511,8 @@ public class PencilUIKitView: UIView {
     public var keyboardCaptureEnabled = false {
         didSet { updateKeyboardCapture() }
     }
-    private var activeRemoteVirtualKeys: Set<UInt16> = []
+    private var activeRemotePhysicalKeys: [UIKeyboardHIDUsage: UInt16] = [:]
+    private var remoteVirtualKeyOwnerCounts: [UInt16: Int] = [:]
 
     override public var canBecomeFirstResponder: Bool { true }
 
@@ -525,10 +526,11 @@ public class PencilUIKitView: UIView {
     }
 
     private func releaseActiveRemoteKeys() {
-        for virtualKey in activeRemoteVirtualKeys.sorted() {
+        for virtualKey in remoteVirtualKeyOwnerCounts.keys.sorted() {
             onKeyboardInput?(KeyboardInputCommand(action: .keyUp, virtualKey: virtualKey))
         }
-        activeRemoteVirtualKeys.removeAll()
+        activeRemotePhysicalKeys.removeAll()
+        remoteVirtualKeyOwnerCounts.removeAll()
     }
 
     override public func didMoveToWindow() {
@@ -543,9 +545,19 @@ public class PencilUIKitView: UIView {
         guard keyboardCaptureEnabled,
               let virtualKey = RemoteKeyboardKeyMapper.virtualKey(for: usage) else { return false }
         if action == .keyDown {
-            activeRemoteVirtualKeys.insert(virtualKey)
-        } else if activeRemoteVirtualKeys.remove(virtualKey) == nil {
-            return true
+            if activeRemotePhysicalKeys[usage] == nil {
+                activeRemotePhysicalKeys[usage] = virtualKey
+                remoteVirtualKeyOwnerCounts[virtualKey, default: 0] += 1
+            }
+            // UIKit repeats still travel remotely without acquiring another owner.
+        } else {
+            guard activeRemotePhysicalKeys.removeValue(forKey: usage) != nil else { return true }
+            let remaining = (remoteVirtualKeyOwnerCounts[virtualKey] ?? 1) - 1
+            if remaining > 0 {
+                remoteVirtualKeyOwnerCounts[virtualKey] = remaining
+                return true
+            }
+            remoteVirtualKeyOwnerCounts.removeValue(forKey: virtualKey)
         }
         onKeyboardInput?(KeyboardInputCommand(action: action, virtualKey: virtualKey))
         return true
