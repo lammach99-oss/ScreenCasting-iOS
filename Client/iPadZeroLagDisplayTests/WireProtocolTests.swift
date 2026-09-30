@@ -2681,7 +2681,7 @@ final class RemoteKeyboardV1Tests: XCTestCase {
     }
 
     @MainActor func testDisableReleasesBeforeResigning() {
-        let view = PencilUIKitView(frame: .zero)
+        let view = KeyboardResponderOrderView(frame: .zero)
         var commands: [KeyboardInputCommand] = []
         view.onKeyboardInput = {
             XCTAssertTrue(view.keyboardCaptureEnabled || $0.action == .keyUp)
@@ -2691,7 +2691,14 @@ final class RemoteKeyboardV1Tests: XCTestCase {
         XCTAssertTrue(view.handleHardwareKey(.keyboardLeftGUI, action: .keyDown))
         XCTAssertTrue(view.handleHardwareKey(.keyboardA, action: .keyDown))
         XCTAssertTrue(view.handleHardwareKey(.keyboardA, action: .keyDown))
+        var releaseOrdering: [String] = []
+        view.onKeyboardInput = { command in
+            commands.append(command)
+            releaseOrdering.append("up")
+        }
+        view.onResign = { releaseOrdering.append("resign") }
         view.keyboardCaptureEnabled = false
+        XCTAssertEqual(releaseOrdering, ["up", "up", "resign"])
         XCTAssertEqual(commands.map(\.action), [.keyDown, .keyDown, .keyDown, .keyUp, .keyUp])
         XCTAssertEqual(commands.suffix(2).map(\.virtualKey), [0x41, 0xA2])
         XCTAssertFalse(view.handleHardwareKey(.keyboardA, action: .keyDown))
@@ -2712,5 +2719,13 @@ final class RemoteKeyboardV1Tests: XCTestCase {
         view.keyboardCaptureEnabled = false
         XCTAssertEqual(commands.map(\.virtualKey), [0xA2, 0xA3, 0xA2, 0xA3])
         XCTAssertEqual(commands.map(\.action), [.keyDown, .keyDown, .keyUp, .keyUp])
+    }
+}
+
+@MainActor private final class KeyboardResponderOrderView: PencilUIKitView {
+    var onResign: (() -> Void)?
+    override func resignFirstResponder() -> Bool {
+        onResign?()
+        return super.resignFirstResponder()
     }
 }

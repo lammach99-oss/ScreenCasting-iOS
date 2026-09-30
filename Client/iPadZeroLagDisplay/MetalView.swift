@@ -233,12 +233,16 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     var onTouchBoundsChanged: ((CGRect) -> Void)?
     var onPencilInput: ((PencilPacket) -> Void)?
     var onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)?
+    var keyboardCaptureEnabled: Bool
+    var onKeyboardInput: ((KeyboardInputCommand) -> Void)?
     var onPointerInput: ((PointerInputCommand) -> Void)?
     var onOpenSettings: (() -> Void)?
 
     public init(
         networkManager: NetworkManager,
         gameModeEnabled: Bool = false,
+        keyboardCaptureEnabled: Bool = false,
+        onKeyboardInput: ((KeyboardInputCommand) -> Void)? = nil,
         onFrameRendered: (() -> Void)? = nil,
         onContentViewportChanged: ((VideoContentViewport?) -> Void)? = nil,
         onGeometrySnapshotChanged: ((RendererGeometrySnapshot) -> Void)? = nil,
@@ -258,6 +262,8 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         self.onTouchBoundsChanged = onTouchBoundsChanged
         self.onPencilInput = onPencilInput
         self.onSendTouchEvent = onSendTouchEvent
+        self.keyboardCaptureEnabled = keyboardCaptureEnabled
+        self.onKeyboardInput = onKeyboardInput
         self.onPointerInput = onPointerInput
         self.onOpenSettings = onOpenSettings
     }
@@ -320,6 +326,8 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         touchView.onSendTouchEvent = { type, x, y, pressure in
             sendTouchEvent?(type, x, y, pressure)
         }
+        touchView.onKeyboardInput = onKeyboardInput
+        touchView.keyboardCaptureEnabled = keyboardCaptureEnabled
         touchView.onPointerInput = onPointerInput
         touchView.onOpenSettings = onOpenSettings
         touchView.inputGeometryContext = coordinator.inputGeometryContext

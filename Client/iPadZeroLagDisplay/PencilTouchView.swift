@@ -459,7 +459,131 @@ struct DirectTouchGestureStateMachine {
 
 // MARK: - PencilUIKitView
 
+enum RemoteKeyboardKeyMapper {
+    static func virtualKey(for usage: UIKeyboardHIDUsage) -> UInt16? {
+        let hid = usage.rawValue
+        switch hid {
+        case 0x04...0x1D: return UInt16(0x41 + hid - 0x04)
+        case 0x1E...0x26: return UInt16(0x31 + hid - 0x1E)
+        case 0x27: return 0x30
+        case 0x28: return 0x0D
+        case 0x29: return 0x1B
+        case 0x2A: return 0x08
+        case 0x2B: return 0x09
+        case 0x2C: return 0x20
+        case 0x2D: return 0xBD
+        case 0x2E: return 0xBB
+        case 0x2F: return 0xDB
+        case 0x30: return 0xDD
+        case 0x31: return 0xDC
+        case 0x33: return 0xBA
+        case 0x34: return 0xDE
+        case 0x35: return 0xC0
+        case 0x36: return 0xBC
+        case 0x37: return 0xBE
+        case 0x38: return 0xBF
+        case 0x39: return 0x14
+        case 0x3A...0x45: return UInt16(0x70 + hid - 0x3A)
+        case 0x49: return 0x2D
+        case 0x4A: return 0x24
+        case 0x4B: return 0x21
+        case 0x4C: return 0x2E
+        case 0x4D: return 0x23
+        case 0x4E: return 0x22
+        case 0x4F: return 0x27
+        case 0x50: return 0x25
+        case 0x51: return 0x28
+        case 0x52: return 0x26
+        case 0xE1: return 0xA0
+        case 0xE5: return 0xA1
+        case 0xE2: return 0xA4
+        case 0xE6: return 0xA5
+        case 0xE3, 0xE7: return 0xA2 // Command -> left Ctrl
+        case 0xE0, 0xE4: return 0xA3 // Control -> right Ctrl
+        default: return nil
+        }
+    }
+}
+
 public class PencilUIKitView: UIView {
+
+    public var onKeyboardInput: ((KeyboardInputCommand) -> Void)?
+    public var keyboardCaptureEnabled = false {
+        didSet { updateKeyboardCapture() }
+    }
+    private var activeRemoteVirtualKeys: Set<UInt16> = []
+
+    override public var canBecomeFirstResponder: Bool { true }
+
+    private func updateKeyboardCapture() {
+        if keyboardCaptureEnabled && window != nil {
+            if !isFirstResponder { becomeFirstResponder() }
+        } else {
+            releaseActiveRemoteKeys()
+            resignFirstResponder()
+        }
+    }
+
+    private func releaseActiveRemoteKeys() {
+        for virtualKey in activeRemoteVirtualKeys.sorted() {
+            onKeyboardInput?(KeyboardInputCommand(action: .keyUp, virtualKey: virtualKey))
+        }
+        activeRemoteVirtualKeys.removeAll()
+    }
+
+    override public func didMoveToWindow() {
+        super.didMoveToWindow()
+        updateKeyboardCapture()
+    }
+
+    // Kept separate from UIPress construction so key lifetime can be tested
+    // deterministically without synthesizing UIKit hardware events.
+    @discardableResult
+    func handleHardwareKey(_ usage: UIKeyboardHIDUsage, action: KeyboardInputAction) -> Bool {
+        guard keyboardCaptureEnabled,
+              let virtualKey = RemoteKeyboardKeyMapper.virtualKey(for: usage) else { return false }
+        if action == .keyDown {
+            activeRemoteVirtualKeys.insert(virtualKey)
+        } else if activeRemoteVirtualKeys.remove(virtualKey) == nil {
+            return true
+        }
+        onKeyboardInput?(KeyboardInputCommand(action: action, virtualKey: virtualKey))
+        return true
+    }
+
+    private func unhandledPresses(_ presses: Set<UIPress>, action: KeyboardInputAction) -> Set<UIPress> {
+        // UIKit supplies a set: apply modifiers before ordinary Down events,
+        // and release them after ordinary Up events in the same batch.
+        let ordered = presses.sorted { lhs, rhs in
+            let left = lhs.key?.keyCode.rawValue ?? 0
+            let right = rhs.key?.keyCode.rawValue ?? 0
+            let leftModifier = (0xE0...0xE7).contains(left)
+            let rightModifier = (0xE0...0xE7).contains(right)
+            if leftModifier != rightModifier {
+                return action == .keyDown ? leftModifier : !leftModifier
+            }
+            return left < right
+        }
+        return Set(ordered.filter { press in
+            guard let key = press.key else { return true }
+            return !handleHardwareKey(key.keyCode, action: action)
+        })
+    }
+
+    override public func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let unhandled = unhandledPresses(presses, action: .keyDown)
+        if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
+
+    override public func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let unhandled = unhandledPresses(presses, action: .keyUp)
+        if !unhandled.isEmpty { super.pressesEnded(unhandled, with: event) }
+    }
+
+    override public func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let unhandled = unhandledPresses(presses, action: .keyUp)
+        if !unhandled.isEmpty { super.pressesCancelled(unhandled, with: event) }
+    }
 
     // MARK: Callbacks (set by PencilTouchView.updateUIView)
     public var onPencilInput:    ((PencilPacket) -> Void)?

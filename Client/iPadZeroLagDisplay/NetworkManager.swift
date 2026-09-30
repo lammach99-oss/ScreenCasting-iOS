@@ -82,6 +82,37 @@ enum WireMessageType: UInt8 {
     case presentationActivity = 35
     case pipelineMode = 36
     case pointerInput = 37
+    case keyboardInput = 38
+}
+
+public enum KeyboardInputAction: UInt8, CaseIterable {
+    case keyDown = 0
+    case keyUp = 1
+}
+
+public struct KeyboardInputCommand: Equatable {
+    static let version: UInt8 = 1
+    static let encodedSize = 4
+    public let action: KeyboardInputAction
+    public let virtualKey: UInt16
+
+    public init(action: KeyboardInputAction, virtualKey: UInt16) {
+        self.action = action
+        self.virtualKey = virtualKey
+    }
+
+    func encode() -> Data {
+        Data([Self.version, action.rawValue,
+              UInt8(truncatingIfNeeded: virtualKey), UInt8(virtualKey >> 8)])
+    }
+
+    static func decode(_ payload: Data) -> KeyboardInputCommand? {
+        guard payload.count == encodedSize, payload[0] == version,
+              let action = KeyboardInputAction(rawValue: payload[1]) else { return nil }
+        let virtualKey = UInt16(payload[2]) | UInt16(payload[3]) << 8
+        guard virtualKey != 0 else { return nil }
+        return KeyboardInputCommand(action: action, virtualKey: virtualKey)
+    }
 }
 
 public enum PointerInputAction: UInt8, CaseIterable {
@@ -1397,6 +1428,8 @@ final class WireStreamParser {
             fixedLength = 2
         case .presentationActivity, .pipelineMode:
             fixedLength = 1
+        case .keyboardInput:
+            fixedLength = KeyboardInputCommand.encodedSize
         case .pointerInput:
             fixedLength = PointerInputCommand.encodedSize
         case .clientCapabilities:
@@ -2358,6 +2391,24 @@ public class NetworkManager: ObservableObject {
         let y        = UInt16(clamping: Int((normY.clamped(0, 1) * 65535).rounded()))
         let pressure = UInt8 (clamping: Int((pressure01.clamped(0, 1) * 255).rounded()))
         sendTouchEvent(type: type, x: x, y: y, pressure: pressure)
+    }
+
+    public func sendKeyboardInput(_ command: KeyboardInputCommand) {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            let generation = self.connectionGeneration
+            guard self.transportState == .streaming,
+                  self.committedTransportGeneration == generation,
+                  command.virtualKey != 0,
+                  KeyboardInputDeliveryPolicy.maySend(
+                    action: command.action,
+                    inputSuppressed: self.displayRequestGate.isInputSuppressed) else { return }
+            self.sendWireMessage(
+                type: .keyboardInput,
+                payload: command.encode(),
+                sequence: 0,
+                movement: false)
+        }
     }
 
     public func sendPointerInput(_ command: PointerInputCommand) {
@@ -3853,7 +3904,7 @@ public class NetworkManager: ObservableObject {
         case .pipelineMode:
             return
 
-        case .pointerInput:
+        case .pointerInput, .keyboardInput:
             return
 
         case .video:
@@ -5109,6 +5160,12 @@ enum WifiConnectionReadinessPolicy {
         if actualReady { return true }
         if waitingOwned { return false }
         return simulatedReady
+    }
+}
+
+enum KeyboardInputDeliveryPolicy {
+    static func maySend(action: KeyboardInputAction, inputSuppressed: Bool) -> Bool {
+        !inputSuppressed || action == .keyUp
     }
 }
 
