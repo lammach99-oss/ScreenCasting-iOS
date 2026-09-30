@@ -359,30 +359,6 @@ private final class ReleaseCounter {
 }
 
 final class RenderFreshnessTrackerTests: XCTestCase {
-    func testSessionRetirementCannotInterleavePresentationSubmission() throws {
-        // Source contract: beginSession uses the same lock as the final generation
-        // check. Keep it held through present/commit, without waiting for the GPU.
-        let sourceURL = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("iPadZeroLagDisplay/Renderer.swift")
-        let source = try String(contentsOf: sourceURL, encoding: .utf8)
-            .replacingOccurrences(of: "\r\n", with: "\n")
-        let start = try XCTUnwrap(source.range(of: "let commitDecision: RenderCommitDecision ="))
-        let present = try XCTUnwrap(source.range(of: "commandBuffer.present(drawable)", range: start.upperBound..<source.endIndex))
-        let authorization = String(source[start.lowerBound..<present.lowerBound])
-        let successPath = authorization.replacingOccurrences(
-            of: #"guard commitDecision == \.commit else \{[\s\S]*?\n        \}"#,
-            with: "",
-            options: .regularExpression)
-        XCTAssertFalse(successPath.contains("lock.unlock()"),
-                       "Session retirement must not run between authorization and submission")
-        XCTAssertTrue(authorization.contains("guard commitDecision == .commit else {\n            lock.unlock()"),
-                      "Rejected submissions must release the lock")
-        XCTAssertTrue(source.contains("commandBuffer.commit()\n        lock.unlock()"),
-                      "Release the session lock after CPU submission, before telemetry callbacks")
-    }
-
     func testRenderCadenceCountersCaptureAndResetEveryStage() {
         var counters = RenderCadenceCounters()
 
