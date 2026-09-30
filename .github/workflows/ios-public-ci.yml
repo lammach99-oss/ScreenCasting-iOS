@@ -13,7 +13,7 @@ on:
         default: true
         type: boolean
       xctest_filter:
-        description: Optional xcodebuild -only-testing selector
+        description: Optional comma-separated xcodebuild -only-testing selectors
         required: false
         default: ''
         type: string
@@ -260,7 +260,11 @@ jobs:
           [[ "$REPEAT_COUNT" =~ ^([1-9]|1[0-9]|20)$ ]]
           test_args=()
           if [[ -n "$XCTEST_FILTER" ]]; then
-            test_args+=("-only-testing:$XCTEST_FILTER")
+            IFS=',' read -r -a selectors <<< "$XCTEST_FILTER"
+            for selector in "${selectors[@]}"; do
+              [[ -n "$selector" ]]
+              test_args+=("-only-testing:$selector")
+            done
           else
             [[ "$REPEAT_COUNT" == 1 ]]
           fi
