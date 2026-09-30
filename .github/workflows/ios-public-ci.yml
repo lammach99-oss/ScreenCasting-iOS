@@ -17,6 +17,11 @@ on:
         required: false
         default: ''
         type: string
+      run_xctest:
+        description: Run native simulator XCTest before packaging
+        required: false
+        default: true
+        type: boolean
       repeat_count:
         description: Focused XCTest repetitions (1-20)
         required: false
@@ -240,6 +245,7 @@ jobs:
           echo "NATIVE_DEPENDENCY_ARTIFACT_VERIFY_SECONDS=$(( $(date +%s) - started_epoch ))"
           echo 'NATIVE_DEPENDENCY_CONSUMER_VERIFY=PASS'
       - name: Build unsigned iOS Simulator app
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_xctest != false }}
         run: |
           set -euo pipefail
           started_epoch=$(date +%s)
@@ -249,6 +255,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
           echo "SIMULATOR_BUILD_SECONDS=$(( $(date +%s) - started_epoch ))"
       - name: Run XCTest
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_xctest != false }}
         env:
           XCTEST_FILTER: ${{ inputs.xctest_filter }}
           REPEAT_COUNT: ${{ inputs.repeat_count || '1' }}
