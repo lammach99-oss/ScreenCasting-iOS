@@ -982,8 +982,8 @@ public class Renderer: NSObject, MTKViewDelegate {
         lock.lock()
         let commitDecision: RenderCommitDecision =
             freshness.isCurrent(identity) ? .commit : .superseded
-        lock.unlock()
         guard commitDecision == .commit else {
+            lock.unlock()
             recordCadence(
                 .precommitSuperseded,
                 generation: identity.generation)
@@ -1030,6 +1030,7 @@ public class Renderer: NSObject, MTKViewDelegate {
             }
         }
         commandBuffer.commit()
+        lock.unlock()
         recordCadence(.commandCommitted, generation: identity.generation)
         if drawKind != .gameRepeated {
             onDrawableCommitted?(identity.sequence, identity.generation)
