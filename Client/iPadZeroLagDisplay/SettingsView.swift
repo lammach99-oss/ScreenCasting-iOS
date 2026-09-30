@@ -251,7 +251,7 @@ public struct SettingsView: View {
 
                                     Slider(
                                         value: $draftBitrate,
-                                        in: 3...50,
+                                        in: 3...100,
                                         step: 1,
                                         onEditingChanged: { editing in
                                             if !editing {
@@ -266,7 +266,7 @@ public struct SettingsView: View {
                                             .font(.system(size: 10))
                                             .foregroundColor(.white.opacity(0.4))
                                         Spacer()
-                                        Text("50 Mbps")
+                                        Text("100 Mbps")
                                             .font(.system(size: 10))
                                             .foregroundColor(.white.opacity(0.4))
                                     }

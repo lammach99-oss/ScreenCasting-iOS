@@ -515,7 +515,7 @@ enum WifiReconnectTargetStore {
 
 struct ClientStreamSettingsPreference: Equatable {
     static let minimumBitrateMbps: Double = 3
-    static let maximumBitrateMbps: Double = 50
+    static let maximumBitrateMbps: Double = 100
     static let defaultBitrateMbps: Double = 20
     static let defaultAudioEnabled = true
 
@@ -763,7 +763,7 @@ struct TrustedSettingsState: Equatable {
         let bitrateBps = payload.withUnsafeBytes {
             $0.loadUnaligned(fromByteOffset: 16, as: UInt32.self).littleEndian
         }
-        guard bitrateBps >= 3_000_000, bitrateBps <= 50_000_000,
+        guard bitrateBps >= 3_000_000, bitrateBps <= 100_000_000,
               bitrateBps.isMultiple(of: 1_000_000) else { return nil }
         return TrustedSettingsState(
             generation: generation,
