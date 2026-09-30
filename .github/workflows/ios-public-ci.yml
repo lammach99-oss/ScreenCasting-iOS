@@ -12,6 +12,16 @@ on:
         required: true
         default: true
         type: boolean
+      xctest_filter:
+        description: Optional xcodebuild -only-testing selector
+        required: false
+        default: ''
+        type: string
+      repeat_count:
+        description: Focused XCTest repetitions (1-20)
+        required: false
+        default: '1'
+        type: string
 
 permissions:
   contents: read
@@ -239,16 +249,35 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
           echo "SIMULATOR_BUILD_SECONDS=$(( $(date +%s) - started_epoch ))"
       - name: Run XCTest
+        env:
+          XCTEST_FILTER: ${{ inputs.xctest_filter }}
+          REPEAT_COUNT: ${{ inputs.repeat_count || '1' }}
         run: |
           set -euo pipefail
           started_epoch=$(date +%s)
           destination=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(("platform=iOS Simulator,id="+device["udid"]+",arch=x86_64" for devices in data.get("devices", {}).values() for device in devices if device.get("isAvailable") and "iPad" in device.get("name", "")), ""))')
           test -n "$destination"
-          xcodebuild test -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj \
-            -scheme iPadCasting -destination "$destination" \
-            ARCHS=x86_64 ONLY_ACTIVE_ARCH=YES \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          [[ "$REPEAT_COUNT" =~ ^([1-9]|1[0-9]|20)$ ]]
+          test_args=()
+          if [[ -n "$XCTEST_FILTER" ]]; then
+            test_args+=("-only-testing:$XCTEST_FILTER")
+          else
+            [[ "$REPEAT_COUNT" == 1 ]]
+          fi
+          failed=0
+          for ((iteration=1; iteration<=REPEAT_COUNT; iteration++)); do
+            if xcodebuild test -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj \
+              -scheme iPadCasting -destination "$destination" \
+              ARCHS=x86_64 ONLY_ACTIVE_ARCH=YES \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO "${test_args[@]}"; then
+              echo "XCTEST_ITERATION=$iteration RESULT=PASS"
+            else
+              echo "XCTEST_ITERATION=$iteration RESULT=FAIL"
+              failed=1
+            fi
+          done
           echo "XCTEST_SECONDS=$(( $(date +%s) - started_epoch ))"
+          exit "$failed"
 
   build-unsigned-ipad-app:
     name: Build unsigned iPad app
