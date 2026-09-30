@@ -934,6 +934,25 @@ final class WifiReconnectTargetTests: XCTestCase {
 }
 
 final class ClientStreamSettingsPreferenceTests: XCTestCase {
+    func testBitrateV1CeilingAndHostState() {
+        XCTAssertEqual(ClientStreamSettingsPreference.defaultBitrateMbps, 20)
+        for value in [3.0, 20, 50, 75, 100] {
+            XCTAssertEqual(ClientStreamSettingsPreference.normalized(bitrateMbps: value, audioEnabled: true).bitrateMbps, value)
+        }
+        XCTAssertEqual(ClientStreamSettingsPreference.normalized(bitrateMbps: 101, audioEnabled: true).bitrateMbps, 100)
+        XCTAssertEqual(ClientStreamSettingsPreference.normalized(bitrateMbps: 2, audioEnabled: true).bitrateMbps, 3)
+        func decode(_ bitrate: UInt32) -> TrustedSettingsState? {
+            var data = Data(count: 24)
+            data[0] = 1
+            var little = bitrate.littleEndian
+            withUnsafeBytes(of: &little) { data.replaceSubrange(16..<20, with: $0) }
+            return TrustedSettingsState.decode(data)
+        }
+        XCTAssertEqual(decode(100_000_000)?.bitrateBps, 100_000_000)
+        XCTAssertNil(decode(101_000_000))
+        XCTAssertNil(decode(99_500_000))
+    }
+
     func testClientStreamSettingsDefaultTo20MbpsAndAudioOn() throws {
         let suite = "ScreenCasting.ClientStreamSettingsDefaultsTests"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -967,9 +986,9 @@ final class ClientStreamSettingsPreferenceTests: XCTestCase {
             3)
         XCTAssertEqual(
             ClientStreamSettingsPreference.normalized(
-                bitrateMbps: 80,
+                bitrateMbps: 101,
                 audioEnabled: false).bitrateMbps,
-            50)
+            100)
         XCTAssertEqual(
             ClientStreamSettingsPreference.normalized(
                 bitrateMbps: 12.6,
