@@ -1,5 +1,6 @@
 import XCTest
 import Network
+import UIKit
 @testable import iPadCasting
 
 final class UsbSplitCommitGateTests: XCTestCase {
@@ -2624,5 +2625,92 @@ final class WireProtocolTests: XCTestCase {
             bytes.storeBytes(of: sequence.littleEndian, toByteOffset: 12, as: UInt32.self)
         }
         return data
+    }
+}
+
+final class KeyboardWireV1Tests: XCTestCase {
+    func testFixedABIAndRoundTrips() {
+        XCTAssertEqual(WireMessageType.keyboardInput.rawValue, 38)
+        XCTAssertEqual(WireMessageType.pointerInput.rawValue, 37)
+        XCTAssertEqual(PointerInputCommand.encodedSize, 8)
+        for command in [KeyboardInputCommand(action: .keyDown, virtualKey: 0x41),
+                        KeyboardInputCommand(action: .keyUp, virtualKey: 0xA2),
+                        KeyboardInputCommand(action: .keyDown, virtualKey: 0x1234)] {
+            XCTAssertEqual(Array(command.encode()), [1, command.action.rawValue, UInt8(truncatingIfNeeded: command.virtualKey), UInt8(command.virtualKey >> 8)])
+            XCTAssertEqual(KeyboardInputCommand.decode(command.encode()), command)
+        }
+    }
+
+    func testMalformedPayloadsReject() {
+        for bytes in [[2, 0, 65, 0], [1, 2, 65, 0], [1, 0, 0, 0], [1, 0, 65], [1, 0, 65, 0, 0]] as [[UInt8]] {
+            XCTAssertNil(KeyboardInputCommand.decode(Data(bytes)))
+        }
+    }
+}
+
+final class RemoteKeyboardV1Tests: XCTestCase {
+    func testPhysicalHIDMapping() {
+        let pairs: [(Int, UInt16)] = [
+            (0x04, 0x41), (0x1D, 0x5A), (0x1E, 0x31), (0x26, 0x39), (0x27, 0x30),
+            (0x28, 0x0D), (0x29, 0x1B), (0x2A, 0x08), (0x2B, 0x09), (0x2C, 0x20),
+            (0x2D, 0xBD), (0x2E, 0xBB), (0x2F, 0xDB), (0x30, 0xDD), (0x31, 0xDC),
+            (0x33, 0xBA), (0x34, 0xDE), (0x35, 0xC0), (0x36, 0xBC), (0x37, 0xBE), (0x38, 0xBF),
+            (0x39, 0x14), (0x49, 0x2D), (0x4A, 0x24), (0x4B, 0x21), (0x4C, 0x2E),
+            (0x4D, 0x23), (0x4E, 0x22), (0x4F, 0x27), (0x50, 0x25), (0x51, 0x28), (0x52, 0x26),
+            (0xE0, 0xA3), (0xE4, 0xA3), (0xE3, 0xA2), (0xE7, 0xA2),
+            (0xE1, 0xA0), (0xE5, 0xA1), (0xE2, 0xA4), (0xE6, 0xA5)
+        ]
+        for (hid, vk) in pairs {
+            XCTAssertEqual(RemoteKeyboardKeyMapper.virtualKey(for: UIKeyboardHIDUsage(rawValue: hid)!), vk)
+        }
+        for hid in 0x04...0x1D {
+            XCTAssertEqual(RemoteKeyboardKeyMapper.virtualKey(for: UIKeyboardHIDUsage(rawValue: hid)!), UInt16(0x41 + hid - 0x04))
+        }
+        for hid in 0x3A...0x45 {
+            XCTAssertEqual(RemoteKeyboardKeyMapper.virtualKey(for: UIKeyboardHIDUsage(rawValue: hid)!), UInt16(0x70 + hid - 0x3A))
+        }
+        XCTAssertNil(RemoteKeyboardKeyMapper.virtualKey(for: UIKeyboardHIDUsage(rawValue: 0x32)!))
+        XCTAssertNil(RemoteKeyboardKeyMapper.virtualKey(for: UIKeyboardHIDUsage(rawValue: 0x59)!))
+    }
+
+    func testDeliveryAllowsOnlyKeyUpDuringSuppression() {
+        XCTAssertTrue(KeyboardInputDeliveryPolicy.maySend(action: .keyDown, inputSuppressed: false))
+        XCTAssertTrue(KeyboardInputDeliveryPolicy.maySend(action: .keyUp, inputSuppressed: false))
+        XCTAssertFalse(KeyboardInputDeliveryPolicy.maySend(action: .keyDown, inputSuppressed: true))
+        XCTAssertTrue(KeyboardInputDeliveryPolicy.maySend(action: .keyUp, inputSuppressed: true))
+    }
+
+    @MainActor func testDisableReleasesBeforeResigning() {
+        let view = PencilUIKitView(frame: .zero)
+        var commands: [KeyboardInputCommand] = []
+        view.onKeyboardInput = {
+            XCTAssertTrue(view.keyboardCaptureEnabled || $0.action == .keyUp)
+            commands.append($0)
+        }
+        view.keyboardCaptureEnabled = true
+        XCTAssertTrue(view.handleHardwareKey(.keyboardLeftGUI, action: .keyDown))
+        XCTAssertTrue(view.handleHardwareKey(.keyboardA, action: .keyDown))
+        XCTAssertTrue(view.handleHardwareKey(.keyboardA, action: .keyDown))
+        view.keyboardCaptureEnabled = false
+        XCTAssertEqual(commands.map(\.action), [.keyDown, .keyDown, .keyDown, .keyUp, .keyUp])
+        XCTAssertEqual(commands.suffix(2).map(\.virtualKey), [0x41, 0xA2])
+        XCTAssertFalse(view.handleHardwareKey(.keyboardA, action: .keyDown))
+        view.keyboardCaptureEnabled = false
+        XCTAssertEqual(commands.count, 5)
+    }
+
+    @MainActor func testKeyUpAndCancellationStateIsIdempotent() {
+        let view = PencilUIKitView(frame: .zero)
+        var commands: [KeyboardInputCommand] = []
+        view.onKeyboardInput = { commands.append($0) }
+        view.keyboardCaptureEnabled = true
+        XCTAssertFalse(view.handleHardwareKey(UIKeyboardHIDUsage(rawValue: 0x59)!, action: .keyDown))
+        XCTAssertTrue(view.handleHardwareKey(.keyboardLeftGUI, action: .keyDown))
+        XCTAssertTrue(view.handleHardwareKey(.keyboardLeftControl, action: .keyDown))
+        XCTAssertTrue(view.handleHardwareKey(.keyboardLeftGUI, action: .keyUp))
+        XCTAssertTrue(view.handleHardwareKey(.keyboardLeftGUI, action: .keyUp))
+        view.keyboardCaptureEnabled = false
+        XCTAssertEqual(commands.map(\.virtualKey), [0xA2, 0xA3, 0xA2, 0xA3])
+        XCTAssertEqual(commands.map(\.action), [.keyDown, .keyDown, .keyUp, .keyUp])
     }
 }
