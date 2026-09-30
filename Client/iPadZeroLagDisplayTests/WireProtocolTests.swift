@@ -2649,6 +2649,37 @@ final class KeyboardWireV1Tests: XCTestCase {
 }
 
 final class RemoteKeyboardV1Tests: XCTestCase {
+    @MainActor func testOverlappingPhysicalCommandKeysOwnCtrlUntilLastRelease() {
+        let view = PencilUIKitView(frame: .zero)
+        var commands: [KeyboardInputCommand] = []
+        view.onKeyboardInput = { commands.append($0) }
+        view.keyboardCaptureEnabled = true
+        view.handleHardwareKey(.keyboardLeftGUI, action: .keyDown)
+        view.handleHardwareKey(.keyboardRightGUI, action: .keyDown)
+        view.handleHardwareKey(.keyboardLeftGUI, action: .keyDown)
+        view.handleHardwareKey(.keyboardLeftGUI, action: .keyUp)
+        view.handleHardwareKey(.keyboardLeftGUI, action: .keyUp)
+        XCTAssertEqual(commands.map(\.action), [.keyDown, .keyDown, .keyDown])
+        view.handleHardwareKey(.keyboardRightGUI, action: .keyUp)
+        XCTAssertEqual(commands.map(\.action), [.keyDown, .keyDown, .keyDown, .keyUp])
+        XCTAssertEqual(commands.map(\.virtualKey), [0xA2, 0xA2, 0xA2, 0xA2])
+        view.keyboardCaptureEnabled = false
+        XCTAssertEqual(commands.count, 4)
+    }
+
+    @MainActor func testCaptureDisableReleasesOneUpPerSharedVirtualKey() {
+        let view = PencilUIKitView(frame: .zero)
+        var commands: [KeyboardInputCommand] = []
+        view.onKeyboardInput = { commands.append($0) }
+        view.keyboardCaptureEnabled = true
+        for usage: UIKeyboardHIDUsage in [.keyboardLeftGUI, .keyboardRightGUI, .keyboardLeftControl, .keyboardRightControl] {
+            view.handleHardwareKey(usage, action: .keyDown)
+            view.handleHardwareKey(usage, action: .keyDown)
+        }
+        view.keyboardCaptureEnabled = false
+        XCTAssertEqual(commands.filter { $0.action == .keyUp }.map(\.virtualKey), [0xA2, 0xA3])
+    }
+
     func testPhysicalHIDMapping() {
         let pairs: [(Int, UInt16)] = [
             (0x04, 0x41), (0x1D, 0x5A), (0x1E, 0x31), (0x26, 0x39), (0x27, 0x30),
