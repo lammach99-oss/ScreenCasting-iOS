@@ -521,17 +521,20 @@ struct ClientStreamSettingsPreference: Equatable {
 
     let bitrateMbps: Double
     let audioEnabled: Bool
+    let adaptiveBitrateEnabled: Bool
 
     static func normalized(
         bitrateMbps: Double,
-        audioEnabled: Bool
+        audioEnabled: Bool,
+        adaptiveBitrateEnabled: Bool = false
     ) -> ClientStreamSettingsPreference {
         let rounded = round(bitrateMbps)
         return ClientStreamSettingsPreference(
             bitrateMbps: min(
                 maximumBitrateMbps,
                 max(minimumBitrateMbps, rounded)),
-            audioEnabled: audioEnabled)
+            audioEnabled: audioEnabled,
+            adaptiveBitrateEnabled: adaptiveBitrateEnabled)
     }
 }
 
@@ -540,6 +543,9 @@ enum ClientStreamSettingsStore {
         "ScreenCasting.client.desiredBitrateMbps.v1"
     private static let audioKey =
         "ScreenCasting.client.desiredAudioEnabled.v1"
+
+    private static let adaptiveKey =
+        "ScreenCasting.client.desiredAdaptiveBitrateEnabled.v1"
 
     static func load(
         defaults: UserDefaults = .standard
@@ -550,9 +556,11 @@ enum ClientStreamSettingsStore {
         let audioEnabled =
             (defaults.object(forKey: audioKey) as? NSNumber)?.boolValue
             ?? ClientStreamSettingsPreference.defaultAudioEnabled
+        let adaptive = (defaults.object(forKey: adaptiveKey) as? NSNumber)?.boolValue ?? false
         return .normalized(
             bitrateMbps: bitrate,
-            audioEnabled: audioEnabled)
+            audioEnabled: audioEnabled,
+            adaptiveBitrateEnabled: adaptive)
     }
 
     static func save(
@@ -561,9 +569,11 @@ enum ClientStreamSettingsStore {
     ) {
         let normalized = ClientStreamSettingsPreference.normalized(
             bitrateMbps: preference.bitrateMbps,
-            audioEnabled: preference.audioEnabled)
+            audioEnabled: preference.audioEnabled,
+            adaptiveBitrateEnabled: preference.adaptiveBitrateEnabled)
         defaults.set(normalized.bitrateMbps, forKey: bitrateKey)
         defaults.set(normalized.audioEnabled, forKey: audioKey)
+        defaults.set(normalized.adaptiveBitrateEnabled, forKey: adaptiveKey)
     }
 }
 
@@ -749,12 +759,13 @@ struct TrustedSettingsState: Equatable {
     let generation: UInt64
     let bitrateBps: UInt32
     let audioEnabled: Bool
+    let adaptiveBitrateEnabled: Bool
     let rejectionReason: TrustedSettingsRejectReason
 
     static func decode(_ payload: Data) -> TrustedSettingsState? {
         guard payload.count == 24, payload[0] == 1, payload[1] <= 1,
               let rejectionReason = TrustedSettingsRejectReason(rawValue: payload[2]),
-              payload[3] == 0,
+              payload[3] <= 1,
               payload[20] == 0, payload[21] == 0,
               payload[22] == 0, payload[23] == 0 else { return nil }
         let generation = payload.withUnsafeBytes {
@@ -769,6 +780,7 @@ struct TrustedSettingsState: Equatable {
             generation: generation,
             bitrateBps: bitrateBps,
             audioEnabled: payload[1] == 1,
+            adaptiveBitrateEnabled: payload[3] == 1,
             rejectionReason: rejectionReason)
     }
 }
@@ -1653,6 +1665,7 @@ public class NetworkManager: ObservableObject {
     @Published public var isAdaptiveBitrate: Bool   = false
     @Published public private(set) var desiredBitrateMbps: Double = 20
     @Published public private(set) var desiredAudioEnabled: Bool = true
+    @Published public private(set) var desiredAdaptiveBitrateEnabled: Bool = false
     @Published public private(set) var effectiveBitrateMbps: Double = 20
     @Published public private(set) var effectiveAudioEnabled: Bool = true
     @Published public private(set) var settingsApplyStatus: String = ""
@@ -1897,6 +1910,7 @@ public class NetworkManager: ObservableObject {
         clientSettingsState = ClientSettingsStateModel(desired: desired)
         desiredBitrateMbps = desired.bitrateMbps
         desiredAudioEnabled = desired.audioEnabled
+        desiredAdaptiveBitrateEnabled = desired.adaptiveBitrateEnabled
         reconnectEnabled = RecentWifiResumeStore.consumeIfValid()
         print(
             "[IPAD][APP_LIFECYCLE] state=relaunch_resume " +
@@ -2495,22 +2509,25 @@ public class NetworkManager: ObservableObject {
 
     public func setDesiredStreamSettings(
         bitrateMbps: Double,
-        audioEnabled: Bool
+        audioEnabled: Bool,
+        adaptiveBitrateEnabled: Bool
     ) {
         let desired = ClientStreamSettingsPreference.normalized(
             bitrateMbps: bitrateMbps,
-            audioEnabled: audioEnabled)
+            audioEnabled: audioEnabled,
+            adaptiveBitrateEnabled: adaptiveBitrateEnabled)
         ClientStreamSettingsStore.save(desired)
         DispatchQueue.main.async {
             self.desiredBitrateMbps = desired.bitrateMbps
             self.desiredAudioEnabled = desired.audioEnabled
+            self.desiredAdaptiveBitrateEnabled = desired.adaptiveBitrateEnabled
         }
         networkQueue.async { [weak self] in
             guard let self else { return }
             self.clientSettingsState.setDesired(desired)
             print(
                 "[IPAD][SETTINGS_DESIRED] bitrate_mbps=\(Int(desired.bitrateMbps)) " +
-                "audio=\(desired.audioEnabled) source=user")
+                "audio=\(desired.audioEnabled) adaptive=\(desired.adaptiveBitrateEnabled) source=user")
             _ = self.sendDesiredSettingsIfPossible(reason: "user_change")
         }
     }
@@ -2518,7 +2535,8 @@ public class NetworkManager: ObservableObject {
     public func sendSettingsUpdate(bitrateMbps: Double, audioEnabled: Bool) {
         setDesiredStreamSettings(
             bitrateMbps: bitrateMbps,
-            audioEnabled: audioEnabled)
+            audioEnabled: audioEnabled,
+            adaptiveBitrateEnabled: ClientStreamSettingsStore.load().adaptiveBitrateEnabled)
     }
 
     @discardableResult
@@ -2549,6 +2567,10 @@ public class NetworkManager: ObservableObject {
                 as: UInt8.self)
             bytes.storeBytes(of: UInt8(0), toByteOffset: 2, as: UInt8.self)
             bytes.storeBytes(
+                of: desired.adaptiveBitrateEnabled ? UInt8(1) : UInt8(0),
+                toByteOffset: 3,
+                as: UInt8.self)
+            bytes.storeBytes(
                 of: requestID.littleEndian,
                 toByteOffset: 4,
                 as: UInt32.self)
@@ -2569,7 +2591,7 @@ public class NetworkManager: ObservableObject {
             "[IPAD][SETTINGS_UPDATE] request=\(requestID) " +
             "expected_generation=\(generation) " +
             "bitrate_bps=\(UInt32(desired.bitrateMbps * 1_000_000)) " +
-            "audio=\(desired.audioEnabled) reason=\(reason)")
+            "audio=\(desired.audioEnabled) adaptive=\(desired.adaptiveBitrateEnabled) reason=\(reason)")
         sendWireMessage(
             type: .settingsUpdate,
             payload: payload,
@@ -3301,7 +3323,7 @@ public class NetworkManager: ObservableObject {
         }
     }
 
-    private func receiveSettingsState(
+    func receiveSettingsState(
         _ payload: Data,
         outcome: ClientSettingsApplyOutcome
     ) {
@@ -3311,7 +3333,8 @@ public class NetworkManager: ObservableObject {
         let bitrateMbps = Double(state.bitrateBps) / 1_000_000
         let effective = ClientStreamSettingsPreference.normalized(
             bitrateMbps: bitrateMbps,
-            audioEnabled: state.audioEnabled)
+            audioEnabled: state.audioEnabled,
+            adaptiveBitrateEnabled: state.adaptiveBitrateEnabled)
         clientSettingsState.receiveHostState(
             effective,
             generation: state.generation)
@@ -3355,13 +3378,17 @@ public class NetworkManager: ObservableObject {
         }
         DispatchQueue.main.async {
             self.settingsGeneration = state.generation
-            self.effectiveBitrateMbps = bitrateMbps
+            // Settings carries the saved manual fallback. Existing .bitrate
+            // packets remain authoritative for the live target while Auto runs.
+            if !state.adaptiveBitrateEnabled || !self.isAdaptiveBitrate {
+                self.effectiveBitrateMbps = bitrateMbps
+            }
             self.effectiveAudioEnabled = state.audioEnabled
-            self.isAdaptiveBitrate = false
+            self.isAdaptiveBitrate = state.adaptiveBitrateEnabled
+            self.transportTelemetry.recordBitrateMbps(self.effectiveBitrateMbps)
             self.settingsApplyStatus = status
         }
-        transportTelemetry.recordBitrateMbps(bitrateMbps)
-        print("[IPAD][SETTINGS_RESULT] generation=\(state.generation) bitrate_bps=\(state.bitrateBps) audio=\(state.audioEnabled) rejected=\(rejected) reason=\(state.rejectionReason)")
+        print("[IPAD][SETTINGS_RESULT] generation=\(state.generation) bitrate_bps=\(state.bitrateBps) audio=\(state.audioEnabled) adaptive=\(state.adaptiveBitrateEnabled) rejected=\(rejected) reason=\(state.rejectionReason)")
         if decision == .send {
             let isRuntimeRecovery = resolvedOutcome == .state &&
                 settingsReconciliationGate.runtimeReadyRetryGeneration ==

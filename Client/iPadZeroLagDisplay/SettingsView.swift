@@ -24,6 +24,7 @@ public struct SettingsView: View {
     /// Client-owned desired values. Host reports are displayed separately.
     @State private var draftBitrate: Double = 20.0
     @State private var draftAudioEnabled = true
+    @State private var draftAdaptiveBitrateEnabled = false
     @State private var draftResolution = DisplayPreference.defaultValue.resolution
     @State private var draftRefreshHz: UInt32 = DisplayPreference.defaultValue.refreshHz
     @State private var draftOrientationMode: DisplayOrientationMode = .automatic
@@ -234,6 +235,17 @@ public struct SettingsView: View {
 
                                 Divider().background(Color.white.opacity(0.12))
 
+                                Toggle("Auto Bitrate", isOn: Binding(
+                                    get: { draftAdaptiveBitrateEnabled },
+                                    set: { value in
+                                        draftAdaptiveBitrateEnabled = value
+                                        saveDesiredSettings()
+                                    }))
+                                    .tint(Color(hex: "#0EA5E9"))
+                                Text("Automatically adjusts bitrate from 3–100 Mbps for the active Wi-Fi or USB-C transport. The manual value is retained for when Auto is turned off.")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.white.opacity(0.55))
+
                                 // Client desired bitrate is authoritative; Host reports the effective value.
                                 VStack(alignment: .leading, spacing: 8) {
                                     HStack {
@@ -260,6 +272,7 @@ public struct SettingsView: View {
                                         }
                                     )
                                     .tint(Color(hex: "#0EA5E9"))
+                                    .disabled(draftAdaptiveBitrateEnabled)
 
                                     HStack {
                                         Text("3 Mbps")
@@ -281,7 +294,8 @@ public struct SettingsView: View {
                                     .tint(Color(hex: "#0EA5E9"))
                                 Text(
                                     String(
-                                        format: "Host effective: %.0f Mbps • Audio %@",
+                                        format: "Host effective: %@ • %.0f Mbps • Audio %@",
+                                        networkManager.isAdaptiveBitrate ? "Auto" : "Manual",
                                         networkManager.effectiveBitrateMbps,
                                         networkManager.effectiveAudioEnabled ? "On" : "Off"))
                                     .font(.system(size: 11))
@@ -358,6 +372,9 @@ public struct SettingsView: View {
         .onReceive(networkManager.$desiredAudioEnabled) { enabled in
             draftAudioEnabled = enabled
         }
+        .onReceive(networkManager.$desiredAdaptiveBitrateEnabled) { enabled in
+            draftAdaptiveBitrateEnabled = enabled
+        }
         .onReceive(networkManager.$displayCapabilities) { _ in
             synchronizeDisplayDraft()
         }
@@ -370,6 +387,7 @@ public struct SettingsView: View {
         .onAppear {
             draftBitrate = networkManager.desiredBitrateMbps
             draftAudioEnabled = networkManager.desiredAudioEnabled
+            draftAdaptiveBitrateEnabled = networkManager.desiredAdaptiveBitrateEnabled
             synchronizeDisplayDraft()
         }
         .confirmationDialog(
@@ -422,7 +440,8 @@ public struct SettingsView: View {
     private func saveDesiredSettings() {
         networkManager.setDesiredStreamSettings(
             bitrateMbps: draftBitrate,
-            audioEnabled: draftAudioEnabled)
+            audioEnabled: draftAudioEnabled,
+            adaptiveBitrateEnabled: draftAdaptiveBitrateEnabled)
     }
 
     private func deleteClientLogs() {

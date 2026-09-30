@@ -1610,6 +1610,73 @@ final class VideoThroughputV1Tests: XCTestCase {
 }
 
 final class AutoBitrateWireV1Tests: XCTestCase {
+    func testAutoPreferencePersistsWithoutChangingManual75() throws {
+        let suite = "ScreenCasting.AutoBitrateV1Tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertFalse(ClientStreamSettingsStore.load(defaults: defaults).adaptiveBitrateEnabled)
+        defaults.set(75, forKey: "ScreenCasting.client.desiredBitrateMbps.v1")
+        defaults.set(true, forKey: "ScreenCasting.client.desiredAudioEnabled.v1")
+        let oldManual = ClientStreamSettingsStore.load(defaults: defaults)
+        XCTAssertEqual(oldManual.bitrateMbps, 75)
+        XCTAssertFalse(oldManual.adaptiveBitrateEnabled)
+        let auto = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: oldManual.bitrateMbps, audioEnabled: false, adaptiveBitrateEnabled: true)
+        ClientStreamSettingsStore.save(auto, defaults: defaults)
+        XCTAssertEqual(ClientStreamSettingsStore.load(defaults: defaults), auto)
+        let manual = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: auto.bitrateMbps, audioEnabled: auto.audioEnabled, adaptiveBitrateEnabled: false)
+        ClientStreamSettingsStore.save(manual, defaults: defaults)
+        XCTAssertEqual(ClientStreamSettingsStore.load(defaults: defaults).bitrateMbps, 75)
+        XCTAssertFalse(ClientStreamSettingsStore.load(defaults: defaults).adaptiveBitrateEnabled)
+    }
+
+    func testModeMismatchReconcilesEvenWhenBitrateAndAudioMatch() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 75, audioEnabled: true, adaptiveBitrateEnabled: true)
+        let manual = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 75, audioEnabled: true, adaptiveBitrateEnabled: false)
+        var model = ClientSettingsStateModel(desired: desired)
+        model.receiveHostState(manual, generation: 9)
+        var gate = ClientSettingsReconciliationGate()
+        XCTAssertEqual(gate.decision(hostGeneration: 9, desired: model.desired,
+            effective: model.effective, outcome: .state), .send)
+        model.receiveHostState(desired, generation: 10)
+        XCTAssertEqual(model.desired.bitrateMbps, 75)
+        XCTAssertEqual(gate.decision(hostGeneration: 10, desired: model.desired,
+            effective: model.effective, outcome: .applied), .inSync)
+    }
+
+    @MainActor func testAutoSnapshotPreservesLiveTargetAndManualReportsSavedTarget() async {
+        let manager = NetworkManager()
+        let desired = manager.desiredBitrateMbps
+        manager.effectiveBitrateMbps = 60
+        manager.isAdaptiveBitrate = true
+        var payload = Data(count: 24)
+        payload[0] = 1
+        payload[1] = 1
+        payload[2] = TrustedSettingsRejectReason.invalidRequest.rawValue
+        payload[3] = 1
+        var bitrate = UInt32(75_000_000).littleEndian
+        withUnsafeBytes(of: &bitrate) { payload.replaceSubrange(16..<20, with: $0) }
+        manager.receiveSettingsState(payload, outcome: .rejected(.invalidRequest))
+        let auto = expectation(description: "Auto state published")
+        DispatchQueue.main.async { auto.fulfill() }
+        await fulfillment(of: [auto], timeout: 2)
+        XCTAssertTrue(manager.isAdaptiveBitrate)
+        XCTAssertEqual(manager.effectiveBitrateMbps, 60)
+        XCTAssertEqual(manager.desiredBitrateMbps, desired)
+        payload[3] = 0
+        manager.receiveSettingsState(payload, outcome: .rejected(.invalidRequest))
+        let manual = expectation(description: "Manual state published")
+        DispatchQueue.main.async { manual.fulfill() }
+        await fulfillment(of: [manual], timeout: 2)
+        XCTAssertFalse(manager.isAdaptiveBitrate)
+        XCTAssertEqual(manager.effectiveBitrateMbps, 75)
+        XCTAssertEqual(manager.desiredBitrateMbps, desired)
+    }
+
     func testSettingsByte3AcceptsAutoAndKeeps24ByteLayout() {
         var payload = Data(count: 24)
         payload[0] = 1
