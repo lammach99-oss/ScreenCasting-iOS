@@ -1651,14 +1651,20 @@ final class AutoBitrateWireV1Tests: XCTestCase {
     @MainActor func testAutoSnapshotPreservesLiveTargetAndManualReportsSavedTarget() async {
         let manager = NetworkManager()
         let desired = manager.desiredBitrateMbps
-        manager.effectiveBitrateMbps = 60
-        manager.isAdaptiveBitrate = true
         var payload = Data(count: 24)
         payload[0] = 1
         payload[1] = 1
         payload[2] = TrustedSettingsRejectReason.invalidRequest.rawValue
         payload[3] = 1
-        var bitrate = UInt32(75_000_000).littleEndian
+        var bitrate = UInt32(60_000_000).littleEndian
+        withUnsafeBytes(of: &bitrate) { payload.replaceSubrange(16..<20, with: $0) }
+        manager.receiveSettingsState(payload, outcome: .rejected(.invalidRequest))
+        let seed = expectation(description: "Auto seed published")
+        DispatchQueue.main.async { seed.fulfill() }
+        await fulfillment(of: [seed], timeout: 2)
+        XCTAssertTrue(manager.isAdaptiveBitrate)
+        XCTAssertEqual(manager.effectiveBitrateMbps, 60)
+        bitrate = UInt32(75_000_000).littleEndian
         withUnsafeBytes(of: &bitrate) { payload.replaceSubrange(16..<20, with: $0) }
         manager.receiveSettingsState(payload, outcome: .rejected(.invalidRequest))
         let auto = expectation(description: "Auto state published")
