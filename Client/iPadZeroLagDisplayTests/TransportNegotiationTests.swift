@@ -1560,3 +1560,51 @@ final class ClientStreamSettingsPreferenceTests: XCTestCase {
             outcome: .state), .send)
     }
 }
+
+final class VideoThroughputV1Tests: XCTestCase {
+    func testVideoPayloadRateUsesMonotonicDeltasAndResets() {
+        var meter = VideoPayloadRateSampler()
+        XCTAssertEqual(meter.sample(totalBytes: 9_000_000, at: 10), 0)
+        XCTAssertEqual(meter.sample(totalBytes: 10_000_000, at: 10.5), 16)
+        XCTAssertEqual(meter.sample(totalBytes: 10_000_000, at: 11), 0)
+        XCTAssertEqual(meter.sample(totalBytes: 0, at: 11.5), 0)
+        XCTAssertEqual(meter.sample(totalBytes: 1_000_000, at: 12), 16)
+        XCTAssertEqual(meter.sample(totalBytes: 2_000_000, at: 12), 0)
+        meter.reset()
+        XCTAssertEqual(meter.sample(totalBytes: 100_000_000, at: 13), 0)
+    }
+
+    func testUniqueVideoPayloadCounterRejectsDuplicatesAndStaleSessions() {
+        var counter = VideoPayloadCounter()
+        XCTAssertFalse(counter.record(byteCount: 100, sequence: 1, generation: 1))
+        counter.begin(generation: 1)
+        XCTAssertTrue(counter.record(byteCount: 1_000_000, sequence: UInt32.max, generation: 1))
+        XCTAssertFalse(counter.record(byteCount: 1_000_000, sequence: UInt32.max, generation: 1))
+        XCTAssertTrue(counter.record(byteCount: 500_000, sequence: 0, generation: 1))
+        XCTAssertFalse(counter.record(byteCount: 500_000, sequence: UInt32.max, generation: 1))
+        XCTAssertFalse(counter.record(byteCount: 0, sequence: 1, generation: 1))
+        XCTAssertEqual(counter.totalBytes, 1_500_000)
+        counter.begin(generation: 2)
+        XCTAssertFalse(counter.record(byteCount: 100, sequence: 1, generation: 1))
+        XCTAssertTrue(counter.record(byteCount: 100, sequence: 1, generation: 2))
+        XCTAssertEqual(counter.totalBytes, 100)
+        counter.reset()
+        XCTAssertFalse(counter.record(byteCount: 100, sequence: 2, generation: 2))
+        XCTAssertEqual(counter.totalBytes, 0)
+        XCTAssertEqual(TransportHudSnapshot(frameReceiveMs: 2, decodeMs: 3, videoRxMbps: 16).videoRxMbps, 16)
+    }
+    func testFallbackKeepsExistingTelemetryCadence() {
+        let manager = NetworkManager()
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        defer { manager.stopForTesting() }
+        XCTAssertTrue(manager.networkQueueForTesting.sync {
+            manager.fallbackCommittedWifiToLegacy(generation: session.generation)
+        })
+        let sampled = expectation(description: "existing feedback cadence resumes")
+        manager.networkQueueForTesting.asyncAfter(deadline: .now() + 0.6) {
+            XCTAssertGreaterThan(manager.videoFeedbackCountForTesting, 0)
+            sampled.fulfill()
+        }
+        wait(for: [sampled], timeout: 2)
+    }
+}
