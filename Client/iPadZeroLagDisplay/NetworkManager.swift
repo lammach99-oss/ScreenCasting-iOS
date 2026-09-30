@@ -1768,7 +1768,11 @@ public class NetworkManager: ObservableObject {
     private lazy var wifiMediaReceiver = WifiMediaReceiver(
         networkQueue: networkQueue,
         decoder: { [weak self] data, sequence, isIDR, receivedAt in
-            self?.decoder.processInputData(
+            guard let self,
+                  self.committedTransportGeneration == self.connectionGeneration,
+                  self.committedRealtimeMode == RealtimeTransportMode.wifiRTP else { return }
+            self.recordVideoPayloadReceived(data.count, sequence: sequence)
+            self.decoder.processInputData(
                 data,
                 sequence: sequence,
                 isIDR: isIDR,
@@ -1819,6 +1823,7 @@ public class NetworkManager: ObservableObject {
         },
         telemetryProvider: { [weak self] in
             guard let self else { return .zero }
+            self.publishHudSnapshotIfDue()
             let feedback = self.transportTelemetry.makeFeedback()
             return WifiFeedbackTelemetry(
                 lastDecoded: feedback.1,
@@ -1857,6 +1862,8 @@ public class NetworkManager: ObservableObject {
     private var wifiLegacyFallbackGeneration: UInt64?
     private var wifiLegacyFallbackRequestGeneration: UInt64?
     private let transportTelemetry = TransportTelemetry()
+    private var videoPayloadCounter = VideoPayloadCounter()
+    private var videoRxSampler = VideoPayloadRateSampler()
     private var clientDebugLoggingEnabled = false
     private var lastHudSnapshotPublishedAt: TimeInterval = 0
     private var lastClientPingSentAt: TimeInterval = 0
@@ -3468,11 +3475,18 @@ public class NetworkManager: ObservableObject {
         stopTelemetryTimer()
         pendingClientPings.removeAll(keepingCapacity: true)
         lastClientPingSentAt = 0
+        videoPayloadCounter.begin(generation: connectionGeneration)
+        videoRxSampler.reset()
+        lastHudSnapshotPublishedAt = 0
         transportTelemetry.beginRuntimeSession()
         startPersistentTelemetryLoggingIfEnabled()
         if committedRealtimeMode == RealtimeTransportMode.wifiRTP {
             return
         }
+        startLegacyTelemetryTimers()
+    }
+
+    private func startLegacyTelemetryTimers() {
         let timer = DispatchSource.makeTimerSource(queue: networkQueue)
         timer.schedule(deadline: .now() + 0.5, repeating: 0.5)   // 2× per second
         timer.setEventHandler { [weak self] in
@@ -3497,6 +3511,17 @@ public class NetworkManager: ObservableObject {
     }
 
     private func stopTelemetryTimer() {
+        videoPayloadCounter.reset()
+        videoRxSampler.reset()
+        let generation = connectionGeneration
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.connectionGeneration == generation,
+                  self.committedTransportGeneration == nil else { return }
+            self.hudTelemetry = TransportHudSnapshot(
+                frameReceiveMs: self.hudTelemetry.frameReceiveMs,
+                decodeMs: self.hudTelemetry.decodeMs)
+        }
+
         telemetryTimer?.cancel()
         telemetryTimer = nil
         adaptiveTelemetryTimer?.cancel()
@@ -3573,13 +3598,27 @@ public class NetworkManager: ObservableObject {
             sequence: UInt32(truncatingIfNeeded: nonce))
     }
 
+    private func recordVideoPayloadReceived(_ byteCount: Int, sequence: UInt32) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        let generation = connectionGeneration
+        guard committedTransportGeneration == generation,
+              wireAuthenticatedGeneration == generation else { return }
+        videoPayloadCounter.record(byteCount: byteCount, sequence: sequence, generation: generation)
+    }
     private func publishHudSnapshotIfDue() {
         let now = ProcessInfo.processInfo.systemUptime
         guard now - lastHudSnapshotPublishedAt >= 0.5 else { return }
         lastHudSnapshotPublishedAt = now
-        let snapshot = transportTelemetry.hudSnapshot()
+        let stages = transportTelemetry.hudSnapshot()
+        let snapshot = TransportHudSnapshot(frameReceiveMs: stages.frameReceiveMs,
+            decodeMs: stages.decodeMs,
+            videoRxMbps: videoRxSampler.sample(totalBytes: videoPayloadCounter.totalBytes, at: now))
+        let generation = connectionGeneration
+        let mode = committedRealtimeMode
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            guard self.connectionGeneration == generation,
+                  self.committedRealtimeMode == mode else { return }
             self.hudTelemetry = snapshot
             self.lastFrameReceiveDurationMs = snapshot.frameReceiveMs
             self.lastDecodeLatencyMs = snapshot.decodeMs
@@ -3916,6 +3955,7 @@ public class NetworkManager: ObservableObject {
             }
             let receivedAt = CACurrentMediaTime()
             let receiveDurationMs = max(0, (receivedAt - message.firstByteAt) * 1_000.0)
+            recordVideoPayloadReceived(payload.count, sequence: header.sequence)
             bytesReceived &+= UInt64(payload.count)
             transportTelemetry.recordPayloadReceived(
                 sequence: header.sequence,
@@ -4783,7 +4823,7 @@ public class NetworkManager: ObservableObject {
     }
 
     @discardableResult
-    private func fallbackCommittedWifiToLegacy(
+    func fallbackCommittedWifiToLegacy(
         generation: UInt64
     ) -> Bool {
         dispatchPrecondition(condition: .onQueue(networkQueue))
@@ -4798,6 +4838,10 @@ public class NetworkManager: ObservableObject {
         wifiLegacyFallbackRequestGeneration = nil
         committedRealtimeMode = RealtimeTransportMode.legacyTLS
         wifiMediaReceiver.clearOffer()
+        videoPayloadCounter.begin(generation: generation)
+        videoRxSampler.reset()
+        lastHudSnapshotPublishedAt = 0
+        startLegacyTelemetryTimers()
         AudioManager.shared.reset()
         return true
     }

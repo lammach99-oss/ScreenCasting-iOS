@@ -14,8 +14,67 @@ enum VideoFeedbackValidityFlags {
 public struct TransportHudSnapshot: Equatable {
     public let frameReceiveMs: Double
     public let decodeMs: Double
+    public let videoRxMbps: Double
+
+    init(frameReceiveMs: Double, decodeMs: Double, videoRxMbps: Double = 0) {
+        self.frameReceiveMs = frameReceiveMs
+        self.decodeMs = decodeMs
+        self.videoRxMbps = videoRxMbps
+    }
 }
 
+// Video Throughput V1 measures unique encoded payload bytes accepted by the
+// Client video path per unit monotonic time. Audio, control, framing and
+// retransmission duplicates are excluded; this is not NIC/USB link utilization.
+// NetworkManager owns these values exclusively on its existing networkQueue.
+struct VideoPayloadCounter {
+    private(set) var totalBytes: UInt64 = 0
+    private var generation: UInt64?
+    private var lastSequence: UInt32?
+
+    mutating func begin(generation: UInt64) {
+        reset()
+        self.generation = generation
+    }
+
+    mutating func reset() {
+        totalBytes = 0
+        generation = nil
+        lastSequence = nil
+    }
+
+    @discardableResult
+    mutating func record(byteCount: Int, sequence: UInt32, generation: UInt64) -> Bool {
+        guard self.generation == generation, byteCount > 0 else { return false }
+        if let previous = lastSequence, Int32(bitPattern: sequence &- previous) <= 0 {
+            return false
+        }
+        lastSequence = sequence
+        totalBytes &+= UInt64(byteCount)
+        return true
+    }
+}
+
+struct VideoPayloadRateSampler {
+    private var lastBytes: UInt64 = 0
+    private var lastTime: TimeInterval?
+
+    mutating func reset() { lastTime = nil }
+
+    mutating func sample(totalBytes: UInt64, at now: TimeInterval) -> Double {
+        guard now.isFinite else { return 0 }
+        guard let previousTime = lastTime, totalBytes >= lastBytes, now >= previousTime else {
+            lastBytes = totalBytes
+            lastTime = now
+            return 0
+        }
+        guard now > previousTime else { return 0 }
+        let rate = Double(totalBytes - lastBytes) * 8 / (now - previousTime) / 1_000_000
+        lastBytes = totalBytes
+        lastTime = now
+        return rate
+    }
+}
 enum StreamingTransportKind: String, Equatable {
     case wifi
     case usbTypeC = "usb_type_c"

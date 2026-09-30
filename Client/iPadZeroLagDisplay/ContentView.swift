@@ -914,6 +914,14 @@ public struct ContentView: View {
                                 }
                                     .font(.system(size: 13, weight: .bold, design: .monospaced))
                             }
+                            Color.white.opacity(0.2).frame(width: 1, height: 14)
+                            VStack(alignment: .leading, spacing: 0) {
+                                Text(String(format: "%.1f Mbps", networkManager.hudTelemetry.videoRxMbps))
+                                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                Text("Video RX")
+                                    .font(.system(size: 8, weight: .medium))
+                                    .foregroundColor(.white.opacity(0.65))
+                            }
                         }
                         .foregroundColor(.white)
                         .padding(.horizontal, 16).padding(.vertical, 10)

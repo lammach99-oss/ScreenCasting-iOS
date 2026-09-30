@@ -317,13 +317,20 @@ public struct SettingsView: View {
                                                        networkManager.lastDecodeLatencyMs),
                                         color:  latencyColor(networkManager.lastDecodeLatencyMs)
                                     )
-                                    Divider().frame(height: 40)
-                                        .background(Color.white.opacity(0.1))
+                                }
+                                HStack(spacing: 0) {
                                     telemetryTile(
                                         label:  "Active Bitrate",
                                         value:  String(format: "%.0f Mbps",
                                                        networkManager.effectiveBitrateMbps),
                                         color:  Color(hex: "#38BDF8")
+                                    )
+                                    Divider().frame(height: 40)
+                                        .background(Color.white.opacity(0.1))
+                                    telemetryTile(
+                                        label: "Video RX",
+                                        value: String(format: "%.1f Mbps", networkManager.hudTelemetry.videoRxMbps),
+                                        color: Color(hex: "#38BDF8")
                                     )
                                 }
                             }
