@@ -280,7 +280,7 @@ jobs:
             if xcodebuild test -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj \
               -scheme iPadCasting -destination "$destination" \
               ARCHS=x86_64 ONLY_ACTIVE_ARCH=YES \
-              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO "${test_args[@]}"; then
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO ${test_args[@]+"${test_args[@]}"}; then
               echo "XCTEST_ITERATION=$iteration RESULT=PASS"
             else
               echo "XCTEST_ITERATION=$iteration RESULT=FAIL"
