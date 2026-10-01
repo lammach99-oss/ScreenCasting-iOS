@@ -941,16 +941,42 @@ enum SoftwareKeyboardRouter {
         return result
     }
 }
+struct SoftwareKeyboardCommittedShadow {
+    static let maximumCharacters = 128
+    private(set) var text = ""
+
+    func delta(to current: String) -> [SoftwareKeyboardEmission]? {
+        let previous = Array(text)
+        let next = Array(current)
+        var prefix = 0
+        // Character equality normalizes canonically equivalent text; wire text must not.
+        while prefix < min(previous.count, next.count),
+              Array(String(previous[prefix]).utf8) == Array(String(next[prefix]).utf8) {
+            prefix += 1
+        }
+        let suffix = String(next.dropFirst(prefix))
+        let inserted = SoftwareKeyboardRouter.route(suffix)
+        guard suffix.isEmpty || !inserted.isEmpty else { return nil }
+        return Array(repeating: .key(0x08), count: previous.count - prefix) + inserted
+    }
+
+    mutating func commit(_ current: String) {
+        text = String(current.suffix(Self.maximumCharacters))
+    }
+    mutating func reset() { text = "" }
+}
+
 final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate {
     var deliveryEnabled = false
     var onEmission: ((SoftwareKeyboardEmission) -> Void)?
     var onDismiss: (() -> Void)?
     private var consuming = false
+    private var committedShadow = SoftwareKeyboardCommittedShadow()
     override init(frame: CGRect, textContainer: NSTextContainer?) {
         super.init(frame: frame, textContainer: textContainer)
         delegate = self
         backgroundColor = .clear; textColor = .clear; tintColor = .clear
-        // Committed context is flushed; later replacement edits have no wire representation.
+        // Keep native IME context; unsupported predictive rewriting remains disabled.
         autocorrectionType = .no
         spellCheckingType = .no
         smartQuotesType = .no
@@ -969,24 +995,39 @@ final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate {
         guard deliveryEnabled else { discardBuffer(); return }
         guard markedTextRange == nil else { return }
         let committed = text ?? ""
-        guard !committed.isEmpty else { return }
-        consuming = true; text = ""; consuming = false
-        for emission in SoftwareKeyboardRouter.route(committed) {
-            guard deliveryEnabled else { return }
-            onEmission?(emission)
+        guard let delta = committedShadow.delta(to: committed) else {
+            consuming = true; text = committedShadow.text; consuming = false
+            return
         }
+        guard let emit = onEmission else { return }
+        consuming = true
+        defer {
+            consuming = false
+            if !deliveryEnabled { discardBuffer() }
+        }
+        for emission in delta {
+            guard deliveryEnabled else { return }
+            emit(emission)
+        }
+        guard deliveryEnabled else { return }
+        committedShadow.commit(committed)
+        if Array(committed.utf8) != Array(committedShadow.text.utf8) { text = committedShadow.text }
+        selectedRange = NSRange(location: committedShadow.text.utf16.count, length: 0)
     }
     func textViewDidChange(_ textView: UITextView) { consumeCommittedBuffer() }
     override func insertText(_ text: String) { super.insertText(text); consumeCommittedBuffer() }
     override func unmarkText() { super.unmarkText(); consumeCommittedBuffer() }
     override func deleteBackward() {
         guard deliveryEnabled else { discardBuffer(); return }
-        if markedTextRange != nil || !(text ?? "").isEmpty { super.deleteBackward() }
+        if markedTextRange != nil || !(text ?? "").isEmpty || !committedShadow.text.isEmpty {
+            super.deleteBackward()
+            consumeCommittedBuffer()
+        }
         else { onEmission?(.key(0x08)) }
     }
     private func discardBuffer() {
         guard !consuming else { return }
-        consuming = true; text = ""; super.unmarkText(); text = ""; consuming = false
+        consuming = true; text = ""; super.unmarkText(); text = ""; committedShadow.reset(); consuming = false
     }
     func deactivateAndDiscardComposition() {
         deliveryEnabled = false; discardBuffer(); resignFirstResponder()
