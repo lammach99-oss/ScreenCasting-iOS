@@ -397,16 +397,18 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     var onTouchBoundsChanged: ((CGRect) -> Void)?
     var onPencilInput: ((PencilPacket) -> Void)?
     var onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)?
-    var keyboardCaptureEnabled: Bool
+    var remoteKeyboardActive: Bool
     var onKeyboardInput: ((KeyboardInputCommand) -> Void)?
+    var onTextCommit: ((String) -> Void)?
     var onPointerInput: ((PointerInputCommand) -> Void)?
     var onOpenSettings: (() -> Void)?
 
     public init(
         networkManager: NetworkManager,
         gameModeEnabled: Bool = false,
-        keyboardCaptureEnabled: Bool = false,
+        remoteKeyboardActive: Bool = false,
         onKeyboardInput: ((KeyboardInputCommand) -> Void)? = nil,
+        onTextCommit: ((String) -> Void)? = nil,
         onFrameRendered: (() -> Void)? = nil,
         onContentViewportChanged: ((VideoContentViewport?) -> Void)? = nil,
         onGeometrySnapshotChanged: ((RendererGeometrySnapshot) -> Void)? = nil,
@@ -426,8 +428,9 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         self.onTouchBoundsChanged = onTouchBoundsChanged
         self.onPencilInput = onPencilInput
         self.onSendTouchEvent = onSendTouchEvent
-        self.keyboardCaptureEnabled = keyboardCaptureEnabled
+        self.remoteKeyboardActive = remoteKeyboardActive
         self.onKeyboardInput = onKeyboardInput
+        self.onTextCommit = onTextCommit
         self.onPointerInput = onPointerInput
         self.onOpenSettings = onOpenSettings
     }
@@ -495,8 +498,8 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             sendTouchEvent?(type, x, y, pressure)
         }
         touchView.onKeyboardInput = onKeyboardInput
-        container.onTextCommit = { [weak networkManager] text in networkManager?.sendTextCommit(text) }
-        container.configureRemoteKeyboard(active: keyboardCaptureEnabled, generation: networkManager.remoteKeyboardGeneration)
+        container.onTextCommit = onTextCommit
+        container.configureRemoteKeyboard(active: remoteKeyboardActive, generation: networkManager.remoteKeyboardGeneration)
         touchView.onPointerInput = onPointerInput
         let openSettings = onOpenSettings
         touchView.onOpenSettings = { [weak container] in

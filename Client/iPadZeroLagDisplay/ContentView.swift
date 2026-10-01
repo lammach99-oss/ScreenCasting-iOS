@@ -477,9 +477,12 @@ public struct ContentView: View {
             ConnectedPresentationSurface(
                 networkManager: networkManager,
                 gameModeEnabled: gameModeEnabled,
-                keyboardCaptureEnabled: scenePhase == .active && !isSettingsPresented,
+                remoteKeyboardActive: streamManager.isConnected && scenePhase == .active && !isSettingsPresented,
                 onKeyboardInput: { command in
                     networkManager.sendKeyboardInput(command)
+                },
+                onTextCommit: { text in
+                    networkManager.sendTextCommit(text)
                 },
                 onFrameRendered: {
                     streamManager.registerFrameRendered()
