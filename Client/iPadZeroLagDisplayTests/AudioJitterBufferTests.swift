@@ -2,6 +2,83 @@ import XCTest
 @testable import iPadCasting
 
 final class AudioJitterBufferTests: XCTestCase {
+    func testAudioDiagnosticsSeparateTargetDropsOverflowAndConcealment() {
+        let buffer = AudioJitterBuffer(profile: .wifi)
+        XCTAssertNil(buffer.dequeue())
+        XCTAssertEqual(buffer.diagnostics.nilPlayoutActions, 1)
+        [UInt16(1), 2, 3, 4].forEach { buffer.insert(packet($0)) }
+        XCTAssertEqual(decodedSequence(buffer.dequeue()), 2)
+        XCTAssertEqual(buffer.diagnostics.targetPolicyDrops, 1)
+        XCTAssertEqual(buffer.diagnostics.overflowDrops, 0)
+        XCTAssertEqual(buffer.diagnostics.decodeActions, 1)
+        XCTAssertEqual(buffer.diagnostics.insertedPackets, 4)
+        buffer.reset(profile: .usb)
+        for sequence in UInt16(1)...7 { buffer.insert(packet(sequence)) }
+        XCTAssertEqual(buffer.diagnostics.overflowDrops, 1)
+        XCTAssertEqual(buffer.diagnostics.targetPolicyDrops, 0)
+        XCTAssertEqual(buffer.diagnostics.maximumDepth, 6)
+        XCTAssertEqual(buffer.profile, .usb)
+        buffer.reset(profile: .wifi)
+        [UInt16(1), 2, 3].forEach { buffer.insert(packet($0)) }
+        _ = buffer.dequeue(); _ = buffer.dequeue(); _ = buffer.dequeue()
+        buffer.insert(packet(5))
+        XCTAssertEqual(buffer.dequeue(), .plc(sequence: 4, timestamp: 4 * 480))
+        XCTAssertEqual(buffer.diagnostics.plcActions, 1)
+        XCTAssertEqual(buffer.diagnostics.targetPolicyDrops, 0)
+    }
+
+    func testAudioReceiveDiagnosticsClassifyRepairedGapAndWrap() {
+        var rx = AudioReceiveDiagnostics()
+        rx.record(sequence: 1, timestamp: 480, arrivedAt: 1)
+        rx.record(sequence: 3, timestamp: 1440, arrivedAt: 1.02)
+        rx.record(sequence: 2, timestamp: 960, arrivedAt: 1.025)
+        XCTAssertEqual(rx.packets, 3)
+        XCTAssertEqual(rx.forwardGaps, 1)
+        XCTAssertEqual(rx.missingPacketUnits, 1)
+        XCTAssertEqual(rx.reorderedPackets, 1)
+        XCTAssertEqual(rx.repairedPacketUnits, 1)
+        XCTAssertEqual(rx.duplicateOrStalePackets, 0)
+        rx.record(sequence: 2, timestamp: 960, arrivedAt: 1.03)
+        XCTAssertEqual(rx.duplicateOrStalePackets, 1)
+        rx = AudioReceiveDiagnostics()
+        for (index, sequence) in [UInt16.max, 0, 1].enumerated() {
+            rx.record(sequence: sequence, timestamp: UInt32(index * 480), arrivedAt: 2 + Double(index) * 0.01)
+        }
+        XCTAssertEqual(rx.forwardGaps, 0)
+        XCTAssertEqual(rx.reorderedPackets, 0)
+        XCTAssertEqual(rx.jitterMs, 0, accuracy: 0.00001)
+        XCTAssertEqual(rx.interarrivalP95Ms, 10, accuracy: 0.00001)
+    }
+
+    func testAudioPlayoutDiagnosticEventsAreIndependentAndMonotonic() {
+        var counters = AudioPlayoutDiagnostics()
+        counters.record(.tick); counters.record(.nilTick)
+        counters.record(.decode); counters.record(.plc)
+        counters.record(.decodeFailure); counters.record(.pcmRejected)
+        counters.record(.pcmScheduled, frames: 480)
+        counters.record(.playerStart); counters.record(.playerStart)
+        XCTAssertEqual(counters.ticks, 1)
+        XCTAssertEqual(counters.nilTicks, 1)
+        XCTAssertEqual(counters.decodeActions, 1)
+        XCTAssertEqual(counters.plcActions, 1)
+        XCTAssertEqual(counters.decodeFailures, 1)
+        XCTAssertEqual(counters.pcmQueueRejects, 1)
+        XCTAssertEqual(counters.pcmBuffersScheduled, 1)
+        XCTAssertEqual(counters.pcmFramesScheduled, 480)
+        XCTAssertEqual(counters.playerStarts, 2)
+        XCTAssertEqual(counters.playerRestarts, 1)
+    }
+
+    func testAudioDiagnosticsRejectDuplicatesAndStaleWithoutChangingPolicy() {
+        let buffer = AudioJitterBuffer(profile: .usb)
+        buffer.insert(packet(10)); buffer.insert(packet(10)); buffer.insert(packet(11))
+        XCTAssertEqual(buffer.diagnostics.duplicateRejects, 1)
+        _ = buffer.dequeue()
+        buffer.insert(packet(9))
+        XCTAssertEqual(buffer.diagnostics.staleRejects, 1)
+        XCTAssertEqual(buffer.diagnostics.targetPolicyDrops, 0)
+        XCTAssertEqual(buffer.targetDurationMs, 20)
+    }
     func testReorderedPacketsPlayInSequence() {
         let buffer = AudioJitterBuffer(profile: .wifi)
         buffer.insert(packet(102))
