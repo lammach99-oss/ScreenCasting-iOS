@@ -517,6 +517,7 @@ public struct ContentView: View {
                 .frame(width: frame.width, height: frame.height)
                 .offset(x: frame.minX, y: frame.minY)
                 .allowsHitTesting(true)
+                .ignoresSafeArea(.keyboard)
                 // This container has the committed drawable size. Publish
                 // it as an orientation source so capabilities-first startup
                 // cannot miss the initial portrait request.

@@ -908,3 +908,84 @@ private extension Float {
         Swift.min(Swift.max(self, lo), hi)
     }
 }
+
+// MARK: - Native software keyboard; Hardware V1 above remains unchanged.
+public enum RemoteKeyboardMode: Equatable {
+    case none, hardware, softwareAvailable, softwareOpen
+    static func resolve(active: Bool, hardware: Bool, requested: Bool) -> RemoteKeyboardMode {
+        !active ? .none : hardware ? .hardware : requested ? .softwareOpen : .softwareAvailable
+    }
+}
+enum SoftwareKeyboardEmission: Equatable { case text(String), key(UInt16) }
+enum SoftwareKeyboardRouter {
+    static func route(_ text: String) -> [SoftwareKeyboardEmission] {
+        var result: [SoftwareKeyboardEmission] = []
+        var buffer = ""
+        var previousCR = false
+        func flush() { if !buffer.isEmpty { result.append(.text(buffer)); buffer = "" } }
+        for scalar in text.unicodeScalars {
+            switch scalar.value {
+            case 13: flush(); result.append(.key(0x0D)); previousCR = true
+            case 10: flush(); if !previousCR { result.append(.key(0x0D)) }; previousCR = false
+            case 9: flush(); result.append(.key(0x09)); previousCR = false
+            case 8: flush(); result.append(.key(0x08)); previousCR = false
+            default:
+                previousCR = false
+                if scalar.properties.generalCategory != .control { buffer.unicodeScalars.append(scalar) }
+            }
+        }
+        flush()
+        return result
+    }
+}
+final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate {
+    var deliveryEnabled = false
+    var onEmission: ((SoftwareKeyboardEmission) -> Void)?
+    var onDismiss: (() -> Void)?
+    private var consuming = false
+    override init(frame: CGRect, textContainer: NSTextContainer?) {
+        super.init(frame: frame, textContainer: textContainer)
+        delegate = self
+        backgroundColor = .clear; textColor = .clear; tintColor = .clear
+        isScrollEnabled = false; isAccessibilityElement = false
+        inputAssistantItem.leadingBarButtonGroups = []
+        inputAssistantItem.trailingBarButtonGroups = []
+    }
+    required init?(coder: NSCoder) { nil }
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool { false }
+    func consumeCommittedBuffer() {
+        guard !consuming else { return }
+        guard deliveryEnabled else { discardBuffer(); return }
+        guard markedTextRange == nil else { return }
+        let committed = text ?? ""
+        guard !committed.isEmpty else { return }
+        consuming = true; text = ""; consuming = false
+        for emission in SoftwareKeyboardRouter.route(committed) {
+            guard deliveryEnabled else { return }
+            onEmission?(emission)
+        }
+    }
+    func textViewDidChange(_ textView: UITextView) { consumeCommittedBuffer() }
+    override func insertText(_ text: String) { super.insertText(text); consumeCommittedBuffer() }
+    override func unmarkText() { super.unmarkText(); consumeCommittedBuffer() }
+    override func deleteBackward() {
+        guard deliveryEnabled else { discardBuffer(); return }
+        if markedTextRange != nil || !(text ?? "").isEmpty { super.deleteBackward() }
+        else { onEmission?(.key(0x08)) }
+    }
+    private func discardBuffer() {
+        guard !consuming else { return }
+        consuming = true; text = ""; super.unmarkText(); text = ""; consuming = false
+    }
+    func deactivateAndDiscardComposition() {
+        deliveryEnabled = false; discardBuffer(); resignFirstResponder()
+    }
+    override func resignFirstResponder() -> Bool {
+        deliveryEnabled = false; discardBuffer()
+        return super.resignFirstResponder()
+    }
+    func textViewDidEndEditing(_ textView: UITextView) {
+        deliveryEnabled = false; discardBuffer(); onDismiss?()
+    }
+}

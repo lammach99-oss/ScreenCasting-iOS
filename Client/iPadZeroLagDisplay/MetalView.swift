@@ -1,6 +1,7 @@
 import SwiftUI
 import MetalKit
 import UIKit
+import GameController
 
 /// Resolves the size that both UIKit presentation surfaces receive from their
 /// shared SwiftUI container. An incomplete proposal must stay incomplete: the
@@ -159,9 +160,52 @@ public struct MetalView: UIViewRepresentable {
 /// proposed frame, but not an actual UIKit layout contract. Pinning both views
 /// to this container removes that ambiguity while retaining the existing Metal
 /// renderer, decoder callbacks, and Pencil touch implementation.
+enum FloatingKeyboardPlacement {
+    static let fadeSeconds = 3
+    static let dimOpacity: CGFloat = 0.30
+    static func frame(bounds: CGRect, safeArea: UIEdgeInsets, keyboard: CGRect?) -> CGRect {
+        let margin: CGFloat = 12
+        var frame = CGRect(x: max(bounds.minX + safeArea.left, bounds.maxX - safeArea.right - margin - 48),
+                           y: max(bounds.minY + safeArea.top, bounds.maxY - safeArea.bottom - margin - 48), width: 48, height: 48)
+        if let keyboard, frame.intersects(keyboard) {
+            frame.origin.y = max(bounds.minY + safeArea.top, keyboard.minY - margin - 48)
+        }
+        return frame
+    }
+}
+@MainActor final class HardwareKeyboardMonitor {
+    private(set) var isConnected = GCKeyboard.coalesced != nil
+    var onChanged: ((Bool) -> Void)?
+    private var observers: [NSObjectProtocol] = []
+    init() {
+        for name in [Notification.Name.GCKeyboardDidConnect, .GCKeyboardDidDisconnect] {
+            observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refresh() }
+            })
+        }
+    }
+    func refresh() {
+        let present = GCKeyboard.coalesced != nil
+        guard present != isConnected else { return }
+        isConnected = present; onChanged?(present)
+    }
+    deinit { observers.forEach(NotificationCenter.default.removeObserver) }
+}
+
 public final class ConnectedPresentationContainer: UIView {
     let metalView = MTKView()
     let touchView = PencilUIKitView()
+    let softwareTextView = RemoteSoftwareKeyboardTextView(frame: .zero, textContainer: nil)
+    private let keyboardButton = UIButton(type: .system)
+    private let hardwareMonitor = HardwareKeyboardMonitor()
+    private var keyboardObservers: [NSObjectProtocol] = []
+    private var fadeTask: Task<Void, Never>?
+    private var keyboardFrame: CGRect?
+    private var keyboardMode: RemoteKeyboardMode = .none
+    private var keyboardActive = false
+    private var softwareRequested = false
+    private var keyboardGeneration: UInt64?
+    var onTextCommit: ((String) -> Void)?
     var onGeometryChanged: ((PresentationSurfaceGeometry) -> Void)?
     private var publishedGeometry: PresentationSurfaceGeometry?
 
@@ -169,6 +213,36 @@ public final class ConnectedPresentationContainer: UIView {
         super.init(frame: frame)
         isOpaque = true
         clipsToBounds = true
+        softwareTextView.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
+        addSubview(softwareTextView)
+        keyboardButton.setImage(UIImage(systemName: "keyboard"), for: .normal)
+        keyboardButton.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+        keyboardButton.tintColor = .white
+        keyboardButton.layer.cornerRadius = 12
+        keyboardButton.accessibilityLabel = "Software keyboard"
+        keyboardButton.addTarget(self, action: #selector(toggleSoftwareKeyboard), for: .touchUpInside)
+        keyboardButton.isHidden = true
+        softwareTextView.onEmission = { [weak self] emission in
+            guard let self, self.keyboardMode == .softwareOpen, self.softwareTextView.deliveryEnabled else { return }
+            switch emission {
+            case .text(let text): self.onTextCommit?(text)
+            case .key(let vk):
+                self.touchView.onKeyboardInput?(KeyboardInputCommand(action: .keyDown, virtualKey: vk))
+                self.touchView.onKeyboardInput?(KeyboardInputCommand(action: .keyUp, virtualKey: vk))
+            }
+        }
+        softwareTextView.onDismiss = { [weak self] in
+            guard let self, self.keyboardMode == .softwareOpen else { return }
+            self.softwareRequested = false
+            self.applyRemoteKeyboardMode(.softwareAvailable)
+        }
+        hardwareMonitor.onChanged = { [weak self] present in self?.hardwarePresenceChanged(present) }
+        for name in [UIResponder.keyboardWillChangeFrameNotification, UIResponder.keyboardWillHideNotification,
+                     UIApplication.willResignActiveNotification, UIApplication.didBecomeActiveNotification] {
+            keyboardObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                MainActor.assumeIsolated { self?.handleKeyboardNotification(note) }
+            })
+        }
 
         // The container owns the one runtime rectangle used by both surfaces.
         // Explicit edge constraints prevent UIKit from retaining a provisional
@@ -177,6 +251,9 @@ public final class ConnectedPresentationContainer: UIView {
         touchView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(metalView)
         addSubview(touchView)
+        // UIButton owns only its 48pt target, above the unchanged remote touch surface.
+        bringSubviewToFront(softwareTextView)
+        addSubview(keyboardButton)
         NSLayoutConstraint.activate([
             metalView.leadingAnchor.constraint(equalTo: leadingAnchor),
             metalView.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -195,11 +272,14 @@ public final class ConnectedPresentationContainer: UIView {
 
     override public func didMoveToWindow() {
         super.didMoveToWindow()
+        if window == nil { applyRemoteKeyboardMode(.none) }
+        else { hardwareMonitor.refresh(); updateKeyboardAuthority() }
         setNeedsLayout()
     }
 
     override public func layoutSubviews() {
         super.layoutSubviews()
+        keyboardButton.frame = FloatingKeyboardPlacement.frame(bounds: bounds, safeArea: safeAreaInsets, keyboard: keyboardFrame)
 
         let scale = window?.screen.scale ?? traitCollection.displayScale
         guard scale > 0 else { return }
@@ -221,6 +301,85 @@ public final class ConnectedPresentationContainer: UIView {
         publishedGeometry = geometry
         onGeometryChanged?(geometry)
     }
+    func configureRemoteKeyboard(active: Bool, generation: UInt64) {
+        if keyboardGeneration != generation {
+            softwareRequested = false
+            applyRemoteKeyboardMode(.none)
+            keyboardGeneration = generation
+        }
+        keyboardActive = active
+        if !active { softwareRequested = false }
+        hardwareMonitor.refresh()
+        updateKeyboardAuthority()
+    }
+    func hardwarePresenceChanged(_ present: Bool) {
+        // Never carry an old software-open intent across attach or detach.
+        softwareRequested = false
+        applyRemoteKeyboardMode(RemoteKeyboardMode.resolve(active: keyboardActive, hardware: present, requested: false))
+    }
+    private func updateKeyboardAuthority() {
+        let active = keyboardActive && UIApplication.shared.applicationState == .active
+        applyRemoteKeyboardMode(RemoteKeyboardMode.resolve(active: active, hardware: hardwareMonitor.isConnected, requested: softwareRequested))
+    }
+    func applyRemoteKeyboardMode(_ mode: RemoteKeyboardMode) {
+        let changed = mode != keyboardMode
+        // Update authority before callbacks caused by responder loss.
+        keyboardMode = mode
+        if mode != .softwareOpen {
+            softwareRequested = false
+            keyboardFrame = nil
+            softwareTextView.deactivateAndDiscardComposition()
+            setNeedsLayout()
+        }
+        keyboardButton.isHidden = mode == .none || mode == .hardware
+        touchView.keyboardCaptureEnabled = mode == .hardware
+        if mode == .softwareOpen {
+            softwareTextView.deliveryEnabled = true
+            if window != nil && !softwareTextView.isFirstResponder { softwareTextView.becomeFirstResponder() }
+        }
+        if changed {
+            if keyboardButton.isHidden { fadeTask?.cancel(); fadeTask = nil }
+            else { restartKeyboardFade() }
+        }
+    }
+    @objc private func toggleSoftwareKeyboard() {
+        guard keyboardMode == .softwareAvailable || keyboardMode == .softwareOpen else { return }
+        softwareRequested = !softwareRequested
+        updateKeyboardAuthority()
+        restartKeyboardFade()
+    }
+    private func restartKeyboardFade() {
+        fadeTask?.cancel()
+        keyboardButton.alpha = 1
+        fadeTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.keyboardButton.alpha = FloatingKeyboardPlacement.dimOpacity
+        }
+    }
+    private func handleKeyboardNotification(_ note: Notification) {
+        if note.name == UIApplication.willResignActiveNotification {
+            softwareRequested = false; applyRemoteKeyboardMode(.none); return
+        }
+        if note.name == UIApplication.didBecomeActiveNotification {
+            softwareRequested = false; hardwareMonitor.refresh(); updateKeyboardAuthority(); return
+        }
+        guard keyboardMode == .softwareOpen else { return }
+        if note.name == UIResponder.keyboardWillHideNotification {
+            keyboardFrame = nil; softwareRequested = false
+            applyRemoteKeyboardMode(.softwareAvailable)
+        } else if softwareTextView.isFirstResponder,
+                  let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect,
+                  let window {
+            keyboardFrame = convert(window.convert(frame, from: window.screen.coordinateSpace), from: window)
+        }
+        setNeedsLayout()
+    }
+    deinit {
+        fadeTask?.cancel()
+        keyboardObservers.forEach(NotificationCenter.default.removeObserver)
+    }
+
 }
 
 public struct ConnectedPresentationSurface: UIViewRepresentable {
@@ -266,6 +425,10 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         self.onKeyboardInput = onKeyboardInput
         self.onPointerInput = onPointerInput
         self.onOpenSettings = onOpenSettings
+    }
+
+    public static func dismantleUIView(_ uiView: ConnectedPresentationContainer, coordinator: Coordinator) {
+        uiView.applyRemoteKeyboardMode(.none)
     }
 
     public func makeCoordinator() -> Coordinator {
@@ -327,9 +490,14 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             sendTouchEvent?(type, x, y, pressure)
         }
         touchView.onKeyboardInput = onKeyboardInput
-        touchView.keyboardCaptureEnabled = keyboardCaptureEnabled
+        container.onTextCommit = { [weak networkManager] text in networkManager?.sendTextCommit(text) }
+        container.configureRemoteKeyboard(active: keyboardCaptureEnabled, generation: networkManager.decoder.currentSessionGeneration)
         touchView.onPointerInput = onPointerInput
-        touchView.onOpenSettings = onOpenSettings
+        let openSettings = onOpenSettings
+        touchView.onOpenSettings = { [weak container] in
+            container?.configureRemoteKeyboard(active: false, generation: networkManager.decoder.currentSessionGeneration)
+            openSettings?()
+        }
         touchView.inputGeometryContext = coordinator.inputGeometryContext
         touchView.diagnosticSink = { [weak networkManager] line in
             networkManager?.recordDiagnosticLine(line)

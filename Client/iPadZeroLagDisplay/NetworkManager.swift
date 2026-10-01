@@ -84,6 +84,50 @@ enum WireMessageType: UInt8 {
     case pointerInput = 37
     case keyboardInput = 38
     case clientPerformanceFeedback = 39
+    case textCommit = 40
+}
+
+public struct TextCommitCommand: Equatable {
+    static let version: UInt8 = 1
+    static let maxUTF8Bytes = 4096
+    public let text: String
+    func encode() -> Data? {
+        let body = Array(text.utf8)
+        guard !body.isEmpty, body.count <= Self.maxUTF8Bytes,
+              !text.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) else { return nil }
+        return Data([Self.version, UInt8(truncatingIfNeeded: body.count), UInt8(body.count >> 8)] + body)
+    }
+    static func decode(_ payload: Data) -> TextCommitCommand? {
+        guard payload.count >= 4, payload.count <= 4099 else { return nil }
+        let bytes = Array(payload)
+        let count = Int(bytes[1]) | Int(bytes[2]) << 8
+        guard bytes[0] == version, count > 0, count <= maxUTF8Bytes, bytes.count == count + 3,
+              let text = String(bytes: bytes.dropFirst(3), encoding: .utf8) else { return nil }
+        let command = TextCommitCommand(text: text)
+        return command.encode() == payload ? command : nil
+    }
+    static func chunks(_ text: String) -> [TextCommitCommand] {
+        guard !text.isEmpty,
+              !text.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) else { return [] }
+        var result: [TextCommitCommand] = []
+        var buffer = ""
+        var byteCount = 0
+        for character in text {
+            let part = String(character)
+            let count = part.utf8.count
+            guard count <= maxUTF8Bytes else { return [] }
+            if byteCount + count > maxUTF8Bytes {
+                result.append(TextCommitCommand(text: buffer)); buffer = ""; byteCount = 0
+            }
+            buffer += part; byteCount += count
+        }
+        if !buffer.isEmpty { result.append(TextCommitCommand(text: buffer)) }
+        return result
+    }
+}
+
+enum TextCommitDeliveryPolicy {
+    static func maySend(inputSuppressed: Bool) -> Bool { !inputSuppressed }
 }
 
 public enum KeyboardInputAction: UInt8, CaseIterable {
@@ -2479,6 +2523,20 @@ public class NetworkManager: ObservableObject {
         sendTouchEvent(type: type, x: x, y: y, pressure: pressure)
     }
 
+    public func sendTextCommit(_ text: String) {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            let generation = self.connectionGeneration
+            guard self.transportState == .streaming,
+                  self.committedTransportGeneration == generation,
+                  TextCommitDeliveryPolicy.maySend(inputSuppressed: self.displayRequestGate.isInputSuppressed) else { return }
+            for command in TextCommitCommand.chunks(text) {
+                guard let payload = command.encode() else { return }
+                self.sendWireMessage(type: .textCommit, payload: payload, sequence: 0, movement: false)
+            }
+        }
+    }
+
     public func sendKeyboardInput(_ command: KeyboardInputCommand) {
         networkQueue.async { [weak self] in
             guard let self else { return }
@@ -4077,7 +4135,7 @@ public class NetworkManager: ObservableObject {
         case .clientPerformanceFeedback:
             return
 
-        case .pointerInput, .keyboardInput:
+        case .pointerInput, .keyboardInput, .textCommit:
             return
 
         case .video:
