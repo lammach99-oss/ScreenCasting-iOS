@@ -5023,16 +5023,25 @@ public class NetworkManager: ObservableObject {
     ) -> Bool {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard generation == connectionGeneration,
+              wireAuthenticatedGeneration == generation,
               committedTransportGeneration == generation,
               committedRealtimeMode == RealtimeTransportMode.wifiRTP,
               wifiLegacyFallbackGeneration != generation,
-              connection != nil else {
+              let expectedConnection = connection else {
             return false
         }
         wifiLegacyFallbackGeneration = generation
         wifiLegacyFallbackRequestGeneration = nil
         committedRealtimeMode = RealtimeTransportMode.legacyTLS
         wifiMediaReceiver.clearOffer()
+        decoder.invalidate(waitForCompletion: true)
+        guard connection === expectedConnection,
+              generation == connectionGeneration,
+              wireAuthenticatedGeneration == generation,
+              committedTransportGeneration == generation,
+              committedRealtimeMode == RealtimeTransportMode.legacyTLS,
+              wifiLegacyFallbackGeneration == generation else { return false }
+        decoder.beginSession(generation: generation)
         videoPayloadCounter.begin(generation: generation)
         videoRxSampler.reset()
         lastHudSnapshotPublishedAt = 0

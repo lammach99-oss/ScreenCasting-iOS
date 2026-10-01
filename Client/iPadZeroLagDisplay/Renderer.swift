@@ -104,6 +104,13 @@ enum RenderCommitDecision: Equatable {
 struct RenderFrameIdentity: Equatable {
     let generation: UInt64
     let sequence: UInt32
+    let mediaResetIdentity: UInt64
+
+    init(generation: UInt64, sequence: UInt32, mediaResetIdentity: UInt64 = 0) {
+        self.generation = generation
+        self.sequence = sequence
+        self.mediaResetIdentity = mediaResetIdentity
+    }
 }
 
 enum RenderCadenceStage {
@@ -324,11 +331,14 @@ struct OfficePresentationHandoff {
 /// Persistent, wrap-safe sequence watermarks scoped to one wire session.
 struct RenderFreshnessTracker {
     private(set) var sessionGeneration: UInt64?
+    private var mediaResetIdentity: UInt64 = 0
     private(set) var acceptedSequence: UInt32?
     private(set) var presentedSequence: UInt32?
     private(set) var pendingIdentity: RenderFrameIdentity?
 
     mutating func beginSession(generation: UInt64) {
+        // A media re-anchor can retain the wire generation while retiring old draws.
+        if sessionGeneration != nil { mediaResetIdentity &+= 1 }
         sessionGeneration = generation
         acceptedSequence = nil
         presentedSequence = nil
@@ -348,7 +358,8 @@ struct RenderFreshnessTracker {
         acceptedSequence = sequence
         pendingIdentity = RenderFrameIdentity(
             generation: generation,
-            sequence: sequence)
+            sequence: sequence,
+            mediaResetIdentity: mediaResetIdentity)
         return .accepted(replaced: replaced)
     }
 
@@ -359,7 +370,7 @@ struct RenderFreshnessTracker {
     }
 
     func shouldCommit(_ identity: RenderFrameIdentity) -> Bool {
-        guard identity.generation == sessionGeneration else { return false }
+        guard isCurrent(identity) else { return false }
         let sequence = identity.sequence
         if let acceptedSequence,
            acceptedSequence != sequence,
@@ -378,7 +389,7 @@ struct RenderFreshnessTracker {
     }
 
     mutating func markPresented(_ identity: RenderFrameIdentity) -> Bool {
-        guard identity.generation == sessionGeneration else { return false }
+        guard isCurrent(identity) else { return false }
         let sequence = identity.sequence
         if let presentedSequence,
            !Self.isNewer(sequence, than: presentedSequence) {
@@ -389,7 +400,8 @@ struct RenderFreshnessTracker {
     }
 
     func isCurrent(_ identity: RenderFrameIdentity) -> Bool {
-        identity.generation == sessionGeneration
+        identity.generation == sessionGeneration &&
+            identity.mediaResetIdentity == mediaResetIdentity
     }
 
     static func isNewer(_ candidate: UInt32, than reference: UInt32) -> Bool {
@@ -1022,6 +1034,10 @@ public class Renderer: NSObject, MTKViewDelegate {
                     generation: identity.generation)
             }
             DispatchQueue.main.async {
+                self.lock.lock()
+                let stillCurrent = self.freshness.isCurrent(identity)
+                self.lock.unlock()
+                guard stillCurrent else { return }
                 if drawKind != .gameRepeated {
                     self.onFrameRendered?(
                         identity.sequence,
