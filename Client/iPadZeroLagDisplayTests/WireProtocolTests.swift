@@ -3,6 +3,36 @@ import Network
 import UIKit
 @testable import iPadCasting
 
+final class DrawableSizingDiagnosticTests: XCTestCase {
+    func testProductionUsesAutomaticDrawableSizingWithoutManualAssignment() throws {
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("iPadZeroLagDisplay/MetalView.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let containerStart = try XCTUnwrap(source.range(of: "public final class ConnectedPresentationContainer"))
+        let containerSource = String(source[containerStart.lowerBound...])
+        XCTAssertFalse(containerSource.contains("metalView.drawableSize ="))
+        XCTAssertFalse(containerSource.contains("metalView.autoResizeDrawable = false"))
+        XCTAssertTrue(containerSource.contains("metalView.autoResizeDrawable = true"))
+    }
+
+    @MainActor func testAutomaticDrawableDiagnosticPreservesSharedRotationGeometry() {
+        let container = ConnectedPresentationContainer(frame: CGRect(x: 0, y: 0, width: 1194, height: 834))
+        var snapshots: [PresentationSurfaceGeometry] = []
+        container.onGeometryChanged = { snapshots.append($0) }
+        for size in [CGSize(width: 1194, height: 834), CGSize(width: 834, height: 1194)] {
+            container.frame.size = size
+            container.setNeedsLayout()
+            container.layoutIfNeeded()
+            XCTAssertEqual(container.metalView.frame, container.bounds)
+            XCTAssertEqual(container.touchView.frame, container.bounds)
+            XCTAssertEqual(snapshots.last?.metalBounds, container.bounds)
+            XCTAssertEqual(snapshots.last?.touchBounds, container.bounds)
+        }
+        XCTAssertEqual(snapshots.count, 2)
+    }
+}
+
 final class UsbSplitCommitGateTests: XCTestCase {
     func testFeedbackWindowUnknownHistoryIsNotLoss() {
         var window = WifiFeedbackWindow()
