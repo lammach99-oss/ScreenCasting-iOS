@@ -2813,6 +2813,96 @@ final class KeyboardV2Tests: XCTestCase {
         view.deleteBackward()
         XCTAssertEqual(delivered.last, .key(0x08))
     }
+    @MainActor func testNativeVietnameseTailReplacementDoesNotAppendOldBase() {
+        let view = RemoteSoftwareKeyboardTextView()
+        var emitted: [SoftwareKeyboardEmission] = []
+        view.onEmission = { emitted.append($0) }
+        view.deliveryEnabled = true
+        view.text = "d"
+        view.consumeCommittedBuffer()
+        view.text = "đ"
+        view.consumeCommittedBuffer()
+        XCTAssertEqual(emitted, [.text("d"), .key(0x08), .text("đ")])
+        XCTAssertEqual(view.text, "đ")
+    }
+    @MainActor func testNativeCommittedEditTraceMatchesPhysicalVietnamesePhrase() {
+        let view = RemoteSoftwareKeyboardTextView()
+        var remote = ""
+        view.onEmission = {
+            switch $0 {
+            case .text(let text): remote.append(text)
+            case .key(0x08): if !remote.isEmpty { remote.removeLast() }
+            default: XCTFail("Unexpected control key in phrase")
+            }
+        }
+        view.deliveryEnabled = true
+        for text in ["d", "đ", "đe", "đep", "đẹp", "đẹp ", "đẹp v", "đẹp va",
+                     "đẹp vai", "đẹp vãi", "đẹp vãi ", "đẹp vãi c", "đẹp vãi ca",
+                     "đẹp vãi cả", "đẹp vãi cả ", "đẹp vãi cả n", "đẹp vãi cả nh",
+                     "đẹp vãi cả nho", "đẹp vãi cả nhô", "đẹp vãi cả nhôn", "đẹp vãi cả nhồn"] {
+            view.text = text
+            view.consumeCommittedBuffer()
+            view.consumeCommittedBuffer()
+            XCTAssertEqual(Array(remote.utf8), Array(text.utf8))
+        }
+        XCTAssertEqual(remote, "đẹp vãi cả nhồn")
+    }
+    @MainActor func testNativeCommittedShadowPreservesExactUnicodeAndGraphemes() {
+        let view = RemoteSoftwareKeyboardTextView()
+        var emitted: [SoftwareKeyboardEmission] = []
+        view.deliveryEnabled = true
+        view.onEmission = { emitted.append($0) }
+        for text in ["a", "ab", "abc"] { view.text = text; view.consumeCommittedBuffer() }
+        XCTAssertEqual(emitted, [.text("a"), .text("b"), .text("c")])
+        view.deactivateAndDiscardComposition()
+        view.deliveryEnabled = true
+        emitted.removeAll()
+        view.text = "é👨‍👩‍👧‍👦"
+        view.consumeCommittedBuffer()
+        view.text = "e\u{0301}👩🏽‍💻"
+        view.consumeCommittedBuffer()
+        XCTAssertEqual(emitted.count, 4)
+        XCTAssertEqual(emitted[1], .key(0x08))
+        XCTAssertEqual(emitted[2], .key(0x08))
+        if case .text(let replacement) = emitted[3] {
+            XCTAssertEqual(Array(replacement.utf8), Array("e\u{0301}👩🏽‍💻".utf8))
+        } else { XCTFail("Missing exact NFD replacement") }
+    }
+    @MainActor func testNativeShadowBackspaceAndControlKeysKeepOrdering() {
+        let view = RemoteSoftwareKeyboardTextView()
+        var emitted: [SoftwareKeyboardEmission] = []
+        view.deliveryEnabled = true
+        view.onEmission = { emitted.append($0) }
+        view.insertText("a")
+        view.deleteBackward()
+        view.consumeCommittedBuffer()
+        XCTAssertEqual(emitted, [.text("a"), .key(0x08)])
+        view.deleteBackward()
+        XCTAssertEqual(emitted, [.text("a"), .key(0x08), .key(0x08)])
+        emitted.removeAll()
+        view.insertText("abc\r\nđ\t")
+        view.consumeCommittedBuffer()
+        XCTAssertEqual(emitted, [.text("abc"), .key(0x0D), .text("đ"), .key(0x09)])
+    }
+    @MainActor func testNativeShadowIsBoundedAndDeactivationDoesNotDeleteRemoteText() {
+        let view = RemoteSoftwareKeyboardTextView()
+        var emitted: [SoftwareKeyboardEmission] = []
+        view.deliveryEnabled = true
+        view.onEmission = { emitted.append($0) }
+        let longText = String(repeating: "a", count: 1000)
+        view.text = longText
+        view.consumeCommittedBuffer()
+        XCTAssertEqual(emitted, [.text(longText)])
+        XCTAssertLessThanOrEqual(view.text.count, 128)
+        let tail = view.text ?? ""
+        view.text = tail + "b"
+        view.consumeCommittedBuffer()
+        XCTAssertEqual(emitted.last, .text("b"))
+        let before = emitted
+        view.deactivateAndDiscardComposition()
+        XCTAssertEqual(emitted, before)
+        XCTAssertEqual(view.text, "")
+    }
     @MainActor func testResponderHandoff() {
         let container = ConnectedPresentationContainer(frame:CGRect(x:0,y:0,width:500,height:500))
         var keys: [KeyboardInputCommand] = []
