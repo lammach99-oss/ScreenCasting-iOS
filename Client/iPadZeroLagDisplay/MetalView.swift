@@ -72,7 +72,7 @@ public struct MetalView: UIViewRepresentable {
                 networkManager?.recordDiagnosticLine(line)
             }
             renderer.beginSession(
-                generation: networkManager.remoteKeyboardGeneration)
+                generation: networkManager.decoder.currentSessionGeneration)
             renderer.onFrameRendered = { [weak coordinator = context.coordinator, weak networkManager] sequence, generation in
                 networkManager?.recordRenderCompletion(
                     sequence: sequence,
@@ -534,7 +534,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         renderer.diagnosticSink = { [weak networkManager] line in
             networkManager?.recordDiagnosticLine(line)
         }
-        renderer.beginSession(generation: networkManager.remoteKeyboardGeneration)
+        renderer.beginSession(generation: networkManager.decoder.currentSessionGeneration)
         renderer.onFrameRendered = { [weak coordinator, weak networkManager] sequence, generation in
             networkManager?.recordRenderCompletion(
                 sequence: sequence,
