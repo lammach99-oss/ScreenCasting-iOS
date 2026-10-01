@@ -950,6 +950,13 @@ final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate {
         super.init(frame: frame, textContainer: textContainer)
         delegate = self
         backgroundColor = .clear; textColor = .clear; tintColor = .clear
+        // Committed context is flushed; later replacement edits have no wire representation.
+        autocorrectionType = .no
+        spellCheckingType = .no
+        smartQuotesType = .no
+        smartDashesType = .no
+        smartInsertDeleteType = .no
+        inlinePredictionType = .no
         isScrollEnabled = false; isAccessibilityElement = false
         inputAssistantItem.leadingBarButtonGroups = []
         inputAssistantItem.trailingBarButtonGroups = []
