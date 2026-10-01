@@ -516,6 +516,30 @@ final class RenderFreshnessTrackerTests: XCTestCase {
         XCTAssertEqual(tracker.offer(2, generation: 20), .staleSession)
         XCTAssertEqual(tracker.acceptedSequence, 1)
     }
+
+    func testSameGenerationMediaResetRejectsOldDomainCompletion() {
+        var tracker = RenderFreshnessTracker()
+        tracker.beginSession(generation: 28)
+        _ = tracker.offer(60_841, generation: 28)
+        let oldCommand = tracker.takePending()!
+        _ = tracker.offer(60_842, generation: 28)
+
+        tracker.beginSession(generation: 28)
+        XCTAssertNil(tracker.pendingIdentity)
+        XCTAssertNil(tracker.acceptedSequence)
+        XCTAssertNil(tracker.presentedSequence)
+        XCTAssertFalse(tracker.isCurrent(oldCommand))
+        XCTAssertFalse(tracker.shouldCommit(oldCommand))
+        XCTAssertFalse(tracker.markPresented(oldCommand))
+        XCTAssertNil(tracker.presentedSequence)
+        XCTAssertEqual(tracker.offer(1, generation: 28), .accepted(replaced: nil))
+        let legacy = tracker.takePending()!
+        XCTAssertTrue(tracker.shouldCommit(legacy))
+        XCTAssertTrue(tracker.markPresented(legacy))
+        XCTAssertFalse(tracker.markPresented(oldCommand))
+        XCTAssertEqual(tracker.presentedSequence, 1)
+        XCTAssertEqual(tracker.offer(2, generation: 28), .accepted(replaced: nil))
+    }
 }
 
 final class GamePresentationHandoffTests: XCTestCase {

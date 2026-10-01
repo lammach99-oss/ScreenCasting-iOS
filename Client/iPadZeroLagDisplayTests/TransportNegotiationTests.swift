@@ -1607,6 +1607,53 @@ final class VideoThroughputV1Tests: XCTestCase {
         }
         wait(for: [sampled], timeout: 2)
     }
+
+    func testCommittedFallbackRearmsDecoderOnceWithoutReplacingSession() {
+        let manager = NetworkManager()
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        defer { manager.stopForTesting() }
+        let decoder = manager.decoderForTesting
+        let invalidates = decoder.invalidateCountForTesting
+        let begins = decoder.sessionBeganCountForTesting
+        XCTAssertTrue(manager.networkQueueForTesting.sync {
+            manager.fallbackCommittedWifiToLegacy(generation: session.generation)
+        })
+        let after = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(after.connection === session.connection)
+        XCTAssertEqual(after.generation, session.generation)
+        XCTAssertEqual(after.authenticatedGeneration, session.generation)
+        XCTAssertEqual(after.committedGeneration, session.generation)
+        XCTAssertEqual(after.realtimeMode, RealtimeTransportMode.legacyTLS)
+        XCTAssertEqual(decoder.invalidateCountForTesting, invalidates + 1)
+        XCTAssertEqual(decoder.sessionBeganCountForTesting, begins + 1)
+        XCTAssertEqual(Array(decoder.lifecycleEventsForTesting.suffix(3)), [
+            "invalidate-begin", "invalidate-end", "begin-\(session.generation)"])
+        XCTAssertFalse(manager.networkQueueForTesting.sync {
+            manager.fallbackCommittedWifiToLegacy(generation: session.generation)
+        })
+        XCTAssertEqual(decoder.invalidateCountForTesting, invalidates + 1)
+        XCTAssertEqual(decoder.sessionBeganCountForTesting, begins + 1)
+    }
+
+    func testStaleFallbackCannotRearmReplacementWifiDecoder() {
+        let manager = NetworkManager()
+        let old = manager.simulateCommittedWifiSessionForTesting()
+        let current = manager.simulateCommittedWifiSessionForTesting()
+        defer { manager.stopForTesting() }
+        let decoder = manager.decoderForTesting
+        let invalidates = decoder.invalidateCountForTesting
+        let begins = decoder.sessionBeganCountForTesting
+        XCTAssertFalse(manager.networkQueueForTesting.sync {
+            manager.fallbackCommittedWifiToLegacy(generation: old.generation)
+        })
+        let after = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(after.connection === current.connection)
+        XCTAssertEqual(after.authenticatedGeneration, current.generation)
+        XCTAssertEqual(after.committedGeneration, current.generation)
+        XCTAssertEqual(after.realtimeMode, RealtimeTransportMode.wifiRTP)
+        XCTAssertEqual(decoder.invalidateCountForTesting, invalidates)
+        XCTAssertEqual(decoder.sessionBeganCountForTesting, begins)
+    }
 }
 
 final class AutoBitrateWireV1Tests: XCTestCase {
