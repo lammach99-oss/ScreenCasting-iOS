@@ -2760,3 +2760,83 @@ final class RemoteKeyboardV1Tests: XCTestCase {
         return super.resignFirstResponder()
     }
 }
+
+final class KeyboardV2Tests: XCTestCase {
+    func testTextCommitWireAndStrictUnicode() {
+        XCTAssertEqual(WireMessageType.textCommit.rawValue, 40)
+        for text in ["hello", "Tiếng Việt", "a\u{0301}", "😀", "👨‍👩‍👧‍👦", " "] {
+            let command = TextCommitCommand(text: text)
+            XCTAssertEqual(TextCommitCommand.decode(command.encode()!)?.text.utf8.map { $0 }, Array(text.utf8))
+        }
+        for bytes in [[UInt8](), [1,0,0], [2,1,0,65], [1,2,0,65], [1,1,0,65,66], [1,2,0,0xC0,0xAF], [1,3,0,0xED,0xA0,0x80]] {
+            XCTAssertNil(TextCommitCommand.decode(Data(bytes)))
+        }
+        for text in ["", "\0", "\t", "\n", "\r", "\u{85}", String(repeating: "a", count: 4097)] {
+            XCTAssertNil(TextCommitCommand(text: text).encode())
+        }
+    }
+    func testChunkingPreservesGraphemes() {
+        let original = String(repeating: "a\u{0301}👨‍👩‍👧‍👦", count: 1000)
+        let chunks = TextCommitCommand.chunks(original)
+        XCTAssertEqual(Array(chunks.map(\.text).joined().utf8), Array(original.utf8))
+        XCTAssertTrue(chunks.allSatisfy { !$0.text.isEmpty && $0.text.utf8.count <= 4096 })
+        XCTAssertFalse(TextCommitDeliveryPolicy.maySend(inputSuppressed: true))
+    }
+    func testAuthorityPriority() {
+        for active in [false,true] { for hardware in [false,true] { for requested in [false,true] {
+            XCTAssertEqual(RemoteKeyboardMode.resolve(active:active,hardware:hardware,requested:requested), !active ? .none : hardware ? .hardware : requested ? .softwareOpen : .softwareAvailable)
+        } } }
+    }
+    func testSpecialKeyOrdering() {
+        XCTAssertEqual(SoftwareKeyboardRouter.route("abc\r\nđ\t"), [.text("abc"), .key(0x0D), .text("đ"), .key(0x09)])
+    }
+    @MainActor func testMarkedDiscardAndCommittedExactlyOnce() {
+        let view = RemoteSoftwareKeyboardTextView()
+        var delivered: [SoftwareKeyboardEmission] = []
+        view.onEmission = { delivered.append($0) }
+        view.deliveryEnabled = true
+        view.setMarkedText("Tiếng", selectedRange:NSRange(location:5,length:0))
+        view.consumeCommittedBuffer()
+        XCTAssertTrue(delivered.isEmpty)
+        view.deactivateAndDiscardComposition()
+        view.consumeCommittedBuffer()
+        XCTAssertTrue(delivered.isEmpty)
+        XCTAssertEqual(view.text, "")
+        XCTAssertFalse(view.deliveryEnabled)
+        view.deliveryEnabled = true
+        view.text = "đ😀"
+        view.consumeCommittedBuffer()
+        view.consumeCommittedBuffer()
+        XCTAssertEqual(delivered, [.text("đ😀")])
+        view.deleteBackward()
+        XCTAssertEqual(delivered.last, .key(0x08))
+    }
+    @MainActor func testResponderHandoff() {
+        let container = ConnectedPresentationContainer(frame:CGRect(x:0,y:0,width:500,height:500))
+        var keys: [KeyboardInputCommand] = []
+        container.touchView.onKeyboardInput = { keys.append($0) }
+        container.applyRemoteKeyboardMode(.hardware)
+        _ = container.touchView.handleHardwareKey(.keyboardLeftGUI, action:.keyDown)
+        container.applyRemoteKeyboardMode(.softwareOpen)
+        XCTAssertFalse(container.touchView.keyboardCaptureEnabled)
+        XCTAssertEqual(keys.last?.action, .keyUp)
+        XCTAssertTrue(container.softwareTextView.deliveryEnabled)
+        container.applyRemoteKeyboardMode(.hardware)
+        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+        XCTAssertEqual(container.softwareTextView.text, "")
+        container.applyRemoteKeyboardMode(.softwareAvailable)
+        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+        XCTAssertFalse(container.touchView.keyboardCaptureEnabled)
+    }
+    func testFloatingPlacementAndFade() {
+        let bounds = CGRect(x:0,y:0,width:1000,height:800)
+        let insets = UIEdgeInsets(top:20,left:0,bottom:20,right:20)
+        let normal = FloatingKeyboardPlacement.frame(bounds:bounds,safeArea:insets,keyboard:nil)
+        XCTAssertEqual(normal.size, CGSize(width:48,height:48))
+        let raised = FloatingKeyboardPlacement.frame(bounds:bounds,safeArea:insets,keyboard:CGRect(x:500,y:500,width:500,height:300))
+        XCTAssertLessThanOrEqual(raised.maxY, 500)
+        XCTAssertEqual(normal.minX, raised.minX)
+        XCTAssertEqual(FloatingKeyboardPlacement.dimOpacity, 0.30)
+        XCTAssertEqual(FloatingKeyboardPlacement.fadeSeconds, 3)
+    }
+}
