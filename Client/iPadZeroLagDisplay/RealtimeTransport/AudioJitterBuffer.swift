@@ -33,6 +33,14 @@ struct AudioJitterDiagnostics {
     var nilPlayoutActions = 0
     var targetPolicyDrops = 0
     var overflowDrops = 0
+    var startupWaitTicks = 0
+    private var depthSamples = [Double]()
+    private var depthIndex = 0
+    var depthPercentiles: LatencyPercentiles { LatencyPercentiles.calculate(depthSamples) }
+    mutating func observeDepth(_ depth: Int) {
+        if depthSamples.count < 256 { depthSamples.append(Double(depth)) }
+        else { depthSamples[depthIndex] = Double(depth); depthIndex = (depthIndex + 1) % 256 }
+    }
 }
 
 /// Observation only: never participates in packet admission or playout.
@@ -50,11 +58,8 @@ struct AudioReceiveDiagnostics {
     private(set) var repairedPacketUnits = 0
     private(set) var duplicateOrStalePackets = 0
     private(set) var jitterMs = 0.0
-    var interarrivalP95Ms: Double {
-        let ordered = intervals.sorted()
-        guard !ordered.isEmpty else { return 0 }
-        return ordered[min(ordered.count - 1, Int(Double(ordered.count - 1) * 0.95))]
-    }
+    var interarrivalP95Ms: Double { LatencyPercentiles.calculate(intervals).p95 }
+    var interarrivalMaxMs: Double { intervals.max() ?? 0 }
 
     mutating func record(sequence: UInt16, timestamp: UInt32, arrivedAt: TimeInterval) {
         packets += 1
@@ -149,9 +154,13 @@ final class AudioJitterBuffer {
     }
 
     func dequeue() -> AudioJitterAction? {
+        diagnostics.observeDepth(packets.count)
         guard let expectedSequence else { return noPlayout() }
         if !started {
-            guard packets.count >= profile.targetPacketCount else { return noPlayout() }
+            guard packets.count >= profile.targetPacketCount else {
+                diagnostics.startupWaitTicks += 1
+                return noPlayout()
+            }
             started = true
             startupAnchorSequence = nil
         }

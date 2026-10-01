@@ -12,6 +12,7 @@ final class AudioJitterBufferTests: XCTestCase {
         XCTAssertEqual(buffer.diagnostics.overflowDrops, 0)
         XCTAssertEqual(buffer.diagnostics.decodeActions, 1)
         XCTAssertEqual(buffer.diagnostics.insertedPackets, 4)
+        XCTAssertEqual(buffer.diagnostics.depthPercentiles.p95, 4)
         buffer.reset(profile: .usb)
         for sequence in UInt16(1)...7 { buffer.insert(packet(sequence)) }
         XCTAssertEqual(buffer.diagnostics.overflowDrops, 1)
@@ -48,6 +49,7 @@ final class AudioJitterBufferTests: XCTestCase {
         XCTAssertEqual(rx.reorderedPackets, 0)
         XCTAssertEqual(rx.jitterMs, 0, accuracy: 0.00001)
         XCTAssertEqual(rx.interarrivalP95Ms, 10, accuracy: 0.00001)
+        XCTAssertEqual(rx.interarrivalMaxMs, 10, accuracy: 0.00001)
     }
 
     func testAudioPlayoutDiagnosticEventsAreIndependentAndMonotonic() {
