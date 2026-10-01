@@ -919,6 +919,9 @@ public enum RemoteKeyboardMode: Equatable {
 enum SoftwareKeyboardEmission: Equatable { case text(String), key(UInt16) }
 enum SoftwareKeyboardRouter {
     static func route(_ text: String) -> [SoftwareKeyboardEmission] {
+        guard !text.unicodeScalars.contains(where: {
+            $0.properties.generalCategory == .control && ![8, 9, 10, 13].contains($0.value)
+        }) else { return [] }
         var result: [SoftwareKeyboardEmission] = []
         var buffer = ""
         var previousCR = false
@@ -931,7 +934,7 @@ enum SoftwareKeyboardRouter {
             case 8: flush(); result.append(.key(0x08)); previousCR = false
             default:
                 previousCR = false
-                if scalar.properties.generalCategory != .control { buffer.unicodeScalars.append(scalar) }
+                buffer.unicodeScalars.append(scalar)
             }
         }
         flush()

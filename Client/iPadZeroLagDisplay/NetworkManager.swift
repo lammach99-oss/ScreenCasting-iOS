@@ -1820,6 +1820,7 @@ public class NetworkManager: ObservableObject {
     private var connectionGeneration: UInt64 {
         connectionGenerationClock.current
     }
+    var remoteKeyboardGeneration: UInt64 { connectionGenerationClock.current }
     private var listenerGeneration: UInt64 = 0
     private let networkQueueKey = DispatchSpecificKey<Bool>()
     private let networkQueue = DispatchQueue(label: "com.iPadCasting.network", qos: .userInteractive)

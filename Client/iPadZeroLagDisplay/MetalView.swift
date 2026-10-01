@@ -72,7 +72,7 @@ public struct MetalView: UIViewRepresentable {
                 networkManager?.recordDiagnosticLine(line)
             }
             renderer.beginSession(
-                generation: networkManager.decoder.currentSessionGeneration)
+                generation: networkManager.remoteKeyboardGeneration)
             renderer.onFrameRendered = { [weak coordinator = context.coordinator, weak networkManager] sequence, generation in
                 networkManager?.recordRenderCompletion(
                     sequence: sequence,
@@ -196,12 +196,12 @@ public final class ConnectedPresentationContainer: UIView {
     let metalView = MTKView()
     let touchView = PencilUIKitView()
     let softwareTextView = RemoteSoftwareKeyboardTextView(frame: .zero, textContainer: nil)
-    private let keyboardButton = UIButton(type: .system)
+    let keyboardButton = UIButton(type: .system)
     private let hardwareMonitor = HardwareKeyboardMonitor()
     private var keyboardObservers: [NSObjectProtocol] = []
     private var fadeTask: Task<Void, Never>?
     private var keyboardFrame: CGRect?
-    private var keyboardMode: RemoteKeyboardMode = .none
+    private(set) var keyboardMode: RemoteKeyboardMode = .none
     private var keyboardActive = false
     private var softwareRequested = false
     private var keyboardGeneration: UInt64?
@@ -272,7 +272,7 @@ public final class ConnectedPresentationContainer: UIView {
 
     override public func didMoveToWindow() {
         super.didMoveToWindow()
-        if window == nil { applyRemoteKeyboardMode(.none) }
+        if window == nil { retireRemoteKeyboard() }
         else { hardwareMonitor.refresh(); updateKeyboardAuthority() }
         setNeedsLayout()
     }
@@ -301,6 +301,11 @@ public final class ConnectedPresentationContainer: UIView {
         publishedGeometry = geometry
         onGeometryChanged?(geometry)
     }
+    func retireRemoteKeyboard() {
+        keyboardActive = false
+        softwareRequested = false
+        applyRemoteKeyboardMode(.none)
+    }
     func configureRemoteKeyboard(active: Bool, generation: UInt64) {
         if keyboardGeneration != generation {
             softwareRequested = false
@@ -315,7 +320,7 @@ public final class ConnectedPresentationContainer: UIView {
     func hardwarePresenceChanged(_ present: Bool) {
         // Never carry an old software-open intent across attach or detach.
         softwareRequested = false
-        applyRemoteKeyboardMode(RemoteKeyboardMode.resolve(active: keyboardActive, hardware: present, requested: false))
+        applyRemoteKeyboardMode(RemoteKeyboardMode.resolve(active: keyboardActive && UIApplication.shared.applicationState == .active, hardware: present, requested: false))
     }
     private func updateKeyboardAuthority() {
         let active = keyboardActive && UIApplication.shared.applicationState == .active
@@ -428,7 +433,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     }
 
     public static func dismantleUIView(_ uiView: ConnectedPresentationContainer, coordinator: Coordinator) {
-        uiView.applyRemoteKeyboardMode(.none)
+        uiView.retireRemoteKeyboard()
     }
 
     public func makeCoordinator() -> Coordinator {
@@ -491,11 +496,11 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         }
         touchView.onKeyboardInput = onKeyboardInput
         container.onTextCommit = { [weak networkManager] text in networkManager?.sendTextCommit(text) }
-        container.configureRemoteKeyboard(active: keyboardCaptureEnabled, generation: networkManager.decoder.currentSessionGeneration)
+        container.configureRemoteKeyboard(active: keyboardCaptureEnabled, generation: networkManager.remoteKeyboardGeneration)
         touchView.onPointerInput = onPointerInput
         let openSettings = onOpenSettings
         touchView.onOpenSettings = { [weak container] in
-            container?.configureRemoteKeyboard(active: false, generation: networkManager.decoder.currentSessionGeneration)
+            container?.configureRemoteKeyboard(active: false, generation: networkManager.remoteKeyboardGeneration)
             openSettings?()
         }
         touchView.inputGeometryContext = coordinator.inputGeometryContext
@@ -526,7 +531,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         renderer.diagnosticSink = { [weak networkManager] line in
             networkManager?.recordDiagnosticLine(line)
         }
-        renderer.beginSession(generation: networkManager.decoder.currentSessionGeneration)
+        renderer.beginSession(generation: networkManager.remoteKeyboardGeneration)
         renderer.onFrameRendered = { [weak coordinator, weak networkManager] sequence, generation in
             networkManager?.recordRenderCompletion(
                 sequence: sequence,

@@ -2781,6 +2781,7 @@ final class KeyboardV2Tests: XCTestCase {
         XCTAssertEqual(Array(chunks.map(\.text).joined().utf8), Array(original.utf8))
         XCTAssertTrue(chunks.allSatisfy { !$0.text.isEmpty && $0.text.utf8.count <= 4096 })
         XCTAssertFalse(TextCommitDeliveryPolicy.maySend(inputSuppressed: true))
+        XCTAssertTrue(TextCommitCommand.chunks("a" + String(repeating:"\u{0301}",count:4096)).isEmpty)
     }
     func testAuthorityPriority() {
         for active in [false,true] { for hardware in [false,true] { for requested in [false,true] {
@@ -2789,6 +2790,7 @@ final class KeyboardV2Tests: XCTestCase {
     }
     func testSpecialKeyOrdering() {
         XCTAssertEqual(SoftwareKeyboardRouter.route("abc\r\nđ\t"), [.text("abc"), .key(0x0D), .text("đ"), .key(0x09)])
+        XCTAssertTrue(SoftwareKeyboardRouter.route("a\0b").isEmpty)
     }
     @MainActor func testMarkedDiscardAndCommittedExactlyOnce() {
         let view = RemoteSoftwareKeyboardTextView()
@@ -2821,12 +2823,60 @@ final class KeyboardV2Tests: XCTestCase {
         XCTAssertFalse(container.touchView.keyboardCaptureEnabled)
         XCTAssertEqual(keys.last?.action, .keyUp)
         XCTAssertTrue(container.softwareTextView.deliveryEnabled)
+        container.softwareTextView.setMarkedText("pending", selectedRange: NSRange(location:7,length:0))
         container.applyRemoteKeyboardMode(.hardware)
         XCTAssertFalse(container.softwareTextView.deliveryEnabled)
         XCTAssertEqual(container.softwareTextView.text, "")
         container.applyRemoteKeyboardMode(.softwareAvailable)
         XCTAssertFalse(container.softwareTextView.deliveryEnabled)
         XCTAssertFalse(container.touchView.keyboardCaptureEnabled)
+        for mode in [RemoteKeyboardMode.none, .hardware, .softwareAvailable, .softwareOpen] {
+            container.applyRemoteKeyboardMode(mode)
+            XCTAssertEqual(container.keyboardButton.isHidden, mode == .none || mode == .hardware)
+            XCTAssertFalse(container.touchView.keyboardCaptureEnabled && container.softwareTextView.deliveryEnabled)
+        }
+        container.retireRemoteKeyboard()
+        XCTAssertEqual(container.keyboardMode, .none)
+        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+    }
+    @MainActor func testFloatingControlOwnsOnlyItsLocalHitTarget() {
+        let container = ConnectedPresentationContainer(frame:CGRect(x:0,y:0,width:1000,height:800))
+        container.applyRemoteKeyboardMode(.softwareAvailable)
+        container.layoutIfNeeded()
+        let button = container.keyboardButton
+        let point = CGPoint(x:button.frame.midX,y:button.frame.midY)
+        XCTAssertTrue(container.hitTest(point,with:nil) === button)
+        XCTAssertTrue(container.hitTest(CGPoint(x:300,y:300),with:nil) === container.touchView)
+    }
+    @MainActor func testKeyboardFadeRemainsOneTapAndCancellationRestoresOpacity() async throws {
+        let container = ConnectedPresentationContainer(frame:CGRect(x:0,y:0,width:1000,height:800))
+        container.applyRemoteKeyboardMode(.softwareAvailable)
+        XCTAssertEqual(container.keyboardButton.alpha, 1)
+        try await Task.sleep(nanoseconds: 3_100_000_000)
+        XCTAssertEqual(container.keyboardButton.alpha, 0.30, accuracy:0.001)
+        container.applyRemoteKeyboardMode(.none)
+        container.applyRemoteKeyboardMode(.softwareAvailable)
+        XCTAssertEqual(container.keyboardButton.alpha, 1)
+        XCTAssertTrue(container.keyboardButton.isUserInteractionEnabled)
+        container.retireRemoteKeyboard()
+    }
+    @MainActor func testGenerationAndLifecycleDoNotReplaySoftwareIntent() {
+        let container = ConnectedPresentationContainer(frame:CGRect(x:0,y:0,width:1000,height:800))
+        container.configureRemoteKeyboard(active:true,generation:1)
+        container.applyRemoteKeyboardMode(.softwareOpen)
+        container.softwareTextView.setMarkedText("pending",selectedRange:NSRange(location:7,length:0))
+        container.hardwarePresenceChanged(true)
+        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+        XCTAssertEqual(container.softwareTextView.text, "")
+        container.hardwarePresenceChanged(false)
+        XCTAssertNotEqual(container.keyboardMode, .softwareOpen)
+        container.applyRemoteKeyboardMode(.softwareOpen)
+        container.configureRemoteKeyboard(active:true,generation:2)
+        XCTAssertNotEqual(container.keyboardMode, .softwareOpen)
+        container.configureRemoteKeyboard(active:false,generation:2)
+        XCTAssertEqual(container.keyboardMode, .none)
+        container.configureRemoteKeyboard(active:true,generation:2)
+        XCTAssertNotEqual(container.keyboardMode, .softwareOpen)
     }
     func testFloatingPlacementAndFade() {
         let bounds = CGRect(x:0,y:0,width:1000,height:800)
