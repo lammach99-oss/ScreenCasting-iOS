@@ -1008,6 +1008,8 @@ final class WifiMediaReceiver {
     private var rttSamplesMs: [UInt16] = []
     private var smoothedRttMs: Double?
     private(set) var securityDropCounters = WifiSecurityDropCounters()
+    private(set) var audioParseRejects = 0
+    private(set) var audioCryptoRejects = 0
     private lazy var inputWriter = WifiLatestInputWriter(
         queue: networkQueue,
         packetBuilder: { [weak self] touch, sequence in
@@ -1397,6 +1399,8 @@ final class WifiMediaReceiver {
         rttSamplesMs.removeAll(keepingCapacity: false)
         smoothedRttMs = nil
         securityDropCounters = WifiSecurityDropCounters()
+        audioParseRejects = 0
+        audioCryptoRejects = 0
         endpointCommitted = false
         committedFailureSource = nil
         transientMediaErrorCount = 0
@@ -1629,13 +1633,14 @@ final class WifiMediaReceiver {
             guard let opus = WifiOpusRtpCodec.parse(
                 packet,
                 expectedSsrc: WifiMediaContract.audioSsrc(sessionID))
-            else { return }
+            else { audioParseRejects += 1; return }
             audioConsumer(
                 opus.payload,
                 opus.sequence,
                 opus.timestamp,
                 generation)
         } catch {
+            audioCryptoRejects += 1
             securityDropCounters.recordCryptoFailure(error)
             return
         }

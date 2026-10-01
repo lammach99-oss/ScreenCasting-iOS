@@ -11,6 +11,35 @@ enum RealtimeAudioTimerPolicy {
 
 // MARK: - AudioManager
 
+enum AudioPlayoutDiagnosticEvent {
+    case tick, nilTick, decode, plc, decodeFailure, pcmRejected, pcmScheduled, playerStart
+}
+
+struct AudioPlayoutDiagnostics {
+    var ticks = 0
+    var nilTicks = 0
+    var decodeActions = 0
+    var plcActions = 0
+    var decodeFailures = 0
+    var pcmQueueRejects = 0
+    var pcmBuffersScheduled = 0
+    var pcmFramesScheduled = 0
+    var playerStarts = 0
+    var playerRestarts: Int { max(0, playerStarts - 1) }
+    mutating func record(_ event: AudioPlayoutDiagnosticEvent, frames: Int = 0) {
+        switch event {
+        case .tick: ticks += 1
+        case .nilTick: nilTicks += 1
+        case .decode: decodeActions += 1
+        case .plc: plcActions += 1
+        case .decodeFailure: decodeFailures += 1
+        case .pcmRejected: pcmQueueRejects += 1
+        case .pcmScheduled: pcmBuffersScheduled += 1; pcmFramesScheduled += frames
+        case .playerStart: playerStarts += 1
+        }
+    }
+}
+
 /// Singleton that receives raw 16-bit / 48 kHz / Stereo PCM from the
 /// ScreenCasting Windows host and plays it through the device's speaker
 /// using AVAudioEngine + AVAudioPlayerNode.
@@ -56,6 +85,8 @@ public final class AudioManager {
     private var realtimeGeneration: UInt64?
     private var playoutTimer: DispatchSourceTimer?
     private var playbackEpoch: UInt64 = 0
+    private var receiveDiagnostics = AudioReceiveDiagnostics()
+    private var playoutDiagnostics = AudioPlayoutDiagnostics()
 
     // MARK: Init
     private init() {
@@ -137,6 +168,8 @@ public final class AudioManager {
             self.playoutTimer?.cancel()
             self.playoutTimer = nil
             self.jitterBuffer.reset(profile: profile)
+            self.receiveDiagnostics = AudioReceiveDiagnostics()
+            self.playoutDiagnostics = AudioPlayoutDiagnostics()
             self.opusDecoder = nil
             do {
                 self.opusDecoder = try RealtimeOpusDecoder()
@@ -156,9 +189,11 @@ public final class AudioManager {
         generation: UInt64
     ) {
         guard !data.isEmpty else { return }
+        let arrivedAt = ProcessInfo.processInfo.systemUptime
         audioQueue.async { [weak self] in
             guard let self,
                   self.realtimeGeneration == generation else { return }
+            self.receiveDiagnostics.record(sequence: sequence, timestamp: timestamp, arrivedAt: arrivedAt)
             self.jitterBuffer.insert(AudioJitterPacket(
                 sequence: sequence,
                 timestamp: timestamp,
@@ -193,6 +228,7 @@ public final class AudioManager {
             }
 
             guard self.queuedFrames + frameCount <= self.maxQueuedFrames else {
+                self.playoutDiagnostics.record(.pcmRejected)
                 return
             }
 
@@ -231,10 +267,12 @@ public final class AudioManager {
                     self.queuedFrames = max(0, self.queuedFrames - frameCount)
                 }
             }
+            self.playoutDiagnostics.record(.pcmScheduled, frames: frameCount)
 
             // Start playing if not already doing so.
             if !self.playerNode.isPlaying {
                 self.playerNode.play()
+                self.playoutDiagnostics.record(.playerStart)
             }
         }
     }
@@ -253,6 +291,8 @@ public final class AudioManager {
             self.jitterBuffer.reset()
             self.opusDecoder = nil
             self.realtimeGeneration = nil
+            self.receiveDiagnostics = AudioReceiveDiagnostics()
+            self.playoutDiagnostics = AudioPlayoutDiagnostics()
         }
     }
 
@@ -270,24 +310,45 @@ public final class AudioManager {
     }
 
     private func playoutTick() {
+        playoutDiagnostics.record(.tick)
         guard let opusDecoder,
-              let action = jitterBuffer.dequeue() else { return }
+              let action = jitterBuffer.dequeue() else {
+            playoutDiagnostics.record(.nilTick)
+            return
+        }
         do {
             let samples: [Int16]
             switch action {
             case .decode(let packet):
+                playoutDiagnostics.record(.decode)
                 samples = try opusDecoder.decode(packet.payload)
             case .plc:
+                playoutDiagnostics.record(.plc)
                 samples = try opusDecoder.decode(nil)
             }
             let data = samples.withUnsafeBytes { Data($0) }
             playPCMData(data)
         } catch {
+            playoutDiagnostics.record(.decodeFailure)
             print("[AudioManager] Opus decode failed: \(error)")
         }
     }
 
     // MARK: - Audio Session Interruption Handling
+
+    func publishDiagnostics(generation: UInt64, profile: String, opus: Bool,
+                            receiveRejects: String, sink: @escaping (String) -> Void) {
+        audioQueue.async { [weak self] in
+            guard let self, !opus || self.realtimeGeneration == generation else { return }
+            let rx = self.receiveDiagnostics
+            let jitter = self.jitterBuffer.diagnostics
+            let play = self.playoutDiagnostics
+            let packetMetrics = opus
+                ? "packets=\(rx.packets) gaps=\(rx.forwardGaps) missing=\(rx.missingPacketUnits) repaired=\(rx.repairedPacketUnits) reorder=\(rx.reorderedPackets) duplicate_stale=\(rx.duplicateOrStalePackets) jitter_ms=\(rx.jitterMs) interarrival_p95_ms=\(rx.interarrivalP95Ms) depth=\(self.jitterBuffer.bufferedPacketCount) depth_max=\(jitter.maximumDepth) target_ms=\(self.jitterBuffer.targetDurationMs) target_drop=\(jitter.targetPolicyDrops) overflow_drop=\(jitter.overflowDrops) plc=\(play.plcActions)"
+                : "rtp_jitter_plc=not_applicable"
+            sink("[AUDIO_PLAYOUT] generation=\(generation) epoch=\(self.playbackEpoch) profile=\(profile) codec=\(opus ? "opus" : "pcm") \(packetMetrics) \(receiveRejects) ticks=\(play.ticks) nil=\(play.nilTicks) decode=\(play.decodeActions) decode_fail=\(play.decodeFailures) pcm_reject=\(play.pcmQueueRejects) pcm_scheduled=\(play.pcmBuffersScheduled) pcm_frames=\(play.pcmFramesScheduled) queued_frames=\(self.queuedFrames) player_start=\(play.playerStarts) player_restart=\(play.playerRestarts)")
+        }
+    }
 
     @objc private func handleInterruption(_ notification: Notification) {
         guard let info = notification.userInfo,
@@ -313,6 +374,7 @@ public final class AudioManager {
                 audioQueue.async { [weak self] in
                     self?.startEngineIfNeeded()
                     self?.playerNode.play()
+                    self?.playoutDiagnostics.record(.playerStart)
                 }
             }
 

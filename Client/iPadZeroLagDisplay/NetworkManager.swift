@@ -1878,6 +1878,8 @@ public class NetworkManager: ObservableObject {
     #endif
     private var wireAuthenticatedGeneration: UInt64?
     private var committedTransportGeneration: UInt64?
+    private var audioDiagnosticGeneration: UInt64?
+    private var audioDiagnosticPublishedAt: TimeInterval = 0
     private var pendingTransportOffer: TransportOffer?
     private var activeVideoCodec: VideoDecoderCodec = .hevc
     private var wifiCommitGate = WifiCommitGate()
@@ -1943,6 +1945,7 @@ public class NetworkManager: ObservableObject {
         telemetryProvider: { [weak self] in
             guard let self else { return .zero }
             self.publishHudSnapshotIfDue()
+            self.publishAudioDiagnosticsIfDue()
             let feedback = self.transportTelemetry.makeFeedback()
             return WifiFeedbackTelemetry(
                 lastDecoded: feedback.1,
@@ -3695,8 +3698,31 @@ public class NetworkManager: ObservableObject {
         transportTelemetry.stopLogging()
     }
 
+    private func publishAudioDiagnosticsIfDue() {
+        let generation = connectionGeneration
+        guard wireAuthenticatedGeneration == generation,
+              committedTransportGeneration == generation else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard audioDiagnosticGeneration != generation || now - audioDiagnosticPublishedAt >= 1 else { return }
+        audioDiagnosticGeneration = generation
+        audioDiagnosticPublishedAt = now
+        let opus = committedRealtimeMode == RealtimeTransportMode.wifiRTP ||
+            committedRealtimeMode == RealtimeTransportMode.usbSplitTLS
+        let profile = usbListenerExplicitlyStarted ? "usb" : "wifi"
+        let rejects = "parse_reject=\(wifiMediaReceiver.audioParseRejects) crypto_reject=\(wifiMediaReceiver.audioCryptoRejects)"
+        AudioManager.shared.publishDiagnostics(generation: generation, profile: profile,
+            opus: opus, receiveRejects: rejects) { [weak self] line in
+                self?.networkQueue.async { [weak self] in
+                    guard let self, self.connectionGeneration == generation,
+                          self.committedTransportGeneration == generation else { return }
+                    self.recordDiagnosticLine(line)
+                }
+            }
+    }
+
     private func sendVideoFeedback() {
         guard wireAuthenticatedGeneration == connectionGeneration else { return }
+        publishAudioDiagnosticsIfDue()
         #if targetEnvironment(simulator)
         testingVideoFeedbackCount += 1
         #endif
