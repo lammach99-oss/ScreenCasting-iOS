@@ -2890,3 +2890,33 @@ final class KeyboardV2Tests: XCTestCase {
         XCTAssertEqual(FloatingKeyboardPlacement.fadeSeconds, 3)
     }
 }
+
+final class PostKeyboardV2CorrectiveTests: XCTestCase {
+    @MainActor func testAppendOnlyKeyboardDisablesReplacementTraits() {
+        let view = RemoteSoftwareKeyboardTextView()
+        XCTAssertEqual(view.autocorrectionType, .no)
+        XCTAssertEqual(view.spellCheckingType, .no)
+        XCTAssertEqual(view.smartQuotesType, .no)
+        XCTAssertEqual(view.smartDashesType, .no)
+        XCTAssertEqual(view.smartInsertDeleteType, .no)
+        XCTAssertEqual(view.inlinePredictionType, .no)
+    }
+
+    @MainActor func testAppendOnlyMarkedUnicodeStillCommitsExactlyOnce() {
+        let view = RemoteSoftwareKeyboardTextView()
+        let original = "Tiếng Việt a\u{0301}😀👨‍👩‍👧‍👦"
+        var emissions: [SoftwareKeyboardEmission] = []
+        view.onEmission = { emissions.append($0) }
+        view.deliveryEnabled = true
+        view.setMarkedText(original, selectedRange: NSRange(location:0, length:0))
+        view.consumeCommittedBuffer()
+        XCTAssertTrue(emissions.isEmpty)
+        view.unmarkText()
+        view.consumeCommittedBuffer()
+        XCTAssertEqual(emissions.count, 1)
+        guard case .text(let committed) = emissions.first else { return XCTFail("missing commit") }
+        XCTAssertEqual(Array(committed.utf8), Array(original.utf8))
+        view.deleteBackward()
+        XCTAssertEqual(emissions.last, .key(0x08))
+    }
+}
