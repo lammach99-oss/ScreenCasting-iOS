@@ -3117,14 +3117,11 @@ final class PointerV2GestureMigrationTests: XCTestCase {
 }
 
 final class PointerV2CursorOverlayTests: XCTestCase {
-    @MainActor func testLocalCursorIsNonHitTestingAndHiddenUntilOwnership() {
+    @MainActor func testLocalCursorIsAbsentAndKeyboardRetainsLocalHitTarget() {
         let container = ConnectedPresentationContainer(frame: CGRect(x: 0, y: 0, width: 500, height: 300))
-        guard let overlay = container.subviews.first(where: { $0.accessibilityIdentifier == "client-local-cursor" }) else {
-            return XCTFail("Independent Client cursor overlay missing")
-        }
-        XCTAssertFalse(overlay.isUserInteractionEnabled)
-        XCTAssertTrue(overlay.isHidden, "Unknown ownership must remain hidden")
-        XCTAssertLessThan(container.subviews.firstIndex(of: overlay)!, container.subviews.firstIndex(of: container.keyboardButton)!)
+        XCTAssertFalse(container.subviews.contains { $0.accessibilityIdentifier == "client-local-cursor" })
+        XCTAssertLessThan(container.subviews.firstIndex(of: container.metalView)!, container.subviews.firstIndex(of: container.touchView)!)
+        XCTAssertLessThan(container.subviews.firstIndex(of: container.touchView)!, container.subviews.firstIndex(of: container.keyboardButton)!)
     }
 }
 
