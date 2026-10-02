@@ -579,15 +579,12 @@ public class PencilUIKitView: UIView {
     public var onPencilInput:    ((PencilPacket) -> Void)?
     public var onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)?
     public var onNetworkSend:    ((Data) -> Void)?
-    var onLocalCursorPosition: ((CGPoint) -> Void)?
     public var onDirectTouchContact: ((DirectTouchContactCommand) -> Void)?
     public var onPointerInput: ((PointerInputCommand) -> Void)?
     public var onOpenSettings: (() -> Void)?
     public var contentViewport: VideoContentViewport? {
         willSet { if newValue != contentViewport { retireDirectTouch() } }
-        didSet { onCursorViewportChanged?() }
     }
-    var onCursorViewportChanged: (() -> Void)?
     private var directTouchEnabled = false
     private var directTouchGeneration: UInt64?
     var inputGeometryContext: InputGeometryDiagnosticContext?
@@ -674,9 +671,6 @@ public class PencilUIKitView: UIView {
                 id = existing
             }
             let point = touch.location(in: self)
-            if let normalized = contentViewport?.normalizedPoint(for: point, in: bounds) {
-                onLocalCursorPosition?(normalized)
-            }
             let outputs: [DirectTouchGestureOutput]
             switch flags {
             case 1:

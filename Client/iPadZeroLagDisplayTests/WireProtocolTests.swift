@@ -3051,6 +3051,22 @@ final class PointerV2WireRegistrationTests: XCTestCase {
 }
 
 final class PointerV2GestureMigrationTests: XCTestCase {
+    func testContinuousFileSelectionDragEmitsOnlyRaw41Contacts() {
+        var machine = DirectTouchGestureStateMachine()
+        var outputs = machine.begin(id: 500, point: CGPoint(x: 100, y: 100), timestamp: 0)
+        for index in 1...40 {
+            outputs += machine.move(id: 500, point: CGPoint(x: 100 + index * 5, y: 100 + index * 3), timestamp: Double(index) * 0.02)
+        }
+        outputs += machine.end(id: 500, point: CGPoint(x: 300, y: 220), timestamp: 1)
+        XCTAssertTrue(mouseActions(outputs).isEmpty)
+        let phases = outputs.compactMap { output -> DirectTouchPhase? in
+            if case .directTouch(let phase, _, _, _) = output { return phase }
+            return nil
+        }
+        XCTAssertEqual(phases.first, .down)
+        XCTAssertEqual(phases.last, .up)
+        XCTAssertGreaterThan(phases.filter { $0 == .update }.count, 20)
+    }
     private func mouseActions(_ outputs: [DirectTouchGestureOutput]) -> [PointerInputAction] {
         outputs.compactMap { if case .pointer(let action, _, _) = $0 { return action }; return nil }
     }
@@ -3144,6 +3160,28 @@ final class PointerV2LifecycleTests: XCTestCase {
 }
 
 final class PointerV2FinalBoundaryTests: XCTestCase {
+    @MainActor func testPencilOnlyKeepsSoftwareAuthorityAndRealHardwareStillWins() {
+        let container = ConnectedPresentationContainer(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        var diagnostics: [String] = []
+        container.touchView.diagnosticSink = { diagnostics.append($0) }
+        container.configureRemoteKeyboard(active: true, generation: 1)
+        container.hardwarePresenceChanged(false)
+        XCTAssertEqual(container.keyboardMode, .softwareAvailable)
+        container.applyRemoteKeyboardMode(.softwareOpen)
+        XCTAssertTrue(container.softwareTextView.deliveryEnabled)
+        // Pencil arbitration is local to the direct gesture machine, not keyboard authority.
+        var gestures = DirectTouchGestureStateMachine()
+        _ = gestures.pencilBegan(timestamp: 1)
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertFalse(container.keyboardButton.isHidden)
+        container.hardwarePresenceChanged(true)
+        XCTAssertEqual(container.keyboardMode, .hardware)
+        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+        XCTAssertTrue(diagnostics.contains { $0.contains("[KEYBOARD_AUTHORITY]") && $0.contains("gc_keyboard_present=") && $0.contains("software_first_responder=") })
+        container.hardwarePresenceChanged(false)
+        XCTAssertEqual(container.keyboardMode, .softwareAvailable)
+        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+    }
     func testLocalPositionSurvivesHostPriorityAndNewGenerationStartsCentered() {
         var state = ClientCursorState()
         state.configure(ownership: nil, generation: 1)
@@ -3160,7 +3198,7 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         XCTAssertFalse(state.visible)
         XCTAssertEqual(state.normalizedPosition, CGPoint(x: 0.5, y: 0.5))
     }
-    @MainActor func testCursorPriorityNeverCancelsContactAndUsesCanonicalViewport() {
+    @MainActor func testCursorOwnershipAndTouchNeverCreateLocalCursorOverlay() {
         let container = ConnectedPresentationContainer(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
         container.touchView.frame = container.bounds
         container.touchView.contentViewport = VideoContentViewport(rect: CGRect(x: 0.25, y: 0, width: 0.5, height: 1))
@@ -3169,18 +3207,16 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         container.touchView.onDirectTouchContact = { packets.append($0) }
         container.touchView.emitDirectOutputs([.directTouch(.down, 1, CGPoint(x: 200, y: 150), 255)])
         container.configureClientCursor(ownership: .clientActive, generation: 1, active: true)
-        XCTAssertFalse(container.cursorOverlay.isHidden)
-        XCTAssertEqual(container.cursorOverlay.center, CGPoint(x: 200, y: 150))
-        container.touchView.onLocalCursorPosition?(CGPoint(x: 0.9, y: 0.2))
-        let local = container.cursorOverlay.center
+        XCTAssertFalse(container.subviews.contains { $0.accessibilityIdentifier == "client-local-cursor" })
+        container.touchView.emitDirectOutputs([.directTouch(.update, 1, CGPoint(x: 210, y: 160), 255)])
         container.configureClientCursor(ownership: .hostActive, generation: 1, active: true)
-        XCTAssertTrue(container.cursorOverlay.isHidden)
-        XCTAssertEqual(packets.map(\.phase), [.down])
+        XCTAssertFalse(container.subviews.contains { $0.accessibilityIdentifier == "client-local-cursor" })
+        XCTAssertEqual(packets.map(\.phase), [.down, .update])
         container.configureClientCursor(ownership: .clientActive, generation: 1, active: true)
-        XCTAssertEqual(container.cursorOverlay.center, local)
-        XCTAssertEqual(packets.map(\.phase), [.down])
+        XCTAssertFalse(container.subviews.contains { $0.accessibilityIdentifier == "client-local-cursor" })
+        XCTAssertEqual(packets.map(\.phase), [.down, .update])
         container.touchView.emitDirectOutputs([.directTouch(.up, 1, CGPoint(x: 200, y: 150), 255)])
-        XCTAssertEqual(packets.map(\.phase), [.down, .up])
+        XCTAssertEqual(packets.map(\.phase), [.down, .update, .up])
     }
     @MainActor func testLetterboxRejectsDownAndTerminalUsesLastValidPoint() {
         let view = PencilUIKitView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))

@@ -209,27 +209,11 @@ struct ClientCursorState {
     var visible: Bool { ownership == .clientActive }
 }
 
-final class ClientCursorOverlayView: UIView {
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        isUserInteractionEnabled = false
-        accessibilityIdentifier = "client-local-cursor"
-        isHidden = true
-        backgroundColor = UIColor.white.withAlphaComponent(0.9)
-        layer.cornerRadius = 7
-        layer.borderWidth = 2
-        layer.borderColor = UIColor.black.cgColor
-    }
-    required init?(coder: NSCoder) { nil }
-}
-
 public final class ConnectedPresentationContainer: UIView {
     let metalView = MTKView()
     let touchView = PencilUIKitView()
     let softwareTextView = RemoteSoftwareKeyboardTextView(frame: .zero, textContainer: nil)
-    let cursorOverlay = ClientCursorOverlayView(frame: CGRect(x: 0, y: 0, width: 14, height: 14))
     private var clientCursor = ClientCursorState()
-    private var cursorActive = false
     let keyboardButton = UIButton(type: .system)
     private let hardwareMonitor = HardwareKeyboardMonitor()
     private var keyboardObservers: [NSObjectProtocol] = []
@@ -239,6 +223,8 @@ public final class ConnectedPresentationContainer: UIView {
     private var keyboardActive = false
     private var softwareRequested = false
     private var keyboardGeneration: UInt64?
+    private var lastKeyboardAuthorityDiagnostic: String?
+    private var lastSoftwareResponderResult: Bool?
     var onTextCommit: ((String) -> Void)?
     var onGeometryChanged: ((PresentationSurfaceGeometry) -> Void)?
     private var publishedGeometry: PresentationSurfaceGeometry?
@@ -285,12 +271,6 @@ public final class ConnectedPresentationContainer: UIView {
         touchView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(metalView)
         addSubview(touchView)
-        addSubview(cursorOverlay)
-        touchView.onCursorViewportChanged = { [weak self] in self?.updateClientCursorOverlay() }
-        touchView.onLocalCursorPosition = { [weak self] point in
-            self?.clientCursor.update(point)
-            self?.updateClientCursorOverlay()
-        }
         // UIButton owns only its 48pt target, above the unchanged remote touch surface.
         bringSubviewToFront(softwareTextView)
         addSubview(keyboardButton)
@@ -319,7 +299,6 @@ public final class ConnectedPresentationContainer: UIView {
 
     override public func layoutSubviews() {
         super.layoutSubviews()
-        updateClientCursorOverlay()
         keyboardButton.frame = FloatingKeyboardPlacement.frame(bounds: bounds, safeArea: safeAreaInsets, keyboard: keyboardFrame)
 
         let scale = window?.screen.scale ?? traitCollection.displayScale
@@ -344,28 +323,10 @@ public final class ConnectedPresentationContainer: UIView {
     }
     func retireDirectPointer() {
         touchView.configureDirectTouch(active: false, generation: keyboardGeneration ?? 0)
-        cursorActive = false
-        cursorOverlay.isHidden = true
     }
 
     func configureClientCursor(ownership: CursorOwnershipState?, generation: UInt64, active: Bool) {
         clientCursor.configure(ownership: ownership, generation: generation)
-        cursorActive = active
-        updateClientCursorOverlay()
-    }
-
-    private func updateClientCursorOverlay() {
-        guard cursorActive, clientCursor.visible, let viewport = touchView.contentViewport else {
-            cursorOverlay.isHidden = true; return
-        }
-        let content = viewport.contentRect(in: bounds)
-        guard content.width > 0 && content.height > 0 else { cursorOverlay.isHidden = true; return }
-        let point = clientCursor.normalizedPosition
-        // Keep the small local glyph wholly inside the canonical content rectangle.
-        cursorOverlay.center = CGPoint(
-            x: max(content.minX + 7, min(content.maxX - 7, content.minX + point.x * content.width)),
-            y: max(content.minY + 7, min(content.maxY - 7, content.minY + point.y * content.height)))
-        cursorOverlay.isHidden = false
     }
 
     func retireRemoteKeyboard() {
@@ -394,6 +355,7 @@ public final class ConnectedPresentationContainer: UIView {
         applyRemoteKeyboardMode(RemoteKeyboardMode.resolve(active: active, hardware: hardwareMonitor.isConnected, requested: softwareRequested))
     }
     func applyRemoteKeyboardMode(_ mode: RemoteKeyboardMode) {
+        let previousMode = keyboardMode
         let changed = mode != keyboardMode
         // Update authority before callbacks caused by responder loss.
         keyboardMode = mode
@@ -407,15 +369,28 @@ public final class ConnectedPresentationContainer: UIView {
         touchView.keyboardCaptureEnabled = mode == .hardware
         if mode == .softwareOpen {
             softwareTextView.deliveryEnabled = true
-            if window != nil && !softwareTextView.isFirstResponder { softwareTextView.becomeFirstResponder() }
+            if window != nil && !softwareTextView.isFirstResponder {
+                lastSoftwareResponderResult = softwareTextView.becomeFirstResponder()
+                recordKeyboardAuthority(reason: "software_responder_attempt")
+            }
         }
         if changed {
             if keyboardButton.isHidden { fadeTask?.cancel(); fadeTask = nil }
             else { restartKeyboardFade() }
+            recordKeyboardAuthority(reason: "mode_changed", previousMode: previousMode)
         }
     }
+    fileprivate func recordKeyboardAuthority(reason: String, previousMode: RemoteKeyboardMode? = nil) {
+        let line = "[KEYBOARD_AUTHORITY] reason=\(reason) gc_keyboard_present=\(GCKeyboard.coalesced != nil ? 1 : 0) hardware_monitor=\(hardwareMonitor.isConnected ? 1 : 0) keyboard_active=\(keyboardActive ? 1 : 0) software_requested=\(softwareRequested ? 1 : 0) old_mode=\(previousMode ?? keyboardMode) new_mode=\(keyboardMode) software_first_responder=\(softwareTextView.isFirstResponder ? 1 : 0) responder_result=\(lastSoftwareResponderResult.map { $0 ? "success" : "failure" } ?? "not_attempted") keyboard_button_hidden=\(keyboardButton.isHidden ? 1 : 0)"
+        guard line != lastKeyboardAuthorityDiagnostic else { return }
+        lastKeyboardAuthorityDiagnostic = line
+        touchView.diagnosticSink?(line)
+    }
     @objc private func toggleSoftwareKeyboard() {
-        guard keyboardMode == .softwareAvailable || keyboardMode == .softwareOpen else { return }
+        guard keyboardMode == .softwareAvailable || keyboardMode == .softwareOpen else {
+            recordKeyboardAuthority(reason: "software_toggle_blocked")
+            return
+        }
         softwareRequested = !softwareRequested
         updateKeyboardAuthority()
         restartKeyboardFade()
@@ -430,6 +405,7 @@ public final class ConnectedPresentationContainer: UIView {
         }
     }
     private func handleKeyboardNotification(_ note: Notification) {
+        recordKeyboardAuthority(reason: note.name.rawValue)
         if note.name == UIApplication.willResignActiveNotification {
             retireDirectPointer()
             softwareRequested = false; applyRemoteKeyboardMode(.none); return
@@ -564,13 +540,20 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         container.setNeedsLayout()
 
         let touchView = container.touchView
-        touchView.onPencilInput = onPencilInput
+        let pencilInput = onPencilInput
+        touchView.onPencilInput = { [weak container] packet in
+            pencilInput?(packet)
+            if packet.pointerFlags == 1 || packet.pointerFlags == 4 {
+                container?.recordKeyboardAuthority(reason: packet.pointerFlags == 1 ? "pencil_down" : "pencil_up")
+            }
+        }
         let sendTouchEvent = onSendTouchEvent
         touchView.onSendTouchEvent = { type, x, y, pressure in
             sendTouchEvent?(type, x, y, pressure)
         }
         touchView.onKeyboardInput = onKeyboardInput
         container.onTextCommit = onTextCommit
+        touchView.diagnosticSink = { [weak networkManager] line in networkManager?.recordDiagnosticLine(line) }
         container.configureRemoteKeyboard(active: remoteKeyboardActive, generation: networkManager.remoteKeyboardGeneration)
         container.configureClientCursor(ownership: networkManager.cursorOwnershipState,
             generation: networkManager.remoteKeyboardGeneration, active: remoteKeyboardActive)
