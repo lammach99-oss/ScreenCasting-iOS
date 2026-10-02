@@ -3154,3 +3154,34 @@ final class PointerV2CursorOverlayTests: XCTestCase {
         XCTAssertLessThan(container.subviews.firstIndex(of: overlay)!, container.subviews.firstIndex(of: container.keyboardButton)!)
     }
 }
+
+final class PointerV2LifecycleTests: XCTestCase {
+    @MainActor func testCaptureDisableAndViewportReplacementCancelExactlyOnce() {
+        let view = PencilUIKitView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        view.contentViewport = VideoContentViewport(rect: CGRect(x: 0, y: 0, width: 1, height: 1))
+        view.configureDirectTouch(active: true, generation: 1)
+        var packets: [DirectTouchContactCommand] = []
+        view.onDirectTouchContact = { packets.append($0) }
+        view.emitDirectOutputs([.directTouch(.down, 1, CGPoint(x: 100, y: 100), 255)])
+        view.configureDirectTouch(active: false, generation: 1)
+        view.configureDirectTouch(active: false, generation: 1)
+        XCTAssertEqual(packets.map(\.phase), [.down, .cancel])
+        view.configureDirectTouch(active: true, generation: 1)
+        view.emitDirectOutputs([.directTouch(.down, 2, CGPoint(x: 100, y: 100), 255)])
+        view.contentViewport = VideoContentViewport(rect: CGRect(x: 0.2, y: 0, width: 0.6, height: 1))
+        view.emitDirectOutputs([.directTouch(.up, 2, CGPoint(x: 100, y: 100), 255)])
+        XCTAssertEqual(packets.map(\.phase), [.down, .cancel, .down, .cancel])
+    }
+    func testSuppressionAllowsOnlyTerminalAndNoContactRevival() {
+        for phase: DirectTouchPhase in [.down, .update, .up, .cancel] {
+            XCTAssertEqual(DirectTouchDeliveryPolicy.maySend(phase: phase, inputSuppressed: true),
+                phase == .up || phase == .cancel)
+        }
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        machine.move(id: 1, point: CGPoint(x: 0, y: 13), timestamp: 0.02)
+        XCTAssertEqual(machine.retire().count, 1)
+        XCTAssertTrue(machine.retire().isEmpty)
+        XCTAssertTrue(machine.end(id: 1, point: .zero, timestamp: 0.03).isEmpty)
+    }
+}
