@@ -3099,3 +3099,126 @@ final class PointerV2GestureMigrationTests: XCTestCase {
         XCTAssertTrue(machine.end(id: 21, point: .zero, timestamp: 0.04).isEmpty)
     }
 }
+
+final class PointerV2CursorOverlayTests: XCTestCase {
+    @MainActor func testLocalCursorIsNonHitTestingAndHiddenUntilOwnership() {
+        let container = ConnectedPresentationContainer(frame: CGRect(x: 0, y: 0, width: 500, height: 300))
+        guard let overlay = container.subviews.first(where: { $0.accessibilityIdentifier == "client-local-cursor" }) else {
+            return XCTFail("Independent Client cursor overlay missing")
+        }
+        XCTAssertFalse(overlay.isUserInteractionEnabled)
+        XCTAssertTrue(overlay.isHidden, "Unknown ownership must remain hidden")
+        XCTAssertLessThan(container.subviews.firstIndex(of: overlay)!, container.subviews.firstIndex(of: container.keyboardButton)!)
+    }
+}
+
+final class PointerV2LifecycleTests: XCTestCase {
+    @MainActor func testCaptureDisableAndViewportReplacementCancelExactlyOnce() {
+        let view = PencilUIKitView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        view.contentViewport = VideoContentViewport(rect: CGRect(x: 0, y: 0, width: 1, height: 1))
+        view.configureDirectTouch(active: true, generation: 1)
+        var packets: [DirectTouchContactCommand] = []
+        view.onDirectTouchContact = { packets.append($0) }
+        view.emitDirectOutputs([.directTouch(.down, 1, CGPoint(x: 100, y: 100), 255)])
+        view.configureDirectTouch(active: false, generation: 1)
+        view.configureDirectTouch(active: false, generation: 1)
+        XCTAssertEqual(packets.map(\.phase), [.down, .cancel])
+        view.configureDirectTouch(active: true, generation: 1)
+        view.emitDirectOutputs([.directTouch(.down, 2, CGPoint(x: 100, y: 100), 255)])
+        view.contentViewport = VideoContentViewport(rect: CGRect(x: 0.2, y: 0, width: 0.6, height: 1))
+        view.emitDirectOutputs([.directTouch(.up, 2, CGPoint(x: 100, y: 100), 255)])
+        XCTAssertEqual(packets.map(\.phase), [.down, .cancel, .down, .cancel])
+    }
+    func testSuppressionAllowsOnlyTerminalAndNoContactRevival() {
+        for phase: DirectTouchPhase in [.down, .update, .up, .cancel] {
+            XCTAssertEqual(DirectTouchDeliveryPolicy.maySend(phase: phase, inputSuppressed: true),
+                phase == .up || phase == .cancel)
+        }
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        machine.move(id: 1, point: CGPoint(x: 0, y: 13), timestamp: 0.02)
+        XCTAssertEqual(machine.retire().count, 1)
+        XCTAssertTrue(machine.retire().isEmpty)
+        XCTAssertTrue(machine.end(id: 1, point: .zero, timestamp: 0.03).isEmpty)
+    }
+}
+
+final class PointerV2FinalBoundaryTests: XCTestCase {
+    func testLocalPositionSurvivesHostPriorityAndNewGenerationStartsCentered() {
+        var state = ClientCursorState()
+        state.configure(ownership: nil, generation: 1)
+        XCTAssertFalse(state.visible)
+        state.update(CGPoint(x: 0.2, y: 0.8))
+        state.configure(ownership: .hostActive, generation: 1)
+        XCTAssertFalse(state.visible)
+        XCTAssertEqual(state.normalizedPosition, CGPoint(x: 0.2, y: 0.8))
+        state.update(CGPoint(x: 0.7, y: 0.1))
+        state.configure(ownership: .clientActive, generation: 1)
+        XCTAssertTrue(state.visible)
+        XCTAssertEqual(state.normalizedPosition, CGPoint(x: 0.7, y: 0.1))
+        state.configure(ownership: nil, generation: 2)
+        XCTAssertFalse(state.visible)
+        XCTAssertEqual(state.normalizedPosition, CGPoint(x: 0.5, y: 0.5))
+    }
+    @MainActor func testCursorPriorityNeverCancelsContactAndUsesCanonicalViewport() {
+        let container = ConnectedPresentationContainer(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        container.touchView.frame = container.bounds
+        container.touchView.contentViewport = VideoContentViewport(rect: CGRect(x: 0.25, y: 0, width: 0.5, height: 1))
+        container.touchView.configureDirectTouch(active: true, generation: 1)
+        var packets: [DirectTouchContactCommand] = []
+        container.touchView.onDirectTouchContact = { packets.append($0) }
+        container.touchView.emitDirectOutputs([.directTouch(.down, 1, CGPoint(x: 200, y: 150), 255)])
+        container.configureClientCursor(ownership: .clientActive, generation: 1, active: true)
+        XCTAssertFalse(container.cursorOverlay.isHidden)
+        XCTAssertEqual(container.cursorOverlay.center, CGPoint(x: 200, y: 150))
+        container.touchView.onLocalCursorPosition?(CGPoint(x: 0.9, y: 0.2))
+        let local = container.cursorOverlay.center
+        container.configureClientCursor(ownership: .hostActive, generation: 1, active: true)
+        XCTAssertTrue(container.cursorOverlay.isHidden)
+        XCTAssertEqual(packets.map(\.phase), [.down])
+        container.configureClientCursor(ownership: .clientActive, generation: 1, active: true)
+        XCTAssertEqual(container.cursorOverlay.center, local)
+        XCTAssertEqual(packets.map(\.phase), [.down])
+        container.touchView.emitDirectOutputs([.directTouch(.up, 1, CGPoint(x: 200, y: 150), 255)])
+        XCTAssertEqual(packets.map(\.phase), [.down, .up])
+    }
+    @MainActor func testLetterboxRejectsDownAndTerminalUsesLastValidPoint() {
+        let view = PencilUIKitView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        view.contentViewport = VideoContentViewport(rect: CGRect(x: 0.25, y: 0, width: 0.5, height: 1))
+        view.configureDirectTouch(active: true, generation: 1)
+        var packets: [DirectTouchContactCommand] = []
+        view.onDirectTouchContact = { packets.append($0) }
+        view.emitDirectOutputs([.directTouch(.down, 1, .zero, 255), .directTouch(.up, 1, .zero, 255)])
+        XCTAssertTrue(packets.isEmpty)
+        view.emitDirectOutputs([.directTouch(.down, 2, CGPoint(x: 200, y: 150), 255),
+            .directTouch(.update, 2, .zero, 255), .directTouch(.up, 2, .zero, 255)])
+        XCTAssertEqual(packets.map(\.phase), [.down, .up])
+        XCTAssertEqual(packets.first?.x, packets.last?.x)
+        XCTAssertEqual(packets.first?.y, packets.last?.y)
+    }
+    @MainActor func testGenerationReplacementCancelsOnceAndNeverRevivesOldContact() {
+        let view = PencilUIKitView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        view.contentViewport = VideoContentViewport(rect: CGRect(x: 0, y: 0, width: 1, height: 1))
+        view.configureDirectTouch(active: true, generation: 1)
+        var packets: [DirectTouchContactCommand] = []
+        view.onDirectTouchContact = { packets.append($0) }
+        view.emitDirectOutputs([.directTouch(.down, 1, CGPoint(x: 100, y: 100), 255)])
+        view.configureDirectTouch(active: true, generation: 2)
+        view.emitDirectOutputs([.directTouch(.update, 1, .zero, 255), .directTouch(.up, 1, .zero, 255)])
+        XCTAssertEqual(packets.map(\.phase), [.down, .cancel])
+        view.emitDirectOutputs([.directTouch(.down, 2, CGPoint(x: 100, y: 100), 255), .directTouch(.up, 2, CGPoint(x: 100, y: 100), 255)])
+        XCTAssertEqual(packets.map(\.phase), [.down, .cancel, .down, .up])
+    }
+    func testFourthFingerAfterCommitTerminatesOnce() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        machine.move(id: 1, point: CGPoint(x: 0, y: 13), timestamp: 0.01)
+        machine.begin(id: 2, point: .zero, timestamp: 0.02)
+        machine.begin(id: 3, point: .zero, timestamp: 0.03)
+        let cancel = machine.begin(id: 4, point: .zero, timestamp: 0.04)
+        XCTAssertEqual(cancel, [.directTouch(.cancel, 1, CGPoint(x: 0, y: 13), 255)])
+        for id in UInt64(1)...4 {
+            XCTAssertTrue(machine.end(id: id, point: .zero, timestamp: 0.1).isEmpty)
+        }
+    }
+}

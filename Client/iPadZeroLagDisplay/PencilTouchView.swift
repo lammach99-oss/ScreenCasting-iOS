@@ -155,6 +155,8 @@ struct LifetimeIdentityMap<Key: Hashable> {
 
     func existing(_ key: Key) -> UInt64? { identities[key] }
 
+    mutating func removeAll() { identities.removeAll() }
+
     @discardableResult
     mutating func end(_ key: Key) -> UInt64? {
         identities.removeValue(forKey: key)
@@ -511,6 +513,7 @@ public class PencilUIKitView: UIView {
     override public func didMoveToWindow() {
         super.didMoveToWindow()
         updateKeyboardCapture()
+        if window == nil { retireDirectTouch(); directTouchEnabled = false }
     }
 
     // Kept separate from UIPress construction so key lifetime can be tested
@@ -576,10 +579,17 @@ public class PencilUIKitView: UIView {
     public var onPencilInput:    ((PencilPacket) -> Void)?
     public var onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)?
     public var onNetworkSend:    ((Data) -> Void)?
+    var onLocalCursorPosition: ((CGPoint) -> Void)?
     public var onDirectTouchContact: ((DirectTouchContactCommand) -> Void)?
     public var onPointerInput: ((PointerInputCommand) -> Void)?
     public var onOpenSettings: (() -> Void)?
-    public var contentViewport: VideoContentViewport?
+    public var contentViewport: VideoContentViewport? {
+        willSet { if newValue != contentViewport { retireDirectTouch() } }
+        didSet { onCursorViewportChanged?() }
+    }
+    var onCursorViewportChanged: (() -> Void)?
+    private var directTouchEnabled = false
+    private var directTouchGeneration: UInt64?
     var inputGeometryContext: InputGeometryDiagnosticContext?
     var diagnosticSink: ((String) -> Void)?
     public var onBoundsChanged: ((CGRect) -> Void)?
@@ -606,6 +616,7 @@ public class PencilUIKitView: UIView {
     override public func layoutSubviews() {
         super.layoutSubviews()
         guard bounds != lastReportedBounds else { return }
+        if lastReportedBounds != nil { retireDirectTouch() }
         lastReportedBounds = bounds
         onBoundsChanged?(bounds)
     }
@@ -652,6 +663,7 @@ public class PencilUIKitView: UIView {
             }
         }
 
+        guard directTouchEnabled else { return }
         for touch in directTouches {
             let key = ObjectIdentifier(touch)
             let id: UInt64
@@ -662,6 +674,9 @@ public class PencilUIKitView: UIView {
                 id = existing
             }
             let point = touch.location(in: self)
+            if let normalized = contentViewport?.normalizedPoint(for: point, in: bounds) {
+                onLocalCursorPosition?(normalized)
+            }
             let outputs: [DirectTouchGestureOutput]
             switch flags {
             case 1:
@@ -682,6 +697,23 @@ public class PencilUIKitView: UIView {
         }
     }
 
+    func configureDirectTouch(active: Bool, generation: UInt64) {
+        if directTouchGeneration != generation || !active { retireDirectTouch() }
+        directTouchGeneration = generation
+        directTouchEnabled = active
+    }
+
+    func retireDirectTouch() {
+        if let active = activeDirectContact {
+            activeDirectContact = nil
+            onDirectTouchContact?(DirectTouchContactCommand(phase: .cancel, pressure: 255, contactID: active.id,
+                x: UInt16(clamping: Int((active.point.x * 65_535).rounded())),
+                y: UInt16(clamping: Int((active.point.y * 65_535).rounded()))))
+        }
+        _ = directGesture.retire()
+        directTouchIDs.removeAll()
+    }
+
     private func emit(_ outputs: [DirectTouchGestureOutput]) { emitDirectOutputs(outputs) }
 
     func emitDirectOutputs(_ outputs: [DirectTouchGestureOutput]) {
@@ -690,7 +722,7 @@ public class PencilUIKitView: UIView {
             case .directTouch(let phase, let id, let point, let pressure):
                 let mapped = contentViewport?.normalizedPoint(for: point, in: bounds)
                 if phase == .down {
-                    guard let mapped, activeDirectContact == nil else { continue }
+                    guard directTouchEnabled, let mapped, activeDirectContact == nil else { continue }
                     activeDirectContact = (id, mapped)
                 } else {
                     guard activeDirectContact?.id == id else { continue }

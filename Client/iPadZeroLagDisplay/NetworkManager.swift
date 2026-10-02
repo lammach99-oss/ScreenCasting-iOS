@@ -1812,6 +1812,7 @@ public class NetworkManager: ObservableObject {
 
     // The Host is the authority for selectable modes. These values only mirror
     // authenticated control responses for the connected settings surface.
+    @Published private(set) var cursorOwnershipState: CursorOwnershipState?
     @Published private(set) var displayCapabilities: DisplayCapabilities?
     @Published private(set) var displayPreference = DisplayPreference.defaultValue
     @Published private(set) var effectiveDisplayState: DisplayReady?
@@ -1870,6 +1871,7 @@ public class NetworkManager: ObservableObject {
     private var usbListener: NWListener?
     private var usbListenerExplicitlyStarted = false
     private var usbScdpConnection: NWConnection?
+    private var activeDirectTouchCommand: DirectTouchContactCommand?
     private let connectionGenerationClock = ConnectionGenerationClock()
     private var connectionGeneration: UInt64 {
         connectionGenerationClock.current
@@ -2160,6 +2162,7 @@ public class NetworkManager: ObservableObject {
         wifiLifecycleTransitionGeneration = nil
         wifiWaitingOwner = nil
         _ = connectionGenerationClock.advance()
+        resetDirectTouchSessionOnQueue()
         #if targetEnvironment(simulator)
         testingSimulatedWifiSession = false
         #endif
@@ -2303,6 +2306,7 @@ public class NetworkManager: ObservableObject {
     public func applicationWillResignActive() {
         networkQueue.async { [weak self] in
             guard let self else { return }
+            self.cancelActiveDirectTouchOnQueue()
             self.isForegroundActive = false
             self.reconnectWorkItem?.cancel()
             self.reconnectWorkItem = nil
@@ -2613,6 +2617,24 @@ public class NetworkManager: ObservableObject {
         }
     }
 
+    private func resetDirectTouchSessionOnQueue() {
+        activeDirectTouchCommand = nil
+        let generation = connectionGenerationClock.current
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.connectionGenerationClock.current == generation else { return }
+            self.cursorOwnershipState = nil
+        }
+    }
+
+    private func cancelActiveDirectTouchOnQueue() {
+        guard let command = activeDirectTouchCommand else { return }
+        activeDirectTouchCommand = nil
+        guard transportState == .streaming, committedTransportGeneration == connectionGeneration else { return }
+        let cancel = DirectTouchContactCommand(phase: .cancel, pressure: command.pressure,
+            contactID: command.contactID, x: command.x, y: command.y)
+        sendWireMessage(type: .directTouchContact, payload: cancel.encode(), sequence: 0)
+    }
+
     public func sendDirectTouchContact(_ command: DirectTouchContactCommand) {
         let requestedGeneration = connectionGenerationClock.current
         networkQueue.async { [weak self] in
@@ -2622,6 +2644,13 @@ public class NetworkManager: ObservableObject {
                   command.contactID != 0,
                   DirectTouchDeliveryPolicy.maySend(phase: command.phase,
                     inputSuppressed: self.displayRequestGate.isInputSuppressed) else { return }
+            if command.phase == .down {
+                guard self.activeDirectTouchCommand == nil else { return }
+                self.activeDirectTouchCommand = command
+            } else {
+                guard self.activeDirectTouchCommand?.contactID == command.contactID else { return }
+                self.activeDirectTouchCommand = command.phase == .up || command.phase == .cancel ? nil : command
+            }
             self.sendWireMessage(type: .directTouchContact, payload: command.encode(), sequence: 0,
                 movement: command.phase == .update)
         }
@@ -2853,6 +2882,7 @@ public class NetworkManager: ObservableObject {
         #endif
         RecentWifiResumeStore.clear()
         let stoppedGeneration = connectionGenerationClock.advance()
+        resetDirectTouchSessionOnQueue()
         listenerGeneration &+= 1
         decoder.invalidate()
         AudioManager.shared.reset()
@@ -3042,6 +3072,7 @@ public class NetworkManager: ObservableObject {
                         reason: "replacement_candidate_accepted")
                 }
                 _ = self.connectionGenerationClock.advance()
+                self.resetDirectTouchSessionOnQueue()
                 self.clientSettingsState.resetHostGeneration()
                 self.settingsReconciliationGate.reset()
                 self.usbScdpConnection = newConnection
@@ -4230,7 +4261,18 @@ public class NetworkManager: ObservableObject {
         case .clientPerformanceFeedback:
             return
 
-        case .directTouchContact, .cursorOwnership, .pointerInput, .keyboardInput, .textCommit:
+        case .cursorOwnership:
+            guard generation == connectionGeneration,
+                  committedTransportGeneration == generation,
+                  transportState == .streaming,
+                  let command = CursorOwnershipCommand.decode(payload) else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.connectionGenerationClock.current == generation else { return }
+                self.cursorOwnershipState = command.state
+            }
+            return
+
+        case .directTouchContact, .pointerInput, .keyboardInput, .textCommit:
             return
 
         case .video:
@@ -5205,6 +5247,7 @@ public class NetworkManager: ObservableObject {
         connectionTimeoutWorkItem?.cancel()
         connectionTimeoutWorkItem = nil
         let failedGeneration = connectionGenerationClock.advance()
+        resetDirectTouchSessionOnQueue()
         wireReceiveActiveGeneration = nil
         wireAuthenticatedGeneration = nil
         committedTransportGeneration = nil
@@ -5364,6 +5407,7 @@ public class NetworkManager: ObservableObject {
         networkQueue.sync {
             let peer = NWConnection(host: "127.0.0.1", port: 27015, using: .tcp)
             let generation = connectionGenerationClock.advance()
+            resetDirectTouchSessionOnQueue()
             connection?.cancel()
             wifiBackgroundDisconnectWorkItem?.cancel()
             wifiBackgroundDisconnectWorkItem = nil
