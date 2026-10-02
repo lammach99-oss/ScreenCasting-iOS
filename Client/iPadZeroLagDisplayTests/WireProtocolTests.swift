@@ -3092,3 +3092,65 @@ final class PointerV2WireRegistrationTests: XCTestCase {
         return data
     }
 }
+
+final class PointerV2GestureMigrationTests: XCTestCase {
+    private func mouseActions(_ outputs: [DirectTouchGestureOutput]) -> [PointerInputAction] {
+        outputs.compactMap { if case .pointer(let action, _, _) = $0 { return action }; return nil }
+    }
+    func testQualifiedTapIsContactPairWithNoMousePacket() {
+        var machine = DirectTouchGestureStateMachine()
+        XCTAssertTrue(machine.begin(id: 17, point: .zero, timestamp: 0).isEmpty)
+        let output = machine.end(id: 17, point: .zero, timestamp: 0.1)
+        XCTAssertEqual(output.count, 2, "Qualified tap must produce Down/Up")
+        XCTAssertTrue(mouseActions(output).isEmpty, "Finger tap must not emit raw37 mouse activation")
+    }
+    func testQualifiedScrollAndDragRetainContactsAndTerminal() {
+        for horizontal in [false, true] {
+            var machine = DirectTouchGestureStateMachine()
+            machine.begin(id: 18, point: .zero, timestamp: 0)
+            let point = horizontal ? CGPoint(x: 13, y: 0) : CGPoint(x: 0, y: 13)
+            let start = machine.move(id: 18, point: point, timestamp: 0.02)
+            XCTAssertEqual(start.count, 2, "Scroll commits Down at anchor plus Update")
+            XCTAssertTrue(mouseActions(start).isEmpty)
+            let move = machine.move(id: 18, point: CGPoint(x: 55, y: 55), timestamp: 0.04)
+            XCTAssertEqual(move.count, 1)
+            XCTAssertTrue(mouseActions(move).isEmpty)
+            let end = machine.end(id: 18, point: CGPoint(x: 55, y: 55), timestamp: 0.08)
+            XCTAssertEqual(end.count, 1, "Committed scroll needs terminal Up")
+            XCTAssertTrue(mouseActions(end).isEmpty)
+            XCTAssertTrue(machine.end(id: 18, point: .zero, timestamp: 0.09).isEmpty)
+        }
+        var drag = DirectTouchGestureStateMachine()
+        drag.begin(id: 19, point: .zero, timestamp: 0)
+        drag.begin(id: 20, point: .zero, timestamp: 0.01)
+        let start = drag.move(id: 19, point: CGPoint(x: 7, y: 0), timestamp: 0.02)
+        XCTAssertEqual(start.count, 2)
+        XCTAssertTrue(mouseActions(start).isEmpty)
+        let cancelled = drag.end(id: 19, point: CGPoint(x: 7, y: 0), timestamp: 0.03, cancelled: true)
+        XCTAssertEqual(cancelled.count, 1)
+        XCTAssertTrue(mouseActions(cancelled).isEmpty)
+        XCTAssertTrue(drag.end(id: 20, point: .zero, timestamp: 0.04).isEmpty)
+    }
+    func testPencilPreemptsContactWithoutMouseRelease() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 21, point: .zero, timestamp: 0)
+        machine.begin(id: 22, point: .zero, timestamp: 0.01)
+        machine.move(id: 21, point: CGPoint(x: 7, y: 0), timestamp: 0.02)
+        let output = machine.pencilBegan(timestamp: 0.03)
+        XCTAssertEqual(output.count, 1)
+        XCTAssertTrue(mouseActions(output).isEmpty, "Pencil preemption must Cancel native contact")
+        XCTAssertTrue(machine.end(id: 21, point: .zero, timestamp: 0.04).isEmpty)
+    }
+}
+
+final class PointerV2CursorOverlayTests: XCTestCase {
+    @MainActor func testLocalCursorIsNonHitTestingAndHiddenUntilOwnership() {
+        let container = ConnectedPresentationContainer(frame: CGRect(x: 0, y: 0, width: 500, height: 300))
+        guard let overlay = container.subviews.first(where: { $0.accessibilityIdentifier == "client-local-cursor" }) else {
+            return XCTFail("Independent Client cursor overlay missing")
+        }
+        XCTAssertFalse(overlay.isUserInteractionEnabled)
+        XCTAssertTrue(overlay.isHidden, "Unknown ownership must remain hidden")
+        XCTAssertLessThan(container.subviews.firstIndex(of: overlay)!, container.subviews.firstIndex(of: container.keyboardButton)!)
+    }
+}
