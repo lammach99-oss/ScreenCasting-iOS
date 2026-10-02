@@ -4,6 +4,7 @@ enum RealtimeAudioTransportProfile {
     case wifi
     case usb
 
+    // Startup/prebuffer depth only; retained capacity is the separate hard bound.
     var targetPacketCount: Int {
         switch self {
         case .wifi: return 3
@@ -46,7 +47,7 @@ struct AudioJitterDiagnostics {
 /// Observation only: never participates in packet admission or playout.
 struct AudioReceiveDiagnostics {
     private var highest: UInt16?
-    private var history = UInt64.max
+    private var history: UInt64 = 0
     private var lastArrival: TimeInterval?
     private var lastTimestamp: UInt32 = 0
     private var intervals: [Double] = []
@@ -72,7 +73,7 @@ struct AudioReceiveDiagnostics {
         }
         lastArrival = arrivedAt
         lastTimestamp = timestamp
-        guard let highest else { self.highest = sequence; return }
+        guard let highest else { self.highest = sequence; history = 1; return }
         let forward = sequence &- highest
         if forward > 0 && forward < 0x8000 {
             if forward > 1 { forwardGaps += 1; missingPacketUnits += Int(forward) - 1 }
@@ -165,10 +166,6 @@ final class AudioJitterBuffer {
             startupAnchorSequence = nil
         }
 
-        if packets.count >= profile.targetPacketCount + 1 {
-            dropOldest()
-        }
-
         guard let currentExpected = self.expectedSequence else { return noPlayout() }
         if let packet = packets.removeValue(forKey: currentExpected) {
             advance(after: packet)
@@ -176,8 +173,7 @@ final class AudioJitterBuffer {
             return .decode(packet)
         }
 
-        if !packets.isEmpty &&
-            packets.count <= max(0, profile.targetPacketCount - 1) {
+        if !packets.isEmpty {
             let timestamp = expectedTimestamp
             self.expectedSequence = currentExpected &+ 1
             expectedTimestamp &+= Self.packetDurationSamples
