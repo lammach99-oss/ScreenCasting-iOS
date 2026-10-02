@@ -7,8 +7,8 @@ final class AudioJitterBufferTests: XCTestCase {
         XCTAssertNil(buffer.dequeue())
         XCTAssertEqual(buffer.diagnostics.nilPlayoutActions, 1)
         [UInt16(1), 2, 3, 4].forEach { buffer.insert(packet($0)) }
-        XCTAssertEqual(decodedSequence(buffer.dequeue()), 2)
-        XCTAssertEqual(buffer.diagnostics.targetPolicyDrops, 1)
+        XCTAssertEqual(decodedSequence(buffer.dequeue()), 1)
+        XCTAssertEqual(buffer.diagnostics.targetPolicyDrops, 0)
         XCTAssertEqual(buffer.diagnostics.overflowDrops, 0)
         XCTAssertEqual(buffer.diagnostics.decodeActions, 1)
         XCTAssertEqual(buffer.diagnostics.insertedPackets, 4)
@@ -135,8 +135,8 @@ final class AudioJitterBufferTests: XCTestCase {
 
         XCTAssertEqual(buffer.bufferedPacketCount, 6)
         XCTAssertEqual(buffer.droppedPacketCount, 1)
-        XCTAssertEqual(decodedSequence(buffer.dequeue()), 103)
-        XCTAssertEqual(buffer.droppedPacketCount, 2)
+        XCTAssertEqual(decodedSequence(buffer.dequeue()), 102)
+        XCTAssertEqual(buffer.droppedPacketCount, 1)
     }
 
     func testSevenPacketsDropOldestAndRemainCappedAtSixtyMs() {
@@ -163,11 +163,123 @@ final class AudioJitterBufferTests: XCTestCase {
         XCTAssertEqual(decodedSequence(buffer.dequeue()), 5)
     }
 
-    func testTargetPlusTenDropsOldestBeforeScheduling() {
+    func testWifiTargetPlusOneRetainsOldestValidPacket() {
         let buffer = AudioJitterBuffer(profile: .wifi)
         [UInt16(1), 2, 3, 4].forEach { buffer.insert(packet($0)) }
-        XCTAssertEqual(decodedSequence(buffer.dequeue()), 2)
+        XCTAssertEqual(decodedSequence(buffer.dequeue()), 1)
+        XCTAssertEqual(buffer.droppedPacketCount, 0)
+        XCTAssertEqual(buffer.diagnostics.targetPolicyDrops, 0)
+    }
+
+    func testWifiDepthFourToSixRetainsValidInOrderPackets() {
+        for depth in 4...6 {
+            let buffer = AudioJitterBuffer(profile: .wifi)
+            for sequence in UInt16(1)...UInt16(depth) { buffer.insert(packet(sequence)) }
+            for sequence in UInt16(1)...UInt16(depth) {
+                XCTAssertEqual(decodedSequence(buffer.dequeue()), sequence, "depth=\(depth)")
+            }
+            XCTAssertEqual(buffer.diagnostics.decodeActions, depth)
+            XCTAssertEqual(buffer.diagnostics.targetPolicyDrops, 0)
+            XCTAssertEqual(buffer.diagnostics.overflowDrops, 0)
+            XCTAssertEqual(buffer.diagnostics.plcActions, 0)
+        }
+    }
+
+    func testWifiHardOverflowRemainsBoundedAtSixPackets() {
+        let buffer = AudioJitterBuffer(profile: .wifi)
+        for sequence in UInt16(1)...UInt16(7) {
+            buffer.insert(packet(sequence))
+            XCTAssertLessThanOrEqual(buffer.bufferedPacketCount, 6)
+        }
+        XCTAssertEqual(buffer.bufferedDurationMs, 60)
+        XCTAssertEqual(buffer.diagnostics.maximumDepth, 6)
+        XCTAssertEqual(buffer.diagnostics.overflowDrops, 1)
+        for sequence in UInt16(2)...UInt16(7) {
+            XCTAssertEqual(decodedSequence(buffer.dequeue()), sequence)
+        }
+        XCTAssertEqual(buffer.diagnostics.overflowDrops, 1)
+        XCTAssertEqual(buffer.diagnostics.targetPolicyDrops, 0)
         XCTAssertEqual(buffer.droppedPacketCount, 1)
+    }
+
+    func testMissingExpectedPacketUsesOnePlcThenContinuesInOrder() {
+        let buffer = AudioJitterBuffer(profile: .wifi)
+        [UInt16(1), 2, 3].forEach { buffer.insert(packet($0)) }
+        for sequence in UInt16(1)...UInt16(3) { XCTAssertEqual(decodedSequence(buffer.dequeue()), sequence) }
+        [UInt16(5), 6, 7].forEach { buffer.insert(packet($0)) }
+        XCTAssertEqual(buffer.dequeue(), .plc(sequence: 4, timestamp: 4 * 480))
+        for sequence in UInt16(5)...UInt16(7) { XCTAssertEqual(decodedSequence(buffer.dequeue()), sequence) }
+        XCTAssertEqual(buffer.diagnostics.plcActions, 1)
+        XCTAssertEqual(buffer.diagnostics.nilPlayoutActions, 0)
+        XCTAssertEqual(buffer.diagnostics.targetPolicyDrops, 0)
+    }
+
+    func testStartedWifiPlayoutDoesNotReturnNilForRecoverableSequenceGap() {
+        for depth in 1...6 {
+            let buffer = AudioJitterBuffer(profile: .wifi)
+            [UInt16(1), 2, 3].forEach { buffer.insert(packet($0)) }
+            for sequence in UInt16(1)...UInt16(3) { XCTAssertEqual(decodedSequence(buffer.dequeue()), sequence) }
+            for sequence in UInt16(5)...UInt16(4 + depth) { buffer.insert(packet(sequence)) }
+            XCTAssertEqual(buffer.dequeue(), .plc(sequence: 4, timestamp: 4 * 480), "depth=\(depth)")
+            XCTAssertEqual(decodedSequence(buffer.dequeue()), 5)
+            XCTAssertEqual(buffer.diagnostics.nilPlayoutActions, 0)
+            XCTAssertEqual(buffer.diagnostics.plcActions, 1)
+            XCTAssertEqual(buffer.diagnostics.targetPolicyDrops, 0)
+        }
+    }
+
+    func testWifiMissingPacketPlcWrapsSequenceAndTimestampByOnePacket() {
+        let buffer = AudioJitterBuffer(profile: .wifi)
+        buffer.insert(packet(UInt16.max - 3, timestamp: UInt32.max - 1919))
+        buffer.insert(packet(UInt16.max - 2, timestamp: UInt32.max - 1439))
+        buffer.insert(packet(UInt16.max - 1, timestamp: UInt32.max - 959))
+        for sequence in (UInt16.max - 3)...(UInt16.max - 1) {
+            XCTAssertEqual(decodedSequence(buffer.dequeue()), sequence)
+        }
+        buffer.insert(packet(0, timestamp: 0))
+        buffer.insert(packet(1, timestamp: 480))
+        buffer.insert(packet(2, timestamp: 960))
+        XCTAssertEqual(buffer.dequeue(), .plc(sequence: UInt16.max, timestamp: UInt32.max - 479))
+        XCTAssertEqual(decodedSequence(buffer.dequeue()), 0)
+        XCTAssertEqual(decodedSequence(buffer.dequeue()), 1)
+        XCTAssertEqual(decodedSequence(buffer.dequeue()), 2)
+        XCTAssertEqual(buffer.diagnostics.plcActions, 1)
+        XCTAssertEqual(buffer.diagnostics.nilPlayoutActions, 0)
+    }
+
+    func testWifiStartupStillWaitsForThreePackets() {
+        let buffer = AudioJitterBuffer(profile: .wifi)
+        buffer.insert(packet(1)); XCTAssertNil(buffer.dequeue())
+        buffer.insert(packet(2)); XCTAssertNil(buffer.dequeue())
+        buffer.insert(packet(3)); XCTAssertEqual(decodedSequence(buffer.dequeue()), 1)
+        XCTAssertEqual(buffer.targetDurationMs, 30)
+        XCTAssertEqual(buffer.diagnostics.startupWaitTicks, 2)
+    }
+
+    func testEmptyOrResetBufferDoesNotGenerateEndlessPlc() {
+        let buffer = AudioJitterBuffer(profile: .wifi)
+        [UInt16(1), 2, 3].forEach { buffer.insert(packet($0)) }
+        for _ in 0..<3 { _ = buffer.dequeue() }
+        for _ in 0..<10 { XCTAssertNil(buffer.dequeue()) }
+        XCTAssertEqual(buffer.diagnostics.plcActions, 0)
+        buffer.reset()
+        XCTAssertNil(buffer.dequeue())
+        XCTAssertEqual(buffer.bufferedPacketCount, 0)
+        XCTAssertEqual(buffer.diagnostics.plcActions, 0)
+    }
+
+    func testFirstReceivePacketMarksOnlyItsObservedSequence() {
+        for first in [UInt16(100), UInt16(0)] {
+            var rx = AudioReceiveDiagnostics()
+            rx.record(sequence: first, timestamp: 480, arrivedAt: 1)
+            rx.record(sequence: first &- 1, timestamp: 0, arrivedAt: 1.01)
+            XCTAssertEqual(rx.reorderedPackets, 1)
+            XCTAssertEqual(rx.repairedPacketUnits, 1)
+            XCTAssertEqual(rx.duplicateOrStalePackets, 0)
+            rx.record(sequence: first &- 1, timestamp: 0, arrivedAt: 1.02)
+            XCTAssertEqual(rx.duplicateOrStalePackets, 1)
+            XCTAssertEqual(rx.repairedPacketUnits, 1)
+        }
     }
 
     func testWifiAndUsbTargetsAreExactAndResetIsSessionBound() {
@@ -191,13 +303,14 @@ final class AudioJitterBufferTests: XCTestCase {
         XCTAssertEqual(decodedSequence(buffer.dequeue()), 1)
     }
 
-    func testUsbTargetAndPlcThresholdAreExact() {
+    func testUsbStartupTargetAndMissingPacketDurationAreExact() {
         let buffer = AudioJitterBuffer(profile: .usb)
         buffer.insert(packet(10))
         buffer.insert(packet(11))
         buffer.insert(packet(12))
+        XCTAssertEqual(decodedSequence(buffer.dequeue()), 10)
+        XCTAssertEqual(buffer.droppedPacketCount, 0)
         XCTAssertEqual(decodedSequence(buffer.dequeue()), 11)
-        XCTAssertEqual(buffer.droppedPacketCount, 1)
         XCTAssertEqual(decodedSequence(buffer.dequeue()), 12)
         buffer.insert(packet(14))
         XCTAssertEqual(
@@ -214,7 +327,7 @@ final class AudioJitterBufferTests: XCTestCase {
         XCTAssertEqual(buffer.bufferedPacketCount, 1)
     }
 
-    func testEvictionRebasesMissingExpectedAndPlcAdvancesOneTick() {
+    func testFuturePacketsDoNotRebaseMissingExpectedAndPlcAdvancesOneTick() {
         let buffer = AudioJitterBuffer(profile: .wifi)
         buffer.insert(packet(100))
         buffer.insert(packet(102))
@@ -223,8 +336,10 @@ final class AudioJitterBufferTests: XCTestCase {
 
         buffer.insert(packet(104))
         buffer.insert(packet(105))
+        XCTAssertEqual(buffer.dequeue(), .plc(sequence: 101, timestamp: 101 * 480))
+        XCTAssertEqual(decodedSequence(buffer.dequeue()), 102)
         XCTAssertEqual(decodedSequence(buffer.dequeue()), 103)
-        XCTAssertEqual(buffer.droppedPacketCount, 1)
+        XCTAssertEqual(buffer.droppedPacketCount, 0)
         XCTAssertEqual(decodedSequence(buffer.dequeue()), 104)
         XCTAssertEqual(decodedSequence(buffer.dequeue()), 105)
 
