@@ -285,6 +285,9 @@ public final class ConnectedPresentationContainer: UIView {
         guard scale > 0 else { return }
 
         metalView.contentScaleFactor = scale
+        metalView.drawableSize = CGSize(
+            width: metalView.bounds.width * scale,
+            height: metalView.bounds.height * scale)
 
         let geometry = PresentationSurfaceGeometry(
             screenBounds: window?.screen.bounds ?? .zero,
@@ -512,8 +515,9 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         }
 
         let metalView = container.metalView
-        // Both surfaces retain shared bounds; MTKView owns drawable resizing.
-        metalView.autoResizeDrawable = true
+        // ConnectedPresentationContainer owns drawable sizing from its shared
+        // bounds so the Metal surface and the touch surface cannot diverge.
+        metalView.autoResizeDrawable = false
         if let screen = metalView.window?.screen {
             metalView.contentScaleFactor = screen.scale
         }
