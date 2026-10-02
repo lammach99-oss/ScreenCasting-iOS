@@ -511,6 +511,9 @@ public struct ContentView: View {
                         y: y,
                         pressure: pressure)
                 },
+                onDirectTouchContact: { command in
+                    networkManager.sendDirectTouchContact(command)
+                },
                 onPointerInput: { command in
                     networkManager.sendPointerInput(command)
                 },

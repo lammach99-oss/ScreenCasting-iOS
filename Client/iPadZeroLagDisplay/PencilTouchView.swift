@@ -29,6 +29,7 @@ public struct PencilTouchView: UIViewRepresentable {
     /// Legacy raw-bytes callback. Now emits the 8-byte TouchInputPacket wire format.
     /// Kept for backward compatibility with code that passes bytes directly to `sendData`.
     public var onNetworkSend: ((Data) -> Void)?
+    public var onDirectTouchContact: ((DirectTouchContactCommand) -> Void)?
     public var onPointerInput: ((PointerInputCommand) -> Void)?
     public var onOpenSettings: (() -> Void)?
 
@@ -43,6 +44,7 @@ public struct PencilTouchView: UIViewRepresentable {
         onPencilInput:    ((PencilPacket) -> Void)?                        = nil,
         onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)? = nil,
         onNetworkSend:    ((Data) -> Void)?                                = nil,
+        onDirectTouchContact: ((DirectTouchContactCommand) -> Void)? = nil,
         onPointerInput:   ((PointerInputCommand) -> Void)?                 = nil,
         onOpenSettings:   (() -> Void)?                                    = nil,
         contentViewport:  VideoContentViewport?                             = nil,
@@ -51,6 +53,7 @@ public struct PencilTouchView: UIViewRepresentable {
         self.onPencilInput    = onPencilInput
         self.onSendTouchEvent = onSendTouchEvent
         self.onNetworkSend    = onNetworkSend
+        self.onDirectTouchContact = onDirectTouchContact
         self.onPointerInput   = onPointerInput
         self.onOpenSettings   = onOpenSettings
         self.contentViewport  = contentViewport
@@ -78,6 +81,7 @@ public struct PencilTouchView: UIViewRepresentable {
         uiView.onPencilInput    = onPencilInput
         uiView.onSendTouchEvent = onSendTouchEvent
         uiView.onNetworkSend    = onNetworkSend
+        uiView.onDirectTouchContact = onDirectTouchContact
         uiView.onPointerInput   = onPointerInput
         uiView.onOpenSettings   = onOpenSettings
         uiView.contentViewport  = contentViewport
@@ -114,6 +118,7 @@ private let kTouchMagic: UInt16 = 0x5449
 private let kTouchPacketSize    = 8
 
 enum DirectTouchGestureOutput: Equatable {
+    case directTouch(DirectTouchPhase, UInt64, CGPoint, UInt8)
     case pointer(PointerInputAction, CGPoint, Int16)
     case openSettings
 }
@@ -168,8 +173,8 @@ struct DirectTouchGestureStateMachine {
     private enum State {
         case idle
         case oneFinger(UInt64)
-        case scrolling(UInt64, lastY: CGFloat, wheelRemainder: CGFloat)
-        case horizontalScrolling(UInt64, lastX: CGFloat, wheelRemainder: CGFloat)
+        case scrolling(UInt64)
+        case horizontalScrolling(UInt64)
         case twoFinger(UInt64, UInt64, secondBeganAt: TimeInterval)
         case dragging(UInt64, UInt64)
         case threeFinger(
@@ -184,6 +189,7 @@ struct DirectTouchGestureStateMachine {
 
     private var state: State = .idle
     private var contacts: [UInt64: Contact] = [:]
+    private var committedContactID: UInt64?
     private var ignoredContacts: Set<UInt64> = []
     private let tapDuration: TimeInterval = 0.250
     private let tapMovement: CGFloat = 12
@@ -192,8 +198,6 @@ struct DirectTouchGestureStateMachine {
     private let threeFingerDuration: TimeInterval = 0.300
     private let threeFingerMovement: CGFloat = 15
     private let palmGuardDuration: TimeInterval = 0.150
-    private let wheelPointsPerStep: CGFloat = 42
-    private let wheelUnitsPerStep: CGFloat = 120
 
     mutating func begin(
         id: UInt64,
@@ -227,8 +231,9 @@ struct DirectTouchGestureStateMachine {
             return []
         }
         if contacts.count >= 4 {
+            let output = finishContact(cancelled: true)
             state = .suppressed
-            return []
+            return output
         }
         if case .scrolling = state { return [] }
         if case .horizontalScrolling = state { return [] }
@@ -281,49 +286,24 @@ struct DirectTouchGestureStateMachine {
             let dx = point.x - contact.start.x
             let dy = point.y - contact.start.y
             if abs(dy) >= 12 && abs(dy) >= abs(dx) * 0.6 {
-                state = .scrolling(primary, lastY: point.y, wheelRemainder: 0)
-                return [.pointer(.move, contact.start, 0)]
+                state = .scrolling(primary)
+                return commitContact(contact, point: point)
             }
             if abs(dx) >= 12 && abs(dy) < abs(dx) * 0.6 {
-                state = .horizontalScrolling(
-                    primary,
-                    lastX: point.x,
-                    wheelRemainder: 0)
-                return [.pointer(.move, contact.start, 0)]
+                state = .horizontalScrolling(primary)
+                return commitContact(contact, point: point)
             }
-        case .scrolling(let primary, let lastY, let remainder) where primary == id:
-            let result = proportionalWheelDelta(
-                fingerDelta: point.y - lastY,
-                wheelUnitRemainder: remainder,
-                invertDirection: false)
-            state = .scrolling(
-                primary,
-                lastY: point.y,
-                wheelRemainder: result.remainder)
-            guard let value = result.value else { return [] }
-            return [.pointer(.verticalWheel, point, value)]
-        case .horizontalScrolling(
-            let primary,
-            let lastX,
-            let remainder
-        ) where primary == id:
-            let result = proportionalWheelDelta(
-                fingerDelta: point.x - lastX,
-                wheelUnitRemainder: remainder,
-                invertDirection: true)
-            state = .horizontalScrolling(
-                primary,
-                lastX: point.x,
-                wheelRemainder: result.remainder)
-            guard let value = result.value else { return [] }
-            return [.pointer(.horizontalWheel, point, value)]
+        case .scrolling(let primary) where primary == id:
+            return [.directTouch(.update, primary, point, 255)]
+        case .horizontalScrolling(let primary) where primary == id:
+            return [.directTouch(.update, primary, point, 255)]
         case .twoFinger(let primary, let secondary, _) where primary == id:
             if distance(contact.start, point) >= dragMovement {
                 state = .dragging(primary, secondary)
-                return [.pointer(.leftDown, point, 0)]
+                return commitContact(contact, point: point)
             }
         case .dragging(let primary, _) where primary == id:
-            return [.pointer(.move, point, 0)]
+            return [.directTouch(.update, primary, point, 255)]
         case .threeFinger(let startedAt, let participants, let completed, let valid):
             state = .threeFinger(
                 startedAt: startedAt,
@@ -360,12 +340,11 @@ struct DirectTouchGestureStateMachine {
             if !cancelled,
                timestamp - contact.beganAt <= tapDuration,
                contact.maxExcursion <= tapMovement {
-                outputs.append(.pointer(.leftClick, point, 0))
+                outputs += [.directTouch(.down, id, point, 255), .directTouch(.up, id, point, 255)]
             }
             state = .suppressed
-        case .scrolling:
-            state = .suppressed
-        case .horizontalScrolling:
+        case .scrolling, .horizontalScrolling:
+            outputs += finishContact(cancelled: cancelled)
             state = .suppressed
         case .twoFinger(let primary, let secondary, let secondBeganAt):
             if id == secondary,
@@ -376,9 +355,8 @@ struct DirectTouchGestureStateMachine {
                 outputs.append(.pointer(.rightClick, primaryContact.point, 0))
             }
             state = .suppressed
-        case .dragging(let primary, _):
-            let finalPoint = contacts[primary]?.point ?? point
-            outputs.append(.pointer(.leftUp, finalPoint, 0))
+        case .dragging:
+            outputs += finishContact(cancelled: cancelled)
             state = .suppressed
         case .threeFinger(
             let startedAt,
@@ -412,11 +390,7 @@ struct DirectTouchGestureStateMachine {
     }
 
     mutating func pencilBegan(timestamp: TimeInterval) -> [DirectTouchGestureOutput] {
-        var outputs: [DirectTouchGestureOutput] = []
-        if case .dragging(let primary, _) = state {
-            let point = contacts[primary]?.point ?? .zero
-            outputs.append(.pointer(.leftUp, point, 0))
-        }
+        let outputs = finishContact(cancelled: true)
         ignoredContacts.formUnion(contacts.keys)
         contacts.removeAll()
         state = .pencilExclusive
@@ -438,23 +412,24 @@ struct DirectTouchGestureStateMachine {
         hypot(rhs.x - lhs.x, rhs.y - lhs.y)
     }
 
-    private func proportionalWheelDelta(
-        fingerDelta: CGFloat,
-        wheelUnitRemainder: CGFloat,
-        invertDirection: Bool
-    ) -> (value: Int16?, remainder: CGFloat) {
-        let direction: CGFloat = invertDirection ? -1 : 1
-        let accumulatedUnits = wheelUnitRemainder +
-            direction * fingerDelta * wheelUnitsPerStep / wheelPointsPerStep
-        let unclampedUnits = Int(accumulatedUnits.rounded(.towardZero))
-        let emittedUnits = max(-960, min(960, unclampedUnits))
-        guard emittedUnits != 0 else {
-            return (nil, accumulatedUnits)
-        }
-        return (
-            Int16(emittedUnits),
-            accumulatedUnits - CGFloat(emittedUnits))
+    private mutating func commitContact(_ contact: Contact, point: CGPoint) -> [DirectTouchGestureOutput] {
+        committedContactID = contact.id
+        return [.directTouch(.down, contact.id, contact.start, 255),
+                .directTouch(.update, contact.id, point, 255)]
     }
+
+    private mutating func finishContact(cancelled: Bool) -> [DirectTouchGestureOutput] {
+        guard let id = committedContactID else { return [] }
+        committedContactID = nil
+        return [.directTouch(cancelled ? .cancel : .up, id, contacts[id]?.point ?? .zero, 255)]
+    }
+
+    mutating func retire() -> [DirectTouchGestureOutput] {
+        let outputs = finishContact(cancelled: true)
+        contacts.removeAll(); ignoredContacts.removeAll(); state = .idle
+        return outputs
+    }
+
 }
 
 // MARK: - PencilUIKitView
@@ -601,6 +576,7 @@ public class PencilUIKitView: UIView {
     public var onPencilInput:    ((PencilPacket) -> Void)?
     public var onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)?
     public var onNetworkSend:    ((Data) -> Void)?
+    public var onDirectTouchContact: ((DirectTouchContactCommand) -> Void)?
     public var onPointerInput: ((PointerInputCommand) -> Void)?
     public var onOpenSettings: (() -> Void)?
     public var contentViewport: VideoContentViewport?
@@ -615,6 +591,7 @@ public class PencilUIKitView: UIView {
     private var directGesture = DirectTouchGestureStateMachine()
     private var pointerCoordinateState = PointerInputCoordinateState()
     private var directTouchIDs = LifetimeIdentityMap<ObjectIdentifier>()
+    private var activeDirectContact: (id: UInt64, point: CGPoint)?
 
     override public init(frame: CGRect) {
         super.init(frame: frame)
@@ -705,9 +682,26 @@ public class PencilUIKitView: UIView {
         }
     }
 
-    private func emit(_ outputs: [DirectTouchGestureOutput]) {
+    private func emit(_ outputs: [DirectTouchGestureOutput]) { emitDirectOutputs(outputs) }
+
+    func emitDirectOutputs(_ outputs: [DirectTouchGestureOutput]) {
         for output in outputs {
             switch output {
+            case .directTouch(let phase, let id, let point, let pressure):
+                let mapped = contentViewport?.normalizedPoint(for: point, in: bounds)
+                if phase == .down {
+                    guard let mapped, activeDirectContact == nil else { continue }
+                    activeDirectContact = (id, mapped)
+                } else {
+                    guard activeDirectContact?.id == id else { continue }
+                    if phase == .update, mapped == nil { continue }
+                }
+                guard let normalized = mapped ?? activeDirectContact?.point else { continue }
+                if phase == .up || phase == .cancel { activeDirectContact = nil }
+                else { activeDirectContact = (id, normalized) }
+                onDirectTouchContact?(DirectTouchContactCommand(phase: phase, pressure: pressure, contactID: id,
+                    x: UInt16(clamping: Int((normalized.x * 65_535).rounded())),
+                    y: UInt16(clamping: Int((normalized.y * 65_535).rounded()))))
             case .openSettings:
                 onOpenSettings?()
             case .pointer(let action, let point, let value):

@@ -400,6 +400,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     var remoteKeyboardActive: Bool
     var onKeyboardInput: ((KeyboardInputCommand) -> Void)?
     var onTextCommit: ((String) -> Void)?
+    var onDirectTouchContact: ((DirectTouchContactCommand) -> Void)?
     var onPointerInput: ((PointerInputCommand) -> Void)?
     var onOpenSettings: (() -> Void)?
 
@@ -416,6 +417,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         onTouchBoundsChanged: ((CGRect) -> Void)? = nil,
         onPencilInput: ((PencilPacket) -> Void)? = nil,
         onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)? = nil,
+        onDirectTouchContact: ((DirectTouchContactCommand) -> Void)? = nil,
         onPointerInput: ((PointerInputCommand) -> Void)? = nil,
         onOpenSettings: (() -> Void)? = nil
     ) {
@@ -431,6 +433,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         self.remoteKeyboardActive = remoteKeyboardActive
         self.onKeyboardInput = onKeyboardInput
         self.onTextCommit = onTextCommit
+        self.onDirectTouchContact = onDirectTouchContact
         self.onPointerInput = onPointerInput
         self.onOpenSettings = onOpenSettings
     }
@@ -500,6 +503,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         touchView.onKeyboardInput = onKeyboardInput
         container.onTextCommit = onTextCommit
         container.configureRemoteKeyboard(active: remoteKeyboardActive, generation: networkManager.remoteKeyboardGeneration)
+        touchView.onDirectTouchContact = onDirectTouchContact
         touchView.onPointerInput = onPointerInput
         let openSettings = onOpenSettings
         touchView.onOpenSettings = { [weak container] in

@@ -2613,6 +2613,20 @@ public class NetworkManager: ObservableObject {
         }
     }
 
+    public func sendDirectTouchContact(_ command: DirectTouchContactCommand) {
+        let requestedGeneration = connectionGenerationClock.current
+        networkQueue.async { [weak self] in
+            guard let self, requestedGeneration == self.connectionGeneration,
+                  self.transportState == .streaming,
+                  self.committedTransportGeneration == requestedGeneration,
+                  command.contactID != 0,
+                  DirectTouchDeliveryPolicy.maySend(phase: command.phase,
+                    inputSuppressed: self.displayRequestGate.isInputSuppressed) else { return }
+            self.sendWireMessage(type: .directTouchContact, payload: command.encode(), sequence: 0,
+                movement: command.phase == .update)
+        }
+    }
+
     public func sendPointerInput(_ command: PointerInputCommand) {
         networkQueue.async { [weak self] in
             guard let self else { return }
@@ -5500,5 +5514,11 @@ enum KeyboardInputDeliveryPolicy {
 enum PointerInputDeliveryPolicy {
     static func maySend(action: PointerInputAction, inputSuppressed: Bool) -> Bool {
         !inputSuppressed || action == .leftUp
+    }
+}
+
+enum DirectTouchDeliveryPolicy {
+    static func maySend(phase: DirectTouchPhase, inputSuppressed: Bool) -> Bool {
+        !inputSuppressed || phase == .up || phase == .cancel
     }
 }
