@@ -3010,3 +3010,56 @@ final class PostKeyboardV2CorrectiveTests: XCTestCase {
         XCTAssertEqual(emissions.last, .key(0x08))
     }
 }
+
+final class PointerV2WireRegistrationTests: XCTestCase {
+    func testAdditiveIDsPreserveFrozenInputABI() {
+        XCTAssertNotNil(WireMessageType(rawValue: 41), "DirectTouchContact must register audited free raw41")
+        XCTAssertNotNil(WireMessageType(rawValue: 42), "CursorOwnership must register audited free raw42")
+        XCTAssertEqual(WireMessageType.pipelineMode.rawValue, 36)
+        XCTAssertEqual(WireMessageType.pointerInput.rawValue, 37)
+        XCTAssertEqual(PointerInputCommand.encodedSize, 8)
+        XCTAssertEqual(WireMessageType.keyboardInput.rawValue, 38)
+        XCTAssertEqual(WireMessageType.clientPerformanceFeedback.rawValue, 39)
+        XCTAssertEqual(WireMessageType.textCommit.rawValue, 40)
+    }
+
+    func testMalformedFixedV2PacketDrainsAndNextMessageParses() {
+        for (raw, expectedSize): (UInt8, Int) in [(41, 16), (42, 2)] {
+            for malformedSize in [0, expectedSize - 1, expectedSize + 1] {
+                let parser = WireStreamParser(generation: 4)
+                var discarded = 0
+                var acceptedPing = 0
+                var failures = 0
+                var input = packet(raw: raw, payload: Data(repeating: 0, count: malformedSize))
+                input.append(packet(raw: WireMessageType.ping.rawValue, payload: Data(repeating: 0, count: 16)))
+                for byte in input {
+                    parser.consume(Data([byte]), generation: 4) { event in
+                        switch event {
+                        case .discardedFixedControl(let header):
+                            if header.type.rawValue == raw { discarded += 1 }
+                        case .message(let message):
+                            if message.header.type == .ping { acceptedPing += 1 }
+                        case .failure: failures += 1
+                        default: break
+                        }
+                    }
+                }
+                XCTAssertEqual(discarded, 1, "raw\(raw) malformed length \(malformedSize)")
+                XCTAssertEqual(acceptedPing, 1)
+                XCTAssertEqual(failures, 0)
+            }
+        }
+    }
+
+    private func packet(raw: UInt8, payload: Data) -> Data {
+        var data = Data(count: WireProtocol.headerSize)
+        data.withUnsafeMutableBytes { bytes in
+            bytes.storeBytes(of: WireProtocol.magic.littleEndian, toByteOffset: 0, as: UInt32.self)
+            bytes.storeBytes(of: WireProtocol.version, toByteOffset: 4, as: UInt8.self)
+            bytes.storeBytes(of: raw, toByteOffset: 5, as: UInt8.self)
+            bytes.storeBytes(of: UInt32(payload.count).littleEndian, toByteOffset: 8, as: UInt32.self)
+        }
+        data.append(payload)
+        return data
+    }
+}
