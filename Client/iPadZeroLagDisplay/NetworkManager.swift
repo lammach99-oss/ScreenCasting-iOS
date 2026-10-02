@@ -85,6 +85,56 @@ enum WireMessageType: UInt8 {
     case keyboardInput = 38
     case clientPerformanceFeedback = 39
     case textCommit = 40
+    case directTouchContact = 41
+    case cursorOwnership = 42
+}
+
+public enum DirectTouchPhase: UInt8 { case down = 0, update = 1, up = 2, cancel = 3 }
+
+public struct DirectTouchContactCommand: Equatable {
+    static let encodedSize = 16
+    public let phase: DirectTouchPhase
+    public let pressure: UInt8
+    public let contactID: UInt64
+    public let x: UInt16
+    public let y: UInt16
+
+    func encode() -> Data {
+        precondition(contactID != 0)
+        var data = Data(count: Self.encodedSize)
+        data.withUnsafeMutableBytes { bytes in
+            bytes.storeBytes(of: UInt8(1), toByteOffset: 0, as: UInt8.self)
+            bytes.storeBytes(of: phase.rawValue, toByteOffset: 1, as: UInt8.self)
+            bytes.storeBytes(of: pressure, toByteOffset: 2, as: UInt8.self)
+            bytes.storeBytes(of: contactID.littleEndian, toByteOffset: 4, as: UInt64.self)
+            bytes.storeBytes(of: x.littleEndian, toByteOffset: 12, as: UInt16.self)
+            bytes.storeBytes(of: y.littleEndian, toByteOffset: 14, as: UInt16.self)
+        }
+        return data
+    }
+    static func decode(_ data: Data) -> Self? {
+        guard data.count == encodedSize, data[0] == 1, data[3] == 0,
+              let phase = DirectTouchPhase(rawValue: data[1]) else { return nil }
+        return data.withUnsafeBytes { bytes in
+            let id = UInt64(littleEndian: bytes.loadUnaligned(fromByteOffset: 4, as: UInt64.self))
+            guard id != 0 else { return nil }
+            return Self(phase: phase, pressure: data[2], contactID: id,
+                x: UInt16(littleEndian: bytes.loadUnaligned(fromByteOffset: 12, as: UInt16.self)),
+                y: UInt16(littleEndian: bytes.loadUnaligned(fromByteOffset: 14, as: UInt16.self)))
+        }
+    }
+}
+
+enum CursorOwnershipState: UInt8 { case clientActive = 0, hostActive = 1 }
+struct CursorOwnershipCommand: Equatable {
+    static let encodedSize = 2
+    let state: CursorOwnershipState
+    func encode() -> Data { Data([1, state.rawValue]) }
+    static func decode(_ data: Data) -> Self? {
+        guard data.count == encodedSize, data[0] == 1,
+              let state = CursorOwnershipState(rawValue: data[1]) else { return nil }
+        return Self(state: state)
+    }
 }
 
 public struct TextCommitCommand: Equatable {
@@ -1547,6 +1597,10 @@ final class WireStreamParser {
             fixedLength = KeyboardInputCommand.encodedSize
         case .clientPerformanceFeedback:
             fixedLength = 24
+        case .directTouchContact:
+            fixedLength = DirectTouchContactCommand.encodedSize
+        case .cursorOwnership:
+            fixedLength = CursorOwnershipCommand.encodedSize
         case .pointerInput:
             fixedLength = PointerInputCommand.encodedSize
         case .clientCapabilities:
@@ -4162,7 +4216,7 @@ public class NetworkManager: ObservableObject {
         case .clientPerformanceFeedback:
             return
 
-        case .pointerInput, .keyboardInput, .textCommit:
+        case .directTouchContact, .cursorOwnership, .pointerInput, .keyboardInput, .textCommit:
             return
 
         case .video:

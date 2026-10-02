@@ -3012,6 +3012,35 @@ final class PostKeyboardV2CorrectiveTests: XCTestCase {
 }
 
 final class PointerV2WireRegistrationTests: XCTestCase {
+    func testDirectTouchExactLittleEndianAndMalformedPayloads() {
+        for phase: DirectTouchPhase in [.down, .update, .up, .cancel] {
+            let command = DirectTouchContactCommand(phase: phase, pressure: 255,
+                contactID: 0x0807060504030201, x: 0x1234, y: 0xABCD)
+            let bytes: [UInt8] = [1, phase.rawValue, 255, 0, 1, 2, 3, 4, 5, 6, 7, 8, 0x34, 0x12, 0xCD, 0xAB]
+            XCTAssertEqual(Array(command.encode()), bytes)
+            XCTAssertEqual(DirectTouchContactCommand.decode(Data(bytes)), command)
+            for (offset, value): (Int, UInt8) in [(0, 2), (1, 4), (3, 1)] {
+                var bad = bytes; bad[offset] = value
+                XCTAssertNil(DirectTouchContactCommand.decode(Data(bad)))
+            }
+            var zero = bytes; zero.replaceSubrange(4..<12, with: repeatElement(UInt8(0), count: 8))
+            XCTAssertNil(DirectTouchContactCommand.decode(Data(zero)))
+            XCTAssertNil(DirectTouchContactCommand.decode(Data(bytes.dropLast())))
+            XCTAssertNil(DirectTouchContactCommand.decode(Data(bytes + [0])))
+        }
+    }
+
+    func testOwnershipExactABIAndStrictValidation() {
+        for state: CursorOwnershipState in [.clientActive, .hostActive] {
+            let command = CursorOwnershipCommand(state: state)
+            XCTAssertEqual(Array(command.encode()), [1, state.rawValue])
+            XCTAssertEqual(CursorOwnershipCommand.decode(command.encode()), command)
+        }
+        for bytes: [UInt8] in [[2, 0], [1, 2], [1], [1, 0, 0]] {
+            XCTAssertNil(CursorOwnershipCommand.decode(Data(bytes)))
+        }
+    }
+
     func testAdditiveIDsPreserveFrozenInputABI() {
         XCTAssertNotNil(WireMessageType(rawValue: 41), "DirectTouchContact must register audited free raw41")
         XCTAssertNotNil(WireMessageType(rawValue: 42), "CursorOwnership must register audited free raw42")
