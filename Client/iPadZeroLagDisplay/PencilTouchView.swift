@@ -305,7 +305,22 @@ struct DirectTouchGestureStateMachine {
     mutating func moveBatch(
         _ movements: [(id: UInt64, point: CGPoint, timestamp: TimeInterval)]
     ) -> [DirectTouchGestureOutput] {
-        movements.flatMap { move(id: $0.id, point: $0.point, timestamp: $0.timestamp) }
+        if case .twoFinger(var pair) = state, pair.completed.isEmpty {
+            let owned = movements.filter { contacts[$0.id] != nil && !ignoredContacts.contains($0.id) }
+            guard let last = owned.last else { return [] }
+            // UIKit reports both moved contacts together; do not classify an intermediate span.
+            for movement in owned.dropLast() {
+                guard var contact = contacts[movement.id] else { continue }
+                contact.point = movement.point
+                contact.maxExcursion = max(contact.maxExcursion, distance(contact.start, movement.point))
+                contacts[movement.id] = contact
+                pair.points[movement.id] = movement.point
+                pair.validTap = pair.validTap && contact.maxExcursion <= tapMovement
+            }
+            state = .twoFinger(pair)
+            return move(id: last.id, point: last.point, timestamp: last.timestamp)
+        }
+        return movements.flatMap { move(id: $0.id, point: $0.point, timestamp: $0.timestamp) }
     }
 
     mutating func move(
@@ -407,9 +422,8 @@ struct DirectTouchGestureStateMachine {
                 outputs += [.directTouch(.down, id, contact.start, 255), .directTouch(.up, id, contact.start, 255)]
             }
             state = .suppressed
-        case .scrolling, .horizontalScrolling:
-            outputs += finishContact(cancelled: cancelled)
-            state = .suppressed
+        case .scrolling(let primary), .horizontalScrolling(let primary):
+            if primary == id { state = .suppressed }
         case .twoFinger(var pair):
             pair.points[id] = point
             pair.completed.insert(id)
@@ -424,9 +438,11 @@ struct DirectTouchGestureStateMachine {
             } else {
                 state = .twoFinger(pair)
             }
-        case .dragging:
-            outputs += finishContact(cancelled: cancelled)
-            state = .suppressed
+        case .dragging(let primary):
+            if primary == id {
+                outputs += finishContact(cancelled: cancelled)
+                state = .suppressed
+            }
         case .threeFinger(
             let startedAt,
             let participants,
@@ -761,6 +777,14 @@ public class PencilUIKitView: UIView {
         }
 
         guard directTouchEnabled else { return }
+        if flags == 2 {
+            let movements = directTouches.compactMap { touch -> (id: UInt64, point: CGPoint, timestamp: TimeInterval)? in
+                guard let id = directTouchIDs.existing(ObjectIdentifier(touch)) else { return nil }
+                return (id, touch.location(in: self), touch.timestamp)
+            }
+            emit(directGesture.moveBatch(movements))
+            return
+        }
         for touch in directTouches {
             let key = ObjectIdentifier(touch)
             let id: UInt64
@@ -775,9 +799,6 @@ public class PencilUIKitView: UIView {
             switch flags {
             case 1:
                 outputs = directGesture.begin(
-                    id: id, point: point, timestamp: touch.timestamp)
-            case 2:
-                outputs = directGesture.move(
                     id: id, point: point, timestamp: touch.timestamp)
             default:
                 outputs = directGesture.end(

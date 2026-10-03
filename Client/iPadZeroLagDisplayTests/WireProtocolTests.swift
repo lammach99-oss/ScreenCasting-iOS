@@ -3571,13 +3571,13 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
     func testFourthFingerAfterCommitTerminatesOnce() {
         var machine = DirectTouchGestureStateMachine()
         machine.begin(id: 1, point: .zero, timestamp: 0)
-        machine.move(id: 1, point: CGPoint(x: 0, y: 13), timestamp: 0.01)
-        machine.begin(id: 2, point: .zero, timestamp: 0.02)
-        machine.begin(id: 3, point: .zero, timestamp: 0.03)
-        let cancel = machine.begin(id: 4, point: .zero, timestamp: 0.04)
+        machine.move(id: 1, point: CGPoint(x: 0, y: 13), timestamp: 1.1)
+        machine.begin(id: 2, point: .zero, timestamp: 1.12)
+        machine.begin(id: 3, point: .zero, timestamp: 1.13)
+        let cancel = machine.begin(id: 4, point: .zero, timestamp: 1.14)
         XCTAssertEqual(cancel, [.directTouch(.cancel, 1, CGPoint(x: 0, y: 13), 255)])
         for id in UInt64(1)...4 {
-            XCTAssertTrue(machine.end(id: id, point: .zero, timestamp: 0.1).isEmpty)
+            XCTAssertTrue(machine.end(id: id, point: .zero, timestamp: 1.2).isEmpty)
         }
     }
 }
