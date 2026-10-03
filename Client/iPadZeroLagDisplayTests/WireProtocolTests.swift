@@ -3212,6 +3212,74 @@ final class PointerV2LifecycleTests: XCTestCase {
 }
 
 final class PointerV2FinalBoundaryTests: XCTestCase {
+    @MainActor func testSoftwareResponderHardwarePressTakesAuthorityAndDeliversFirstKeyOnce() {
+        let container = ConnectedPresentationContainer(frame: .zero)
+        container.configureRemoteKeyboard(active: true, generation: 9)
+        container.applyRemoteKeyboardMode(.softwareOpen)
+        container.softwareTextView.setMarkedText("đẹp", selectedRange: NSRange(location: 3, length: 0))
+        let press = UIPress()
+        let nextPress = UIPress()
+        container.touchView.hardwareKeyUsageForTesting = { candidate in
+            candidate === press ? .keyboardA : .keyboardB
+        }
+        var commands: [KeyboardInputCommand] = []
+        var text: [String] = []
+        container.touchView.onKeyboardInput = { commands.append($0) }
+        container.onTextCommit = { text.append($0) }
+        container.softwareTextView.pressesBegan([press], with: nil)
+        XCTAssertEqual(container.keyboardMode, .hardware)
+        XCTAssertTrue(container.keyboardButton.isHidden)
+        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+        XCTAssertNil(container.softwareTextView.markedTextRange)
+        XCTAssertTrue((container.softwareTextView.text ?? "").isEmpty)
+        XCTAssertEqual(commands.map(\.action), [.keyDown])
+        XCTAssertEqual(commands.map(\.virtualKey), [0x41])
+        container.touchView.pressesBegan([nextPress], with: nil)
+        container.touchView.pressesEnded([press, nextPress], with: nil)
+        XCTAssertEqual(commands.map(\.action), [.keyDown, .keyDown, .keyUp, .keyUp])
+        XCTAssertEqual(commands.map(\.virtualKey), [0x41, 0x42, 0x41, 0x42])
+        XCTAssertTrue(text.isEmpty)
+        container.hardwarePresenceChanged(false)
+        XCTAssertEqual(container.keyboardMode, .softwareAvailable)
+        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+    }
+
+    @MainActor func testPencilCandidateAppearanceAndRemovalNeverClaimSoftwareAuthority() {
+        var present = false
+        let monitor = HardwareKeyboardMonitor(candidatePresence: { present })
+        let container = ConnectedPresentationContainer(frame: .zero)
+        container.configureRemoteKeyboard(active: true, generation: 9)
+        container.applyRemoteKeyboardMode(.softwareAvailable)
+        var transitions: [Bool] = []
+        monitor.onChanged = { transitions.append($0); container.hardwarePresenceChanged($0) }
+        present = true
+        monitor.refresh()
+        XCTAssertEqual(container.keyboardMode, .softwareAvailable)
+        XCTAssertFalse(container.keyboardButton.isHidden)
+        container.applyRemoteKeyboardMode(.softwareOpen)
+        container.softwareTextView.setMarkedText("đ", selectedRange: NSRange(location: 1, length: 0))
+        monitor.refresh()
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertNotNil(container.softwareTextView.markedTextRange)
+        present = false
+        monitor.refresh(disconnected: true)
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertNotNil(container.softwareTextView.markedTextRange)
+        XCTAssertTrue(transitions.isEmpty)
+    }
+
+    @MainActor func testUnidentifiedDisconnectRevokesAuthorityWithoutReopeningSoftwareKeyboard() {
+        let monitor = HardwareKeyboardMonitor(candidatePresence: { true })
+        var transitions: [Bool] = []
+        monitor.onChanged = { transitions.append($0) }
+        monitor.recordKeyActivity()
+        monitor.refresh(disconnected: true)
+        XCTAssertFalse(monitor.isConnected)
+        XCTAssertEqual(transitions, [true, false])
+        monitor.refresh()
+        XCTAssertFalse(monitor.isConnected, "A remaining accessory object is not positive key activity")
+    }
+
     @MainActor func testKeyboardCandidateDoesNotOwnAuthorityUntilActualKeyActivity() {
         var present = false
         let monitor = HardwareKeyboardMonitor(candidatePresence: { present })
