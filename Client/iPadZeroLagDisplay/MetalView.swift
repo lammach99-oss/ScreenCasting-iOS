@@ -174,20 +174,26 @@ enum FloatingKeyboardPlacement {
     }
 }
 @MainActor final class HardwareKeyboardMonitor {
-    private(set) var isConnected = GCKeyboard.coalesced != nil
+    private(set) var isConnected = false
+    private let candidatePresence: () -> Bool
     var onChanged: ((Bool) -> Void)?
     private var observers: [NSObjectProtocol] = []
-    init() {
+    init(candidatePresence: @escaping () -> Bool = { GCKeyboard.coalesced != nil }) {
+        self.candidatePresence = candidatePresence
         for name in [Notification.Name.GCKeyboardDidConnect, .GCKeyboardDidDisconnect] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.refresh() }
+                MainActor.assumeIsolated { self?.refresh(disconnected: name == .GCKeyboardDidDisconnect) }
             })
         }
     }
-    func refresh() {
-        let present = GCKeyboard.coalesced != nil
-        guard present != isConnected else { return }
-        isConnected = present; onChanged?(present)
+    func refresh(disconnected: Bool = false) {
+        // Candidate presence (including the observed Pencil false-positive) is not authority.
+        guard isConnected && (disconnected || !candidatePresence()) else { return }
+        isConnected = false; onChanged?(false)
+    }
+    func recordKeyActivity() {
+        guard !isConnected else { return }
+        isConnected = true; onChanged?(true)
     }
     deinit { observers.forEach(NotificationCenter.default.removeObserver) }
 }
@@ -257,6 +263,10 @@ public final class ConnectedPresentationContainer: UIView {
             self.applyRemoteKeyboardMode(.softwareAvailable)
         }
         hardwareMonitor.onChanged = { [weak self] present in self?.hardwarePresenceChanged(present) }
+        touchView.onHardwareKeyActivity = { [weak self] in self?.hardwareMonitor.recordKeyActivity() }
+        softwareTextView.onHardwarePresses = { [weak self] presses, action in
+            self?.touchView.unhandledHardwarePresses(presses, action: action) ?? presses
+        }
         for name in [UIResponder.keyboardWillChangeFrameNotification, UIResponder.keyboardWillHideNotification,
                      UIApplication.willResignActiveNotification, UIApplication.didBecomeActiveNotification] {
             keyboardObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
@@ -366,6 +376,8 @@ public final class ConnectedPresentationContainer: UIView {
             setNeedsLayout()
         }
         keyboardButton.isHidden = mode == .none || mode == .hardware
+        touchView.hardwareKeyActivityEnabled = mode != .none
+        touchView.passiveKeyboardCaptureEnabled = mode == .softwareAvailable
         touchView.keyboardCaptureEnabled = mode == .hardware
         if mode == .softwareOpen {
             softwareTextView.deliveryEnabled = true

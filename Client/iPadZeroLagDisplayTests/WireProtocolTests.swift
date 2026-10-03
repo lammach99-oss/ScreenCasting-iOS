@@ -3157,6 +3157,60 @@ final class PointerV2LifecycleTests: XCTestCase {
 }
 
 final class PointerV2FinalBoundaryTests: XCTestCase {
+    @MainActor func testKeyboardCandidateDoesNotOwnAuthorityUntilActualKeyActivity() {
+        var present = false
+        let monitor = HardwareKeyboardMonitor(candidatePresence: { present })
+        var authority: [Bool] = []
+        monitor.onChanged = { authority.append($0) }
+        XCTAssertFalse(monitor.isConnected)
+        present = true
+        monitor.refresh()
+        XCTAssertFalse(monitor.isConnected, "Pencil-only candidate must not activate hardware")
+        XCTAssertTrue(authority.isEmpty)
+        let container = ConnectedPresentationContainer(frame: .zero)
+        container.configureRemoteKeyboard(active: true, generation: 1)
+        container.applyRemoteKeyboardMode(.softwareOpen)
+        monitor.onChanged = { authority.append($0); container.hardwarePresenceChanged($0) }
+        monitor.refresh()
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertTrue(container.softwareTextView.deliveryEnabled)
+        monitor.recordKeyActivity()
+        XCTAssertTrue(monitor.isConnected)
+        monitor.recordKeyActivity()
+        XCTAssertEqual(authority, [true])
+        present = false
+        monitor.refresh()
+        XCTAssertFalse(monitor.isConnected)
+        XCTAssertEqual(authority, [true, false])
+        XCTAssertEqual(container.keyboardMode, .softwareAvailable)
+        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+    }
+
+    @MainActor func testFirstHardwareKeyTakesSoftwareAuthorityAndIsDeliveredOnce() {
+        let container = ConnectedPresentationContainer(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        container.configureRemoteKeyboard(active: true, generation: 1)
+        container.applyRemoteKeyboardMode(.softwareOpen)
+        container.softwareTextView.setMarkedText("pending", selectedRange: NSRange(location: 7, length: 0))
+        var commands: [KeyboardInputCommand] = []
+        var textCommits: [String] = []
+        container.touchView.onKeyboardInput = { commands.append($0) }
+        container.onTextCommit = { textCommits.append($0) }
+        XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardA, action: .keyDown))
+        XCTAssertEqual(container.keyboardMode, .hardware)
+        XCTAssertTrue(container.keyboardButton.isHidden)
+        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+        XCTAssertNil(container.softwareTextView.markedTextRange)
+        XCTAssertTrue((container.softwareTextView.text ?? "").isEmpty)
+        XCTAssertEqual(commands.map(\.action), [.keyDown])
+        XCTAssertEqual(commands.map(\.virtualKey), [0x41])
+        XCTAssertTrue(textCommits.isEmpty)
+        XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardA, action: .keyUp))
+        XCTAssertEqual(commands.map(\.action), [.keyDown, .keyUp])
+        container.hardwarePresenceChanged(false)
+        XCTAssertEqual(container.keyboardMode, .softwareAvailable)
+        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+    }
+
     @MainActor func testPencilOnlyKeepsSoftwareAuthorityAndRealHardwareStillWins() {
         let container = ConnectedPresentationContainer(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
         var diagnostics: [String] = []

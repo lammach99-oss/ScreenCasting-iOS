@@ -488,16 +488,21 @@ public class PencilUIKitView: UIView {
     public var keyboardCaptureEnabled = false {
         didSet { updateKeyboardCapture() }
     }
+    var hardwareKeyActivityEnabled = false
+    var onHardwareKeyActivity: (() -> Void)?
+    var passiveKeyboardCaptureEnabled = false {
+        didSet { updateKeyboardCapture() }
+    }
     private var activeRemotePhysicalKeys: [UIKeyboardHIDUsage: UInt16] = [:]
     private var remoteVirtualKeyOwnerCounts: [UInt16: Int] = [:]
 
     override public var canBecomeFirstResponder: Bool { true }
 
     private func updateKeyboardCapture() {
-        if keyboardCaptureEnabled && window != nil {
+        if !keyboardCaptureEnabled { releaseActiveRemoteKeys() }
+        if (keyboardCaptureEnabled || passiveKeyboardCaptureEnabled) && window != nil {
             if !isFirstResponder { becomeFirstResponder() }
         } else {
-            releaseActiveRemoteKeys()
             resignFirstResponder()
         }
     }
@@ -520,6 +525,7 @@ public class PencilUIKitView: UIView {
     // deterministically without synthesizing UIKit hardware events.
     @discardableResult
     func handleHardwareKey(_ usage: UIKeyboardHIDUsage, action: KeyboardInputAction) -> Bool {
+        if action == .keyDown && hardwareKeyActivityEnabled { onHardwareKeyActivity?() }
         guard keyboardCaptureEnabled,
               let virtualKey = RemoteKeyboardKeyMapper.virtualKey(for: usage) else { return false }
         if action == .keyDown {
@@ -541,7 +547,7 @@ public class PencilUIKitView: UIView {
         return true
     }
 
-    private func unhandledPresses(_ presses: Set<UIPress>, action: KeyboardInputAction) -> Set<UIPress> {
+    func unhandledHardwarePresses(_ presses: Set<UIPress>, action: KeyboardInputAction) -> Set<UIPress> {
         // UIKit supplies a set: apply modifiers before ordinary Down events,
         // and release them after ordinary Up events in the same batch.
         let ordered = presses.sorted { lhs, rhs in
@@ -561,17 +567,17 @@ public class PencilUIKitView: UIView {
     }
 
     override public func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        let unhandled = unhandledPresses(presses, action: .keyDown)
+        let unhandled = unhandledHardwarePresses(presses, action: .keyDown)
         if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
     }
 
     override public func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        let unhandled = unhandledPresses(presses, action: .keyUp)
+        let unhandled = unhandledHardwarePresses(presses, action: .keyUp)
         if !unhandled.isEmpty { super.pressesEnded(unhandled, with: event) }
     }
 
     override public func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        let unhandled = unhandledPresses(presses, action: .keyUp)
+        let unhandled = unhandledHardwarePresses(presses, action: .keyUp)
         if !unhandled.isEmpty { super.pressesCancelled(unhandled, with: event) }
     }
 
@@ -990,6 +996,7 @@ final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate {
     var deliveryEnabled = false
     var onEmission: ((SoftwareKeyboardEmission) -> Void)?
     var onDismiss: (() -> Void)?
+    var onHardwarePresses: ((Set<UIPress>, KeyboardInputAction) -> Set<UIPress>)?
     private var consuming = false
     private var committedShadow = SoftwareKeyboardCommittedShadow()
     override init(frame: CGRect, textContainer: NSTextContainer?) {
@@ -1008,6 +1015,18 @@ final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate {
         inputAssistantItem.trailingBarButtonGroups = []
     }
     required init?(coder: NSCoder) { nil }
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let remaining = onHardwarePresses?(presses, .keyDown) ?? presses
+        if !remaining.isEmpty { super.pressesBegan(remaining, with: event) }
+    }
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let remaining = onHardwarePresses?(presses, .keyUp) ?? presses
+        if !remaining.isEmpty { super.pressesEnded(remaining, with: event) }
+    }
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let remaining = onHardwarePresses?(presses, .keyUp) ?? presses
+        if !remaining.isEmpty { super.pressesCancelled(remaining, with: event) }
+    }
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool { false }
     func consumeCommittedBuffer() {
