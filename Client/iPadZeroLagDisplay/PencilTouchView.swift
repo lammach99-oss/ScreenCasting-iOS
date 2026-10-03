@@ -495,6 +495,16 @@ public class PencilUIKitView: UIView {
     }
     private var activeRemotePhysicalKeys: [UIKeyboardHIDUsage: UInt16] = [:]
     private var remoteVirtualKeyOwnerCounts: [UInt16: Int] = [:]
+    #if targetEnvironment(simulator)
+    var hardwareKeyUsageForTesting: ((UIPress) -> UIKeyboardHIDUsage?)?
+    #endif
+
+    private func hardwareKeyUsage(for press: UIPress) -> UIKeyboardHIDUsage? {
+        #if targetEnvironment(simulator)
+        if let decode = hardwareKeyUsageForTesting { return decode(press) }
+        #endif
+        return press.key?.keyCode
+    }
 
     override public var canBecomeFirstResponder: Bool { true }
 
@@ -551,8 +561,8 @@ public class PencilUIKitView: UIView {
         // UIKit supplies a set: apply modifiers before ordinary Down events,
         // and release them after ordinary Up events in the same batch.
         let ordered = presses.sorted { lhs, rhs in
-            let left = lhs.key?.keyCode.rawValue ?? 0
-            let right = rhs.key?.keyCode.rawValue ?? 0
+            let left = hardwareKeyUsage(for: lhs)?.rawValue ?? 0
+            let right = hardwareKeyUsage(for: rhs)?.rawValue ?? 0
             let leftModifier = (0xE0...0xE7).contains(left)
             let rightModifier = (0xE0...0xE7).contains(right)
             if leftModifier != rightModifier {
@@ -561,8 +571,8 @@ public class PencilUIKitView: UIView {
             return left < right
         }
         return Set(ordered.filter { press in
-            guard let key = press.key else { return true }
-            return !handleHardwareKey(key.keyCode, action: action)
+            guard let usage = hardwareKeyUsage(for: press) else { return true }
+            return !handleHardwareKey(usage, action: action)
         })
     }
 
