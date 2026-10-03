@@ -1045,7 +1045,10 @@ final class USBListenerLifetimeTests: XCTestCase {
                 let stateHandler = listener.stateUpdateHandler
                 listener.stateUpdateHandler = { state in
                     stateHandler?(state)
-                    if case .ready = state { listenerReady.fulfill() }
+                    if case .ready = state {
+                        listener.stateUpdateHandler = stateHandler
+                        listenerReady.fulfill()
+                    }
                 }
             }
         }
@@ -1064,7 +1067,10 @@ final class USBListenerLifetimeTests: XCTestCase {
                 let stateHandler = connection.stateUpdateHandler
                 connection.stateUpdateHandler = { state in
                     stateHandler?(state)
-                    if case .ready = state { acceptedReady.fulfill() }
+                    if case .ready = state {
+                        connection.stateUpdateHandler = stateHandler
+                        acceptedReady.fulfill()
+                    }
                 }
             }
         }
