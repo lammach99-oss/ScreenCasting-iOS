@@ -302,6 +302,12 @@ struct DirectTouchGestureStateMachine {
         return []
     }
 
+    mutating func moveBatch(
+        _ movements: [(id: UInt64, point: CGPoint, timestamp: TimeInterval)]
+    ) -> [DirectTouchGestureOutput] {
+        movements.flatMap { move(id: $0.id, point: $0.point, timestamp: $0.timestamp) }
+    }
+
     mutating func move(
         id: UInt64,
         point: CGPoint,
