@@ -818,7 +818,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         let listener = try XCTUnwrap(manager.usbSessionSnapshot().listener)
         let snapBefore = manager.usbSessionSnapshot()
         let decoderInvalidations = manager.decoderForTesting.invalidateCountForTesting
-        let feedbacks = manager.videoFeedbackCountForTesting
+        let feedbacks = manager.usbForegroundRecoveryFeedbackCountForTesting
 
         manager.applicationWillResignActive()
         manager.applicationDidBecomeActive()
@@ -830,17 +830,20 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertEqual(
             manager.decoderForTesting.invalidateCountForTesting,
             decoderInvalidations)
-        XCTAssertEqual(manager.videoFeedbackCountForTesting, feedbacks)
+        XCTAssertEqual(manager.usbForegroundRecoveryFeedbackCountForTesting, feedbacks)
     }
 
     func testUsbBackgroundForegroundRearmsDecoderOnceForSameGeneration() throws {
         let peer = try connect()
+        guard case .ready = peer.state else {
+            return XCTFail("Foreground recovery requires a healthy accepted socket")
+        }
         manager.simulateSessionAuthenticatedAndCommitted(
             mode: RealtimeTransportMode.usbSplitTLS)
         let before = manager.usbSessionSnapshot()
         let invalidations = manager.decoderForTesting.invalidateCountForTesting
         let sessions = manager.decoderForTesting.sessionBeganCountForTesting
-        let feedbacks = manager.videoFeedbackCountForTesting
+        let feedbacks = manager.usbForegroundRecoveryFeedbackCountForTesting
         manager.decoderForTesting.resetLifecycleEventsForTesting()
 
         manager.applicationDidEnterBackground()
@@ -856,7 +859,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertEqual(
             manager.decoderForTesting.sessionBeganCountForTesting,
             sessions + 1)
-        XCTAssertEqual(manager.videoFeedbackCountForTesting, feedbacks + 1)
+        XCTAssertEqual(manager.usbForegroundRecoveryFeedbackCountForTesting, feedbacks + 1)
         XCTAssertEqual(
             manager.decoderForTesting.lifecycleEventsForTesting,
             ["invalidate-begin", "invalidate-end", "begin-\(before.generation)"])
@@ -865,7 +868,19 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertEqual(
             manager.decoderForTesting.invalidateCountForTesting,
             invalidations + 1)
-        XCTAssertEqual(manager.videoFeedbackCountForTesting, feedbacks + 1)
+        XCTAssertEqual(manager.usbForegroundRecoveryFeedbackCountForTesting, feedbacks + 1)
+    }
+
+    func testConnectionFailureCleanupIsNotForegroundRecovery() throws {
+        let peer = try connect()
+        manager.simulateSessionAuthenticatedAndCommitted(mode: RealtimeTransportMode.usbSplitTLS)
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+        let recoveries = manager.usbForegroundRecoveryFeedbackCountForTesting
+        try deliver(.failed(.posix(.ECONNRESET)), to: peer)
+        manager.decoderForTesting.sessionQueueForTesting.sync { }
+        XCTAssertNil(manager.usbSessionSnapshot().connection)
+        XCTAssertEqual(manager.decoderForTesting.invalidateCountForTesting, invalidations + 1)
+        XCTAssertEqual(manager.usbForegroundRecoveryFeedbackCountForTesting, recoveries)
     }
 
     func testStaleUsbBackgroundTokenCannotRearmReplacementGeneration() throws {
@@ -879,7 +894,7 @@ final class USBListenerLifetimeTests: XCTestCase {
             mode: RealtimeTransportMode.usbSplitTLS)
         let before = manager.usbSessionSnapshot()
         let invalidations = manager.decoderForTesting.invalidateCountForTesting
-        let feedbacks = manager.videoFeedbackCountForTesting
+        let feedbacks = manager.usbForegroundRecoveryFeedbackCountForTesting
 
         manager.applicationDidBecomeActive()
 
@@ -889,7 +904,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertEqual(
             manager.decoderForTesting.invalidateCountForTesting,
             invalidations)
-        XCTAssertEqual(manager.videoFeedbackCountForTesting, feedbacks)
+        XCTAssertEqual(manager.usbForegroundRecoveryFeedbackCountForTesting, feedbacks)
     }
 
     func testUsbBackgroundStopRevokesDecoderRearm() throws {
@@ -898,7 +913,7 @@ final class USBListenerLifetimeTests: XCTestCase {
             mode: RealtimeTransportMode.usbSplitTLS)
         manager.applicationDidEnterBackground()
         let invalidations = manager.decoderForTesting.invalidateCountForTesting
-        let feedbacks = manager.videoFeedbackCountForTesting
+        let feedbacks = manager.usbForegroundRecoveryFeedbackCountForTesting
 
         manager.stopForTesting()
         manager.applicationDidBecomeActive()
@@ -907,7 +922,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertEqual(
             manager.decoderForTesting.invalidateCountForTesting,
             invalidations + 1)
-        XCTAssertEqual(manager.videoFeedbackCountForTesting, feedbacks)
+        XCTAssertEqual(manager.usbForegroundRecoveryFeedbackCountForTesting, feedbacks)
         _ = peer
     }
 
@@ -915,7 +930,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         let snapshot = manager.usbSessionSnapshot()
         let listener = try XCTUnwrap(snapshot.listener)
         let invalidations = manager.decoderForTesting.invalidateCountForTesting
-        let feedbacks = manager.videoFeedbackCountForTesting
+        let feedbacks = manager.usbForegroundRecoveryFeedbackCountForTesting
 
         manager.applicationDidEnterBackground()
         manager.applicationDidBecomeActive()
@@ -926,7 +941,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertEqual(
             manager.decoderForTesting.invalidateCountForTesting,
             invalidations)
-        XCTAssertEqual(manager.videoFeedbackCountForTesting, feedbacks)
+        XCTAssertEqual(manager.usbForegroundRecoveryFeedbackCountForTesting, feedbacks)
     }
 
     func testHealthyCommittedSessionRejectsLateCandidate() throws {
@@ -1022,12 +1037,46 @@ final class USBListenerLifetimeTests: XCTestCase {
         let snapshot = manager.usbSessionSnapshot()
         let listener = try XCTUnwrap(snapshot.listener)
         let acceptHandler = try XCTUnwrap(listener.newConnectionHandler)
-        let peer = NWConnection(host: "127.0.0.1", port: 42042, using: .tcp)
-        peers.append(peer)
+        let listenerReady = expectation(description: "ephemeral USB listener ready")
         manager.networkQueueForTesting.sync {
-            acceptHandler(peer)
+            if case .ready = listener.state {
+                listenerReady.fulfill()
+            } else {
+                let stateHandler = listener.stateUpdateHandler
+                listener.stateUpdateHandler = { state in
+                    stateHandler?(state)
+                    if case .ready = state { listenerReady.fulfill() }
+                }
+            }
         }
-        return peer
+        wait(for: [listenerReady], timeout: 5)
+        let port = try XCTUnwrap(listener.port)
+        let acceptedReady = expectation(description: "USB candidate ready or rejected")
+        var acceptedPeer: NWConnection?
+        manager.networkQueueForTesting.sync {
+            listener.newConnectionHandler = { connection in
+                acceptHandler(connection)
+                acceptedPeer = connection
+                guard self.manager.usbSessionSnapshot().connection === connection else {
+                    acceptedReady.fulfill()
+                    return
+                }
+                let stateHandler = connection.stateUpdateHandler
+                connection.stateUpdateHandler = { state in
+                    stateHandler?(state)
+                    if case .ready = state { acceptedReady.fulfill() }
+                }
+            }
+        }
+        let client = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
+        peers.append(client)
+        client.start(queue: manager.networkQueueForTesting)
+        wait(for: [acceptedReady], timeout: 5)
+        let accepted = try manager.networkQueueForTesting.sync {
+            listener.newConnectionHandler = acceptHandler
+            return try XCTUnwrap(acceptedPeer)
+        }
+        return accepted
     }
 
     private func deliver(_ state: NWConnection.State, to connection: NWConnection) throws {
