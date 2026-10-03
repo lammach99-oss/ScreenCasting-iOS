@@ -3118,6 +3118,51 @@ final class PointerV2WireRegistrationTests: XCTestCase {
 }
 
 final class TouchGestureV2ContractTests: XCTestCase {
+    func testTwoFingerTapRequiresBothContactsAndUsesCentroidAfterBothLift() {
+        for firstLift: UInt64 in [1, 2] {
+            var machine = DirectTouchGestureStateMachine()
+            machine.begin(id: 1, point: CGPoint(x: 20, y: 40), timestamp: 0)
+            machine.begin(id: 2, point: CGPoint(x: 100, y: 40), timestamp: 0.03)
+            let firstPoint = firstLift == 1 ? CGPoint(x: 20, y: 40) : CGPoint(x: 100, y: 40)
+            XCTAssertTrue(machine.end(id: firstLift, point: firstPoint, timestamp: 0.1).isEmpty)
+            let lastPoint = firstLift == 1 ? CGPoint(x: 100, y: 40) : CGPoint(x: 20, y: 40)
+            XCTAssertEqual(machine.end(id: firstLift == 1 ? 2 : 1, point: lastPoint, timestamp: 0.12),
+                [.pointer(.rightClick, CGPoint(x: 60, y: 40), 0)])
+        }
+    }
+
+    func testEitherFingerExcursionPermanentlyDisqualifiesRightClick() {
+        for moved: UInt64 in [1, 2] {
+            var machine = DirectTouchGestureStateMachine()
+            let start = moved == 1 ? CGPoint.zero : CGPoint(x: 100, y: 0)
+            machine.begin(id: 1, point: .zero, timestamp: 0)
+            machine.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01)
+            machine.move(id: moved, point: CGPoint(x: start.x, y: 14), timestamp: 0.05)
+            machine.move(id: moved, point: start, timestamp: 0.06)
+            let output = machine.end(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.1) +
+                machine.end(id: 1, point: .zero, timestamp: 0.12)
+            XCTAssertFalse(output.contains { if case .pointer(.rightClick, _, _) = $0 { return true }; return false })
+            XCTAssertTrue(phases(output).isEmpty)
+        }
+    }
+
+    func testPinchApartAndTogetherProduceSignedZoomWithoutContactOrSettings() {
+        for (x, sign) in [(CGFloat(120), 1), (CGFloat(80), -1)] {
+            var machine = DirectTouchGestureStateMachine()
+            machine.begin(id: 1, point: .zero, timestamp: 0)
+            machine.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01)
+            let output = machine.move(id: 2, point: CGPoint(x: x, y: 0), timestamp: 0.05)
+            XCTAssertTrue(phases(output).isEmpty)
+            XCTAssertGreaterThan(wheel(output, action: .zoomWheel) * sign, 0)
+            machine.begin(id: 3, point: CGPoint(x: 50, y: 0), timestamp: 0.06)
+            var terminal = machine.end(id: 1, point: .zero, timestamp: 0.1)
+            terminal += machine.end(id: 2, point: CGPoint(x: x, y: 0), timestamp: 0.11)
+            terminal += machine.end(id: 3, point: CGPoint(x: 50, y: 0), timestamp: 0.12)
+            XCTAssertFalse(terminal.contains(.openSettings))
+            XCTAssertFalse(terminal.contains { if case .pointer(.rightClick, _, _) = $0 { return true }; return false })
+        }
+    }
+
     private func phases(_ outputs: [DirectTouchGestureOutput]) -> [DirectTouchPhase] {
         outputs.compactMap { if case .directTouch(let phase, _, _, _) = $0 { return phase }; return nil }
     }
