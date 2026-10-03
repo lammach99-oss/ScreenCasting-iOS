@@ -170,6 +170,19 @@ struct DirectTouchGestureStateMachine {
         let start: CGPoint
         var point: CGPoint
         var maxExcursion: CGFloat
+        var movedBeforeHold = false
+    }
+
+    private struct TwoFingerGesture {
+        let first: UInt64
+        let second: UInt64
+        let beganAt: TimeInterval
+        let initialSpan: CGFloat
+        var lastSpan: CGFloat
+        var points: [UInt64: CGPoint]
+        var completed: Set<UInt64> = []
+        var validTap = true
+        var pinching = false
     }
 
     private enum State {
@@ -177,8 +190,8 @@ struct DirectTouchGestureStateMachine {
         case oneFinger(UInt64)
         case scrolling(UInt64)
         case horizontalScrolling(UInt64)
-        case twoFinger(UInt64, UInt64, secondBeganAt: TimeInterval)
-        case dragging(UInt64, UInt64)
+        case twoFinger(TwoFingerGesture)
+        case dragging(UInt64)
         case threeFinger(
             startedAt: TimeInterval,
             participants: Set<UInt64>,
@@ -193,9 +206,14 @@ struct DirectTouchGestureStateMachine {
     private var contacts: [UInt64: Contact] = [:]
     private var committedContactID: UInt64?
     private var ignoredContacts: Set<UInt64> = []
+    private var wheelRemainder: CGFloat = 0
+    private var zoomRemainder: CGFloat = 0
     private let tapDuration: TimeInterval = 0.250
     private let tapMovement: CGFloat = 12
     private let dragMovement: CGFloat = 6
+    private let holdDuration: TimeInterval = 1.000
+    private let holdSlop: CGFloat = 8
+    private let wheelPointsPerStep: CGFloat = 42
     private let threeFingerSync: TimeInterval = 0.150
     private let threeFingerDuration: TimeInterval = 0.300
     private let threeFingerMovement: CGFloat = 15
@@ -241,9 +259,15 @@ struct DirectTouchGestureStateMachine {
         if case .horizontalScrolling = state { return [] }
         if case .dragging = state { return [] }
         if contacts.count == 3 {
+            if case .twoFinger(let pair) = state,
+               pair.pinching || !pair.completed.isEmpty || !pair.validTap {
+                state = .suppressed
+                return []
+            }
             let times = contacts.values.map(\.beganAt)
             if let first = times.min(), let last = times.max(),
-               last - first <= threeFingerSync {
+               last - first <= threeFingerSync,
+               contacts.values.allSatisfy({ $0.maxExcursion <= threeFingerMovement }) {
                 state = .threeFinger(
                     startedAt: first,
                     participants: Set(contacts.keys),
@@ -257,9 +281,17 @@ struct DirectTouchGestureStateMachine {
 
         switch state {
         case .idle, .palmGuard:
+            wheelRemainder = 0
+            zoomRemainder = 0
             state = .oneFinger(id)
         case .oneFinger(let primary) where contacts.count == 2:
-            state = .twoFinger(primary, id, secondBeganAt: timestamp)
+            guard let first = contacts[primary] else { return [] }
+            let span = distance(first.point, point)
+            state = .twoFinger(TwoFingerGesture(
+                first: primary, second: id, beganAt: first.beganAt,
+                initialSpan: span, lastSpan: span,
+                points: [primary: first.point, id: point],
+                validTap: first.maxExcursion <= tapMovement))
         case .scrolling:
             break
         case .horizontalScrolling:
@@ -277,34 +309,57 @@ struct DirectTouchGestureStateMachine {
     ) -> [DirectTouchGestureOutput] {
         guard !ignoredContacts.contains(id),
               var contact = contacts[id] else { return [] }
+        let previousPoint = contact.point
+        let holdEligible = !contact.movedBeforeHold && contact.maxExcursion <= holdSlop
         contact.point = point
         contact.maxExcursion = max(
             contact.maxExcursion,
             distance(contact.start, point))
+        if timestamp - contact.beganAt < holdDuration && contact.maxExcursion > holdSlop {
+            contact.movedBeforeHold = true
+        }
         contacts[id] = contact
 
         switch state {
         case .oneFinger(let primary) where primary == id:
             let dx = point.x - contact.start.x
             let dy = point.y - contact.start.y
+            if timestamp - contact.beganAt >= holdDuration,
+               holdEligible, distance(contact.start, point) >= dragMovement {
+                state = .dragging(primary)
+                return commitContact(contact, point: point)
+            }
             if abs(dy) >= 12 && abs(dy) >= abs(dx) * 0.6 {
                 state = .scrolling(primary)
-                return commitContact(contact, point: point)
+                return wheel(action: .verticalWheel, points: dy, target: point)
             }
             if abs(dx) >= 12 && abs(dy) < abs(dx) * 0.6 {
                 state = .horizontalScrolling(primary)
-                return commitContact(contact, point: point)
+                return wheel(action: .horizontalWheel, points: -dx, target: point)
             }
         case .scrolling(let primary) where primary == id:
-            return [.directTouch(.update, primary, point, 255)]
+            return wheel(action: .verticalWheel, points: point.y - previousPoint.y, target: point)
         case .horizontalScrolling(let primary) where primary == id:
-            return [.directTouch(.update, primary, point, 255)]
-        case .twoFinger(let primary, let secondary, _) where primary == id:
-            if distance(contact.start, point) >= dragMovement {
-                state = .dragging(primary, secondary)
-                return commitContact(contact, point: point)
+            return wheel(action: .horizontalWheel, points: previousPoint.x - point.x, target: point)
+        case .twoFinger(var pair):
+            guard pair.completed.isEmpty else { return [] }
+            pair.points[id] = point
+            pair.validTap = pair.validTap && contact.maxExcursion <= tapMovement
+            let first = pair.points[pair.first] ?? .zero
+            let second = pair.points[pair.second] ?? .zero
+            let span = distance(first, second)
+            if pair.initialSpan > 0, span > 0,
+               pair.pinching || (abs(span - pair.initialSpan) >= 11 && abs(log(span / pair.initialSpan)) >= 0.05) {
+                pair.pinching = true
+                pair.validTap = false
+                zoomRemainder += log(span / pair.lastSpan) * 120 / log(1.1)
+                pair.lastSpan = span
+                state = .twoFinger(pair)
+                let value = Self.takeWheelUnits(&zoomRemainder)
+                return value == 0 ? [] : [.pointer(.zoomWheel, midpoint(first, second), value)]
             }
-        case .dragging(let primary, _) where primary == id:
+            state = .twoFinger(pair)
+        case .dragging(let primary) where primary == id:
             return [.directTouch(.update, primary, point, 255)]
         case .threeFinger(let startedAt, let participants, let completed, let valid):
             state = .threeFinger(
@@ -340,23 +395,29 @@ struct DirectTouchGestureStateMachine {
         switch state {
         case .oneFinger(let primary) where primary == id:
             if !cancelled,
-               timestamp - contact.beganAt <= tapDuration,
-               contact.maxExcursion <= tapMovement {
-                outputs += [.directTouch(.down, id, point, 255), .directTouch(.up, id, point, 255)]
+               contact.maxExcursion <= tapMovement,
+               (timestamp - contact.beganAt <= tapDuration ||
+                (!contact.movedBeforeHold && contact.maxExcursion <= holdSlop && timestamp - contact.beganAt >= holdDuration)) {
+                outputs += [.directTouch(.down, id, contact.start, 255), .directTouch(.up, id, contact.start, 255)]
             }
             state = .suppressed
         case .scrolling, .horizontalScrolling:
             outputs += finishContact(cancelled: cancelled)
             state = .suppressed
-        case .twoFinger(let primary, let secondary, let secondBeganAt):
-            if id == secondary,
-               !cancelled,
-               timestamp - secondBeganAt <= tapDuration,
-               let primaryContact = contacts[primary],
-               primaryContact.maxExcursion <= tapMovement {
-                outputs.append(.pointer(.rightClick, primaryContact.point, 0))
+        case .twoFinger(var pair):
+            pair.points[id] = point
+            pair.completed.insert(id)
+            pair.validTap = pair.validTap && !cancelled &&
+                contact.maxExcursion <= tapMovement && timestamp - pair.beganAt <= tapDuration
+            if pair.completed.count == 2 {
+                if pair.validTap && !pair.pinching,
+                   let first = pair.points[pair.first], let second = pair.points[pair.second] {
+                    outputs.append(.pointer(.rightClick, midpoint(first, second), 0))
+                }
+                state = .suppressed
+            } else {
+                state = .twoFinger(pair)
             }
-            state = .suppressed
         case .dragging:
             outputs += finishContact(cancelled: cancelled)
             state = .suppressed
@@ -414,6 +475,22 @@ struct DirectTouchGestureStateMachine {
         hypot(rhs.x - lhs.x, rhs.y - lhs.y)
     }
 
+    private func midpoint(_ first: CGPoint, _ second: CGPoint) -> CGPoint {
+        CGPoint(x: (first.x + second.x) / 2, y: (first.y + second.y) / 2)
+    }
+
+    private static func takeWheelUnits(_ remainder: inout CGFloat) -> Int16 {
+        let units = max(-960, min(960, remainder.rounded(.towardZero)))
+        remainder -= units
+        return Int16(units)
+    }
+
+    private mutating func wheel(action: PointerInputAction, points: CGFloat, target: CGPoint) -> [DirectTouchGestureOutput] {
+        wheelRemainder += points * 120 / wheelPointsPerStep
+        let value = Self.takeWheelUnits(&wheelRemainder)
+        return value == 0 ? [] : [.pointer(action, target, value)]
+    }
+
     private mutating func commitContact(_ contact: Contact, point: CGPoint) -> [DirectTouchGestureOutput] {
         committedContactID = contact.id
         return [.directTouch(.down, contact.id, contact.start, 255),
@@ -429,6 +506,7 @@ struct DirectTouchGestureStateMachine {
     mutating func retire() -> [DirectTouchGestureOutput] {
         let outputs = finishContact(cancelled: true)
         contacts.removeAll(); ignoredContacts.removeAll(); state = .idle
+        wheelRemainder = 0; zoomRemainder = 0
         return outputs
     }
 
