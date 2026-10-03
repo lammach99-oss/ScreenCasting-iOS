@@ -525,7 +525,7 @@ public class PencilUIKitView: UIView {
     // deterministically without synthesizing UIKit hardware events.
     @discardableResult
     func handleHardwareKey(_ usage: UIKeyboardHIDUsage, action: KeyboardInputAction) -> Bool {
-        if action == .keyDown && hardwareKeyActivityEnabled { onHardwareKeyActivity?() }
+        if action == .keyDown && !keyboardCaptureEnabled && hardwareKeyActivityEnabled { onHardwareKeyActivity?() }
         guard keyboardCaptureEnabled,
               let virtualKey = RemoteKeyboardKeyMapper.virtualKey(for: usage) else { return false }
         if action == .keyDown {
