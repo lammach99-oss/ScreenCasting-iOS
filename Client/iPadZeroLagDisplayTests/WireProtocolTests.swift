@@ -2334,6 +2334,18 @@ final class WireProtocolTests: XCTestCase {
         XCTAssertNil(PointerInputCommand.decode(Data(repeating: 0, count: 7)))
     }
 
+    func testSemanticZoomKeepsPointerV1EightByteLayoutAndRejectsFutureAction() throws {
+        let payload = Data([1, 7, 0x34, 0x12, 0xCD, 0xAB, 0x88, 0xFF])
+        let decoded = try XCTUnwrap(PointerInputCommand.decode(payload))
+        XCTAssertEqual(decoded.action.rawValue, 7)
+        XCTAssertEqual(decoded.x, 0x1234)
+        XCTAssertEqual(decoded.y, 0xABCD)
+        XCTAssertEqual(decoded.value, -120)
+        XCTAssertEqual(decoded.encode(), payload)
+        XCTAssertEqual(decoded.encode().count, 8)
+        XCTAssertNil(PointerInputCommand.decode(Data([1, 8, 0, 0, 0, 0, 0, 0])))
+    }
+
     func testMalformedPointerInputLengthIsDrainedAndSessionContinues() {
         let parser = WireStreamParser(generation: 4)
         let malformed = makeMessage(
@@ -3102,6 +3114,84 @@ final class PointerV2WireRegistrationTests: XCTestCase {
         }
         data.append(payload)
         return data
+    }
+}
+
+final class TouchGestureV2ContractTests: XCTestCase {
+    private func phases(_ outputs: [DirectTouchGestureOutput]) -> [DirectTouchPhase] {
+        outputs.compactMap { if case .directTouch(let phase, _, _, _) = $0 { return phase }; return nil }
+    }
+
+    private func wheel(_ outputs: [DirectTouchGestureOutput], action: PointerInputAction) -> Int {
+        outputs.reduce(0) { total, output in
+            if case .pointer(let candidate, _, let value) = output, candidate == action { return total + Int(value) }
+            return total
+        }
+    }
+
+    func testEarlyVerticalMovementIsWheelOnlyWithNaturalCalibration() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        let output = machine.move(id: 1, point: CGPoint(x: 0, y: 42), timestamp: 0.2)
+        XCTAssertTrue(phases(output).isEmpty)
+        XCTAssertEqual(wheel(output, action: .verticalWheel), 120)
+        XCTAssertTrue(machine.end(id: 1, point: CGPoint(x: 0, y: 42), timestamp: 0.3).isEmpty)
+    }
+
+    func testEarlyHorizontalMovementIsWheelOnlyAndAxisStaysLocked() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        let first = machine.move(id: 1, point: CGPoint(x: 42, y: 0), timestamp: 0.2)
+        XCTAssertTrue(phases(first).isEmpty)
+        XCTAssertEqual(wheel(first, action: .horizontalWheel), -120)
+        let next = machine.move(id: 1, point: CGPoint(x: 49, y: 100), timestamp: 1.5)
+        XCTAssertTrue(phases(next).isEmpty)
+        XCTAssertEqual(wheel(next, action: .horizontalWheel), -20)
+        XCTAssertEqual(wheel(next, action: .verticalWheel), 0)
+    }
+
+    func testMovementBeforeHoldCannotBecomeDragWhenThresholdCrossesLater() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        XCTAssertTrue(machine.move(id: 1, point: CGPoint(x: 0, y: 9), timestamp: 0.7).isEmpty)
+        let output = machine.move(id: 1, point: CGPoint(x: 0, y: 42), timestamp: 1.05)
+        XCTAssertTrue(phases(output).isEmpty)
+        XCTAssertEqual(wheel(output, action: .verticalWheel), 120)
+    }
+
+    func testStationaryHoldThenMoveCommitsOneContactAndRetiresOnce() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: CGPoint(x: 10, y: 20), timestamp: 0)
+        XCTAssertTrue(machine.move(id: 1, point: CGPoint(x: 10, y: 20), timestamp: 1).isEmpty)
+        let output = machine.move(id: 1, point: CGPoint(x: 17, y: 20), timestamp: 1.1)
+        XCTAssertEqual(phases(output), [.down, .update])
+        XCTAssertEqual(wheel(output, action: .horizontalWheel), 0)
+        XCTAssertEqual(phases(machine.retire()), [.cancel])
+        XCTAssertTrue(machine.retire().isEmpty)
+        XCTAssertTrue(machine.end(id: 1, point: .zero, timestamp: 1.2).isEmpty)
+    }
+
+    func testLongHoldWithoutDragStillTapsOriginalAnchor() {
+        var machine = DirectTouchGestureStateMachine()
+        let anchor = CGPoint(x: 10, y: 20)
+        machine.begin(id: 1, point: anchor, timestamp: 0)
+        let output = machine.end(id: 1, point: CGPoint(x: 12, y: 21), timestamp: 1.5)
+        XCTAssertEqual(phases(output), [.down, .up])
+        for event in output {
+            if case .directTouch(_, _, let point, _) = event { XCTAssertEqual(point, anchor) }
+        }
+    }
+
+    func testTwoFingerMovementNeverCommitsOldModifierDragOrRightClick() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        machine.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01)
+        var output = machine.move(id: 1, point: CGPoint(x: 20, y: 0), timestamp: 0.1)
+        output += machine.move(id: 2, point: CGPoint(x: 120, y: 0), timestamp: 0.11)
+        output += machine.end(id: 2, point: CGPoint(x: 120, y: 0), timestamp: 0.15)
+        output += machine.end(id: 1, point: CGPoint(x: 20, y: 0), timestamp: 0.16)
+        XCTAssertTrue(phases(output).isEmpty)
+        XCTAssertFalse(output.contains { if case .pointer(.rightClick, _, _) = $0 { return true }; return false })
     }
 }
 
