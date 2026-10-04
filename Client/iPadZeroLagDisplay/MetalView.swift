@@ -365,9 +365,7 @@ public final class ConnectedPresentationContainer: UIView {
         updateKeyboardAuthority()
     }
     func hardwarePresenceChanged(_ present: Bool) {
-        // Never carry an old software-open intent across attach or detach.
-        softwareRequested = false
-        applyRemoteKeyboardMode(RemoteKeyboardMode.resolve(active: keyboardActive && UIApplication.shared.applicationState == .active, hardware: present, requested: false))
+        applyRemoteKeyboardMode(RemoteKeyboardMode.resolve(active: keyboardActive && UIApplication.shared.applicationState == .active, hardware: present, requested: softwareRequested))
     }
     private func updateKeyboardAuthority() {
         let active = keyboardActive && UIApplication.shared.applicationState == .active
@@ -378,6 +376,7 @@ public final class ConnectedPresentationContainer: UIView {
         let changed = mode != keyboardMode
         // Update authority before callbacks caused by responder loss.
         keyboardMode = mode
+        if mode == .softwareOpen { softwareRequested = true }
         if mode != .softwareOpen {
             softwareKeyboardRecoveryGeneration = nil
             softwareRequested = false
@@ -385,10 +384,11 @@ public final class ConnectedPresentationContainer: UIView {
             softwareTextView.deactivateAndDiscardComposition()
             setNeedsLayout()
         }
-        keyboardButton.isHidden = mode == .none || mode == .hardware
+        keyboardButton.isHidden = mode == .none
         touchView.hardwareKeyActivityEnabled = mode != .none
+        touchView.softwareResponderOwnsInput = mode == .softwareOpen
         touchView.passiveKeyboardCaptureEnabled = mode == .softwareAvailable
-        touchView.keyboardCaptureEnabled = mode == .hardware
+        touchView.keyboardCaptureEnabled = mode == .hardware || (mode != .none && hardwareMonitor.isConnected)
         if mode == .softwareOpen {
             softwareTextView.deliveryEnabled = true
             if window != nil && !softwareTextView.isFirstResponder {
@@ -409,7 +409,7 @@ public final class ConnectedPresentationContainer: UIView {
         touchView.diagnosticSink?(line)
     }
     @objc private func toggleSoftwareKeyboard() {
-        guard keyboardMode == .softwareAvailable || keyboardMode == .softwareOpen else {
+        guard keyboardMode != .none else {
             recordKeyboardAuthority(reason: "software_toggle_blocked")
             return
         }
@@ -430,7 +430,7 @@ public final class ConnectedPresentationContainer: UIView {
     }
     private var preserveRequestedSoftwareKeyboard: Bool {
         keyboardActive && keyboardGeneration != nil && softwareRequested &&
-            keyboardMode == .softwareOpen && !hardwareMonitor.isConnected &&
+            keyboardMode == .softwareOpen &&
             UIApplication.shared.applicationState == .active
     }
 

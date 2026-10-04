@@ -598,6 +598,9 @@ public class PencilUIKitView: UIView {
     var passiveKeyboardCaptureEnabled = false {
         didSet { updateKeyboardCapture() }
     }
+    var softwareResponderOwnsInput = false {
+        didSet { updateKeyboardCapture() }
+    }
     private var activeRemotePhysicalKeys: [UIKeyboardHIDUsage: UInt16] = [:]
     private var remoteVirtualKeyOwnerCounts: [UInt16: Int] = [:]
     #if targetEnvironment(simulator)
@@ -615,7 +618,9 @@ public class PencilUIKitView: UIView {
 
     private func updateKeyboardCapture() {
         if !keyboardCaptureEnabled { releaseActiveRemoteKeys() }
-        if (keyboardCaptureEnabled || passiveKeyboardCaptureEnabled) && window != nil {
+        if softwareResponderOwnsInput {
+            if isFirstResponder { resignFirstResponder() }
+        } else if (keyboardCaptureEnabled || passiveKeyboardCaptureEnabled) && window != nil {
             if !isFirstResponder { becomeFirstResponder() }
         } else {
             resignFirstResponder()
@@ -1075,7 +1080,7 @@ private extension Float {
 public enum RemoteKeyboardMode: Equatable {
     case none, hardware, softwareAvailable, softwareOpen
     static func resolve(active: Bool, hardware: Bool, requested: Bool) -> RemoteKeyboardMode {
-        !active ? .none : hardware ? .hardware : requested ? .softwareOpen : .softwareAvailable
+        !active ? .none : requested ? .softwareOpen : hardware ? .hardware : .softwareAvailable
     }
 }
 enum SoftwareKeyboardEmission: Equatable { case text(String), key(UInt16) }

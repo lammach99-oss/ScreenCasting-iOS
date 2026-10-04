@@ -3135,7 +3135,7 @@ final class KeyboardV2Tests: XCTestCase {
     }
     func testAuthorityPriority() {
         for active in [false,true] { for hardware in [false,true] { for requested in [false,true] {
-            XCTAssertEqual(RemoteKeyboardMode.resolve(active:active,hardware:hardware,requested:requested), !active ? .none : hardware ? .hardware : requested ? .softwareOpen : .softwareAvailable)
+            XCTAssertEqual(RemoteKeyboardMode.resolve(active:active,hardware:hardware,requested:requested), !active ? .none : requested ? .softwareOpen : hardware ? .hardware : .softwareAvailable)
         } } }
     }
     func testSpecialKeyOrdering() {
@@ -3272,7 +3272,7 @@ final class KeyboardV2Tests: XCTestCase {
         XCTAssertFalse(container.touchView.keyboardCaptureEnabled)
         for mode in [RemoteKeyboardMode.none, .hardware, .softwareAvailable, .softwareOpen] {
             container.applyRemoteKeyboardMode(mode)
-            XCTAssertEqual(container.keyboardButton.isHidden, mode == .none || mode == .hardware)
+            XCTAssertEqual(container.keyboardButton.isHidden, mode == .none)
             XCTAssertFalse(container.touchView.keyboardCaptureEnabled && container.softwareTextView.deliveryEnabled)
         }
         container.retireRemoteKeyboard()
@@ -3799,7 +3799,7 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         XCTAssertEqual(diagnostics.filter { $0.contains("reason=software_hide_recovery") }.count, 1)
     }
 
-    @MainActor func testRealHardwareCancelsPendingPencilHideRecoveryAndComposition() async {
+    @MainActor func testRealHardwarePreservesPendingSoftwareHideAndComposition() async {
         let container = ConnectedPresentationContainer(frame: .zero)
         var diagnostics: [String] = []
         container.touchView.diagnosticSink = { diagnostics.append($0) }
@@ -3812,12 +3812,12 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardA, action: .keyDown))
         NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
         await Task.yield()
-        XCTAssertEqual(container.keyboardMode, .hardware)
-        XCTAssertTrue(container.keyboardButton.isHidden)
-        XCTAssertNil(container.softwareTextView.markedTextRange)
-        XCTAssertEqual(container.softwareTextView.text, "")
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertFalse(container.keyboardButton.isHidden)
+        XCTAssertNotNil(container.softwareTextView.markedTextRange)
+        XCTAssertEqual(container.softwareTextView.text, "đẹp")
         XCTAssertEqual(commands.map(\.virtualKey), [0x41])
-        XCTAssertTrue(diagnostics.filter { $0.contains("reason=software_hide_recovery") }.isEmpty)
+        XCTAssertEqual(diagnostics.filter { $0.contains("reason=software_hide_recovery") }.count, 1)
     }
 
     @MainActor func testExplicitSoftwareDismissDoesNotRecover() async {
@@ -3848,7 +3848,7 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         XCTAssertTrue(diagnostics.filter { $0.contains("reason=software_hide_recovery") }.isEmpty)
     }
 
-    @MainActor func testSoftwareResponderHardwarePressTakesAuthorityAndDeliversFirstKeyOnce() {
+    @MainActor func testSoftwareResponderHardwarePressCoexistsAndDeliversFirstKeyOnce() {
         let container = ConnectedPresentationContainer(frame: .zero)
         container.configureRemoteKeyboard(active: true, generation: 9)
         container.applyRemoteKeyboardMode(.softwareOpen)
@@ -3863,11 +3863,11 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         container.touchView.onKeyboardInput = { commands.append($0) }
         container.onTextCommit = { text.append($0) }
         container.softwareTextView.pressesBegan([press], with: nil)
-        XCTAssertEqual(container.keyboardMode, .hardware)
-        XCTAssertTrue(container.keyboardButton.isHidden)
-        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
-        XCTAssertNil(container.softwareTextView.markedTextRange)
-        XCTAssertTrue((container.softwareTextView.text ?? "").isEmpty)
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertFalse(container.keyboardButton.isHidden)
+        XCTAssertTrue(container.softwareTextView.deliveryEnabled)
+        XCTAssertNotNil(container.softwareTextView.markedTextRange)
+        XCTAssertEqual(container.softwareTextView.text, "đẹp")
         XCTAssertEqual(commands.map(\.action), [.keyDown])
         XCTAssertEqual(commands.map(\.virtualKey), [0x41])
         container.touchView.pressesBegan([nextPress], with: nil)
@@ -3876,8 +3876,8 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         XCTAssertEqual(commands.map(\.virtualKey), [0x41, 0x42, 0x41, 0x42])
         XCTAssertTrue(text.isEmpty)
         container.hardwarePresenceChanged(false)
-        XCTAssertEqual(container.keyboardMode, .softwareAvailable)
-        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertTrue(container.softwareTextView.deliveryEnabled)
     }
 
     @MainActor func testPencilCandidateAppearanceAndRemovalNeverClaimSoftwareAuthority() {
@@ -3941,11 +3941,11 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         monitor.refresh()
         XCTAssertFalse(monitor.isConnected)
         XCTAssertEqual(authority, [true, false])
-        XCTAssertEqual(container.keyboardMode, .softwareAvailable)
-        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertTrue(container.softwareTextView.deliveryEnabled)
     }
 
-    @MainActor func testFirstHardwareKeyTakesSoftwareAuthorityAndIsDeliveredOnce() {
+    @MainActor func testFirstHardwareKeyCoexistsWithSoftwareAndIsDeliveredOnce() {
         let container = ConnectedPresentationContainer(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
         container.configureRemoteKeyboard(active: true, generation: 1)
         container.applyRemoteKeyboardMode(.softwareOpen)
@@ -3955,22 +3955,22 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         container.touchView.onKeyboardInput = { commands.append($0) }
         container.onTextCommit = { textCommits.append($0) }
         XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardA, action: .keyDown))
-        XCTAssertEqual(container.keyboardMode, .hardware)
-        XCTAssertTrue(container.keyboardButton.isHidden)
-        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
-        XCTAssertNil(container.softwareTextView.markedTextRange)
-        XCTAssertTrue((container.softwareTextView.text ?? "").isEmpty)
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertFalse(container.keyboardButton.isHidden)
+        XCTAssertTrue(container.softwareTextView.deliveryEnabled)
+        XCTAssertNotNil(container.softwareTextView.markedTextRange)
+        XCTAssertEqual(container.softwareTextView.text, "pending")
         XCTAssertEqual(commands.map(\.action), [.keyDown])
         XCTAssertEqual(commands.map(\.virtualKey), [0x41])
         XCTAssertTrue(textCommits.isEmpty)
         XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardA, action: .keyUp))
         XCTAssertEqual(commands.map(\.action), [.keyDown, .keyUp])
         container.hardwarePresenceChanged(false)
-        XCTAssertEqual(container.keyboardMode, .softwareAvailable)
-        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertTrue(container.softwareTextView.deliveryEnabled)
     }
 
-    @MainActor func testPencilOnlyKeepsSoftwareAuthorityAndRealHardwareStillWins() {
+    @MainActor func testPencilAndRealHardwarePreserveRequestedSoftwareKeyboard() {
         let container = ConnectedPresentationContainer(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
         var diagnostics: [String] = []
         container.touchView.diagnosticSink = { diagnostics.append($0) }
@@ -3985,12 +3985,12 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         XCTAssertEqual(container.keyboardMode, .softwareOpen)
         XCTAssertFalse(container.keyboardButton.isHidden)
         container.hardwarePresenceChanged(true)
-        XCTAssertEqual(container.keyboardMode, .hardware)
-        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertTrue(container.softwareTextView.deliveryEnabled)
         XCTAssertTrue(diagnostics.contains { $0.contains("[KEYBOARD_AUTHORITY]") && $0.contains("gc_keyboard_present=") && $0.contains("software_first_responder=") })
         container.hardwarePresenceChanged(false)
-        XCTAssertEqual(container.keyboardMode, .softwareAvailable)
-        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertTrue(container.softwareTextView.deliveryEnabled)
     }
     func testLocalPositionSurvivesHostPriorityAndNewGenerationStartsCentered() {
         var state = ClientCursorState()
