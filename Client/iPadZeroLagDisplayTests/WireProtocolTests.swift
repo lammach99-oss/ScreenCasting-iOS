@@ -3696,6 +3696,69 @@ final class PointerV2LifecycleTests: XCTestCase {
 }
 
 final class PointerV2FinalBoundaryTests: XCTestCase {
+    @MainActor func testFirstResponderRequestDoesNotImplyNativeKeyboardVisible() {
+        let container = ConnectedPresentationContainer(frame: .zero)
+        var lines: [String] = []
+        container.touchView.diagnosticSink = { lines.append($0) }
+        container.configureRemoteKeyboard(active: true, generation: 301)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertTrue(lines.last?.contains("native_keyboard_visible=0") == true)
+        XCTAssertTrue(lines.last?.contains("show_attempt=1") == true)
+    }
+
+    @MainActor func testKeyboardDidShowAndDidHideTrackNativeVisibility() {
+        let container = ConnectedPresentationContainer(frame: .zero)
+        var lines: [String] = []
+        container.touchView.diagnosticSink = { lines.append($0) }
+        container.configureRemoteKeyboard(active: true, generation: 302)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidShowNotification, object: nil)
+        XCTAssertTrue(lines.last?.contains("native_keyboard_visible=1") == true)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertTrue(lines.last?.contains("native_keyboard_visible=0") == true)
+        XCTAssertTrue(lines.last?.contains("native_keyboard_suppressed=1") == true)
+        XCTAssertTrue(lines.last?.contains("software_requested=1") == true)
+    }
+
+    @MainActor func testSuppressionKeepsRequestWithoutRepeatedShowAttempts() {
+        let container = ConnectedPresentationContainer(frame: .zero)
+        var lines: [String] = []
+        container.touchView.diagnosticSink = { lines.append($0) }
+        container.configureRemoteKeyboard(active: true, generation: 303)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        for _ in 0..<5 {
+            NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+            NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+            container.configureRemoteKeyboard(active: true, generation: 303)
+        }
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertFalse(container.keyboardButton.isHidden)
+        XCTAssertTrue(lines.last?.contains("native_keyboard_suppressed=1") == true)
+        XCTAssertTrue(lines.last?.contains("show_attempt=1") == true)
+        XCTAssertEqual(lines.filter { $0.contains("reason=native_show_request") }.count, 1)
+        XCTAssertTrue(lines.filter { $0.contains("reason=software_hide_recovery") }.isEmpty)
+    }
+
+    @MainActor func testExplicitNewRequestAndRetirementResetNativeVisibilityState() {
+        let container = ConnectedPresentationContainer(frame: .zero)
+        var lines: [String] = []
+        container.touchView.diagnosticSink = { lines.append($0) }
+        container.configureRemoteKeyboard(active: true, generation: 304)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertTrue(lines.last?.contains("show_attempt=2") == true)
+        XCTAssertTrue(lines.last?.contains("native_keyboard_suppressed=0") == true)
+        container.configureRemoteKeyboard(active: false, generation: 305)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidShowNotification, object: nil)
+        XCTAssertEqual(container.keyboardMode, .none)
+        XCTAssertTrue(lines.last?.contains("native_keyboard_visible=0") == true)
+        XCTAssertTrue(lines.last?.contains("software_requested=0") == true)
+    }
+
     @MainActor func testHardwarePresenceDoesNotHideSoftwareKeyboardButton() {
         let container = ConnectedPresentationContainer(frame: .zero)
         container.configureRemoteKeyboard(active: true, generation: 201)
