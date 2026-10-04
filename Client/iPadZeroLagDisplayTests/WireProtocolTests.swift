@@ -3696,6 +3696,81 @@ final class PointerV2LifecycleTests: XCTestCase {
 }
 
 final class PointerV2FinalBoundaryTests: XCTestCase {
+    @MainActor func testHardwarePresenceDoesNotHideSoftwareKeyboardButton() {
+        let container = ConnectedPresentationContainer(frame: .zero)
+        container.configureRemoteKeyboard(active: true, generation: 201)
+        container.hardwarePresenceChanged(true)
+        XCTAssertFalse(container.keyboardButton.isHidden)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertTrue(container.softwareTextView.deliveryEnabled)
+    }
+
+    @MainActor func testHardwareKeyActivityDoesNotClearSoftwareRequest() {
+        let container = ConnectedPresentationContainer(frame: .zero)
+        var diagnostics: [String] = []
+        container.touchView.diagnosticSink = { diagnostics.append($0) }
+        container.configureRemoteKeyboard(active: true, generation: 202)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardA, action: .keyDown))
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertFalse(container.keyboardButton.isHidden)
+        XCTAssertTrue(diagnostics.last?.contains("software_requested=1") == true)
+    }
+
+    @MainActor func testHardwareKeyActivityDoesNotDiscardMarkedSoftwareComposition() {
+        let container = ConnectedPresentationContainer(frame: .zero)
+        container.configureRemoteKeyboard(active: true, generation: 203)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        container.softwareTextView.setMarkedText("đẹp", selectedRange: NSRange(location: 3, length: 0))
+        XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardA, action: .keyDown))
+        XCTAssertNotNil(container.softwareTextView.markedTextRange)
+        XCTAssertEqual(container.softwareTextView.text, "đẹp")
+        XCTAssertTrue(container.softwareTextView.deliveryEnabled)
+    }
+
+    @MainActor func testSoftwareAndHardwareInputMayCoexist() {
+        let container = ConnectedPresentationContainer(frame: .zero)
+        container.configureRemoteKeyboard(active: true, generation: 204)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        var commands: [KeyboardInputCommand] = []
+        var text: [String] = []
+        container.touchView.onKeyboardInput = { commands.append($0) }
+        container.onTextCommit = { text.append($0) }
+        XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardA, action: .keyDown))
+        XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardA, action: .keyUp))
+        container.softwareTextView.insertText("đẹp")
+        XCTAssertEqual(commands.map(\.action), [.keyDown, .keyUp])
+        XCTAssertEqual(commands.map(\.virtualKey), [0x41, 0x41])
+        XCTAssertEqual(text, ["đẹp"])
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+    }
+
+    @MainActor func testExplicitSoftwareDismissStillClosesOnlySoftwareKeyboard() {
+        let container = ConnectedPresentationContainer(frame: .zero)
+        container.configureRemoteKeyboard(active: true, generation: 205)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        _ = container.touchView.handleHardwareKey(.keyboardA, action: .keyDown)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+        XCTAssertFalse(container.keyboardButton.isHidden)
+        XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardA, action: .keyUp))
+        XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardB, action: .keyDown))
+    }
+
+    @MainActor func testGenerationRetirementStillClearsSoftwareCompositionAndRequest() {
+        let container = ConnectedPresentationContainer(frame: .zero)
+        container.configureRemoteKeyboard(active: true, generation: 206)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        container.softwareTextView.setMarkedText("đ", selectedRange: NSRange(location: 1, length: 0))
+        container.configureRemoteKeyboard(active: false, generation: 207)
+        XCTAssertEqual(container.keyboardMode, .none)
+        XCTAssertTrue(container.keyboardButton.isHidden)
+        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+        XCTAssertNil(container.softwareTextView.markedTextRange)
+        XCTAssertFalse(container.touchView.handleHardwareKey(.keyboardA, action: .keyDown))
+    }
+
     @MainActor func testPencilCandidateHidePreservesSoftwareOpenAndMarkedText() {
         let container = ConnectedPresentationContainer(frame: .zero)
         container.configureRemoteKeyboard(active: true, generation: 91)
