@@ -449,6 +449,40 @@ final class CommittedAudioAvailabilityTests: XCTestCase {
 }
 
 final class AudioInterruptionOwnershipTests: XCTestCase {
+    func testLegacyPcmRejectionRetainsBoundedContextAtExistingDiagnosticCadence() {
+        let audio = AudioManager.makeForTesting()
+        defer { audio.reset(); audio.audioQueueForTesting.sync { } }
+        audio.beginLegacySession(generation: 130)
+        audio.playPCMData(Data(repeating: 0, count: 9_601 * 4), generation: 130)
+        audio.audioQueueForTesting.sync { }
+        var records: [String] = []
+        audio.publishDiagnostics(generation: 130, profile: "usb", opus: false, receiveRejects: "", sink: { records.append($0) })
+        audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(records.count, 1)
+        let record = records.first ?? ""
+        XCTAssertTrue(record.contains("pcm_reject=1"))
+        for field in ["pcm_reject_generation=130", "pcm_reject_epoch=1", "pcm_reject_incoming_frames=9601", "pcm_reject_queued_before=0", "pcm_reject_cap=9600", "pcm_reject_player_playing=", "pcm_reject_engine_started="] {
+            XCTAssertTrue(record.contains(field), "Missing rejection context: \(field)")
+        }
+        XCTAssertEqual(audio.interruptionStateForTesting.queuedFrames, 0)
+    }
+
+    func testLegacyPcmReplacementClearsOldRejectionContextAndRejectsStalePacket() {
+        let audio = AudioManager.makeForTesting()
+        defer { audio.reset(); audio.audioQueueForTesting.sync { } }
+        audio.beginLegacySession(generation: 130)
+        audio.playPCMData(Data(repeating: 0, count: 9_601 * 4), generation: 130)
+        audio.beginLegacySession(generation: 131)
+        audio.playPCMData(Data(repeating: 0, count: 9_601 * 4), generation: 130)
+        var records: [String] = []
+        audio.publishDiagnostics(generation: 131, profile: "usb", opus: false, receiveRejects: "", sink: { records.append($0) })
+        audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(records.count, 1)
+        XCTAssertTrue(records[0].contains("pcm_reject=0"))
+        XCTAssertTrue(records[0].contains("pcm_reject_context=none"))
+        XCTAssertFalse(records[0].contains("pcm_reject_generation=130"))
+    }
+
     func testIdleInterruptionEndCannotStartPlayback() {
         withAudio { audio, resumes in
             audio.interruptForTesting(began: false)
