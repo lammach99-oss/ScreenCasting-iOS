@@ -3660,6 +3660,83 @@ final class PointerV2LifecycleTests: XCTestCase {
 }
 
 final class PointerV2FinalBoundaryTests: XCTestCase {
+    @MainActor func testPencilCandidateHidePreservesSoftwareOpenAndMarkedText() {
+        let container = ConnectedPresentationContainer(frame: .zero)
+        container.configureRemoteKeyboard(active: true, generation: 91)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        container.softwareTextView.setMarkedText("đẹp", selectedRange: NSRange(location: 3, length: 0))
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        container.softwareTextView.textViewDidEndEditing(container.softwareTextView)
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertFalse(container.keyboardButton.isHidden)
+        XCTAssertNotNil(container.softwareTextView.markedTextRange)
+        XCTAssertEqual(container.softwareTextView.text, "đẹp")
+    }
+
+    @MainActor func testPencilSystemHideRecoveryIsBoundedToOneAttempt() async {
+        let container = ConnectedPresentationContainer(frame: .zero)
+        var diagnostics: [String] = []
+        container.touchView.diagnosticSink = { diagnostics.append($0) }
+        container.configureRemoteKeyboard(active: true, generation: 92)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        for _ in 0..<3 {
+            NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+            NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+            await Task.yield()
+        }
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertEqual(diagnostics.filter { $0.contains("reason=software_hide_recovery") }.count, 1)
+    }
+
+    @MainActor func testRealHardwareCancelsPendingPencilHideRecoveryAndComposition() async {
+        let container = ConnectedPresentationContainer(frame: .zero)
+        var diagnostics: [String] = []
+        container.touchView.diagnosticSink = { diagnostics.append($0) }
+        container.configureRemoteKeyboard(active: true, generation: 93)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        container.softwareTextView.setMarkedText("đẹp", selectedRange: NSRange(location: 3, length: 0))
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        var commands: [KeyboardInputCommand] = []
+        container.touchView.onKeyboardInput = { commands.append($0) }
+        XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardA, action: .keyDown))
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        await Task.yield()
+        XCTAssertEqual(container.keyboardMode, .hardware)
+        XCTAssertTrue(container.keyboardButton.isHidden)
+        XCTAssertNil(container.softwareTextView.markedTextRange)
+        XCTAssertEqual(container.softwareTextView.text, "")
+        XCTAssertEqual(commands.map(\.virtualKey), [0x41])
+        XCTAssertTrue(diagnostics.filter { $0.contains("reason=software_hide_recovery") }.isEmpty)
+    }
+
+    @MainActor func testExplicitSoftwareDismissDoesNotRecover() async {
+        let container = ConnectedPresentationContainer(frame: .zero)
+        container.configureRemoteKeyboard(active: true, generation: 94)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        container.softwareTextView.setMarkedText("đ", selectedRange: NSRange(location: 1, length: 0))
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        await Task.yield()
+        XCTAssertEqual(container.keyboardMode, .softwareAvailable)
+        XCTAssertNil(container.softwareTextView.markedTextRange)
+        XCTAssertFalse(container.softwareTextView.deliveryEnabled)
+    }
+
+    @MainActor func testRetiredKeyboardGenerationCannotRecoverSystemHide() async {
+        let container = ConnectedPresentationContainer(frame: .zero)
+        var diagnostics: [String] = []
+        container.touchView.diagnosticSink = { diagnostics.append($0) }
+        container.configureRemoteKeyboard(active: true, generation: 95)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        container.configureRemoteKeyboard(active: true, generation: 96)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        await Task.yield()
+        XCTAssertEqual(container.keyboardMode, .softwareAvailable)
+        XCTAssertTrue(diagnostics.filter { $0.contains("reason=software_hide_recovery") }.isEmpty)
+    }
+
     @MainActor func testSoftwareResponderHardwarePressTakesAuthorityAndDeliversFirstKeyOnce() {
         let container = ConnectedPresentationContainer(frame: .zero)
         container.configureRemoteKeyboard(active: true, generation: 9)
