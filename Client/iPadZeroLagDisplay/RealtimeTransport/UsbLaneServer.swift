@@ -195,7 +195,9 @@ final class UsbLaneServer {
             if let content { bytes.append(content) }
             if let error {
                 connection.cancel()
-                self.onFailure(error)
+                if expectedLane != .audio {
+                    self.onFailure(error)
+                }
                 return
             }
             if bytes.count < totalSize && !isComplete {
