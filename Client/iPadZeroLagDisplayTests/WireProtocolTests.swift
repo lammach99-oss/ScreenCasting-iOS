@@ -658,6 +658,62 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
             [.pointer(.verticalWheel, CGPoint(x: 100, y: 49), 20)])
     }
 
+    func testHorizontalScrollWithMinorVerticalJitterLocksHorizontal() {
+        for direction: CGFloat in [-1, 1] {
+            var machine = DirectTouchGestureStateMachine()
+            machine.begin(id: 1, point: CGPoint(x: 100, y: 100), timestamp: 0)
+            for (index, delta) in [CGPoint(x: 30, y: 18), CGPoint(x: 45, y: 25), CGPoint(x: 60, y: 32)].enumerated() {
+                let point = CGPoint(x: 100 + direction * delta.x, y: 100 + delta.y)
+                let outputs = machine.move(id: 1, point: point, timestamp: Double(index + 1) * 0.05)
+                XCTAssertEqual(pointerActions(outputs), [.horizontalWheel])
+                XCTAssertTrue(touchPhases(outputs).isEmpty)
+                if case .pointer(_, _, let units) = outputs.first {
+                    XCTAssertEqual(units > 0, direction < 0)
+                }
+            }
+        }
+    }
+
+    func testVerticalScrollWithMinorHorizontalJitterLocksVertical() {
+        for direction: CGFloat in [-1, 1] {
+            var machine = DirectTouchGestureStateMachine()
+            machine.begin(id: 1, point: CGPoint(x: 100, y: 100), timestamp: 0)
+            for (index, delta) in [CGPoint(x: 18, y: 30), CGPoint(x: 25, y: 45), CGPoint(x: 32, y: 60)].enumerated() {
+                let outputs = machine.move(id: 1,
+                    point: CGPoint(x: 100 + delta.x, y: 100 + direction * delta.y),
+                    timestamp: Double(index + 1) * 0.05)
+                XCTAssertEqual(pointerActions(outputs), [.verticalWheel])
+                XCTAssertTrue(touchPhases(outputs).isEmpty)
+                if case .pointer(_, _, let units) = outputs.first {
+                    XCTAssertEqual(units > 0, direction > 0)
+                }
+            }
+        }
+    }
+
+    func testAmbiguousDiagonalWaitsForDominantAxis() {
+        for horizontal in [false, true] {
+            var machine = DirectTouchGestureStateMachine()
+            machine.begin(id: 1, point: .zero, timestamp: 0)
+            XCTAssertTrue(machine.move(id: 1, point: CGPoint(x: 15, y: 15), timestamp: 0.05).isEmpty)
+            XCTAssertTrue(machine.move(id: 1, point: CGPoint(x: 20, y: 19), timestamp: 0.1).isEmpty)
+            let point = horizontal ? CGPoint(x: 35, y: 20) : CGPoint(x: 20, y: 35)
+            let output = machine.move(id: 1, point: point, timestamp: 0.15)
+            XCTAssertEqual(pointerActions(output), [horizontal ? .horizontalWheel : .verticalWheel])
+            XCTAssertTrue(touchPhases(output).isEmpty)
+        }
+    }
+
+    func testAxisLockNeverFlipsAfterHorizontalClassification() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: CGPoint(x: 100, y: 100), timestamp: 0)
+        for (index, point) in [CGPoint(x: 114, y: 104), CGPoint(x: 130, y: 108), CGPoint(x: 145, y: 111), CGPoint(x: 152, y: 200)].enumerated() {
+            let output = machine.move(id: 1, point: point, timestamp: Double(index + 1) * 0.05)
+            XCTAssertEqual(pointerActions(output), [.horizontalWheel])
+            XCTAssertTrue(touchPhases(output).isEmpty)
+        }
+    }
+
     func testHorizontalWheelPreservesFractionalDistanceAndBoundsOnePacket() {
         var fractional = DirectTouchGestureStateMachine()
         fractional.begin(id: 1, point: .zero, timestamp: 0)
