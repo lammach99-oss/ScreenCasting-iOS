@@ -93,6 +93,7 @@ public final class AudioManager {
 
     #if targetEnvironment(simulator)
     var interruptionResumeForTesting: (() -> Void)?
+    var engineStartForTesting: (() -> Void)?
     var audioQueueForTesting: DispatchQueue { audioQueue }
 
     static func makeForTesting() -> AudioManager { AudioManager() }
@@ -170,6 +171,9 @@ public final class AudioManager {
 
     private func startEngineIfNeeded() {
         guard !engineStarted else { return }
+        #if targetEnvironment(simulator)
+        if let start = engineStartForTesting { start(); return }
+        #endif
         do {
             try engine.start()
             engineStarted = true

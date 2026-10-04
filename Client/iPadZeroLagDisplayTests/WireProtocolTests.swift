@@ -451,6 +451,7 @@ final class CommittedAudioAvailabilityTests: XCTestCase {
 final class AudioInterruptionOwnershipTests: XCTestCase {
     func testLegacyPcmRejectionRetainsBoundedContextAtExistingDiagnosticCadence() {
         let audio = AudioManager.makeForTesting()
+        audio.engineStartForTesting = { }
         defer { audio.reset(); audio.audioQueueForTesting.sync { } }
         audio.beginLegacySession(generation: 130)
         audio.playPCMData(Data(repeating: 0, count: 9_601 * 4), generation: 130)
@@ -469,6 +470,7 @@ final class AudioInterruptionOwnershipTests: XCTestCase {
 
     func testLegacyPcmReplacementClearsOldRejectionContextAndRejectsStalePacket() {
         let audio = AudioManager.makeForTesting()
+        audio.engineStartForTesting = { }
         defer { audio.reset(); audio.audioQueueForTesting.sync { } }
         audio.beginLegacySession(generation: 130)
         audio.playPCMData(Data(repeating: 0, count: 9_601 * 4), generation: 130)
