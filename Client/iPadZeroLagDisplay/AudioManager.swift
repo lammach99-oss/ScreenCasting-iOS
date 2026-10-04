@@ -25,6 +25,11 @@ struct AudioPlayoutDiagnostics {
     var pcmBuffersScheduled = 0
     var pcmFramesScheduled = 0
     var playerStarts = 0
+    var lastPcmRejection: (generation: UInt64, epoch: UInt64, incoming: Int, queued: Int, cap: Int, playing: Bool, engine: Bool)?
+    var pcmRejectionContext: String {
+        guard let sample = lastPcmRejection else { return "pcm_reject_context=none" }
+        return "pcm_reject_generation=\(sample.generation) pcm_reject_epoch=\(sample.epoch) pcm_reject_incoming_frames=\(sample.incoming) pcm_reject_queued_before=\(sample.queued) pcm_reject_cap=\(sample.cap) pcm_reject_player_playing=\(sample.playing ? 1 : 0) pcm_reject_engine_started=\(sample.engine ? 1 : 0)"
+    }
     var playerRestarts: Int { max(0, playerStarts - 1) }
     mutating func record(_ event: AudioPlayoutDiagnosticEvent, frames: Int = 0) {
         switch event {
@@ -294,6 +299,10 @@ public final class AudioManager {
 
             guard self.queuedFrames + frameCount <= self.maxQueuedFrames else {
                 self.playoutDiagnostics.record(.pcmRejected)
+                self.playoutDiagnostics.lastPcmRejection = (
+                    self.activePlaybackGeneration ?? 0, self.playbackEpoch,
+                    frameCount, self.queuedFrames, self.maxQueuedFrames,
+                    self.playerNode.isPlaying, self.engineStarted)
                 return
             }
 
@@ -415,7 +424,7 @@ public final class AudioManager {
             let packetMetrics = opus
                 ? "packets=\(rx.packets) gaps=\(rx.forwardGaps) missing=\(rx.missingPacketUnits) repaired=\(rx.repairedPacketUnits) reorder=\(rx.reorderedPackets) duplicate_stale=\(rx.duplicateOrStalePackets) jitter_ms=\(rx.jitterMs) interarrival_p95_ms=\(rx.interarrivalP95Ms) interarrival_max_ms=\(rx.interarrivalMaxMs) depth=\(self.jitterBuffer.bufferedPacketCount) depth_max=\(jitter.maximumDepth) depth_p50=\(jitter.depthPercentiles.p50) depth_p95=\(jitter.depthPercentiles.p95) inserted=\(jitter.insertedPackets) duplicate_reject=\(jitter.duplicateRejects) stale_reject=\(jitter.staleRejects) startup_wait=\(jitter.startupWaitTicks) target_ms=\(self.jitterBuffer.targetDurationMs) target_drop=\(jitter.targetPolicyDrops) overflow_drop=\(jitter.overflowDrops) plc=\(play.plcActions)"
                 : "rtp_jitter_plc=not_applicable"
-            sink("[AUDIO_PLAYOUT] generation=\(generation) epoch=\(self.playbackEpoch) profile=\(profile) codec=\(opus ? "opus" : "pcm") \(packetMetrics) \(receiveRejects) ticks=\(play.ticks) nil=\(play.nilTicks) decode=\(play.decodeActions) decode_fail=\(play.decodeFailures) pcm_reject=\(play.pcmQueueRejects) pcm_scheduled=\(play.pcmBuffersScheduled) pcm_frames=\(play.pcmFramesScheduled) queued_frames=\(self.queuedFrames) player_start=\(play.playerStarts) player_restart=\(play.playerRestarts)")
+            sink("[AUDIO_PLAYOUT] generation=\(generation) epoch=\(self.playbackEpoch) profile=\(profile) codec=\(opus ? "opus" : "pcm") \(packetMetrics) \(receiveRejects) ticks=\(play.ticks) nil=\(play.nilTicks) decode=\(play.decodeActions) decode_fail=\(play.decodeFailures) pcm_reject=\(play.pcmQueueRejects) \(play.pcmRejectionContext) pcm_scheduled=\(play.pcmBuffersScheduled) pcm_frames=\(play.pcmFramesScheduled) queued_frames=\(self.queuedFrames) player_start=\(play.playerStarts) player_restart=\(play.playerRestarts)")
         }
     }
 
