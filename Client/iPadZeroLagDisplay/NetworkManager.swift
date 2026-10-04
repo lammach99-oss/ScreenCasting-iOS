@@ -2089,7 +2089,7 @@ public class NetworkManager: ObservableObject {
         networkQueue.setSpecific(key: networkQueueKey, value: true)
         clientDebugLoggingEnabled = ClientDebugLoggingPreference.load(
             defaults: userDefaults)
-        let desired = ClientStreamSettingsStore.load()
+        let desired = ClientStreamSettingsStore.load(defaults: userDefaults)
         clientSettingsState = ClientSettingsStateModel(desired: desired)
         desiredBitrateMbps = desired.bitrateMbps
         desiredAudioEnabled = desired.audioEnabled

@@ -426,6 +426,7 @@ final class CommittedAudioAvailabilityTests: XCTestCase {
         ClientStreamSettingsStore.save(
             .normalized(bitrateMbps: 20, audioEnabled: desiredAudio), defaults: defaults)
         let manager = NetworkManager(userDefaults: defaults)
+        XCTAssertEqual(manager.desiredAudioEnabled, desiredAudio)
         var actions: [Bool] = []
         manager.realtimeAudioPlaybackForTesting = { actions.append($0) }
         manager.controlSendForAudioTesting = { _, completion in completion(nil) }
