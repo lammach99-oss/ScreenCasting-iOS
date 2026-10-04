@@ -784,6 +784,41 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
         XCTAssertEqual(point, CGPoint(x: 70, y: 75))
     }
 
+    func testDragDoesNotActivateBefore500ms() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        XCTAssertTrue(touchPhases(machine.move(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.499)).isEmpty)
+    }
+
+    func testDragActivatesAt500msBoundary() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        XCTAssertEqual(touchPhases(machine.move(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.5)), [.down, .update])
+    }
+
+    func testDragAfter500msEmitsSingleDownBeforeUpdates() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        XCTAssertEqual(touchPhases(machine.move(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.501)), [.down, .update])
+        XCTAssertEqual(touchPhases(machine.move(id: 1, point: CGPoint(x: 20, y: 0), timestamp: 0.52)), [.update])
+        XCTAssertEqual(touchPhases(machine.end(id: 1, point: CGPoint(x: 20, y: 0), timestamp: 0.53)), [.up])
+    }
+
+    func testTapBelow500msStillRemainsTap() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        XCTAssertEqual(touchPhases(machine.end(id: 1, point: .zero, timestamp: 0.2)), [.down, .up])
+    }
+
+    func testMovementBeforeHoldThresholdStillUsesScrollClassification() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        let outputs = machine.move(id: 1, point: CGPoint(x: 0, y: 80), timestamp: 0.499)
+        XCTAssertEqual(pointerActions(outputs), [.verticalWheel])
+        XCTAssertTrue(touchPhases(outputs).isEmpty)
+        XCTAssertTrue(touchPhases(machine.move(id: 1, point: CGPoint(x: 0, y: 90), timestamp: 0.6)).isEmpty)
+    }
+
     func testLongHoldDragOwnsOneContactAndReleasesOnlyPrimary() {
         var machine = DirectTouchGestureStateMachine()
         machine.begin(id: 1, point: .zero, timestamp: 0)
