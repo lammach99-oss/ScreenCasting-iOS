@@ -228,8 +228,9 @@ public final class ConnectedPresentationContainer: UIView {
     private(set) var keyboardMode: RemoteKeyboardMode = .none
     private var keyboardActive = false
     private var softwareRequested = false
-    private var softwareKeyboardRecoveryGeneration: UInt64?
-    private var softwareKeyboardRecoveryUsed = false
+    private var softwareNativeVisible = false
+    private var softwareNativeSuppressed = false
+    private var softwareShowAttempts = 0
     private var keyboardGeneration: UInt64?
     private var lastKeyboardAuthorityDiagnostic: String?
     private var lastSoftwareResponderResult: Bool?
@@ -274,7 +275,7 @@ public final class ConnectedPresentationContainer: UIView {
             self?.touchView.unhandledHardwarePresses(presses, action: action) ?? presses
         }
         for name in [UIResponder.keyboardWillChangeFrameNotification, UIResponder.keyboardWillHideNotification,
-                     UIResponder.keyboardDidHideNotification,
+                     UIResponder.keyboardDidHideNotification, UIResponder.keyboardDidShowNotification,
                      UIApplication.willResignActiveNotification, UIApplication.didBecomeActiveNotification] {
             keyboardObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
                 MainActor.assumeIsolated { self?.handleKeyboardNotification(note) }
@@ -353,8 +354,9 @@ public final class ConnectedPresentationContainer: UIView {
     }
     func configureRemoteKeyboard(active: Bool, generation: UInt64) {
         if keyboardGeneration != generation {
-            softwareKeyboardRecoveryGeneration = nil
-            softwareKeyboardRecoveryUsed = false
+            softwareNativeVisible = false
+            softwareNativeSuppressed = false
+            softwareShowAttempts = 0
             softwareRequested = false
             applyRemoteKeyboardMode(.none)
             keyboardGeneration = generation
@@ -378,7 +380,8 @@ public final class ConnectedPresentationContainer: UIView {
         keyboardMode = mode
         if mode == .softwareOpen { softwareRequested = true }
         if mode != .softwareOpen {
-            softwareKeyboardRecoveryGeneration = nil
+            softwareNativeVisible = false
+            softwareNativeSuppressed = false
             softwareRequested = false
             keyboardFrame = nil
             softwareTextView.deactivateAndDiscardComposition()
@@ -391,10 +394,6 @@ public final class ConnectedPresentationContainer: UIView {
         touchView.keyboardCaptureEnabled = mode == .hardware || (mode != .none && hardwareMonitor.isConnected)
         if mode == .softwareOpen {
             softwareTextView.deliveryEnabled = true
-            if window != nil && !softwareTextView.isFirstResponder {
-                lastSoftwareResponderResult = softwareTextView.becomeFirstResponder()
-                recordKeyboardAuthority(reason: "software_responder_attempt")
-            }
         }
         if changed {
             if keyboardButton.isHidden { fadeTask?.cancel(); fadeTask = nil }
@@ -403,7 +402,7 @@ public final class ConnectedPresentationContainer: UIView {
         }
     }
     fileprivate func recordKeyboardAuthority(reason: String, previousMode: RemoteKeyboardMode? = nil) {
-        let line = "[KEYBOARD_AUTHORITY] reason=\(reason) gc_keyboard_present=\(GCKeyboard.coalesced != nil ? 1 : 0) hardware_monitor=\(hardwareMonitor.isConnected ? 1 : 0) keyboard_active=\(keyboardActive ? 1 : 0) software_requested=\(softwareRequested ? 1 : 0) old_mode=\(previousMode ?? keyboardMode) new_mode=\(keyboardMode) software_first_responder=\(softwareTextView.isFirstResponder ? 1 : 0) responder_result=\(lastSoftwareResponderResult.map { $0 ? "success" : "failure" } ?? "not_attempted") keyboard_button_hidden=\(keyboardButton.isHidden ? 1 : 0)"
+        let line = "[KEYBOARD_AUTHORITY] reason=\(reason) gc_keyboard_present=\(GCKeyboard.coalesced != nil ? 1 : 0) hardware_monitor=\(hardwareMonitor.isConnected ? 1 : 0) keyboard_active=\(keyboardActive ? 1 : 0) software_requested=\(softwareRequested ? 1 : 0) software_native_visible=\(softwareNativeVisible ? 1 : 0) software_native_suppressed=\(softwareNativeSuppressed ? 1 : 0) software_show_attempt=\(softwareShowAttempts) old_mode=\(previousMode ?? keyboardMode) new_mode=\(keyboardMode) software_first_responder=\(softwareTextView.isFirstResponder ? 1 : 0) responder_result=\(lastSoftwareResponderResult.map { $0 ? "success" : "failure" } ?? "not_attempted") keyboard_button_hidden=\(keyboardButton.isHidden ? 1 : 0)"
         guard line != lastKeyboardAuthorityDiagnostic else { return }
         lastKeyboardAuthorityDiagnostic = line
         touchView.diagnosticSink?(line)
@@ -414,9 +413,14 @@ public final class ConnectedPresentationContainer: UIView {
             return
         }
         softwareRequested = !softwareRequested
-        softwareKeyboardRecoveryUsed = false
-        softwareKeyboardRecoveryGeneration = nil
+        softwareNativeSuppressed = false
         updateKeyboardAuthority()
+        if softwareRequested {
+            softwareShowAttempts += 1
+            softwareTextView.reloadInputViews()
+            lastSoftwareResponderResult = window != nil && softwareTextView.becomeFirstResponder()
+            recordKeyboardAuthority(reason: "native_show_request")
+        }
         restartKeyboardFade()
     }
     private func restartKeyboardFade() {
@@ -434,23 +438,8 @@ public final class ConnectedPresentationContainer: UIView {
             UIApplication.shared.applicationState == .active
     }
 
-    private func recoverSoftwareKeyboardAfterHide() {
-        guard let generation = softwareKeyboardRecoveryGeneration else { return }
-        softwareKeyboardRecoveryGeneration = nil
-        guard generation == keyboardGeneration, preserveRequestedSoftwareKeyboard,
-              !softwareKeyboardRecoveryUsed else { return }
-        // Consume before UIKit callbacks, so a rejected/reentrant show cannot loop.
-        softwareKeyboardRecoveryUsed = true
-        softwareTextView.deliveryEnabled = true
-        softwareTextView.reloadInputViews()
-        if window != nil && !softwareTextView.isFirstResponder {
-            lastSoftwareResponderResult = softwareTextView.becomeFirstResponder()
-        }
-        recordKeyboardAuthority(reason: "software_hide_recovery")
-    }
-
     private func handleKeyboardNotification(_ note: Notification) {
-        recordKeyboardAuthority(reason: note.name.rawValue)
+        defer { recordKeyboardAuthority(reason: note.name.rawValue) }
         if note.name == UIApplication.willResignActiveNotification {
             retireDirectPointer()
             softwareRequested = false; applyRemoteKeyboardMode(.none); return
@@ -459,22 +448,27 @@ public final class ConnectedPresentationContainer: UIView {
             softwareRequested = false; hardwareMonitor.refresh(); updateKeyboardAuthority(); return
         }
         guard keyboardMode == .softwareOpen else { return }
-        if note.name == UIResponder.keyboardWillHideNotification {
+        if let screen = note.object as? UIScreen, screen !== window?.screen { return }
+        if note.name == UIResponder.keyboardWillHideNotification || note.name == UIResponder.keyboardDidHideNotification {
             keyboardFrame = nil
+            softwareNativeVisible = false
             if preserveRequestedSoftwareKeyboard {
-                if !softwareKeyboardRecoveryUsed {
-                    softwareKeyboardRecoveryGeneration = keyboardGeneration
-                }
+                softwareNativeSuppressed = true
             } else {
                 softwareRequested = false
                 applyRemoteKeyboardMode(.softwareAvailable)
             }
-        } else if note.name == UIResponder.keyboardDidHideNotification {
-            recoverSoftwareKeyboardAfterHide()
-        } else if softwareTextView.isFirstResponder,
+        } else if note.name == UIResponder.keyboardDidShowNotification {
+            softwareNativeVisible = true
+            softwareNativeSuppressed = false
+        } else if
                   let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect,
                   let window {
             keyboardFrame = convert(window.convert(frame, from: window.screen.coordinateSpace), from: window)
+            if let keyboardFrame, !keyboardFrame.intersection(bounds).isEmpty {
+                softwareNativeVisible = true
+                softwareNativeSuppressed = false
+            }
         }
         setNeedsLayout()
     }

@@ -3847,7 +3847,7 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         XCTAssertEqual(container.softwareTextView.text, "đẹp")
     }
 
-    @MainActor func testPencilSystemHideRecoveryIsBoundedToOneAttempt() async {
+    @MainActor func testPencilSystemHideDoesNotRepeatExplicitShowAttempt() async {
         let container = ConnectedPresentationContainer(frame: .zero)
         var diagnostics: [String] = []
         container.touchView.diagnosticSink = { diagnostics.append($0) }
@@ -3859,7 +3859,8 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
             await Task.yield()
         }
         XCTAssertEqual(container.keyboardMode, .softwareOpen)
-        XCTAssertEqual(diagnostics.filter { $0.contains("reason=software_hide_recovery") }.count, 1)
+        XCTAssertEqual(diagnostics.filter { $0.contains("reason=software_hide_recovery") }.count, 0)
+        XCTAssertEqual(diagnostics.filter { $0.contains("reason=native_show_request") }.count, 1)
     }
 
     @MainActor func testRealHardwarePreservesPendingSoftwareHideAndComposition() async {
@@ -3880,7 +3881,7 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         XCTAssertNotNil(container.softwareTextView.markedTextRange)
         XCTAssertEqual(container.softwareTextView.text, "đẹp")
         XCTAssertEqual(commands.map(\.virtualKey), [0x41])
-        XCTAssertEqual(diagnostics.filter { $0.contains("reason=software_hide_recovery") }.count, 1)
+        XCTAssertEqual(diagnostics.filter { $0.contains("reason=software_hide_recovery") }.count, 0)
     }
 
     @MainActor func testExplicitSoftwareDismissDoesNotRecover() async {
