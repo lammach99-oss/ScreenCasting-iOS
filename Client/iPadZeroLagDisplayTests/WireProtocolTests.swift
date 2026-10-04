@@ -413,6 +413,7 @@ final class CommittedAudioAvailabilityTests: XCTestCase {
         let manager = NetworkManager(userDefaults: defaults)
         var actions: [Bool] = []
         manager.realtimeAudioPlaybackForTesting = { actions.append($0) }
+        manager.controlSendForAudioTesting = { _, completion in completion(nil) }
         defer { manager.stopForTesting() }
         try body(manager, { manager.networkQueueForTesting.sync { actions } })
     }

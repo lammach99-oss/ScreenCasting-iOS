@@ -1888,6 +1888,12 @@ public class NetworkManager: ObservableObject {
                 completion(.posix(.ECANCELED))
                 return
             }
+            #if targetEnvironment(simulator)
+            if let controlSendForAudioTesting = self.controlSendForAudioTesting {
+                controlSendForAudioTesting(data, completion)
+                return
+            }
+            #endif
             let connection = self.activeControlConnection
             if let diagnostic {
                 self.recordUsbTouchSendDiagnostic(
@@ -5328,6 +5334,7 @@ public class NetworkManager: ObservableObject {
 
     #if targetEnvironment(simulator)
     var realtimeAudioPlaybackForTesting: ((Bool) -> Void)?
+    var controlSendForAudioTesting: ((Data, @escaping (NWError?) -> Void) -> Void)?
 
     func commitAudioTransportForTesting(mode: UInt8, audioAvailable: Bool) {
         networkQueue.sync {
