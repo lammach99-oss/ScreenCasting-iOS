@@ -1207,11 +1207,15 @@ final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate {
     func deactivateAndDiscardComposition() {
         deliveryEnabled = false; discardBuffer(); resignFirstResponder()
     }
+    var preserveOnSystemResign: (() -> Bool)?
     override func resignFirstResponder() -> Bool {
-        deliveryEnabled = false; discardBuffer()
+        if !deliveryEnabled || preserveOnSystemResign?() != true {
+            deliveryEnabled = false; discardBuffer()
+        }
         return super.resignFirstResponder()
     }
     func textViewDidEndEditing(_ textView: UITextView) {
+        if deliveryEnabled && preserveOnSystemResign?() == true { return }
         deliveryEnabled = false; discardBuffer(); onDismiss?()
     }
 }
