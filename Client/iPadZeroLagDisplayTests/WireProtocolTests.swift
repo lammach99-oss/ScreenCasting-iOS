@@ -353,6 +353,84 @@ final class OptionalUsbAudioBindingTests: XCTestCase {
     }
 }
 
+final class CommittedAudioAvailabilityTests: XCTestCase {
+    func testSettingsCannotStartPlaybackForVideoOnlyUsbCommit() throws {
+        try withManager { manager, actions in
+            manager.commitAudioTransportForTesting(
+                mode: RealtimeTransportMode.usbSplitTLS, audioAvailable: false)
+            sendSettings(manager, enabled: false, generation: 1)
+            sendSettings(manager, enabled: true, generation: 2)
+            XCTAssertFalse(actions().contains(true))
+            XCTAssertEqual(manager.usbSessionSnapshot().committedGeneration,
+                           manager.usbSessionSnapshot().generation)
+        }
+    }
+
+    func testPersistedDesiredOffPreventsAudioCapableCommitStartingPlayback() throws {
+        try withManager(desiredAudio: false) { manager, actions in
+            manager.commitAudioTransportForTesting(
+                mode: RealtimeTransportMode.usbSplitTLS, audioAvailable: true)
+            XCTAssertFalse(actions().contains(true))
+        }
+    }
+
+    func testAudioCapableUsbSettingsOffOnAndStaleReconcile() throws {
+        try withManager { manager, actions in
+            let mode = RealtimeTransportMode.usbSplitTLS
+            manager.commitAudioTransportForTesting(mode: mode, audioAvailable: true)
+            sendSettings(manager, enabled: false, generation: 1)
+            sendSettings(manager, enabled: true, generation: 2)
+            XCTAssertEqual(actions(), [true, false, true])
+            manager.reconcileAudioForTesting(
+                generation: manager.usbSessionSnapshot().generation &+ 1,
+                mode: mode, audioEnabled: true)
+            XCTAssertEqual(actions(), [true, false, true])
+        }
+    }
+
+    func testWifiOpusAndLegacyTimerBehaviorRemainDistinct() throws {
+        try withManager { manager, actions in
+            manager.commitAudioTransportForTesting(
+                mode: RealtimeTransportMode.wifiRTP, audioAvailable: true)
+            XCTAssertEqual(actions(), [true])
+        }
+        try withManager { manager, actions in
+            manager.commitAudioTransportForTesting(
+                mode: RealtimeTransportMode.legacyTLS, audioAvailable: true)
+            XCTAssertEqual(actions(), [])
+        }
+    }
+
+    private func withManager(
+        desiredAudio: Bool = true,
+        _ body: (NetworkManager, () -> [Bool]) throws -> Void
+    ) throws {
+        let suite = "CommittedAudioAvailabilityTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        ClientStreamSettingsStore.save(
+            .normalized(bitrateMbps: 20, audioEnabled: desiredAudio), defaults: defaults)
+        let manager = NetworkManager(userDefaults: defaults)
+        var actions: [Bool] = []
+        manager.realtimeAudioPlaybackForTesting = { actions.append($0) }
+        defer { manager.stopForTesting() }
+        try body(manager, { manager.networkQueueForTesting.sync { actions } })
+    }
+
+    private func sendSettings(_ manager: NetworkManager, enabled: Bool, generation: UInt64) {
+        var payload = Data(count: 24)
+        payload[0] = 1
+        payload[1] = enabled ? 1 : 0
+        payload.withUnsafeMutableBytes { bytes in
+            bytes.storeBytes(of: generation.littleEndian, toByteOffset: 8, as: UInt64.self)
+            bytes.storeBytes(of: UInt32(20_000_000).littleEndian, toByteOffset: 16, as: UInt32.self)
+        }
+        manager.networkQueueForTesting.sync {
+            manager.receiveSettingsState(payload, outcome: .state)
+        }
+    }
+}
+
 final class DirectTouchGestureStateMachineTests: XCTestCase {
     private func pointerActions(
         _ outputs: [DirectTouchGestureOutput]

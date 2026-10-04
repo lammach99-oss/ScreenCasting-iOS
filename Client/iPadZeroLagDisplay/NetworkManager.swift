@@ -5295,10 +5295,22 @@ public class NetworkManager: ObservableObject {
             mode: mode,
             audioEnabled: audioEnabled) else {
             if !audioEnabled {
+                #if targetEnvironment(simulator)
+                if let realtimeAudioPlaybackForTesting {
+                    realtimeAudioPlaybackForTesting(false)
+                    return
+                }
+                #endif
                 AudioManager.shared.reset()
             }
             return
         }
+        #if targetEnvironment(simulator)
+        if let realtimeAudioPlaybackForTesting {
+            realtimeAudioPlaybackForTesting(true)
+            return
+        }
+        #endif
         AudioManager.shared.beginRealtimeSession(
             generation: generation,
             profile: mode == RealtimeTransportMode.wifiRTP ? .wifi : .usb)
@@ -5315,6 +5327,24 @@ public class NetworkManager: ObservableObject {
     }
 
     #if targetEnvironment(simulator)
+    var realtimeAudioPlaybackForTesting: ((Bool) -> Void)?
+
+    func commitAudioTransportForTesting(mode: UInt8, audioAvailable: Bool) {
+        networkQueue.sync {
+            wireAuthenticatedGeneration = connectionGeneration
+            commitRealtimeTransport(
+                generation: connectionGeneration, mode: mode,
+                audioEnabled: audioAvailable)
+        }
+    }
+
+    func reconcileAudioForTesting(generation: UInt64, mode: UInt8, audioEnabled: Bool) {
+        networkQueue.sync {
+            reconcileRealtimeAudioPlayback(
+                generation: generation, mode: mode, audioEnabled: audioEnabled)
+        }
+    }
+
     var clientDebugLoggingEnabledForTesting: Bool {
         networkQueue.sync { clientDebugLoggingEnabled }
     }
