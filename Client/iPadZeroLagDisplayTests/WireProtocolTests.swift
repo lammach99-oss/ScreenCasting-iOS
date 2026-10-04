@@ -401,6 +401,21 @@ final class CommittedAudioAvailabilityTests: XCTestCase {
         }
     }
 
+    func testVideoOnlyAvailabilityDoesNotLeakIntoNextCapableGeneration() throws {
+        try withManager { manager, actions in
+            let mode = RealtimeTransportMode.usbSplitTLS
+            manager.commitAudioTransportForTesting(mode: mode, audioAvailable: false)
+            let previous = manager.usbSessionSnapshot().generation
+            manager.stopForTesting()
+            manager.commitAudioTransportForTesting(mode: mode, audioAvailable: true)
+            XCTAssertGreaterThan(manager.usbSessionSnapshot().generation, previous)
+            XCTAssertEqual(actions(), [false, true])
+            sendSettings(manager, enabled: true, generation: 1)
+            sendSettings(manager, enabled: true, generation: 2)
+            XCTAssertEqual(actions(), [false, true])
+        }
+    }
+
     private func withManager(
         desiredAudio: Bool = true,
         _ body: (NetworkManager, () -> [Bool]) throws -> Void

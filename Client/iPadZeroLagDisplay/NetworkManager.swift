@@ -2045,6 +2045,7 @@ public class NetworkManager: ObservableObject {
     private var performanceFeedbackSequence: UInt32 = 0
     private var adaptiveTelemetryTimer: DispatchSourceTimer?
     private var committedRealtimeMode: UInt8?
+    private var committedTransportAudioAvailable = false
     private var committedRealtimeSessionID: SessionID?
     private var wifiLegacyFallbackGeneration: UInt64?
     private var wifiLegacyFallbackRequestGeneration: UInt64?
@@ -2916,6 +2917,7 @@ public class NetworkManager: ObservableObject {
         wireAuthenticatedGeneration = nil
         committedTransportGeneration = nil
         committedRealtimeMode = nil
+        committedTransportAudioAvailable = false
         committedRealtimeSessionID = nil
         advertisedClientCapabilities = nil
         settingsSyncPolicy.reset()
@@ -4042,6 +4044,7 @@ public class NetworkManager: ObservableObject {
         wireReceiveActiveGeneration = generation
         wireAuthenticatedGeneration = nil
         committedTransportGeneration = nil
+        committedTransportAudioAvailable = false
         advertisedClientCapabilities = nil
         clearPendingTransportOffer()
         wireParser.reset(generation: generation)
@@ -4181,6 +4184,7 @@ public class NetworkManager: ObservableObject {
                 print("[IPAD][AUTO_RECONNECT_SUCCESS] generation=\(generation)")
                 wireAuthenticatedGeneration = generation
                 committedTransportGeneration = nil
+                committedTransportAudioAvailable = false
                 committedRealtimeSessionID = nil
                 wifiLegacyFallbackRequestGeneration = nil
                 clearPendingTransportOffer()
@@ -4973,6 +4977,7 @@ public class NetworkManager: ObservableObject {
               committedTransportGeneration != generation else { return }
         committedTransportGeneration = generation
         committedRealtimeMode = mode
+        committedTransportAudioAvailable = audioEnabled
         wifiLegacyFallbackGeneration = nil
         wifiLegacyFallbackRequestGeneration = nil
         decoder.beginSession(generation: generation)
@@ -5186,6 +5191,7 @@ public class NetworkManager: ObservableObject {
         wifiLegacyFallbackGeneration = generation
         wifiLegacyFallbackRequestGeneration = nil
         committedRealtimeMode = RealtimeTransportMode.legacyTLS
+        committedTransportAudioAvailable = true
         wifiMediaReceiver.clearOffer()
         decoder.invalidate(waitForCompletion: true)
         guard connection === expectedConnection,
@@ -5269,6 +5275,7 @@ public class NetworkManager: ObservableObject {
         wireAuthenticatedGeneration = nil
         committedTransportGeneration = nil
         committedRealtimeMode = nil
+        committedTransportAudioAvailable = false
         committedRealtimeSessionID = nil
         wifiLegacyFallbackGeneration = nil
         wifiLegacyFallbackRequestGeneration = nil
@@ -5297,10 +5304,12 @@ public class NetworkManager: ObservableObject {
         guard generation == connectionGeneration,
               committedTransportGeneration == generation,
               committedRealtimeMode == mode else { return }
+        let playbackEnabled = audioEnabled && clientSettingsState.desired.audioEnabled &&
+            committedTransportAudioAvailable
         guard RealtimeAudioTimerPolicy.shouldRun(
             mode: mode,
-            audioEnabled: audioEnabled) else {
-            if !audioEnabled {
+            audioEnabled: playbackEnabled) else {
+            if !playbackEnabled {
                 #if targetEnvironment(simulator)
                 if let realtimeAudioPlaybackForTesting {
                     realtimeAudioPlaybackForTesting(false)
@@ -5468,6 +5477,7 @@ public class NetworkManager: ObservableObject {
             wireAuthenticatedGeneration = generation
             committedTransportGeneration = generation
             committedRealtimeMode = mode
+            committedTransportAudioAvailable = true
             lastClientPingSentAt = .greatestFiniteMagnitude
             decoder.beginSession(generation: generation)
             setState(.streaming)
