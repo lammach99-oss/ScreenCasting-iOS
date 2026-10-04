@@ -75,6 +75,16 @@ final class UsbLaneServer {
     private var secret = Data()
     private var stopped = true
 
+    #if targetEnvironment(simulator)
+    var bindingReceiverForTesting: ((NWConnection, @escaping (Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void) -> Void)?
+
+    func receiveBindingForTesting(_ connection: NWConnection, lane: UsbLaneKind) {
+        networkQueue.async { [weak self] in
+            self?.receiveBinding(connection, expectedLane: lane, accumulated: Data())
+        }
+    }
+    #endif
+
     init(
         networkQueue: DispatchQueue,
         parametersProvider: @escaping ParametersProvider,
@@ -179,10 +189,7 @@ final class UsbLaneServer {
         accumulated: Data)
     {
         let totalSize = 16 + UsbLaneBinding.encodedSize
-        connection.receive(
-            minimumIncompleteLength: 1,
-            maximumLength: totalSize - accumulated.count)
-        { [weak self] content, _, isComplete, error in
+        let completion: (Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void = { [weak self] content, _, isComplete, error in
             guard let self else { return }
             var bytes = accumulated
             if let content { bytes.append(content) }
@@ -203,6 +210,16 @@ final class UsbLaneServer {
                 expectedLane: expectedLane,
                 bytes: bytes)
         }
+        #if targetEnvironment(simulator)
+        if let bindingReceiverForTesting {
+            bindingReceiverForTesting(connection, completion)
+            return
+        }
+        #endif
+        connection.receive(
+            minimumIncompleteLength: 1,
+            maximumLength: totalSize - accumulated.count,
+            completion: completion)
     }
 
     private func finishBinding(

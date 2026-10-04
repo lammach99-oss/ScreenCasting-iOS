@@ -315,6 +315,44 @@ final class UsbSplitCommitGateTests: XCTestCase {
     }
 }
 
+final class OptionalUsbAudioBindingTests: XCTestCase {
+    func testAudioBindingReceiveFailureCancelsCandidateWithoutGlobalFailure() {
+        assertReceiveFailure(lane: .audio, expectedGlobalFailures: 0)
+    }
+
+    func testMandatoryVideoBindingReceiveFailureRemainsFatal() {
+        assertReceiveFailure(lane: .video, expectedGlobalFailures: 1)
+    }
+
+    private func assertReceiveFailure(lane: UsbLaneKind, expectedGlobalFailures: Int) {
+        let queue = DispatchQueue(label: "OptionalUsbAudioBindingTests.\(lane)")
+        let received = expectation(description: "binding receive callback completed")
+        let cancelled = expectation(description: "candidate cancelled")
+        var globalFailures = 0
+        var bound = 0
+        let server = UsbLaneServer(
+            networkQueue: queue,
+            parametersProvider: { .tcp },
+            onBound: { _, _, _ in bound += 1 },
+            onFailure: { _ in globalFailures += 1 })
+        let candidate = NWConnection(host: "127.0.0.1", port: 1, using: .tcp)
+        candidate.stateUpdateHandler = { state in
+            if case .cancelled = state { cancelled.fulfill() }
+        }
+        server.bindingReceiverForTesting = { connection, completion in
+            connection.start(queue: queue)
+            completion(nil, nil, false, .posix(.ECONNRESET))
+            received.fulfill()
+        }
+        server.receiveBindingForTesting(candidate, lane: lane)
+        wait(for: [received, cancelled], timeout: 5)
+        queue.sync {
+            XCTAssertEqual(globalFailures, expectedGlobalFailures)
+            XCTAssertEqual(bound, 0)
+        }
+    }
+}
+
 final class DirectTouchGestureStateMachineTests: XCTestCase {
     private func pointerActions(
         _ outputs: [DirectTouchGestureOutput]
