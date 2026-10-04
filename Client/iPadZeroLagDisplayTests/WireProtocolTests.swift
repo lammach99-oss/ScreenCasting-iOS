@@ -503,6 +503,8 @@ final class AudioInterruptionOwnershipTests: XCTestCase {
             audio.interruptForTesting(began: true)
             audio.interruptForTesting(began: false, shouldResume: false)
             XCTAssertEqual(resumes(), 0)
+            audio.interruptForTesting(began: false)
+            XCTAssertEqual(resumes(), 0)
         }
     }
 
@@ -515,6 +517,32 @@ final class AudioInterruptionOwnershipTests: XCTestCase {
             XCTAssertFalse(paused.timerActive)
             XCTAssertEqual(paused.packets, 0)
             XCTAssertEqual(paused.queuedFrames, 0)
+        }
+    }
+
+    func testLegacyPlaybackOwnsResumeAndResetRevokesIt() {
+        withAudio { audio, resumes in
+            audio.beginLegacySession(generation: 40)
+            audio.interruptForTesting(began: true)
+            audio.interruptForTesting(began: false)
+            XCTAssertEqual(resumes(), 1)
+            XCTAssertFalse(audio.interruptionStateForTesting.timerActive)
+            audio.interruptForTesting(began: true)
+            audio.reset()
+            audio.interruptForTesting(began: false)
+            XCTAssertEqual(resumes(), 1)
+        }
+    }
+
+    func testLegacyReplacementRejectsOldInterruptionAndStalePcm() {
+        withAudio { audio, resumes in
+            audio.beginLegacySession(generation: 40)
+            audio.interruptForTesting(began: true)
+            audio.beginLegacySession(generation: 41)
+            audio.interruptForTesting(began: false)
+            audio.playPCMData(Data(repeating: 0, count: 1920), generation: 40)
+            XCTAssertEqual(resumes(), 0)
+            XCTAssertEqual(audio.interruptionStateForTesting.queuedFrames, 0)
         }
     }
 

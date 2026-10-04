@@ -85,6 +85,9 @@ public final class AudioManager {
     private var realtimeGeneration: UInt64?
     private var playoutTimer: DispatchSourceTimer?
     private var playbackEpoch: UInt64 = 0
+    private var activePlaybackGeneration: UInt64?
+    private var interruptedPlaybackEpoch: UInt64?
+    private var playbackInterrupted = false
     private var receiveDiagnostics = AudioReceiveDiagnostics()
     private var playoutDiagnostics = AudioPlayoutDiagnostics()
 
@@ -185,6 +188,9 @@ public final class AudioManager {
         audioQueue.async { [weak self] in
             guard let self else { return }
             self.playbackEpoch &+= 1
+            self.activePlaybackGeneration = nil
+            self.interruptedPlaybackEpoch = nil
+            self.playbackInterrupted = false
             self.playerNode.stop()
             self.playerNode.reset()
             self.queuedFrames = 0
@@ -197,11 +203,34 @@ public final class AudioManager {
             do {
                 self.opusDecoder = try RealtimeOpusDecoder()
                 self.realtimeGeneration = generation
+                self.activePlaybackGeneration = generation
                 self.startPlayoutTimer()
             } catch {
                 self.realtimeGeneration = nil
                 print("[AudioManager] Opus decoder setup failed: \(error)")
             }
+        }
+    }
+
+    func beginLegacySession(generation: UInt64) {
+        audioQueue.async { [weak self] in
+            guard let self else { return }
+            if self.activePlaybackGeneration == generation,
+               self.realtimeGeneration == nil, !self.playbackInterrupted { return }
+            self.playbackEpoch &+= 1
+            self.activePlaybackGeneration = generation
+            self.interruptedPlaybackEpoch = nil
+            self.playbackInterrupted = false
+            self.playerNode.stop()
+            self.playerNode.reset()
+            self.queuedFrames = 0
+            self.playoutTimer?.cancel()
+            self.playoutTimer = nil
+            self.jitterBuffer.reset()
+            self.opusDecoder = nil
+            self.realtimeGeneration = nil
+            self.receiveDiagnostics = AudioReceiveDiagnostics()
+            self.playoutDiagnostics = AudioPlayoutDiagnostics()
         }
     }
 
@@ -215,7 +244,9 @@ public final class AudioManager {
         let arrivedAt = ProcessInfo.processInfo.systemUptime
         audioQueue.async { [weak self] in
             guard let self,
-                  self.realtimeGeneration == generation else { return }
+                  self.realtimeGeneration == generation,
+                  self.activePlaybackGeneration == generation,
+                  !self.playbackInterrupted else { return }
             self.receiveDiagnostics.record(sequence: sequence, timestamp: timestamp, arrivedAt: arrivedAt)
             self.jitterBuffer.insert(AudioJitterPacket(
                 sequence: sequence,
@@ -229,11 +260,18 @@ public final class AudioManager {
     ///
     /// - Parameter data: 16-bit / 48 kHz / Stereo / interleaved PCM bytes.
     ///   Must be non-empty and byte-aligned to 4 bytes (2 ch × 2 bytes/sample).
-    public func playPCMData(_ data: Data) {
+    public func playPCMData(_ data: Data, generation: UInt64? = nil) {
+        enqueuePCMData(data, generation: generation, expectedEpoch: nil)
+    }
+
+    private func enqueuePCMData(_ data: Data, generation: UInt64?, expectedEpoch: UInt64?) {
         guard !data.isEmpty else { return }
 
         audioQueue.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.activePlaybackGeneration != nil,
+                  !self.playbackInterrupted,
+                  generation == nil || self.activePlaybackGeneration == generation,
+                  expectedEpoch == nil || self.playbackEpoch == expectedEpoch else { return }
 
             self.startEngineIfNeeded()
 
@@ -304,6 +342,9 @@ public final class AudioManager {
         audioQueue.async { [weak self] in
             guard let self else { return }
             self.playbackEpoch &+= 1
+            self.activePlaybackGeneration = nil
+            self.interruptedPlaybackEpoch = nil
+            self.playbackInterrupted = false
             self.playerNode.stop()
             self.playerNode.reset()
             self.engine.pause()
@@ -333,6 +374,7 @@ public final class AudioManager {
     }
 
     private func playoutTick() {
+        guard !playbackInterrupted else { return }
         playoutDiagnostics.record(.tick)
         guard let opusDecoder,
               let action = jitterBuffer.dequeue() else {
@@ -350,7 +392,7 @@ public final class AudioManager {
                 samples = try opusDecoder.decode(nil)
             }
             let data = samples.withUnsafeBytes { Data($0) }
-            playPCMData(data)
+            enqueuePCMData(data, generation: realtimeGeneration, expectedEpoch: playbackEpoch)
         } catch {
             playoutDiagnostics.record(.decodeFailure)
             print("[AudioManager] Opus decode failed: \(error)")
@@ -381,30 +423,47 @@ public final class AudioManager {
 
         switch type {
         case .began:
-            // System interrupted us (e.g. phone call): pause the engine.
             audioQueue.async { [weak self] in
-                self?.playerNode.pause()
-                self?.engine.pause()
-                self?.engineStarted = false
+                guard let self, self.activePlaybackGeneration != nil,
+                      !self.playbackInterrupted else { return }
+                // Retire queued output callbacks without retiring the negotiated session.
+                self.playbackEpoch &+= 1
+                self.interruptedPlaybackEpoch = self.playbackEpoch
+                self.playbackInterrupted = true
+                self.playerNode.stop()
+                self.playerNode.reset()
+                self.engine.pause()
+                self.engineStarted = false
+                self.queuedFrames = 0
+                self.playoutTimer?.cancel()
+                self.playoutTimer = nil
+                self.jitterBuffer.reset()
             }
 
         case .ended:
-            // Resume after interruption ends (e.g. call finished).
-            guard let optionsValue = info[AVAudioSessionInterruptionOptionKey] as? UInt else { return }
+            let optionsValue = info[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
             let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
-            if options.contains(.shouldResume) {
-                configureAudioSession()
-                audioQueue.async { [weak self] in
-                    #if targetEnvironment(simulator)
-                    if let resume = self?.interruptionResumeForTesting {
-                        resume()
-                        return
-                    }
-                    #endif
-                    self?.startEngineIfNeeded()
-                    self?.playerNode.play()
-                    self?.playoutDiagnostics.record(.playerStart)
+            audioQueue.async { [weak self] in
+                guard let self, self.activePlaybackGeneration != nil,
+                      let epoch = self.interruptedPlaybackEpoch,
+                      epoch == self.playbackEpoch, self.playbackInterrupted else { return }
+                self.interruptedPlaybackEpoch = nil
+                guard options.contains(.shouldResume) else { return }
+                self.playbackInterrupted = false
+                self.configureAudioSession()
+                if self.realtimeGeneration != nil, self.opusDecoder != nil {
+                    self.startPlayoutTimer()
                 }
+                #if targetEnvironment(simulator)
+                if let resume = self.interruptionResumeForTesting {
+                    resume()
+                    return
+                }
+                #endif
+                self.startEngineIfNeeded()
+                guard self.engineStarted else { return }
+                self.playerNode.play()
+                self.playoutDiagnostics.record(.playerStart)
             }
 
         @unknown default:

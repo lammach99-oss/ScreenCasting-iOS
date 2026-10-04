@@ -4393,7 +4393,7 @@ public class NetworkManager: ObservableObject {
                     timestamp: audioTimestamp,
                     generation: generation)
             case .legacyPCM:
-                AudioManager.shared.playPCMData(payload)
+                AudioManager.shared.playPCMData(payload, generation: generation)
             case .reject:
                 return
             }
@@ -5206,6 +5206,9 @@ public class NetworkManager: ObservableObject {
         lastHudSnapshotPublishedAt = 0
         startLegacyTelemetryTimers()
         AudioManager.shared.reset()
+        reconcileRealtimeAudioPlayback(
+            generation: generation, mode: RealtimeTransportMode.legacyTLS,
+            audioEnabled: clientSettingsState.effective.audioEnabled)
         return true
     }
 
@@ -5306,6 +5309,9 @@ public class NetworkManager: ObservableObject {
               committedRealtimeMode == mode else { return }
         let playbackEnabled = audioEnabled && clientSettingsState.desired.audioEnabled &&
             committedTransportAudioAvailable
+        if mode == RealtimeTransportMode.legacyTLS, playbackEnabled {
+            AudioManager.shared.beginLegacySession(generation: generation)
+        }
         guard RealtimeAudioTimerPolicy.shouldRun(
             mode: mode,
             audioEnabled: playbackEnabled) else {
