@@ -214,6 +214,9 @@ struct DirectTouchGestureStateMachine {
     private let holdDuration: TimeInterval = 1.000
     private let holdSlop: CGFloat = 8
     private let wheelPointsPerStep: CGFloat = 42
+    private let scrollClassificationDistance: CGFloat = 12
+    private let scrollAxisDominance: CGFloat = 1.25
+    private(set) var scrollClassification: (contact: UInt64, horizontal: Bool, dx: CGFloat, dy: CGFloat)?
     private let threeFingerSync: TimeInterval = 0.150
     private let threeFingerDuration: TimeInterval = 0.300
     private let threeFingerMovement: CGFloat = 15
@@ -350,12 +353,14 @@ struct DirectTouchGestureStateMachine {
                 state = .dragging(primary)
                 return commitContact(contact, point: point)
             }
-            if abs(dy) >= 12 && abs(dy) >= abs(dx) * 0.6 {
+            if abs(dy) >= scrollClassificationDistance && abs(dy) >= abs(dx) * scrollAxisDominance {
                 state = .scrolling(primary)
+                scrollClassification = (primary, false, dx, dy)
                 return wheel(action: .verticalWheel, points: dy, target: point)
             }
-            if abs(dx) >= 12 && abs(dy) < abs(dx) * 0.6 {
+            if abs(dx) >= scrollClassificationDistance && abs(dx) >= abs(dy) * scrollAxisDominance {
                 state = .horizontalScrolling(primary)
+                scrollClassification = (primary, true, dx, dy)
                 return wheel(action: .horizontalWheel, points: -dx, target: point)
             }
         case .scrolling(let primary) where primary == id:
@@ -829,7 +834,16 @@ public class PencilUIKitView: UIView {
         directTouchIDs.removeAll()
     }
 
-    private func emit(_ outputs: [DirectTouchGestureOutput]) { emitDirectOutputs(outputs) }
+    private var diagnosedScrollContact: UInt64?
+    private var lastWheelDiagnosticAt: TimeInterval = -.infinity
+
+    private func emit(_ outputs: [DirectTouchGestureOutput]) {
+        if let axis = directGesture.scrollClassification, axis.contact != diagnosedScrollContact {
+            diagnosedScrollContact = axis.contact
+            diagnosticSink?("[TOUCH_GESTURE] kind=scroll_axis axis=\(axis.horizontal ? "horizontal" : "vertical") dx=\(axis.dx) dy=\(axis.dy) contact=\(axis.contact) generation=\(directTouchGeneration)")
+        }
+        emitDirectOutputs(outputs)
+    }
 
     func emitDirectOutputs(_ outputs: [DirectTouchGestureOutput]) {
         for output in outputs {
@@ -858,6 +872,13 @@ public class PencilUIKitView: UIView {
                 guard let resolved = pointerCoordinateState.resolve(
                     action: action,
                     mappedPoint: normalized) else { continue }
+                if action == .horizontalWheel || action == .verticalWheel {
+                    let now = ProcessInfo.processInfo.systemUptime
+                    if now - lastWheelDiagnosticAt >= 1 {
+                        lastWheelDiagnosticAt = now
+                        diagnosticSink?("[TOUCH_GESTURE] kind=wheel action=\(action == .horizontalWheel ? "horizontal" : "vertical") value=\(value) generation=\(directTouchGeneration)")
+                    }
+                }
                 let x = UInt16(clamping: Int((resolved.x * 65_535).rounded()))
                 let y = UInt16(clamping: Int((resolved.y * 65_535).rounded()))
                 onPointerInput?(PointerInputCommand(
