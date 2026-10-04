@@ -448,6 +448,88 @@ final class CommittedAudioAvailabilityTests: XCTestCase {
     }
 }
 
+final class AudioInterruptionOwnershipTests: XCTestCase {
+    func testIdleInterruptionEndCannotStartPlayback() {
+        withAudio { audio, resumes in
+            audio.interruptForTesting(began: false)
+            XCTAssertEqual(resumes(), 0)
+        }
+    }
+
+    func testSameGenerationResumesExactlyOnce() {
+        withAudio { audio, resumes in
+            audio.beginRealtimeSession(generation: 40, profile: .usb)
+            audio.interruptForTesting(began: true)
+            audio.interruptForTesting(began: false)
+            XCTAssertEqual(resumes(), 1)
+            audio.interruptForTesting(began: false)
+            XCTAssertEqual(resumes(), 1)
+        }
+    }
+
+    func testDisableDuringInterruptionCannotResumePlayback() {
+        withAudio { audio, resumes in
+            audio.beginRealtimeSession(generation: 40, profile: .wifi)
+            audio.interruptForTesting(began: true)
+            audio.reset()
+            audio.interruptForTesting(began: false)
+            XCTAssertEqual(resumes(), 0)
+        }
+    }
+
+    func testReplacementGenerationCannotBeResumedByOldInterruption() {
+        withAudio { audio, resumes in
+            audio.beginRealtimeSession(generation: 40, profile: .usb)
+            audio.interruptForTesting(began: true)
+            audio.beginRealtimeSession(generation: 41, profile: .usb)
+            audio.interruptForTesting(began: false)
+            XCTAssertEqual(resumes(), 0)
+        }
+    }
+
+    func testSameGenerationReplacementEpochCannotBeResumedByOldInterruption() {
+        withAudio { audio, resumes in
+            audio.beginRealtimeSession(generation: 40, profile: .wifi)
+            audio.interruptForTesting(began: true)
+            audio.beginRealtimeSession(generation: 40, profile: .wifi)
+            audio.interruptForTesting(began: false)
+            XCTAssertEqual(resumes(), 0)
+        }
+    }
+
+    func testMissingShouldResumeDoesNotStartPlayback() {
+        withAudio { audio, resumes in
+            audio.beginRealtimeSession(generation: 40, profile: .usb)
+            audio.interruptForTesting(began: true)
+            audio.interruptForTesting(began: false, shouldResume: false)
+            XCTAssertEqual(resumes(), 0)
+        }
+    }
+
+    func testInterruptionStopsTimerAndDoesNotAccumulatePausedPackets() {
+        withAudio { audio, _ in
+            audio.beginRealtimeSession(generation: 40, profile: .usb)
+            audio.interruptForTesting(began: true)
+            audio.playOpusData(Data([0x01]), sequence: 1, timestamp: 480, generation: 40)
+            let paused = audio.interruptionStateForTesting
+            XCTAssertFalse(paused.timerActive)
+            XCTAssertEqual(paused.packets, 0)
+            XCTAssertEqual(paused.queuedFrames, 0)
+        }
+    }
+
+    private func withAudio(_ body: (AudioManager, () -> Int) -> Void) {
+        let audio = AudioManager.makeForTesting()
+        var resumes = 0
+        audio.interruptionResumeForTesting = { resumes += 1 }
+        defer {
+            audio.reset()
+            audio.audioQueueForTesting.sync { }
+        }
+        body(audio, { audio.audioQueueForTesting.sync { resumes } })
+    }
+}
+
 final class DirectTouchGestureStateMachineTests: XCTestCase {
     private func pointerActions(
         _ outputs: [DirectTouchGestureOutput]

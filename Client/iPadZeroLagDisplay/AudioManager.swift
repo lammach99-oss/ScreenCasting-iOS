@@ -88,6 +88,29 @@ public final class AudioManager {
     private var receiveDiagnostics = AudioReceiveDiagnostics()
     private var playoutDiagnostics = AudioPlayoutDiagnostics()
 
+    #if targetEnvironment(simulator)
+    var interruptionResumeForTesting: (() -> Void)?
+    var audioQueueForTesting: DispatchQueue { audioQueue }
+
+    static func makeForTesting() -> AudioManager { AudioManager() }
+
+    var interruptionStateForTesting: (queuedFrames: Int, packets: Int, timerActive: Bool) {
+        audioQueue.sync { (queuedFrames, jitterBuffer.bufferedPacketCount, playoutTimer != nil) }
+    }
+
+    func interruptForTesting(began: Bool, shouldResume: Bool = true) {
+        handleInterruption(Notification(
+            name: AVAudioSession.interruptionNotification,
+            userInfo: [
+                AVAudioSessionInterruptionTypeKey:
+                    (began ? AVAudioSession.InterruptionType.began : .ended).rawValue,
+                AVAudioSessionInterruptionOptionKey:
+                    shouldResume ? AVAudioSession.InterruptionOptions.shouldResume.rawValue : UInt(0)
+            ]))
+        audioQueue.sync { }
+    }
+    #endif
+
     // MARK: Init
     private init() {
         guard let fmt = AVAudioFormat(
@@ -372,6 +395,12 @@ public final class AudioManager {
             if options.contains(.shouldResume) {
                 configureAudioSession()
                 audioQueue.async { [weak self] in
+                    #if targetEnvironment(simulator)
+                    if let resume = self?.interruptionResumeForTesting {
+                        resume()
+                        return
+                    }
+                    #endif
                     self?.startEngineIfNeeded()
                     self?.playerNode.play()
                     self?.playoutDiagnostics.record(.playerStart)
