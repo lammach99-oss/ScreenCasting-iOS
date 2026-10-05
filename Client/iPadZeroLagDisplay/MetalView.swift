@@ -392,8 +392,9 @@ public final class ConnectedPresentationContainer: UIView {
         }
         keyboardButton.isHidden = mode == .none
         touchView.hardwareKeyActivityEnabled = mode != .none
-        touchView.softwareResponderOwnsInput = mode == .softwareOpen
-        touchView.passiveKeyboardCaptureEnabled = mode == .softwareAvailable
+        touchView.softwareResponderOwnsInput = mode == .softwareOpen && softwareTextView.isFirstResponder
+        touchView.passiveKeyboardCaptureEnabled = mode == .softwareAvailable ||
+            (mode == .softwareOpen && !touchView.softwareResponderOwnsInput)
         touchView.keyboardCaptureEnabled = mode == .hardware || (mode != .none && hardwareMonitor.isConnected)
         if mode == .softwareOpen {
             softwareTextView.deliveryEnabled = true
@@ -421,8 +422,10 @@ public final class ConnectedPresentationContainer: UIView {
         if softwareRequested {
             softwareShowAttempts += 1
             softwareTextView.reloadInputViews()
-            lastSoftwareResponderResult = acquireSoftwareKeyboardResponder()
-            recordKeyboardAuthority(reason: "native_show_request")
+            let acquired = acquireSoftwareKeyboardResponder()
+            lastSoftwareResponderResult = acquired
+            reconcileKeyboardResponderOwnershipAfterSoftwareShowAttempt(softwareResponderAcquired: acquired)
+            recordKeyboardAuthority(reason: acquired ? "native_show_request" : "native_show_request_failed")
         }
         restartKeyboardFade()
     }
@@ -432,6 +435,12 @@ public final class ConnectedPresentationContainer: UIView {
         #endif
         return softwareTextView.isFirstResponder ||
             (window != nil && softwareTextView.becomeFirstResponder())
+    }
+    private func reconcileKeyboardResponderOwnershipAfterSoftwareShowAttempt(softwareResponderAcquired: Bool) {
+        touchView.softwareResponderOwnsInput = keyboardMode == .softwareOpen && softwareResponderAcquired
+        touchView.passiveKeyboardCaptureEnabled = keyboardMode == .softwareAvailable ||
+            (keyboardMode == .softwareOpen && !softwareResponderAcquired)
+        if !softwareResponderAcquired { softwareNativeVisible = false }
     }
     private func restartKeyboardFade() {
         fadeTask?.cancel()
