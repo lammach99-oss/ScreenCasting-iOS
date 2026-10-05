@@ -211,7 +211,7 @@ struct DirectTouchGestureStateMachine {
     private let tapDuration: TimeInterval = 0.250
     private let tapMovement: CGFloat = 12
     private let dragMovement: CGFloat = 6
-    private let holdDuration: TimeInterval = 1.000
+    private let holdDuration: TimeInterval = 0.500
     private let holdSlop: CGFloat = 8
     private let wheelPointsPerStep: CGFloat = 42
     private let scrollClassificationDistance: CGFloat = 12
