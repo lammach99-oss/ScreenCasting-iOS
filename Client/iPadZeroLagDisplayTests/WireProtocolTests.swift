@@ -3966,6 +3966,22 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         return (window, container)
     }
 
+    @MainActor private func sceneBackedInitialKeyboardFixture() throws -> (UIWindow, ConnectedPresentationContainer) {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let controller = UIViewController()
+        window.rootViewController = controller
+        controller.view.frame = window.bounds
+        window.addSubview(controller.view)
+        let container = ConnectedPresentationContainer(frame: window.bounds)
+        controller.view.addSubview(container)
+        window.isHidden = false
+        XCTAssertTrue(container.window === window)
+        container.configureRemoteKeyboard(active: true, generation: 308)
+        return (window, container)
+    }
+
     @MainActor func testVisibleKeyboardMovingOutsideClearsNativeVisibility() throws {
         let (window, container) = try sceneBackedKeyboardGapFixture()
         defer { container.retireRemoteKeyboard(); window.isHidden = true }
@@ -3997,7 +4013,7 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
     }
 
     @MainActor func testPostHideSoftwareResponderLossPreservesSoftwareRequestAndReconcilesCapture() throws {
-        let (window, container) = try sceneBackedKeyboardGapFixture()
+        let (window, container) = try sceneBackedInitialKeyboardFixture()
         defer { container.retireRemoteKeyboard(); window.isHidden = true }
         var responderAcquired = true
         var acquisitionAttempts = 0
@@ -4023,7 +4039,7 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
     }
 
     @MainActor func testPencilBTPresenceAfterResponderLossDoesNotBecomeHardwareAuthority() throws {
-        let (window, container) = try sceneBackedKeyboardGapFixture()
+        let (window, container) = try sceneBackedInitialKeyboardFixture()
         defer { container.retireRemoteKeyboard(); window.isHidden = true }
         var responderAcquired = true
         container.softwareResponderAcquisitionForTesting = { responderAcquired }
@@ -4048,7 +4064,7 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
     }
 
     @MainActor func testRecoveryOccursAfterSystemHideHasCompletedWithoutUnboundedLoop() throws {
-        let (window, container) = try sceneBackedKeyboardGapFixture()
+        let (window, container) = try sceneBackedInitialKeyboardFixture()
         defer { container.retireRemoteKeyboard(); window.isHidden = true }
         var responderAcquired = true
         var recoveryAttempts = 0
