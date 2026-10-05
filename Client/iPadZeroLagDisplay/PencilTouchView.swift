@@ -211,7 +211,7 @@ struct DirectTouchGestureStateMachine {
     private let dragMovement: CGFloat = 6
     private let holdDuration: TimeInterval = 0.500
     private let holdSlop: CGFloat = 8
-    private let wheelPointsPerStep: CGFloat = 42
+    private let scrollPointsPerNotch: CGFloat = 72
     private let scrollClassificationDistance: CGFloat = 12
     private let scrollAxisDominance: CGFloat = 1.25
     private(set) var scrollClassification: (contact: UInt64, horizontal: Bool, dx: CGFloat, dy: CGFloat)?
@@ -500,16 +500,12 @@ struct DirectTouchGestureStateMachine {
         CGPoint(x: (first.x + second.x) / 2, y: (first.y + second.y) / 2)
     }
 
-    private static func takeWheelUnits(_ remainder: inout CGFloat) -> Int16 {
-        let units = max(-960, min(960, remainder.rounded(.towardZero)))
-        remainder -= units
-        return Int16(units)
-    }
-
     private mutating func wheel(action: PointerInputAction, points: CGFloat, target: CGPoint) -> [DirectTouchGestureOutput] {
-        wheelRemainder += points * 120 / wheelPointsPerStep
-        let value = Self.takeWheelUnits(&wheelRemainder)
-        return value == 0 ? [] : [.pointer(action, target, value)]
+        wheelRemainder += points
+        guard abs(wheelRemainder) >= scrollPointsPerNotch else { return [] }
+        let direction: CGFloat = wheelRemainder > 0 ? 1 : -1
+        wheelRemainder -= direction * scrollPointsPerNotch
+        return [.pointer(action, target, direction > 0 ? 120 : -120)]
     }
 
     private mutating func commitContact(_ contact: Contact, point: CGPoint) -> [DirectTouchGestureOutput] {
