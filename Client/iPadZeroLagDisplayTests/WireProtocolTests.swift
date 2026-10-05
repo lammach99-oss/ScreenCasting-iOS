@@ -3869,8 +3869,11 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1000, height: 800))
         let controller = UIViewController()
         window.rootViewController = controller
+        controller.view.frame = window.bounds
+        window.addSubview(controller.view)
         let container = ConnectedPresentationContainer(frame: window.bounds)
         controller.view.addSubview(container)
+        XCTAssertTrue(container.window === window)
         var lines: [String] = []
         container.touchView.diagnosticSink = { lines.append($0) }
         container.configureRemoteKeyboard(active: true, generation: 306)
@@ -3889,8 +3892,11 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1000, height: 800))
         let controller = UIViewController()
         window.rootViewController = controller
+        controller.view.frame = window.bounds
+        window.addSubview(controller.view)
         let container = ConnectedPresentationContainer(frame: window.bounds)
         controller.view.addSubview(container)
+        XCTAssertTrue(container.window === window)
         var lines: [String] = []
         container.touchView.diagnosticSink = { lines.append($0) }
         container.configureRemoteKeyboard(active: true, generation: 307)
