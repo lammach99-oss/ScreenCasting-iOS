@@ -3996,6 +3996,85 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         }
     }
 
+    @MainActor func testPostHideSoftwareResponderLossPreservesSoftwareRequestAndReconcilesCapture() throws {
+        let (window, container) = try sceneBackedKeyboardGapFixture()
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        var responderAcquired = true
+        var acquisitionAttempts = 0
+        container.softwareResponderAcquisitionForTesting = {
+            acquisitionAttempts += 1
+            return responderAcquired
+        }
+        var diagnostics: [String] = []
+        container.touchView.diagnosticSink = { diagnostics.append($0) }
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertEqual(acquisitionAttempts, 1)
+        XCTAssertTrue(container.touchView.softwareResponderOwnsInput)
+
+        responderAcquired = false
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertFalse(container.keyboardButton.isHidden)
+        XCTAssertFalse(container.touchView.softwareResponderOwnsInput)
+        XCTAssertTrue(container.touchView.passiveKeyboardCaptureEnabled)
+        XCTAssertTrue(diagnostics.contains { $0.contains("reason=software_post_hide_recovery") || $0.contains("reason=software_post_hide_recovery_failed") })
+    }
+
+    @MainActor func testPencilBTPresenceAfterResponderLossDoesNotBecomeHardwareAuthority() throws {
+        let (window, container) = try sceneBackedKeyboardGapFixture()
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        var responderAcquired = true
+        container.softwareResponderAcquisitionForTesting = { responderAcquired }
+        var diagnostics: [String] = []
+        container.touchView.diagnosticSink = { diagnostics.append($0) }
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        container.softwareTextView.setMarkedText("đẹp", selectedRange: NSRange(location: 3, length: 0))
+
+        responderAcquired = false
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+
+        NotificationCenter.default.post(name: Notification.Name.GCKeyboardDidConnect, object: nil)
+        container.touchView.onPencilInput?(PencilPacket(x: 100, y: 100, pressure: 1, tiltX: 0, tiltY: 0, buttonFlags: 0, pointerFlags: 1))
+
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertFalse(container.keyboardButton.isHidden)
+        XCTAssertNotNil(container.softwareTextView.markedTextRange)
+        XCTAssertEqual(container.softwareTextView.text, "đẹp")
+        XCTAssertFalse(container.touchView.softwareResponderOwnsInput)
+        XCTAssertTrue(container.touchView.passiveKeyboardCaptureEnabled)
+    }
+
+    @MainActor func testRecoveryOccursAfterSystemHideHasCompletedWithoutUnboundedLoop() throws {
+        let (window, container) = try sceneBackedKeyboardGapFixture()
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        var responderAcquired = true
+        var recoveryAttempts = 0
+        container.softwareResponderAcquisitionForTesting = {
+            recoveryAttempts += 1
+            return responderAcquired
+        }
+        var diagnostics: [String] = []
+        container.touchView.diagnosticSink = { diagnostics.append($0) }
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertEqual(recoveryAttempts, 1)
+
+        responderAcquired = false
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        XCTAssertEqual(recoveryAttempts, 1)
+
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertEqual(recoveryAttempts, 2)
+        XCTAssertTrue(diagnostics.contains { $0.contains("reason=software_post_hide_recovery") || $0.contains("reason=software_post_hide_recovery_failed") })
+
+        for _ in 0..<3 {
+            NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        }
+        XCTAssertEqual(recoveryAttempts, 2)
+    }
+
     @MainActor func testWillShowRequiresIntersectingKeyboardFrameEvidence() throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
