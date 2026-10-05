@@ -771,6 +771,62 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
             [.pointer(.horizontalWheel, CGPoint(x: 378, y: 0), -960)])
     }
 
+    private func zoomValues(_ outputs: [DirectTouchGestureOutput]) -> [Int16] {
+        outputs.compactMap { if case .pointer(.zoomWheel, _, let value) = $0 { return value }; return nil }
+    }
+
+    func testPinchOutEmitsExactlyOneFixedZoomStep() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        machine.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01)
+        XCTAssertEqual(zoomValues(machine.move(id: 2, point: CGPoint(x: 115, y: 0), timestamp: 0.02)), [120])
+    }
+
+    func testPinchInEmitsExactlyOneFixedZoomStep() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        machine.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01)
+        XCTAssertEqual(zoomValues(machine.move(id: 2, point: CGPoint(x: 85, y: 0), timestamp: 0.02)), [-120])
+    }
+
+    func testLargePinchStillEmitsOnlyOneZoomStep() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        machine.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01)
+        XCTAssertEqual(zoomValues(machine.move(id: 2, point: CGPoint(x: 400, y: 0), timestamp: 0.02)), [120])
+    }
+
+    func testContinuedMovementAfterPinchLatchEmitsNothing() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        machine.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01)
+        machine.move(id: 2, point: CGPoint(x: 115, y: 0), timestamp: 0.02)
+        XCTAssertTrue(machine.move(id: 2, point: CGPoint(x: 300, y: 0), timestamp: 0.03).isEmpty)
+        XCTAssertTrue(machine.move(id: 2, point: CGPoint(x: 40, y: 0), timestamp: 0.04).isEmpty)
+    }
+
+    func testPinchLatchResetsOnlyAfterGestureCompletion() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        machine.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01)
+        machine.move(id: 2, point: CGPoint(x: 115, y: 0), timestamp: 0.02)
+        XCTAssertTrue(machine.end(id: 2, point: CGPoint(x: 115, y: 0), timestamp: 0.03).isEmpty)
+        XCTAssertTrue(machine.move(id: 1, point: CGPoint(x: 50, y: 0), timestamp: 0.04).isEmpty)
+        XCTAssertTrue(machine.end(id: 1, point: CGPoint(x: 50, y: 0), timestamp: 0.05).isEmpty)
+        machine.begin(id: 3, point: .zero, timestamp: 1)
+        machine.begin(id: 4, point: CGPoint(x: 100, y: 0), timestamp: 1.01)
+        XCTAssertEqual(zoomValues(machine.move(id: 4, point: CGPoint(x: 85, y: 0), timestamp: 1.02)), [-120])
+    }
+
+    func testTwoFingerTapBelowPinchThresholdStillEmitsContextAction() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        machine.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01)
+        XCTAssertTrue(machine.move(id: 2, point: CGPoint(x: 105, y: 0), timestamp: 0.02).isEmpty)
+        XCTAssertTrue(machine.end(id: 2, point: CGPoint(x: 105, y: 0), timestamp: 0.03).isEmpty)
+        XCTAssertEqual(pointerActions(machine.end(id: 1, point: .zero, timestamp: 0.04)), [.rightClick])
+    }
+
     func testTwoFingerRightClickUsesCentroidOnlyAfterBothLift() {
         var machine = DirectTouchGestureStateMachine()
         machine.begin(id: 1, point: CGPoint(x: 40, y: 50), timestamp: 0)
