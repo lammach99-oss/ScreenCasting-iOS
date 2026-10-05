@@ -624,6 +624,78 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
         XCTAssertFalse(second.contains(.openSettings))
     }
 
+    func testVerticalScrollBelow72PointsEmitsNoWheel() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        XCTAssertTrue(machine.move(id: 1, point: CGPoint(x: 0, y: 71), timestamp: 0.01).isEmpty)
+    }
+
+    func testVerticalScrollCrossing72PointsEmitsOne120Notch() {
+        for direction: CGFloat in [-1, 1] {
+            var machine = DirectTouchGestureStateMachine()
+            machine.begin(id: 1, point: .zero, timestamp: 0)
+            let point = CGPoint(x: 0, y: direction * 72)
+            XCTAssertEqual(machine.move(id: 1, point: point, timestamp: 0.01), [.pointer(.verticalWheel, point, direction > 0 ? 120 : -120)])
+        }
+    }
+
+    func testVerticalScrollAccumulatesResidualDistance() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        XCTAssertTrue(machine.move(id: 1, point: CGPoint(x: 0, y: 30), timestamp: 0.01).isEmpty)
+        XCTAssertEqual(machine.move(id: 1, point: CGPoint(x: 0, y: 80), timestamp: 0.02), [.pointer(.verticalWheel, CGPoint(x: 0, y: 80), 120)])
+        XCTAssertTrue(machine.move(id: 1, point: CGPoint(x: 0, y: 143), timestamp: 0.03).isEmpty)
+        XCTAssertEqual(machine.move(id: 1, point: CGPoint(x: 0, y: 144), timestamp: 0.04), [.pointer(.verticalWheel, CGPoint(x: 0, y: 144), 120)])
+    }
+
+    func testHorizontalScrollBelow72PointsEmitsNoWheel() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        XCTAssertTrue(machine.move(id: 1, point: CGPoint(x: 71, y: 0), timestamp: 0.01).isEmpty)
+    }
+
+    func testHorizontalScrollCrossing72PointsEmitsOne120Notch() {
+        for direction: CGFloat in [-1, 1] {
+            var machine = DirectTouchGestureStateMachine()
+            machine.begin(id: 1, point: .zero, timestamp: 0)
+            let point = CGPoint(x: direction * 72, y: 0)
+            XCTAssertEqual(machine.move(id: 1, point: point, timestamp: 0.01), [.pointer(.horizontalWheel, point, direction > 0 ? -120 : 120)])
+        }
+    }
+
+    func testLargeMoveDoesNotEmitUnboundedCatchUpBurst() {
+        for horizontal in [false, true] {
+            var machine = DirectTouchGestureStateMachine()
+            machine.begin(id: 1, point: .zero, timestamp: 0)
+            let point = horizontal ? CGPoint(x: 1000, y: 0) : CGPoint(x: 0, y: 1000)
+            let expected: DirectTouchGestureOutput = .pointer(horizontal ? .horizontalWheel : .verticalWheel, point, horizontal ? -120 : 120)
+            XCTAssertEqual(machine.move(id: 1, point: point, timestamp: 0.01), [expected])
+            XCTAssertEqual(machine.move(id: 1, point: point, timestamp: 0.02), [expected])
+        }
+    }
+
+    func testScrollAccumulatorResetsAtGestureEnd() {
+        var machine = DirectTouchGestureStateMachine()
+        machine.begin(id: 1, point: .zero, timestamp: 0)
+        machine.move(id: 1, point: CGPoint(x: 0, y: 70), timestamp: 0.01)
+        machine.end(id: 1, point: CGPoint(x: 0, y: 70), timestamp: 0.02)
+        machine.begin(id: 2, point: .zero, timestamp: 0.03)
+        XCTAssertTrue(machine.move(id: 2, point: CGPoint(x: 0, y: 13), timestamp: 0.04).isEmpty)
+        machine.retire()
+        machine.begin(id: 3, point: .zero, timestamp: 0.05)
+        XCTAssertTrue(machine.move(id: 3, point: CGPoint(x: 0, y: 71), timestamp: 0.06).isEmpty)
+    }
+
+    func testScrollAxisClassifierWithJitterRemainsSymmetric() {
+        for horizontal in [false, true] {
+            var machine = DirectTouchGestureStateMachine()
+            machine.begin(id: 1, point: .zero, timestamp: 0)
+            let point = horizontal ? CGPoint(x: 30, y: 18) : CGPoint(x: 18, y: 30)
+            machine.move(id: 1, point: point, timestamp: 0.01)
+            XCTAssertEqual(machine.scrollClassification?.horizontal, horizontal)
+        }
+    }
+
     func testOneFingerScrollUsesAnchorAndSmoothWheelWhileTinyMotionRemainsTap() {
         var machine = DirectTouchGestureStateMachine()
         machine.begin(id: 1, point: CGPoint(x: 10, y: 10), timestamp: 0)
