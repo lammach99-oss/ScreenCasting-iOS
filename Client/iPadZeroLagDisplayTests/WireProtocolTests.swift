@@ -3583,7 +3583,7 @@ final class TouchGestureV2ContractTests: XCTestCase {
     func testMovementBeforeHoldCannotBecomeDragWhenThresholdCrossesLater() {
         var machine = DirectTouchGestureStateMachine()
         machine.begin(id: 1, point: .zero, timestamp: 0)
-        XCTAssertTrue(machine.move(id: 1, point: CGPoint(x: 0, y: 9), timestamp: 0.7).isEmpty)
+        XCTAssertTrue(machine.move(id: 1, point: CGPoint(x: 0, y: 9), timestamp: 0.499).isEmpty)
         let output = machine.move(id: 1, point: CGPoint(x: 0, y: 42), timestamp: 1.05)
         XCTAssertTrue(phases(output).isEmpty)
         XCTAssertEqual(wheel(output, action: .verticalWheel), 120)
