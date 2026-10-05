@@ -178,7 +178,6 @@ struct DirectTouchGestureStateMachine {
         let second: UInt64
         let beganAt: TimeInterval
         let initialSpan: CGFloat
-        var lastSpan: CGFloat
         var points: [UInt64: CGPoint]
         var completed: Set<UInt64> = []
         var validTap = true
@@ -207,7 +206,6 @@ struct DirectTouchGestureStateMachine {
     private var committedContactID: UInt64?
     private var ignoredContacts: Set<UInt64> = []
     private var wheelRemainder: CGFloat = 0
-    private var zoomRemainder: CGFloat = 0
     private let tapDuration: TimeInterval = 0.250
     private let tapMovement: CGFloat = 12
     private let dragMovement: CGFloat = 6
@@ -285,14 +283,13 @@ struct DirectTouchGestureStateMachine {
         switch state {
         case .idle, .palmGuard:
             wheelRemainder = 0
-            zoomRemainder = 0
             state = .oneFinger(id)
         case .oneFinger(let primary) where contacts.count == 2:
             guard let first = contacts[primary] else { return [] }
             let span = distance(first.point, point)
             state = .twoFinger(TwoFingerGesture(
                 first: primary, second: id, beganAt: first.beganAt,
-                initialSpan: span, lastSpan: span,
+                initialSpan: span,
                 points: [primary: first.point, id: point],
                 validTap: first.maxExcursion <= tapMovement))
         case .scrolling:
@@ -368,21 +365,18 @@ struct DirectTouchGestureStateMachine {
         case .horizontalScrolling(let primary) where primary == id:
             return wheel(action: .horizontalWheel, points: previousPoint.x - point.x, target: point)
         case .twoFinger(var pair):
-            guard pair.completed.isEmpty else { return [] }
+            guard pair.completed.isEmpty, !pair.pinching else { return [] }
             pair.points[id] = point
             pair.validTap = pair.validTap && contact.maxExcursion <= tapMovement
             let first = pair.points[pair.first] ?? .zero
             let second = pair.points[pair.second] ?? .zero
             let span = distance(first, second)
             if pair.initialSpan > 0, span > 0,
-               pair.pinching || (abs(span - pair.initialSpan) >= 11 && abs(log(span / pair.initialSpan)) >= 0.05) {
+               abs(span - pair.initialSpan) >= 11 && abs(log(span / pair.initialSpan)) >= 0.05 {
                 pair.pinching = true
                 pair.validTap = false
-                zoomRemainder += log(span / pair.lastSpan) * 120 / log(1.1)
-                pair.lastSpan = span
                 state = .twoFinger(pair)
-                let value = Self.takeWheelUnits(&zoomRemainder)
-                return value == 0 ? [] : [.pointer(.zoomWheel, midpoint(first, second), value)]
+                return [.pointer(.zoomWheel, midpoint(first, second), span > pair.initialSpan ? 120 : -120)]
             }
             state = .twoFinger(pair)
         case .dragging(let primary) where primary == id:
@@ -533,7 +527,7 @@ struct DirectTouchGestureStateMachine {
     mutating func retire() -> [DirectTouchGestureOutput] {
         let outputs = finishContact(cancelled: true)
         contacts.removeAll(); ignoredContacts.removeAll(); state = .idle
-        wheelRemainder = 0; zoomRemainder = 0
+        wheelRemainder = 0
         return outputs
     }
 
