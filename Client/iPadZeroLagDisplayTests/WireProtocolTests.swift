@@ -4063,6 +4063,66 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         XCTAssertTrue(container.touchView.passiveKeyboardCaptureEnabled)
     }
 
+    @MainActor func testRemoteSoftwareKeyboardSuppressesScribble() throws {
+        let view = RemoteSoftwareKeyboardTextView(frame: .zero, textContainer: nil)
+        let interaction = try XCTUnwrap(view.interactions.compactMap { $0 as? UIScribbleInteraction }.first)
+        let delegate = try XCTUnwrap(interaction.delegate)
+        XCTAssertEqual(delegate.scribbleInteraction?(interaction, shouldBeginAt: .zero), false)
+    }
+
+    @MainActor func testHardwarePresenceDoesNotBlockPostHideSoftwareRecovery() throws {
+        let (window, container) = try sceneBackedInitialKeyboardFixture()
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        var attempts = 0
+        container.softwareResponderAcquisitionForTesting = { attempts += 1; return false }
+        container.touchView.handleHardwareKey(.keyboardA, action: .keyDown)
+        container.touchView.handleHardwareKey(.keyboardA, action: .keyUp)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertTrue(container.touchView.keyboardCaptureEnabled)
+        XCTAssertEqual(attempts, 1)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertTrue(container.touchView.keyboardCaptureEnabled)
+        XCTAssertTrue(container.touchView.passiveKeyboardCaptureEnabled)
+    }
+
+    @MainActor func testTwoDistinctHideEpisodesEachReceiveOneRecoveryAttempt() throws {
+        let (window, container) = try sceneBackedInitialKeyboardFixture()
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        var attempts = 0
+        container.softwareResponderAcquisitionForTesting = { attempts += 1; return false }
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertEqual(attempts, 1)
+        for expected in [2, 3] {
+            NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+            NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+            XCTAssertEqual(attempts, expected)
+            NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+            XCTAssertEqual(attempts, expected, "A duplicate completed hide must not retry")
+            NotificationCenter.default.post(name: UIResponder.keyboardDidShowNotification, object: nil)
+        }
+    }
+
+    @MainActor func testPreservedSystemResponderLossReconcilesTouchCaptureWithoutDiscardingComposition() throws {
+        let (window, container) = try sceneBackedInitialKeyboardFixture()
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        container.softwareResponderAcquisitionForTesting = { true }
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertTrue(container.touchView.softwareResponderOwnsInput)
+        container.softwareTextView.setMarkedText("đẹp", selectedRange: NSRange(location: 3, length: 0))
+        var emissions: [SoftwareKeyboardEmission] = []
+        container.softwareTextView.onEmission = { emissions.append($0) }
+        container.softwareTextView.textViewDidEndEditing(container.softwareTextView)
+        XCTAssertFalse(container.touchView.softwareResponderOwnsInput)
+        XCTAssertTrue(container.touchView.passiveKeyboardCaptureEnabled)
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertEqual(container.softwareTextView.text, "đẹp")
+        XCTAssertNotNil(container.softwareTextView.markedTextRange)
+        XCTAssertTrue(emissions.isEmpty)
+    }
+
     @MainActor func testRecoveryOccursAfterSystemHideHasCompletedWithoutUnboundedLoop() throws {
         let (window, container) = try sceneBackedInitialKeyboardFixture()
         defer { container.retireRemoteKeyboard(); window.isHidden = true }
