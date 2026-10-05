@@ -3865,6 +3865,46 @@ final class PointerV2LifecycleTests: XCTestCase {
 }
 
 final class PointerV2FinalBoundaryTests: XCTestCase {
+    @MainActor func testWillShowRequiresIntersectingKeyboardFrameEvidence() {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1000, height: 800))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let container = ConnectedPresentationContainer(frame: window.bounds)
+        controller.view.addSubview(container)
+        var lines: [String] = []
+        container.touchView.diagnosticSink = { lines.append($0) }
+        container.configureRemoteKeyboard(active: true, generation: 306)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillShowNotification, object: nil,
+            userInfo: [UIResponder.keyboardFrameEndUserInfoKey: CGRect(x: 0, y: 900, width: 1000, height: 200)])
+        XCTAssertTrue(lines.last?.contains("native_keyboard_visible=0") == true)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillShowNotification, object: nil,
+            userInfo: [UIResponder.keyboardFrameEndUserInfoKey: CGRect(x: 0, y: 600, width: 1000, height: 200)])
+        XCTAssertTrue(lines.last?.contains("native_keyboard_visible=1") == true)
+        XCTAssertTrue(lines.last?.contains("show_attempt=1") == true)
+        container.retireRemoteKeyboard()
+    }
+
+    @MainActor func testNativeKeyboardDiagnosticsRetainFrameAndClearItOnHide() {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1000, height: 800))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let container = ConnectedPresentationContainer(frame: window.bounds)
+        controller.view.addSubview(container)
+        var lines: [String] = []
+        container.touchView.diagnosticSink = { lines.append($0) }
+        container.configureRemoteKeyboard(active: true, generation: 307)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillChangeFrameNotification, object: nil,
+            userInfo: [UIResponder.keyboardFrameEndUserInfoKey: CGRect(x: 0, y: 600, width: 1000, height: 200)])
+        XCTAssertTrue(lines.last?.contains("keyboard_frame=") == true)
+        XCTAssertFalse(lines.last?.contains("keyboard_frame=none") == true)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertTrue(lines.last?.contains("keyboard_frame=none") == true)
+        XCTAssertTrue(lines.last?.contains("software_requested=1") == true)
+        container.retireRemoteKeyboard()
+    }
+
     @MainActor func testFirstResponderRequestDoesNotImplyNativeKeyboardVisible() {
         let container = ConnectedPresentationContainer(frame: .zero)
         var lines: [String] = []
