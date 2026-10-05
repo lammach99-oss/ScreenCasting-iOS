@@ -3865,6 +3865,90 @@ final class PointerV2LifecycleTests: XCTestCase {
 }
 
 final class PointerV2FinalBoundaryTests: XCTestCase {
+    @MainActor private func softwareResponderFailureFixture() -> ConnectedPresentationContainer {
+        let container = ConnectedPresentationContainer(frame: .zero)
+        container.configureRemoteKeyboard(active: true, generation: 309)
+        XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardA, action: .keyDown))
+        XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardA, action: .keyUp))
+        container.softwareResponderAcquisitionForTesting = { false }
+        return container
+    }
+
+    @MainActor func testSoftwareResponderFailureRestoresHardwareCaptureEligibility() {
+        let container = softwareResponderFailureFixture()
+        var commands: [KeyboardInputCommand] = []
+        container.touchView.onKeyboardInput = { commands.append($0) }
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertFalse(container.touchView.softwareResponderOwnsInput)
+        XCTAssertTrue(container.touchView.keyboardCaptureEnabled)
+        container.hardwarePresenceChanged(true)
+        XCTAssertFalse(container.touchView.softwareResponderOwnsInput)
+        XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardA, action: .keyDown))
+        XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardA, action: .keyUp))
+        XCTAssertEqual(commands.map(\.action), [.keyDown, .keyUp])
+        XCTAssertEqual(commands.map(\.virtualKey), [0x41, 0x41])
+        container.retireRemoteKeyboard()
+    }
+
+    @MainActor func testSoftwareResponderFailurePreservesSoftwareRequest() {
+        let container = softwareResponderFailureFixture()
+        var lines: [String] = []
+        var attempts = 0
+        container.softwareResponderAcquisitionForTesting = { attempts += 1; return false }
+        container.touchView.diagnosticSink = { lines.append($0) }
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertTrue(container.softwareTextView.deliveryEnabled)
+        XCTAssertTrue(lines.last?.contains("software_requested=1") == true)
+        XCTAssertTrue(lines.last?.contains("responder_result=failure") == true)
+        XCTAssertTrue(lines.last?.contains("reason=native_show_request_failed") == true)
+        XCTAssertEqual(attempts, 1)
+        container.retireRemoteKeyboard()
+    }
+
+    @MainActor func testSoftwareResponderFailureDoesNotDiscardMarkedComposition() {
+        let container = softwareResponderFailureFixture()
+        container.softwareTextView.deliveryEnabled = true
+        container.softwareTextView.setMarkedText("đẹp", selectedRange: NSRange(location: 3, length: 0))
+        XCTAssertNotNil(container.softwareTextView.markedTextRange)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertNotNil(container.softwareTextView.markedTextRange)
+        XCTAssertEqual(container.softwareTextView.text, "đẹp")
+        container.retireRemoteKeyboard()
+    }
+
+    @MainActor func testSoftwareResponderFailureDoesNotHideSoftwareKeyboardButton() {
+        let container = softwareResponderFailureFixture()
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertFalse(container.keyboardButton.isHidden)
+        container.retireRemoteKeyboard()
+    }
+
+    @MainActor func testSoftwareResponderFailureDoesNotClaimNativeVisibility() {
+        let container = softwareResponderFailureFixture()
+        var lines: [String] = []
+        container.touchView.diagnosticSink = { lines.append($0) }
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertFalse(container.softwareTextView.isFirstResponder)
+        XCTAssertTrue(lines.last?.contains("native_keyboard_visible=0") == true)
+        XCTAssertTrue(lines.last?.contains("responder_result=failure") == true)
+        container.retireRemoteKeyboard()
+    }
+
+    @MainActor func testSoftwareResponderSuccessKeepsSoftwareResponderOwnership() {
+        let container = softwareResponderFailureFixture()
+        container.softwareResponderAcquisitionForTesting = { true }
+        var lines: [String] = []
+        container.touchView.diagnosticSink = { lines.append($0) }
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertTrue(container.touchView.softwareResponderOwnsInput)
+        XCTAssertTrue(container.touchView.keyboardCaptureEnabled)
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertTrue(lines.last?.contains("responder_result=success") == true)
+        XCTAssertTrue(lines.last?.contains("native_keyboard_visible=0") == true)
+        container.retireRemoteKeyboard()
+    }
+
     @MainActor private func sceneBackedKeyboardGapFixture() throws -> (UIWindow, ConnectedPresentationContainer) {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)

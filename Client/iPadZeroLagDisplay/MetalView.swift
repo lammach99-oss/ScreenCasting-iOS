@@ -234,6 +234,9 @@ public final class ConnectedPresentationContainer: UIView {
     private var keyboardGeneration: UInt64?
     private var lastKeyboardAuthorityDiagnostic: String?
     private var lastSoftwareResponderResult: Bool?
+    #if targetEnvironment(simulator)
+    var softwareResponderAcquisitionForTesting: (() -> Bool)?
+    #endif
     var onTextCommit: ((String) -> Void)?
     var onGeometryChanged: ((PresentationSurfaceGeometry) -> Void)?
     private var publishedGeometry: PresentationSurfaceGeometry?
@@ -418,11 +421,17 @@ public final class ConnectedPresentationContainer: UIView {
         if softwareRequested {
             softwareShowAttempts += 1
             softwareTextView.reloadInputViews()
-            lastSoftwareResponderResult = softwareTextView.isFirstResponder ||
-                (window != nil && softwareTextView.becomeFirstResponder())
+            lastSoftwareResponderResult = acquireSoftwareKeyboardResponder()
             recordKeyboardAuthority(reason: "native_show_request")
         }
         restartKeyboardFade()
+    }
+    private func acquireSoftwareKeyboardResponder() -> Bool {
+        #if targetEnvironment(simulator)
+        if let attempt = softwareResponderAcquisitionForTesting { return attempt() }
+        #endif
+        return softwareTextView.isFirstResponder ||
+            (window != nil && softwareTextView.becomeFirstResponder())
     }
     private func restartKeyboardFade() {
         fadeTask?.cancel()
