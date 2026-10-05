@@ -3865,48 +3865,59 @@ final class PointerV2LifecycleTests: XCTestCase {
 }
 
 final class PointerV2FinalBoundaryTests: XCTestCase {
-    @MainActor func testWillShowRequiresIntersectingKeyboardFrameEvidence() {
-        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1000, height: 800))
+    @MainActor func testWillShowRequiresIntersectingKeyboardFrameEvidence() throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 1000, height: 800)
         let controller = UIViewController()
         window.rootViewController = controller
         controller.view.frame = window.bounds
         window.addSubview(controller.view)
         let container = ConnectedPresentationContainer(frame: window.bounds)
         controller.view.addSubview(container)
+        window.isHidden = false
+        defer { window.isHidden = true }
         XCTAssertTrue(container.window === window)
         var lines: [String] = []
         container.touchView.diagnosticSink = { lines.append($0) }
         container.configureRemoteKeyboard(active: true, generation: 306)
-        container.keyboardButton.sendActions(for: .touchUpInside)
+        // Geometry notifications are tested without asking UIKit to show a real keyboard.
+        container.applyRemoteKeyboardMode(.softwareOpen)
         let outside = window.convert(container.convert(
             CGRect(x: 0, y: container.bounds.height + 100, width: container.bounds.width, height: 200),
             to: window), to: window.screen.coordinateSpace)
         let inside = window.convert(container.convert(
             CGRect(x: 0, y: container.bounds.height - 200, width: container.bounds.width, height: 200),
             to: window), to: window.screen.coordinateSpace)
+        XCTAssertGreaterThan(inside.height, 0)
+        XCTAssertGreaterThan(container.bounds.height, 0)
         NotificationCenter.default.post(name: UIResponder.keyboardWillShowNotification, object: nil,
             userInfo: [UIResponder.keyboardFrameEndUserInfoKey: outside])
         XCTAssertTrue(lines.last?.contains("native_keyboard_visible=0") == true, lines.last ?? "No diagnostic")
         NotificationCenter.default.post(name: UIResponder.keyboardWillShowNotification, object: nil,
             userInfo: [UIResponder.keyboardFrameEndUserInfoKey: inside])
         XCTAssertTrue(lines.last?.contains("native_keyboard_visible=1") == true, lines.last ?? "No diagnostic")
-        XCTAssertTrue(lines.last?.contains("show_attempt=1") == true)
+        XCTAssertTrue(lines.last?.contains("show_attempt=0") == true)
         container.retireRemoteKeyboard()
     }
 
-    @MainActor func testNativeKeyboardDiagnosticsRetainFrameAndClearItOnHide() {
-        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1000, height: 800))
+    @MainActor func testNativeKeyboardDiagnosticsRetainFrameAndClearItOnHide() throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 1000, height: 800)
         let controller = UIViewController()
         window.rootViewController = controller
         controller.view.frame = window.bounds
         window.addSubview(controller.view)
         let container = ConnectedPresentationContainer(frame: window.bounds)
         controller.view.addSubview(container)
+        window.isHidden = false
+        defer { window.isHidden = true }
         XCTAssertTrue(container.window === window)
         var lines: [String] = []
         container.touchView.diagnosticSink = { lines.append($0) }
         container.configureRemoteKeyboard(active: true, generation: 307)
-        container.keyboardButton.sendActions(for: .touchUpInside)
+        container.applyRemoteKeyboardMode(.softwareOpen)
         NotificationCenter.default.post(name: UIResponder.keyboardWillChangeFrameNotification, object: nil,
             userInfo: [UIResponder.keyboardFrameEndUserInfoKey: CGRect(x: 0, y: 600, width: 1000, height: 200)])
         XCTAssertTrue(lines.last?.contains("keyboard_frame=") == true)
