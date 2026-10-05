@@ -4037,7 +4037,7 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
 
         NotificationCenter.default.post(name: Notification.Name.GCKeyboardDidConnect, object: nil)
-        container.touchView.onPencilInput?(PencilPacket(x: 100, y: 100, pressure: 1, tiltX: 0, tiltY: 0, buttonFlags: 0, pointerFlags: 1))
+        container.touchView.onPencilInput?(PencilPacket(xRatio: 0.5, yRatio: 0.5, pressure: 1.0, tiltX: 0, tiltY: 0, pointerFlags: 1))
 
         XCTAssertEqual(container.keyboardMode, .softwareOpen)
         XCTAssertFalse(container.keyboardButton.isHidden)
