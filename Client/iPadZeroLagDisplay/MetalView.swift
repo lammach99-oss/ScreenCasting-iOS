@@ -466,8 +466,8 @@ public final class ConnectedPresentationContainer: UIView {
                   let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect,
                   let window {
             keyboardFrame = convert(window.convert(frame, from: window.screen.coordinateSpace), from: window)
-            if let keyboardFrame, !keyboardFrame.intersection(bounds).isEmpty {
-                softwareNativeVisible = true
+            softwareNativeVisible = keyboardFrame?.intersection(bounds).isEmpty == false
+            if softwareNativeVisible {
                 softwareNativeSuppressed = false
             }
         }
