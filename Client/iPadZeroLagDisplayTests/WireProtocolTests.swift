@@ -3865,6 +3865,53 @@ final class PointerV2LifecycleTests: XCTestCase {
 }
 
 final class PointerV2FinalBoundaryTests: XCTestCase {
+    @MainActor private func sceneBackedKeyboardGapFixture() throws -> (UIWindow, ConnectedPresentationContainer) {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let controller = UIViewController()
+        window.rootViewController = controller
+        controller.view.frame = window.bounds
+        window.addSubview(controller.view)
+        let container = ConnectedPresentationContainer(frame: window.bounds)
+        controller.view.addSubview(container)
+        window.isHidden = false
+        XCTAssertTrue(container.window === window)
+        container.configureRemoteKeyboard(active: true, generation: 308)
+        container.applyRemoteKeyboardMode(.softwareOpen)
+        return (window, container)
+    }
+
+    @MainActor func testVisibleKeyboardMovingOutsideClearsNativeVisibility() throws {
+        let (window, container) = try sceneBackedKeyboardGapFixture()
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        var lines: [String] = []
+        container.touchView.diagnosticSink = { lines.append($0) }
+        for (y, visible): (CGFloat, Bool) in [(container.bounds.height - 200, true), (container.bounds.height + 100, false)] {
+            let frame = window.convert(container.convert(CGRect(x: 0, y: y, width: container.bounds.width, height: 200), to: window), to: window.screen.coordinateSpace)
+            NotificationCenter.default.post(name: UIResponder.keyboardWillChangeFrameNotification, object: nil,
+                userInfo: [UIResponder.keyboardFrameEndUserInfoKey: frame])
+            XCTAssertTrue(lines.last?.contains("native_keyboard_visible=\(visible ? 1 : 0)") == true, lines.last ?? "No diagnostic")
+            XCTAssertTrue(lines.last?.contains("native_keyboard_suppressed=0") == true)
+            XCTAssertFalse(lines.last?.contains("keyboard_frame=none") == true)
+        }
+    }
+
+    @MainActor func testOutsideKeyboardFrameCanReturnInsideAndBecomeVisibleAgain() throws {
+        let (window, container) = try sceneBackedKeyboardGapFixture()
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        var lines: [String] = []
+        container.touchView.diagnosticSink = { lines.append($0) }
+        for inside in [true, false, true] {
+            let y = inside ? container.bounds.height - 200 : container.bounds.height + 100
+            let frame = window.convert(container.convert(CGRect(x: 0, y: y, width: container.bounds.width, height: 200), to: window), to: window.screen.coordinateSpace)
+            NotificationCenter.default.post(name: UIResponder.keyboardWillChangeFrameNotification, object: nil,
+                userInfo: [UIResponder.keyboardFrameEndUserInfoKey: frame])
+            XCTAssertTrue(lines.last?.contains("native_keyboard_visible=\(inside ? 1 : 0)") == true, lines.last ?? "No diagnostic")
+            XCTAssertTrue(lines.last?.contains("native_keyboard_suppressed=0") == true)
+        }
+    }
+
     @MainActor func testWillShowRequiresIntersectingKeyboardFrameEvidence() throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
