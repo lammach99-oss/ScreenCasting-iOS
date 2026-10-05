@@ -274,7 +274,7 @@ public final class ConnectedPresentationContainer: UIView {
         softwareTextView.onHardwarePresses = { [weak self] presses, action in
             self?.touchView.unhandledHardwarePresses(presses, action: action) ?? presses
         }
-        for name in [UIResponder.keyboardWillChangeFrameNotification, UIResponder.keyboardWillHideNotification,
+        for name in [UIResponder.keyboardWillShowNotification, UIResponder.keyboardWillChangeFrameNotification, UIResponder.keyboardWillHideNotification,
                      UIResponder.keyboardDidHideNotification, UIResponder.keyboardDidShowNotification,
                      UIApplication.willResignActiveNotification, UIApplication.didBecomeActiveNotification] {
             keyboardObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
@@ -402,7 +402,7 @@ public final class ConnectedPresentationContainer: UIView {
         }
     }
     fileprivate func recordKeyboardAuthority(reason: String, previousMode: RemoteKeyboardMode? = nil) {
-        let line = "[KEYBOARD_AUTHORITY] reason=\(reason) gc_keyboard_present=\(GCKeyboard.coalesced != nil ? 1 : 0) hardware_monitor=\(hardwareMonitor.isConnected ? 1 : 0) keyboard_active=\(keyboardActive ? 1 : 0) software_requested=\(softwareRequested ? 1 : 0) native_keyboard_visible=\(softwareNativeVisible ? 1 : 0) native_keyboard_suppressed=\(softwareNativeSuppressed ? 1 : 0) show_attempt=\(softwareShowAttempts) old_mode=\(previousMode ?? keyboardMode) new_mode=\(keyboardMode) software_first_responder=\(softwareTextView.isFirstResponder ? 1 : 0) responder_result=\(lastSoftwareResponderResult.map { $0 ? "success" : "failure" } ?? "not_attempted") keyboard_button_hidden=\(keyboardButton.isHidden ? 1 : 0)"
+        let line = "[KEYBOARD_AUTHORITY] reason=\(reason) gc_keyboard_present=\(GCKeyboard.coalesced != nil ? 1 : 0) hardware_monitor=\(hardwareMonitor.isConnected ? 1 : 0) keyboard_active=\(keyboardActive ? 1 : 0) software_requested=\(softwareRequested ? 1 : 0) native_keyboard_visible=\(softwareNativeVisible ? 1 : 0) native_keyboard_suppressed=\(softwareNativeSuppressed ? 1 : 0) keyboard_frame=\(keyboardFrame.map { String(describing: $0) } ?? "none") show_attempt=\(softwareShowAttempts) old_mode=\(previousMode ?? keyboardMode) new_mode=\(keyboardMode) software_first_responder=\(softwareTextView.isFirstResponder ? 1 : 0) responder_result=\(lastSoftwareResponderResult.map { $0 ? "success" : "failure" } ?? "not_attempted") keyboard_button_hidden=\(keyboardButton.isHidden ? 1 : 0)"
         guard line != lastKeyboardAuthorityDiagnostic else { return }
         lastKeyboardAuthorityDiagnostic = line
         touchView.diagnosticSink?(line)
@@ -418,7 +418,8 @@ public final class ConnectedPresentationContainer: UIView {
         if softwareRequested {
             softwareShowAttempts += 1
             softwareTextView.reloadInputViews()
-            lastSoftwareResponderResult = window != nil && softwareTextView.becomeFirstResponder()
+            lastSoftwareResponderResult = softwareTextView.isFirstResponder ||
+                (window != nil && softwareTextView.becomeFirstResponder())
             recordKeyboardAuthority(reason: "native_show_request")
         }
         restartKeyboardFade()
