@@ -3878,12 +3878,18 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         container.touchView.diagnosticSink = { lines.append($0) }
         container.configureRemoteKeyboard(active: true, generation: 306)
         container.keyboardButton.sendActions(for: .touchUpInside)
+        let outside = window.convert(container.convert(
+            CGRect(x: 0, y: container.bounds.height + 100, width: container.bounds.width, height: 200),
+            to: window), to: window.screen.coordinateSpace)
+        let inside = window.convert(container.convert(
+            CGRect(x: 0, y: container.bounds.height - 200, width: container.bounds.width, height: 200),
+            to: window), to: window.screen.coordinateSpace)
         NotificationCenter.default.post(name: UIResponder.keyboardWillShowNotification, object: nil,
-            userInfo: [UIResponder.keyboardFrameEndUserInfoKey: CGRect(x: 0, y: 900, width: 1000, height: 200)])
-        XCTAssertTrue(lines.last?.contains("native_keyboard_visible=0") == true)
+            userInfo: [UIResponder.keyboardFrameEndUserInfoKey: outside])
+        XCTAssertTrue(lines.last?.contains("native_keyboard_visible=0") == true, lines.last ?? "No diagnostic")
         NotificationCenter.default.post(name: UIResponder.keyboardWillShowNotification, object: nil,
-            userInfo: [UIResponder.keyboardFrameEndUserInfoKey: CGRect(x: 0, y: 600, width: 1000, height: 200)])
-        XCTAssertTrue(lines.last?.contains("native_keyboard_visible=1") == true)
+            userInfo: [UIResponder.keyboardFrameEndUserInfoKey: inside])
+        XCTAssertTrue(lines.last?.contains("native_keyboard_visible=1") == true, lines.last ?? "No diagnostic")
         XCTAssertTrue(lines.last?.contains("show_attempt=1") == true)
         container.retireRemoteKeyboard()
     }
