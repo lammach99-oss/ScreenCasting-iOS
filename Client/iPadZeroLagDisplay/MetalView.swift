@@ -319,7 +319,7 @@ public final class ConnectedPresentationContainer: UIView {
 
     override public func didMoveToWindow() {
         super.didMoveToWindow()
-        if window == nil { retireDirectPointer(); retireRemoteKeyboard() }
+        if window == nil { retireRemotePointerInputs(); retireRemoteKeyboard() }
         else { hardwareMonitor.refresh(); updateKeyboardAuthority() }
         setNeedsLayout()
     }
@@ -350,6 +350,11 @@ public final class ConnectedPresentationContainer: UIView {
     }
     func retireDirectPointer() {
         touchView.configureDirectTouch(active: false, generation: keyboardGeneration ?? 0)
+    }
+
+    func retireRemotePointerInputs() {
+        retireDirectPointer()
+        touchView.configureTouchpad(active: false, generation: keyboardGeneration ?? 0)
     }
 
     func configureClientCursor(ownership: CursorOwnershipState?, generation: UInt64, active: Bool) {
@@ -474,7 +479,7 @@ public final class ConnectedPresentationContainer: UIView {
     private func handleKeyboardNotification(_ note: Notification) {
         defer { recordKeyboardAuthority(reason: note.name.rawValue) }
         if note.name == UIApplication.willResignActiveNotification {
-            retireDirectPointer()
+            retireRemotePointerInputs()
             softwareRequested = false; applyRemoteKeyboardMode(.none); return
         }
         if note.name == UIApplication.didBecomeActiveNotification {
@@ -541,6 +546,7 @@ public final class ConnectedPresentationContainer: UIView {
 public struct ConnectedPresentationSurface: UIViewRepresentable {
     @ObservedObject var networkManager: NetworkManager
     var gameModeEnabled: Bool
+    var touchpadModeEnabled: Bool
     public var onFrameRendered: (() -> Void)?
     public var onContentViewportChanged: ((VideoContentViewport?) -> Void)?
     var onGeometrySnapshotChanged: ((RendererGeometrySnapshot) -> Void)?
@@ -553,11 +559,13 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     var onTextCommit: ((String) -> Void)?
     var onDirectTouchContact: ((DirectTouchContactCommand) -> Void)?
     var onPointerInput: ((PointerInputCommand) -> Void)?
+    var onTouchpadInput: ((TouchpadInputCommand) -> Void)?
     var onOpenSettings: (() -> Void)?
 
     public init(
         networkManager: NetworkManager,
         gameModeEnabled: Bool = false,
+        touchpadModeEnabled: Bool = false,
         remoteKeyboardActive: Bool = false,
         onKeyboardInput: ((KeyboardInputCommand) -> Void)? = nil,
         onTextCommit: ((String) -> Void)? = nil,
@@ -570,10 +578,12 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)? = nil,
         onDirectTouchContact: ((DirectTouchContactCommand) -> Void)? = nil,
         onPointerInput: ((PointerInputCommand) -> Void)? = nil,
+        onTouchpadInput: ((TouchpadInputCommand) -> Void)? = nil,
         onOpenSettings: (() -> Void)? = nil
     ) {
         self.networkManager = networkManager
         self.gameModeEnabled = gameModeEnabled
+        self.touchpadModeEnabled = touchpadModeEnabled
         self.onFrameRendered = onFrameRendered
         self.onContentViewportChanged = onContentViewportChanged
         self.onGeometrySnapshotChanged = onGeometrySnapshotChanged
@@ -586,11 +596,12 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         self.onTextCommit = onTextCommit
         self.onDirectTouchContact = onDirectTouchContact
         self.onPointerInput = onPointerInput
+        self.onTouchpadInput = onTouchpadInput
         self.onOpenSettings = onOpenSettings
     }
 
     public static func dismantleUIView(_ uiView: ConnectedPresentationContainer, coordinator: Coordinator) {
-        uiView.retireDirectPointer()
+        uiView.retireRemotePointerInputs()
         uiView.retireRemoteKeyboard()
     }
 
@@ -665,11 +676,15 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         container.configureClientCursor(ownership: networkManager.cursorOwnershipState,
             generation: networkManager.remoteKeyboardGeneration, active: remoteKeyboardActive)
         touchView.onDirectTouchContact = onDirectTouchContact
-        touchView.configureDirectTouch(active: remoteKeyboardActive, generation: networkManager.remoteKeyboardGeneration)
+        touchView.onTouchpadInput = onTouchpadInput
+        touchView.configureDirectTouch(active: remoteKeyboardActive && !touchpadModeEnabled,
+            generation: networkManager.remoteKeyboardGeneration)
+        touchView.configureTouchpad(active: remoteKeyboardActive && touchpadModeEnabled,
+            generation: networkManager.remoteKeyboardGeneration)
         touchView.onPointerInput = onPointerInput
         let openSettings = onOpenSettings
         touchView.onOpenSettings = { [weak container] in
-            container?.retireDirectPointer()
+            container?.retireRemotePointerInputs()
             container?.configureRemoteKeyboard(active: false, generation: networkManager.remoteKeyboardGeneration)
             openSettings?()
         }

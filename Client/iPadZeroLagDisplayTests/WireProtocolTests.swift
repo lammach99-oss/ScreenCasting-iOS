@@ -2558,6 +2558,27 @@ final class WifiShortBackgroundSameSessionTests: XCTestCase {
 }
 
 final class ControlChannelWriterTests: XCTestCase {
+    func testTouchpadCumulativeMovementSurvivesLatestWinsBeforeEnd() {
+        let queue = DispatchQueue(label: "control.writer.touchpad")
+        let sender = ManualSender()
+        let writer = ControlChannelWriter(queue: queue, sender: sender.send)
+        let begin = TouchpadInputCommand(action: .motionBegin).encode()
+        let end = TouchpadInputCommand(action: .motionEnd).encode()
+        queue.sync {
+            writer.begin(generation: 1)
+            XCTAssertTrue(writer.enqueue(begin))
+            for x: Int16 in [3277, 6553, 9830] {
+                writer.enqueueMovement(TouchpadInputCommand(action: .motionUpdate, cumulativeXQ15: x).encode())
+            }
+            XCTAssertTrue(writer.enqueue(end))
+        }
+        for _ in 0..<3 { sender.completeNext(); queue.sync {} }
+        XCTAssertEqual(sender.sent.count, 3)
+        XCTAssertEqual(sender.sent.first, begin)
+        XCTAssertEqual(TouchpadInputCommand.decode(sender.sent[1])?.cumulativeXQ15, 9830)
+        XCTAssertEqual(sender.sent.last, end)
+    }
+
     func testNetworkManagerReportsMissingControlConnectionAsNotConnected() {
         let manager = NetworkManager()
         let completed = expectation(description: "control completion")
@@ -3956,7 +3977,116 @@ final class PointerV2WireRegistrationTests: XCTestCase {
     }
 }
 
+@MainActor
+final class TouchpadModeTests: XCTestCase {
+    func testDirectContactIsCancelledBeforeTouchpadActivation() {
+        let view = PencilUIKitView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        view.contentViewport = VideoContentViewport(rect: CGRect(x: 0, y: 0, width: 1, height: 1))
+        view.configureDirectTouch(active: true, generation: 1)
+        var phases: [DirectTouchPhase] = []
+        view.onDirectTouchContact = { phases.append($0.phase) }
+        view.emitDirectOutputs([.directTouch(.down, 1, CGPoint(x: 100, y: 100), 255)])
+        view.configureTouchpad(active: true, generation: 1)
+        view.emitDirectOutputs([.directTouch(.down, 2, CGPoint(x: 100, y: 100), 255)])
+        XCTAssertEqual(phases, [.down, .cancel])
+    }
+    func testModeSwitchReleasesDragAndFencesOldMoves() {
+        let view = PencilUIKitView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        var actions: [TouchpadInputAction] = []
+        view.onTouchpadInput = { actions.append($0.action) }
+        view.configureTouchpad(active: true, generation: 1)
+        view.beginTouchpadContact(id: 1, point: .zero, timestamp: 0)
+        view.moveTouchpadContacts([(1, CGPoint(x: 7, y: 0), 0.6)])
+        view.configureDirectTouch(active: true, generation: 1)
+        view.moveTouchpadContacts([(1, CGPoint(x: 20, y: 0), 0.7)])
+        XCTAssertEqual(actions, [.motionBegin, .leftDown, .motionUpdate, .leftUp, .motionEnd])
+    }
+    func testGenerationChangeAndGeometryReplacementReleaseOnce() {
+        let view = PencilUIKitView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        var actions: [TouchpadInputAction] = []
+        view.onTouchpadInput = { actions.append($0.action) }
+        view.configureTouchpad(active: true, generation: 1)
+        view.beginTouchpadContact(id: 1, point: .zero, timestamp: 0)
+        view.moveTouchpadContacts([(1, CGPoint(x: 7, y: 0), 0.6)])
+        view.configureTouchpad(active: true, generation: 2)
+        view.moveTouchpadContacts([(1, CGPoint(x: 20, y: 0), 0.7)])
+        XCTAssertEqual(actions.suffix(2), [.leftUp, .motionEnd])
+        view.beginTouchpadContact(id: 2, point: .zero, timestamp: 1)
+        view.moveTouchpadContacts([(2, CGPoint(x: 7, y: 0), 1.6)])
+        view.contentViewport = VideoContentViewport(rect: CGRect(x: 0.25, y: 0, width: 0.5, height: 1))
+        view.moveTouchpadContacts([(2, CGPoint(x: 20, y: 0), 1.7)])
+        XCTAssertEqual(actions.filter { $0 == .leftUp }.count, 2)
+    }
+    func testModeSwitchIsMutuallyExclusiveAndDefaultOff() {
+        let view = PencilUIKitView()
+        XCTAssertFalse(view.touchpadEnabled)
+        view.configureDirectTouch(active: true, generation: 1)
+        XCTAssertFalse(view.touchpadEnabled)
+        view.configureTouchpad(active: true, generation: 1)
+        XCTAssertTrue(view.touchpadEnabled)
+        view.configureDirectTouch(active: true, generation: 1)
+        XCTAssertFalse(view.touchpadEnabled)
+        view.configureTouchpad(active: true, generation: 2)
+        view.configureTouchpad(active: false, generation: 2)
+        XCTAssertFalse(view.touchpadEnabled)
+    }
+    func testSurfaceRetirementDisablesTouchpad() {
+        let surface = ConnectedPresentationContainer(frame: .zero)
+        surface.touchView.configureTouchpad(active: true, generation: 5)
+        surface.retireRemotePointerInputs()
+        XCTAssertFalse(surface.touchView.touchpadEnabled)
+    }
+}
+
 final class TouchpadGestureTests: XCTestCase {
+    func testCancelledDragReleasesBeforeEndOnce() {
+        var g = TouchpadGestureStateMachine()
+        _ = g.begin(id: 1, point: .zero, timestamp: 0)
+        _ = g.move(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.6)
+        XCTAssertEqual(g.end(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.7, cancelled: true), [.leftUp, .motionEnd])
+        XCTAssertTrue(g.retire().isEmpty)
+    }
+    func testLateUnknownContactCannotMoveLiveGesture() {
+        var g = TouchpadGestureStateMachine()
+        _ = g.begin(id: 1, point: .zero, timestamp: 1)
+        XCTAssertTrue(g.move(id: 99, point: CGPoint(x: 100, y: 0), timestamp: 2).isEmpty)
+        XCTAssertTrue(g.end(id: 99, point: .zero, timestamp: 2).isEmpty)
+    }
+    func testLateThirdFingerCannotOpenSettings() {
+        var g = TouchpadGestureStateMachine()
+        _ = g.begin(id: 1, point: .zero, timestamp: 0)
+        _ = g.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01)
+        _ = g.begin(id: 3, point: CGPoint(x: 200, y: 0), timestamp: 0.16)
+        for id in 1...3 { XCTAssertTrue(g.end(id: UInt64(id), point: CGPoint(x: (id - 1) * 100, y: 0), timestamp: 0.2).isEmpty) }
+    }
+    func testScrollCommitPreventsPinchAndThirdFingerSettings() {
+        var g = TouchpadGestureStateMachine()
+        _ = g.begin(id: 1, point: .zero, timestamp: 0)
+        _ = g.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01)
+        XCTAssertEqual(g.moveBatch([(1, CGPoint(x: 0, y: 24), 0.05), (2, CGPoint(x: 100, y: 24), 0.05)]), [.verticalWheel(120)])
+        XCTAssertFalse(g.moveBatch([(1, CGPoint(x: -10, y: 24), 0.07), (2, CGPoint(x: 110, y: 24), 0.07)]).contains(.zoomWheel(120)))
+        XCTAssertTrue(g.begin(id: 3, point: CGPoint(x: 200, y: 24), timestamp: 0.08).isEmpty)
+        for id in 1...3 { XCTAssertTrue(g.end(id: UInt64(id), point: CGPoint(x: (id - 1) * 100, y: 24), timestamp: 0.1).isEmpty) }
+    }
+    func testHoldDragDownIsNotRepeated() {
+        var g = TouchpadGestureStateMachine()
+        _ = g.begin(id: 1, point: .zero, timestamp: 0)
+        _ = g.move(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.6)
+        XCTAssertEqual(g.move(id: 1, point: CGPoint(x: 10, y: 0), timestamp: 0.7), [.motionUpdate(CGPoint(x: 10, y: 0))])
+    }
+    func testQ15WholeSurfaceAndSymmetricClamp() {
+        for (delta, expected): (CGPoint, (Int16, Int16)) in [
+            (CGPoint(x: 100, y: 200), (32767, 32767)),
+            (CGPoint(x: -100, y: -200), (-32767, -32767)),
+            (CGPoint(x: 1000, y: -2000), (32767, -32767)),
+            (.zero, (0, 0))
+        ] {
+            let command = TouchpadMotionEncoder.command(delta: delta, bounds: CGSize(width: 100, height: 200))
+            XCTAssertEqual(command.cumulativeXQ15, expected.0)
+            XCTAssertEqual(command.cumulativeYQ15, expected.1)
+        }
+    }
+
     func testCumulativeMotionAndTap() {
         var g = TouchpadGestureStateMachine()
         XCTAssertEqual(g.begin(id: 1, point: .zero, timestamp: 0), [.motionBegin])

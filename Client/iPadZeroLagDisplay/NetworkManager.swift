@@ -2754,6 +2754,20 @@ public class NetworkManager: ObservableObject {
         }
     }
 
+    public func sendTouchpadInput(_ command: TouchpadInputCommand) {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            let generation = self.connectionGeneration
+            guard self.transportState == .streaming,
+                  self.committedTransportGeneration == generation,
+                  TouchpadInputCommand.decode(command.encode()) != nil,
+                  TouchpadInputDeliveryPolicy.allows(command.action,
+                    inputSuppressed: self.displayRequestGate.isInputSuppressed) else { return }
+            self.sendWireMessage(type: .touchpadInput, payload: command.encode(), sequence: 0,
+                movement: TouchpadInputDeliveryPolicy.isMovement(command.action))
+        }
+    }
+
     public func setClientDebugLoggingEnabled(_ enabled: Bool) {
         networkQueue.async { [weak self] in
             guard let self else { return }
