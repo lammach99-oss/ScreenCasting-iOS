@@ -3829,6 +3829,27 @@ final class PostKeyboardV2CorrectiveTests: XCTestCase {
 }
 
 final class PointerV2WireRegistrationTests: XCTestCase {
+    func testTouchpadStrictEightByteCodecAndDelivery() {
+        let motion = TouchpadInputCommand(action: .motionUpdate, cumulativeXQ15: 0x1234, cumulativeYQ15: -1234)
+        XCTAssertEqual(Array(motion.encode()), [1, 1, 0x34, 0x12, 0x2e, 0xfb, 0, 0])
+        for action in TouchpadInputAction.allCases {
+            let command = TouchpadInputCommand(action: action,
+                value: action.rawValue >= 7 ? -120 : 0)
+            XCTAssertEqual(TouchpadInputCommand.decode(command.encode()), command)
+            XCTAssertEqual(TouchpadInputDeliveryPolicy.isMovement(action), action == .motionUpdate)
+            XCTAssertEqual(TouchpadInputDeliveryPolicy.allows(action, inputSuppressed: true),
+                action == .leftUp || action == .motionEnd)
+        }
+        for bytes: [UInt8] in [
+            [2, 0, 0, 0, 0, 0, 0, 0], [1, 10, 0, 0, 0, 0, 0, 0],
+            [1, 1, 0, 128, 0, 0, 0, 0], [1, 1, 0, 0, 0, 128, 0, 0], [1, 1, 0, 0, 0, 0, 1, 0],
+            [1, 0, 1, 0, 0, 0, 0, 0], [1, 3, 0, 0, 0, 0, 1, 0],
+            [1, 7, 1, 0, 0, 0, 120, 0], [1, 8, 0, 0, 0, 0, 60, 0], [1, 9, 0, 0, 0, 0, 0, 0]
+        ] { XCTAssertNil(TouchpadInputCommand.decode(Data(bytes))) }
+        XCTAssertNil(TouchpadInputCommand.decode(Data(repeating: 0, count: 7)))
+        XCTAssertNil(TouchpadInputCommand.decode(Data(repeating: 0, count: 9)))
+    }
+
     func testTouchpadAdditiveRegistrationAndMalformedDrain() {
         XCTAssertNotNil(WireMessageType(rawValue: 43))
         for size in [0, 7, 9] {
