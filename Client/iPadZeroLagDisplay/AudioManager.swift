@@ -95,10 +95,26 @@ public final class AudioManager {
     private var playbackInterrupted = false
     private var receiveDiagnostics = AudioReceiveDiagnostics()
     private var playoutDiagnostics = AudioPlayoutDiagnostics()
+    private var pcmCompletionCount: UInt64 = 0
+    private var playoutRecoveryCount: UInt64 = 0
 
     #if targetEnvironment(simulator)
     var interruptionResumeForTesting: (() -> Void)?
     var engineStartForTesting: (() -> Void)?
+    var engineRunningForTesting: (() -> Bool)?
+    var clockForTesting: (() -> TimeInterval)?
+    var pcmScheduleForTesting: ((Int, @escaping () -> Void) -> Void)?
+    var manualPlayoutForTesting = false
+    var engineForTesting: AVAudioEngine { engine }
+    var cachedEngineStartedForTesting: Bool {
+        get { audioQueue.sync { engineStarted } }
+        set { audioQueue.sync { engineStarted = newValue } }
+    }
+    var playbackStateForTesting: (epoch: UInt64, generation: UInt64?, queued: Int, completions: UInt64, recoveries: UInt64) {
+        audioQueue.sync { (playbackEpoch, activePlaybackGeneration, queuedFrames, pcmCompletionCount, playoutRecoveryCount) }
+    }
+    func startEngineForTesting() { audioQueue.sync { startEngineIfNeeded() } }
+    func playoutTickForTesting() { audioQueue.sync { playoutTick() } }
     var audioQueueForTesting: DispatchQueue { audioQueue }
 
     static func makeForTesting() -> AudioManager { AudioManager() }
@@ -189,6 +205,10 @@ public final class AudioManager {
     }
 
     // MARK: - Public API
+
+    func resumeCurrentRealtimeSession(generation: UInt64, profile: RealtimeAudioTransportProfile) {
+        audioQueue.async { }
+    }
 
     func beginRealtimeSession(
         generation: UInt64,
@@ -332,15 +352,20 @@ public final class AudioManager {
             // Schedule with `.interruptsAtLoop = false` so chunks queue smoothly.
             self.queuedFrames += frameCount
             let epoch = self.playbackEpoch
-            self.playerNode.scheduleBuffer(
-                buffer,
-                completionCallbackType: .dataPlayedBack
-            ) { [weak self] _ in
+            let completion: () -> Void = { [weak self] in
                 self?.audioQueue.async {
                     guard let self, self.playbackEpoch == epoch else { return }
                     self.queuedFrames = max(0, self.queuedFrames - frameCount)
                 }
             }
+            #if targetEnvironment(simulator)
+            if let schedule = self.pcmScheduleForTesting {
+                schedule(frameCount, completion)
+                self.playoutDiagnostics.record(.pcmScheduled, frames: frameCount)
+                return
+            }
+            #endif
+            self.playerNode.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { _ in completion() }
             self.playoutDiagnostics.record(.pcmScheduled, frames: frameCount)
 
             // Start playing if not already doing so.
@@ -374,6 +399,9 @@ public final class AudioManager {
     }
 
     private func startPlayoutTimer() {
+        #if targetEnvironment(simulator)
+        if manualPlayoutForTesting { return }
+        #endif
         playoutTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: audioQueue)
         timer.schedule(

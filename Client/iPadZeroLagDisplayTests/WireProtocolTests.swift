@@ -449,6 +449,168 @@ final class CommittedAudioAvailabilityTests: XCTestCase {
 }
 
 final class AudioInterruptionOwnershipTests: XCTestCase {
+    private final class LivenessFixture {
+        let audio = AudioManager.makeForTesting()
+        var now: TimeInterval = 10
+        var running = false
+        var starts = 0
+        var completions: [() -> Void] = []
+        init() {
+            audio.manualPlayoutForTesting = true
+            audio.engineRunningForTesting = { [weak self] in self?.running == true }
+            audio.engineStartForTesting = { [weak self] in self?.starts += 1; self?.running = true }
+            audio.clockForTesting = { [weak self] in self?.now ?? 0 }
+            audio.pcmScheduleForTesting = { [weak self] _, completion in self?.completions.append(completion) }
+            audio.beginRealtimeSession(generation: 40, profile: .wifi)
+            audio.audioQueueForTesting.sync { }
+        }
+        deinit { audio.reset(); audio.audioQueueForTesting.sync { } }
+        func fill() {
+            for _ in 0..<20 { audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 40) }
+            audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 40)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(audio.playbackStateForTesting.queued, 9600)
+        }
+        func resume(_ generation: UInt64 = 40) {
+            audio.resumeCurrentRealtimeSession(generation: generation, profile: .wifi)
+            audio.audioQueueForTesting.sync { }
+        }
+        func tick(_ time: TimeInterval) { now = time; audio.playoutTickForTesting() }
+    }
+
+    func testEngineStartUsesActualEngineRunningStateNotOnlyCachedFlag() {
+        let f = LivenessFixture()
+        f.audio.cachedEngineStartedForTesting = true
+        f.running = false
+        f.audio.startEngineForTesting()
+        XCTAssertEqual(f.starts, 1)
+        f.audio.startEngineForTesting()
+        XCTAssertEqual(f.starts, 1)
+    }
+
+    func testEngineConfigurationChangeFencesOldPlaybackEpoch() {
+        let f = LivenessFixture(); f.fill()
+        let before = f.audio.playbackStateForTesting
+        NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: f.audio.engineForTesting)
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.playbackStateForTesting.epoch, before.epoch + 1)
+        XCTAssertEqual(f.audio.playbackStateForTesting.queued, 0)
+        XCTAssertEqual(f.audio.playbackStateForTesting.generation, 40)
+    }
+
+    func testEngineConfigurationChangeRecoveryIsQueuedNotSynchronous() async {
+        let f = LivenessFixture()
+        let entered = expectation(description: "audio queue blocked")
+        let release = DispatchSemaphore(value: 0)
+        f.audio.audioQueueForTesting.async { entered.fulfill(); release.wait() }
+        await fulfillment(of: [entered], timeout: 1)
+        let posted = expectation(description: "notification returns without waiting for audio queue")
+        DispatchQueue.global().async {
+            NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: f.audio.engineForTesting)
+            posted.fulfill()
+        }
+        await fulfillment(of: [posted], timeout: 1)
+        release.signal()
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.playbackStateForTesting.epoch, 2)
+    }
+
+    func testRouteChangeRecoveryKeepsCurrentGenerationOnly() {
+        let f = LivenessFixture()
+        f.audio.beginRealtimeSession(generation: 41, profile: .wifi)
+        f.audio.audioQueueForTesting.sync { }
+        let before = f.audio.playbackStateForTesting
+        NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil)
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.playbackStateForTesting.epoch, before.epoch + 1)
+        XCTAssertEqual(f.audio.playbackStateForTesting.generation, 41)
+        f.audio.reset(); f.audio.audioQueueForTesting.sync { }
+        let retired = f.audio.playbackStateForTesting
+        NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil)
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.playbackStateForTesting.epoch, retired.epoch)
+        XCTAssertNil(f.audio.playbackStateForTesting.generation)
+    }
+
+    func testPreservedWifiResumeClearsQueuedFramesAndStaleJitter() {
+        let f = LivenessFixture(); f.fill()
+        f.audio.playOpusData(Data([1]), sequence: 1, timestamp: 480, generation: 40)
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.interruptionStateForTesting.packets, 1)
+        f.resume()
+        XCTAssertEqual(f.audio.interruptionStateForTesting.queuedFrames, 0)
+        XCTAssertEqual(f.audio.interruptionStateForTesting.packets, 0)
+        XCTAssertEqual(f.audio.playbackStateForTesting.generation, 40)
+    }
+
+    func testPreservedWifiResumeDoesNotReplayOldPCM() {
+        let f = LivenessFixture(); f.fill()
+        let scheduled = f.completions.count
+        f.resume()
+        XCTAssertEqual(f.completions.count, scheduled)
+        XCTAssertEqual(f.audio.playbackStateForTesting.queued, 0)
+    }
+
+    func testPreservedWifiResumeRejectsWrongGeneration() {
+        let f = LivenessFixture(); f.fill()
+        let before = f.audio.playbackStateForTesting
+        f.resume(39)
+        XCTAssertEqual(f.audio.playbackStateForTesting.epoch, before.epoch)
+        XCTAssertEqual(f.audio.playbackStateForTesting.queued, before.queued)
+    }
+
+    func testSaturatedQueueWithoutPlaybackCompletionsTriggersOneRecovery() {
+        let f = LivenessFixture(); f.fill()
+        f.tick(10.249)
+        XCTAssertEqual(f.audio.playbackStateForTesting.recoveries, 0)
+        f.tick(10.251)
+        XCTAssertEqual(f.audio.playbackStateForTesting.recoveries, 1)
+        XCTAssertEqual(f.audio.playbackStateForTesting.queued, 0)
+        XCTAssertEqual(f.audio.playbackStateForTesting.generation, 40)
+    }
+
+    func testHealthyPlaybackCompletionsNeverTriggerStallRecovery() {
+        let f = LivenessFixture(); f.fill()
+        f.now = 10.2
+        f.completions[0]()
+        f.audio.audioQueueForTesting.sync { }
+        f.tick(10.4)
+        XCTAssertEqual(f.audio.playbackStateForTesting.completions, 1)
+        XCTAssertEqual(f.audio.playbackStateForTesting.recoveries, 0)
+    }
+
+    func testStallRecoveryCooldownPreventsRestartLoop() {
+        let f = LivenessFixture(); f.fill()
+        f.tick(10.3)
+        f.now = 10.4; f.fill()
+        f.tick(10.8)
+        XCTAssertEqual(f.audio.playbackStateForTesting.recoveries, 1)
+        f.tick(11.31)
+        XCTAssertEqual(f.audio.playbackStateForTesting.recoveries, 2)
+    }
+
+    func testOldEpochCompletionCannotMutateNewQueuedFrames() {
+        let f = LivenessFixture(); f.fill()
+        let oldCompletion = f.completions[0]
+        f.resume()
+        f.audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 40)
+        f.audio.audioQueueForTesting.sync { }
+        oldCompletion()
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.playbackStateForTesting.queued, 480)
+        XCTAssertEqual(f.audio.playbackStateForTesting.completions, 0)
+    }
+
+    func testResetCancelsPendingRecoveryOwnership() {
+        let f = LivenessFixture(); f.fill()
+        f.audio.reset()
+        f.resume()
+        f.tick(11)
+        XCTAssertNil(f.audio.playbackStateForTesting.generation)
+        XCTAssertEqual(f.audio.playbackStateForTesting.queued, 0)
+        XCTAssertEqual(f.audio.playbackStateForTesting.recoveries, 0)
+    }
+
     func testLegacyPcmRejectionRetainsBoundedContextAtExistingDiagnosticCadence() {
         let audio = AudioManager.makeForTesting()
         audio.engineStartForTesting = { }
