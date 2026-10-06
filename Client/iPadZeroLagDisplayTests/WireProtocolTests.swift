@@ -4565,7 +4565,11 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
             XCTAssertEqual(attempts, expected)
             NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
             XCTAssertEqual(attempts, expected, "A duplicate completed hide must not retry")
-            NotificationCenter.default.post(name: UIResponder.keyboardDidShowNotification, object: nil)
+            let visible = window.convert(container.convert(
+                CGRect(x: 0, y: container.bounds.height - 200, width: container.bounds.width, height: 200),
+                to: window), to: window.screen.coordinateSpace)
+            NotificationCenter.default.post(name: UIResponder.keyboardDidShowNotification, object: nil,
+                userInfo: [UIResponder.keyboardFrameEndUserInfoKey: visible])
         }
     }
 

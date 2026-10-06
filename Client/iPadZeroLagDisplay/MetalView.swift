@@ -523,10 +523,6 @@ public final class ConnectedPresentationContainer: UIView {
                     frame.width.isFinite && frame.height.isFinite &&
                     !visible.isNull && !visible.isEmpty
             } ?? false
-            if note.name == UIResponder.keyboardDidShowNotification {
-                softwareKeyboardHideInProgress = false
-                softwareKeyboardRecoveryAttemptedForHide = false
-            }
             if softwareNativeVisible {
                 softwareKeyboardHideInProgress = false
                 softwareKeyboardRecoveryAttemptedForHide = false
