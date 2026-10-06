@@ -1,6 +1,7 @@
 import XCTest
 import Network
 import UIKit
+import AVFoundation
 @testable import iPadCasting
 
 final class UsbSplitCommitGateTests: XCTestCase {
