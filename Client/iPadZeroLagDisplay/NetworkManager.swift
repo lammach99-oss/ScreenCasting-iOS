@@ -4743,6 +4743,7 @@ public class NetworkManager: ObservableObject {
         }
         decoder.beginSession(generation: generation)
         wifiMediaReceiver.reanchorForPreservedSessionRecovery(generation: generation)
+        AudioManager.shared.resumeCurrentRealtimeSession(generation: generation, profile: .wifi)
         sendClientPingIfDue()
         let complete = "[WIFI_MEDIA_RECOVERY] generation=\(generation) " +
             "action=decoder_rearmed recovery_requested=true"

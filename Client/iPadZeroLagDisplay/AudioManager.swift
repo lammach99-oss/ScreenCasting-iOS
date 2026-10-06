@@ -97,6 +97,13 @@ public final class AudioManager {
     private var playoutDiagnostics = AudioPlayoutDiagnostics()
     private var pcmCompletionCount: UInt64 = 0
     private var playoutRecoveryCount: UInt64 = 0
+    private var realtimeProfile: RealtimeAudioTransportProfile?
+    private var lastPcmProgressAt: TimeInterval?
+    private var lastAutomaticRecoveryAt: TimeInterval?
+    private var pendingRecoveryDiagnostic: String?
+    private var engineObservers: [NSObjectProtocol] = []
+    private let recoveryOwnerLock = NSLock()
+    private var recoveryOwner: (generation: UInt64, epoch: UInt64)?
 
     #if targetEnvironment(simulator)
     var interruptionResumeForTesting: (() -> Void)?
@@ -153,6 +160,17 @@ public final class AudioManager {
     // MARK: - Engine Setup
 
     private func setupEngine() {
+        for (name, object, reason): (Notification.Name, AnyObject?, String) in [
+            (.AVAudioEngineConfigurationChange, engine, "engine_configuration"),
+            (AVAudioSession.routeChangeNotification, nil, "route_change")
+        ] {
+            engineObservers.append(NotificationCenter.default.addObserver(forName: name, object: object, queue: nil) { [weak self] _ in
+                guard let self, let owner = self.captureRecoveryOwner() else { return }
+                self.audioQueue.async { [weak self] in
+                    self?.reprimeRealtimeOnQueue(generation: owner.generation, epoch: owner.epoch, reason: reason, automatic: true)
+                }
+            })
+        }
         #if !targetEnvironment(simulator)
         engine.attach(playerNode)
 
@@ -191,15 +209,17 @@ public final class AudioManager {
     }
 
     private func startEngineIfNeeded() {
-        guard !engineStarted else { return }
+        guard !engineIsRunning else { engineStarted = true; return }
         #if targetEnvironment(simulator)
-        if let start = engineStartForTesting { start(); return }
+        if let start = engineStartForTesting { start(); engineStarted = engineIsRunning; return }
         #endif
         do {
+            engine.prepare()
             try engine.start()
-            engineStarted = true
+            engineStarted = engine.isRunning
             print("[AudioManager] AVAudioEngine started.")
         } catch {
+            engineStarted = engine.isRunning
             print("[AudioManager] ⚠️ AVAudioEngine failed to start: \(error)")
         }
     }
@@ -207,7 +227,72 @@ public final class AudioManager {
     // MARK: - Public API
 
     func resumeCurrentRealtimeSession(generation: UInt64, profile: RealtimeAudioTransportProfile) {
-        audioQueue.async { }
+        guard case .wifi = profile, let owner = captureRecoveryOwner(), owner.generation == generation else { return }
+        audioQueue.async { [weak self] in
+            self?.reprimeRealtimeOnQueue(generation: generation, epoch: owner.epoch, reason: "preserved_wifi_resume", automatic: false)
+        }
+    }
+
+    private var engineIsRunning: Bool {
+        #if targetEnvironment(simulator)
+        if let read = engineRunningForTesting { return read() }
+        #endif
+        return engine.isRunning
+    }
+
+    private var playoutNow: TimeInterval {
+        #if targetEnvironment(simulator)
+        if let clock = clockForTesting { return clock() }
+        #endif
+        return ProcessInfo.processInfo.systemUptime
+    }
+
+    private func captureRecoveryOwner() -> (generation: UInt64, epoch: UInt64)? {
+        recoveryOwnerLock.lock()
+        defer { recoveryOwnerLock.unlock() }
+        return recoveryOwner
+    }
+
+    private func publishRecoveryOwner() {
+        recoveryOwnerLock.lock()
+        defer { recoveryOwnerLock.unlock() }
+        if case .wifi? = realtimeProfile, let generation = realtimeGeneration,
+           activePlaybackGeneration == generation, opusDecoder != nil, !playbackInterrupted {
+            recoveryOwner = (generation, playbackEpoch)
+        } else {
+            recoveryOwner = nil
+        }
+    }
+
+    private func reprimeRealtimeOnQueue(generation: UInt64, epoch: UInt64, reason: String, automatic: Bool) {
+        guard playbackEpoch == epoch, activePlaybackGeneration == generation,
+              realtimeGeneration == generation, case .wifi? = realtimeProfile,
+              opusDecoder != nil, !playbackInterrupted else { return }
+        let now = playoutNow
+        if automatic, let last = lastAutomaticRecoveryAt, now - last < 1 { return }
+        if automatic { lastAutomaticRecoveryAt = now }
+        let queued = queuedFrames
+        let age = lastPcmProgressAt.map { max(0, now - $0) * 1000 } ?? 0
+        playbackEpoch &+= 1
+        publishRecoveryOwner()
+        playerNode.stop()
+        playerNode.reset()
+        queuedFrames = 0
+        lastPcmProgressAt = nil
+        jitterBuffer.reset(profile: .wifi)
+        configureAudioSession()
+        startEngineIfNeeded()
+        if playoutTimer == nil { startPlayoutTimer() }
+        playoutRecoveryCount &+= 1
+        let line = "[AUDIO_PLAYOUT_RECOVERY] reason=\(reason) generation=\(generation) old_epoch=\(epoch) new_epoch=\(playbackEpoch) queued_frames=\(queued) completion_age_ms=\(age) engine_running=\(engineIsRunning ? 1 : 0) player_playing=\(playerNode.isPlaying ? 1 : 0)"
+        pendingRecoveryDiagnostic = line
+        print(line)
+    }
+
+    deinit {
+        engineObservers.forEach(NotificationCenter.default.removeObserver)
+        NotificationCenter.default.removeObserver(self)
+        playoutTimer?.cancel()
     }
 
     func beginRealtimeSession(
@@ -230,12 +315,20 @@ public final class AudioManager {
             self.playoutDiagnostics = AudioPlayoutDiagnostics()
             self.opusDecoder = nil
             do {
+                self.realtimeProfile = profile
+                self.lastPcmProgressAt = nil
+                self.lastAutomaticRecoveryAt = nil
+                self.pendingRecoveryDiagnostic = nil
+                self.pcmCompletionCount = 0
+                self.playoutRecoveryCount = 0
                 self.opusDecoder = try RealtimeOpusDecoder()
                 self.realtimeGeneration = generation
                 self.activePlaybackGeneration = generation
+                self.publishRecoveryOwner()
                 self.startPlayoutTimer()
             } catch {
                 self.realtimeGeneration = nil
+                self.publishRecoveryOwner()
                 print("[AudioManager] Opus decoder setup failed: \(error)")
             }
         }
@@ -258,6 +351,13 @@ public final class AudioManager {
             self.jitterBuffer.reset()
             self.opusDecoder = nil
             self.realtimeGeneration = nil
+            self.realtimeProfile = nil
+            self.lastPcmProgressAt = nil
+            self.lastAutomaticRecoveryAt = nil
+            self.pendingRecoveryDiagnostic = nil
+            self.pcmCompletionCount = 0
+            self.playoutRecoveryCount = 0
+            self.publishRecoveryOwner()
             self.receiveDiagnostics = AudioReceiveDiagnostics()
             self.playoutDiagnostics = AudioPlayoutDiagnostics()
         }
@@ -350,12 +450,15 @@ public final class AudioManager {
             }
 
             // Schedule with `.interruptsAtLoop = false` so chunks queue smoothly.
+            if self.queuedFrames == 0 { self.lastPcmProgressAt = self.playoutNow }
             self.queuedFrames += frameCount
             let epoch = self.playbackEpoch
             let completion: () -> Void = { [weak self] in
                 self?.audioQueue.async {
                     guard let self, self.playbackEpoch == epoch else { return }
                     self.queuedFrames = max(0, self.queuedFrames - frameCount)
+                    self.pcmCompletionCount &+= 1
+                    self.lastPcmProgressAt = self.playoutNow
                 }
             }
             #if targetEnvironment(simulator)
@@ -369,7 +472,7 @@ public final class AudioManager {
             self.playoutDiagnostics.record(.pcmScheduled, frames: frameCount)
 
             // Start playing if not already doing so.
-            if !self.playerNode.isPlaying {
+            if self.engineIsRunning && !self.playerNode.isPlaying {
                 self.playerNode.play()
                 self.playoutDiagnostics.record(.playerStart)
             }
@@ -393,6 +496,13 @@ public final class AudioManager {
             self.jitterBuffer.reset()
             self.opusDecoder = nil
             self.realtimeGeneration = nil
+            self.realtimeProfile = nil
+            self.lastPcmProgressAt = nil
+            self.lastAutomaticRecoveryAt = nil
+            self.pendingRecoveryDiagnostic = nil
+            self.pcmCompletionCount = 0
+            self.playoutRecoveryCount = 0
+            self.publishRecoveryOwner()
             self.receiveDiagnostics = AudioReceiveDiagnostics()
             self.playoutDiagnostics = AudioPlayoutDiagnostics()
         }
@@ -416,6 +526,11 @@ public final class AudioManager {
 
     private func playoutTick() {
         guard !playbackInterrupted else { return }
+        if let generation = realtimeGeneration, activePlaybackGeneration == generation,
+           case .wifi? = realtimeProfile, queuedFrames >= maxQueuedFrames - 480,
+           let progress = lastPcmProgressAt, playoutNow - progress >= 0.250 {
+            reprimeRealtimeOnQueue(generation: generation, epoch: playbackEpoch, reason: "stalled_playout", automatic: true)
+        }
         playoutDiagnostics.record(.tick)
         guard let opusDecoder,
               let action = jitterBuffer.dequeue() else {
@@ -449,10 +564,14 @@ public final class AudioManager {
             let rx = self.receiveDiagnostics
             let jitter = self.jitterBuffer.diagnostics
             let play = self.playoutDiagnostics
+            if let line = self.pendingRecoveryDiagnostic {
+                sink(line)
+                self.pendingRecoveryDiagnostic = nil
+            }
             let packetMetrics = opus
                 ? "packets=\(rx.packets) gaps=\(rx.forwardGaps) missing=\(rx.missingPacketUnits) repaired=\(rx.repairedPacketUnits) reorder=\(rx.reorderedPackets) duplicate_stale=\(rx.duplicateOrStalePackets) jitter_ms=\(rx.jitterMs) interarrival_p95_ms=\(rx.interarrivalP95Ms) interarrival_max_ms=\(rx.interarrivalMaxMs) depth=\(self.jitterBuffer.bufferedPacketCount) depth_max=\(jitter.maximumDepth) depth_p50=\(jitter.depthPercentiles.p50) depth_p95=\(jitter.depthPercentiles.p95) inserted=\(jitter.insertedPackets) duplicate_reject=\(jitter.duplicateRejects) stale_reject=\(jitter.staleRejects) startup_wait=\(jitter.startupWaitTicks) target_ms=\(self.jitterBuffer.targetDurationMs) target_drop=\(jitter.targetPolicyDrops) overflow_drop=\(jitter.overflowDrops) plc=\(play.plcActions)"
                 : "rtp_jitter_plc=not_applicable"
-            sink("[AUDIO_PLAYOUT] generation=\(generation) epoch=\(self.playbackEpoch) profile=\(profile) codec=\(opus ? "opus" : "pcm") \(packetMetrics) \(receiveRejects) ticks=\(play.ticks) nil=\(play.nilTicks) decode=\(play.decodeActions) decode_fail=\(play.decodeFailures) pcm_reject=\(play.pcmQueueRejects) \(play.pcmRejectionContext) pcm_scheduled=\(play.pcmBuffersScheduled) pcm_frames=\(play.pcmFramesScheduled) queued_frames=\(self.queuedFrames) player_start=\(play.playerStarts) player_restart=\(play.playerRestarts)")
+            sink("[AUDIO_PLAYOUT] generation=\(generation) epoch=\(self.playbackEpoch) profile=\(profile) codec=\(opus ? "opus" : "pcm") \(packetMetrics) \(receiveRejects) ticks=\(play.ticks) nil=\(play.nilTicks) decode=\(play.decodeActions) decode_fail=\(play.decodeFailures) pcm_reject=\(play.pcmQueueRejects) \(play.pcmRejectionContext) pcm_scheduled=\(play.pcmBuffersScheduled) pcm_frames=\(play.pcmFramesScheduled) queued_frames=\(self.queuedFrames) pcm_completed=\(self.pcmCompletionCount) playout_recoveries=\(self.playoutRecoveryCount) engine_running=\(self.engineIsRunning ? 1 : 0) player_start=\(play.playerStarts) player_restart=\(play.playerRestarts)")
         }
     }
 
@@ -471,6 +590,8 @@ public final class AudioManager {
                 self.playbackEpoch &+= 1
                 self.interruptedPlaybackEpoch = self.playbackEpoch
                 self.playbackInterrupted = true
+                self.lastPcmProgressAt = nil
+                self.publishRecoveryOwner()
                 self.playerNode.stop()
                 self.playerNode.reset()
                 self.engine.pause()
@@ -491,6 +612,7 @@ public final class AudioManager {
                 self.interruptedPlaybackEpoch = nil
                 guard options.contains(.shouldResume) else { return }
                 self.playbackInterrupted = false
+                self.publishRecoveryOwner()
                 self.configureAudioSession()
                 if self.realtimeGeneration != nil, self.opusDecoder != nil {
                     self.startPlayoutTimer()
@@ -502,7 +624,7 @@ public final class AudioManager {
                 }
                 #endif
                 self.startEngineIfNeeded()
-                guard self.engineStarted else { return }
+                guard self.engineIsRunning else { return }
                 self.playerNode.play()
                 self.playoutDiagnostics.record(.playerStart)
             }
