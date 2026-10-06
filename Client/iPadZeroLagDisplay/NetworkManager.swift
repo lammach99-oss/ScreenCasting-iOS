@@ -269,6 +269,21 @@ public struct PointerInputCommand: Equatable {
 public enum TouchpadInputAction: UInt8, CaseIterable {
     case motionBegin = 0, motionUpdate, motionEnd, leftClick, leftDown, leftUp, rightClick
     case verticalWheel, horizontalWheel, zoomWheel
+
+    var diagnosticName: String {
+        switch self {
+        case .motionBegin: return "motion_begin"
+        case .motionUpdate: return "motion_update"
+        case .motionEnd: return "motion_end"
+        case .leftClick: return "left_click"
+        case .leftDown: return "left_down"
+        case .leftUp: return "left_up"
+        case .rightClick: return "right_click"
+        case .verticalWheel: return "vertical_wheel"
+        case .horizontalWheel: return "horizontal_wheel"
+        case .zoomWheel: return "zoom_wheel"
+        }
+    }
 }
 
 public struct TouchpadInputCommand: Equatable {

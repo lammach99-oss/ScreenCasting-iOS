@@ -1046,6 +1046,7 @@ public class PencilUIKitView: UIView {
     func retireTouchpad() {
         emitTouchpadOutputs(touchpadGesture.retire())
         touchpadIDs.removeAll()
+        if touchpadEnabled { diagnosticSink?("[TOUCHPAD_GESTURE] action=retire generation=\(touchpadGeneration ?? 0) mode=touchpad") }
     }
 
     func beginTouchpadContact(id: UInt64, point: CGPoint, timestamp: TimeInterval) {
@@ -1081,7 +1082,7 @@ public class PencilUIKitView: UIView {
             let now = CACurrentMediaTime()
             if command.action != .motionUpdate || now - lastTouchpadMotionDiagnosticAt >= 0.25 {
                 if command.action == .motionUpdate { lastTouchpadMotionDiagnosticAt = now }
-                diagnosticSink?("[TOUCHPAD_GESTURE] action=\(command.action) generation=\(touchpadGeneration ?? 0) cumulative_q15=(\(command.cumulativeXQ15),\(command.cumulativeYQ15)) mode=touchpad")
+                diagnosticSink?("[TOUCHPAD_GESTURE] action=\(command.action.diagnosticName) generation=\(touchpadGeneration ?? 0) cumulative_q15=(\(command.cumulativeXQ15),\(command.cumulativeYQ15)) mode=touchpad")
             }
         }
     }
