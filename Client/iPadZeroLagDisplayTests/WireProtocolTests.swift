@@ -4283,6 +4283,68 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         XCTAssertTrue(container.touchView.passiveKeyboardCaptureEnabled)
     }
 
+    @MainActor private func controlledRecycleFixture(acquired: Bool) throws -> (losses: Int, passiveDuring: Bool, ownsAfter: Bool, passiveAfter: Bool, marked: Bool, emissions: Int, reconciliations: Int) {
+        let (window, container) = try sceneBackedInitialKeyboardFixture()
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        container.softwareResponderAcquisitionForTesting = { container.softwareTextView.becomeFirstResponder() }
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertTrue(container.softwareTextView.isFirstResponder)
+        XCTAssertTrue(container.touchView.softwareResponderOwnsInput)
+        container.softwareTextView.setMarkedText("đẹp", selectedRange: NSRange(location: 3, length: 0))
+        var losses = 0, emissions = 0
+        var passiveDuring = false
+        var lines: [String] = []
+        let originalLoss = container.softwareTextView.onPreservedSystemResponderLoss
+        container.softwareTextView.onPreservedSystemResponderLoss = { losses += 1; originalLoss?() }
+        container.softwareTextView.onEmission = { _ in emissions += 1 }
+        container.touchView.diagnosticSink = { lines.append($0) }
+        container.softwareResponderAcquisitionForTesting = {
+            // Model a UIKit end-edit callback delivered inside the controlled acquire boundary.
+            container.softwareTextView.textViewDidEndEditing(container.softwareTextView)
+            passiveDuring = container.touchView.passiveKeyboardCaptureEnabled
+            return acquired && container.softwareTextView.becomeFirstResponder()
+        }
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertEqual(container.softwareTextView.text, "đẹp")
+        return (losses, passiveDuring, container.touchView.softwareResponderOwnsInput,
+                container.touchView.passiveKeyboardCaptureEnabled,
+                container.softwareTextView.markedTextRange != nil, emissions,
+                lines.filter { $0.contains("reason=software_post_hide_recovery") }.count)
+    }
+
+    @MainActor func testControlledSoftwareRecycleDoesNotActivatePassiveCaptureMidRecycle() throws {
+        let result = try controlledRecycleFixture(acquired: true)
+        XCTAssertFalse(result.passiveDuring)
+        XCTAssertEqual(result.losses, 0)
+    }
+
+    @MainActor func testControlledSoftwareRecycleReconcilesOwnershipExactlyOnceAfterAcquire() throws {
+        let result = try controlledRecycleFixture(acquired: true)
+        XCTAssertEqual(result.losses, 0)
+        XCTAssertEqual(result.reconciliations, 1)
+    }
+
+    @MainActor func testFailedControlledRecycleEnablesPassiveCaptureAfterAcquireFailure() throws {
+        let result = try controlledRecycleFixture(acquired: false)
+        XCTAssertFalse(result.passiveDuring)
+        XCTAssertFalse(result.ownsAfter)
+        XCTAssertTrue(result.passiveAfter)
+        XCTAssertEqual(result.reconciliations, 1)
+    }
+
+    @MainActor func testSuccessfulControlledRecycleLeavesSoftwareResponderOwnership() throws {
+        let result = try controlledRecycleFixture(acquired: true)
+        XCTAssertTrue(result.ownsAfter)
+        XCTAssertFalse(result.passiveAfter)
+    }
+
+    @MainActor func testControlledRecyclePreservesMarkedCompositionAndEmitsNoRemoteText() throws {
+        let result = try controlledRecycleFixture(acquired: true)
+        XCTAssertTrue(result.marked)
+        XCTAssertEqual(result.emissions, 0)
+    }
+
     @MainActor func testRemoteSoftwareKeyboardSuppressesScribble() throws {
         let view = RemoteSoftwareKeyboardTextView(frame: .zero, textContainer: nil)
         let interaction = try XCTUnwrap(view.interactions.compactMap { $0 as? UIScribbleInteraction }.first)
