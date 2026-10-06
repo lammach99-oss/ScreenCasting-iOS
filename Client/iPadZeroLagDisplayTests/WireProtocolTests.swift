@@ -4504,6 +4504,65 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         XCTAssertTrue(lines.last?.contains("show_attempt=1") == true)
     }
 
+    @MainActor private func keyboardVisibilityAfterDidShow(frame: CGRect?, preceding: CGRect? = nil, hide: Bool = false) throws -> String {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let container = ConnectedPresentationContainer(frame: window.bounds)
+        controller.view.addSubview(container)
+        window.isHidden = false
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        var lines: [String] = []
+        container.touchView.diagnosticSink = { lines.append($0) }
+        container.configureRemoteKeyboard(active: true, generation: 801)
+        container.applyRemoteKeyboardMode(.softwareOpen)
+        func info(_ local: CGRect?) -> [AnyHashable: Any]? {
+            guard let local else { return nil }
+            return [UIResponder.keyboardFrameEndUserInfoKey:
+                window.convert(container.convert(local, to: window), to: window.screen.coordinateSpace)]
+        }
+        if let preceding {
+            NotificationCenter.default.post(name: UIResponder.keyboardWillChangeFrameNotification, object: nil, userInfo: info(preceding))
+        }
+        NotificationCenter.default.post(name: UIResponder.keyboardDidShowNotification, object: nil, userInfo: info(frame))
+        if hide { NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil) }
+        return try XCTUnwrap(lines.last)
+    }
+
+    @MainActor func testKeyboardDidShowWithoutFrameDoesNotProveNativeVisibility() throws {
+        let line = try keyboardVisibilityAfterDidShow(frame: nil)
+        XCTAssertTrue(line.contains("native_keyboard_visible=0"), line)
+        XCTAssertTrue(line.contains("native_keyboard_suppressed=0"), line)
+    }
+
+    @MainActor func testKeyboardDidShowWithOffscreenFrameRemainsNotVisible() throws {
+        let line = try keyboardVisibilityAfterDidShow(frame: CGRect(x: 0, y: 900, width: 1000, height: 100))
+        XCTAssertTrue(line.contains("native_keyboard_visible=0"), line)
+    }
+
+    @MainActor func testKeyboardDidShowWithIntersectingFrameBecomesVisible() throws {
+        let line = try keyboardVisibilityAfterDidShow(frame: CGRect(x: 0, y: 600, width: 1000, height: 200))
+        XCTAssertTrue(line.contains("native_keyboard_visible=1"), line)
+        XCTAssertTrue(line.contains("native_keyboard_suppressed=0"), line)
+    }
+
+    @MainActor func testKeyboardDidShowWithoutFramePreservesPreviouslyProvenVisibleGeometry() throws {
+        let line = try keyboardVisibilityAfterDidShow(frame: nil, preceding: CGRect(x: 0, y: 600, width: 1000, height: 200))
+        XCTAssertTrue(line.contains("native_keyboard_visible=1"), line)
+    }
+
+    @MainActor func testMinimizedKeyboardCannotBeMarkedVisibleByDidShowOnly() throws {
+        let line = try keyboardVisibilityAfterDidShow(frame: nil, preceding: CGRect(x: 0, y: 800, width: 1000, height: 0))
+        XCTAssertTrue(line.contains("native_keyboard_visible=0"), line)
+    }
+
+    @MainActor func testNativeVisibilityStillClearsOnDidHide() throws {
+        let line = try keyboardVisibilityAfterDidShow(frame: CGRect(x: 0, y: 600, width: 1000, height: 200), hide: true)
+        XCTAssertTrue(line.contains("native_keyboard_visible=0"), line)
+    }
+
     @MainActor func testKeyboardDidShowAndDidHideTrackNativeVisibility() {
         let container = ConnectedPresentationContainer(frame: .zero)
         var lines: [String] = []
@@ -4511,7 +4570,7 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         container.configureRemoteKeyboard(active: true, generation: 302)
         container.keyboardButton.sendActions(for: .touchUpInside)
         NotificationCenter.default.post(name: UIResponder.keyboardDidShowNotification, object: nil)
-        XCTAssertTrue(lines.last?.contains("native_keyboard_visible=1") == true)
+        XCTAssertTrue(lines.last?.contains("native_keyboard_visible=0") == true)
         NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
         NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
         XCTAssertTrue(lines.last?.contains("native_keyboard_visible=0") == true)
