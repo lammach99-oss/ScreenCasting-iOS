@@ -2098,7 +2098,7 @@ final class WifiShortBackgroundSameSessionTests: XCTestCase {
 
     func testPreservedWifiResumeDoesNotBlockNetworkQueueAndKeepsCleanupFIFO() async {
         let session = backgroundWaiting()
-        manager.applicationWillEnterForeground()
+        manager.applicationDidBecomeActive()
         manager.networkQueueForTesting.sync { }
         let decoder = manager.decoderForTesting
         let entered = expectation(description: "decoder barrier entered")
