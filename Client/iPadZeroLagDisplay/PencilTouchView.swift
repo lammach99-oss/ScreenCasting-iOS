@@ -1123,16 +1123,18 @@ struct SoftwareKeyboardCommittedShadow {
     mutating func reset() { text = "" }
 }
 
-final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate {
+final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate, UIScribbleInteractionDelegate {
     var deliveryEnabled = false
     var onEmission: ((SoftwareKeyboardEmission) -> Void)?
     var onDismiss: (() -> Void)?
+    var onPreservedSystemResponderLoss: (() -> Void)?
     var onHardwarePresses: ((Set<UIPress>, KeyboardInputAction) -> Set<UIPress>)?
     private var consuming = false
     private var committedShadow = SoftwareKeyboardCommittedShadow()
     override init(frame: CGRect, textContainer: NSTextContainer?) {
         super.init(frame: frame, textContainer: textContainer)
         delegate = self
+        addInteraction(UIScribbleInteraction(delegate: self))
         backgroundColor = .clear; textColor = .clear; tintColor = .clear
         // Keep native IME context; unsupported predictive rewriting remains disabled.
         autocorrectionType = .no
@@ -1146,6 +1148,9 @@ final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate {
         inputAssistantItem.trailingBarButtonGroups = []
     }
     required init?(coder: NSCoder) { nil }
+    func scribbleInteraction(_ interaction: UIScribbleInteraction, shouldBeginAt location: CGPoint) -> Bool {
+        false
+    }
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
         let remaining = onHardwarePresses?(presses, .keyDown) ?? presses
         if !remaining.isEmpty { super.pressesBegan(remaining, with: event) }
@@ -1210,7 +1215,10 @@ final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate {
         return super.resignFirstResponder()
     }
     func textViewDidEndEditing(_ textView: UITextView) {
-        if deliveryEnabled && preserveOnSystemResign?() == true { return }
+        if deliveryEnabled && preserveOnSystemResign?() == true {
+            onPreservedSystemResponderLoss?()
+            return
+        }
         deliveryEnabled = false; discardBuffer(); onDismiss?()
     }
 }

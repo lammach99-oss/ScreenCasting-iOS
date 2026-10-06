@@ -231,7 +231,8 @@ public final class ConnectedPresentationContainer: UIView {
    private var softwareNativeVisible = false
    private var softwareNativeSuppressed = false
    private var softwareShowAttempts = 0
-   private var softwareKeyboardRecoveryUsed = false
+   private var softwareKeyboardHideInProgress = false
+   private var softwareKeyboardRecoveryAttemptedForHide = false
    private var softwareKeyboardRecoveryGeneration: UInt64?
    private var keyboardGeneration: UInt64?
    private var lastKeyboardAuthorityDiagnostic: String?
@@ -273,6 +274,9 @@ public final class ConnectedPresentationContainer: UIView {
         }
         softwareTextView.preserveOnSystemResign = { [weak self] in
             self?.preserveRequestedSoftwareKeyboard == true
+        }
+        softwareTextView.onPreservedSystemResponderLoss = { [weak self] in
+            self?.reconcileKeyboardResponderOwnershipAfterSoftwareShowAttempt(softwareResponderAcquired: false)
         }
         hardwareMonitor.onChanged = { [weak self] present in self?.hardwarePresenceChanged(present) }
         touchView.onHardwareKeyActivity = { [weak self] in self?.hardwareMonitor.recordKeyActivity() }
@@ -362,7 +366,8 @@ public final class ConnectedPresentationContainer: UIView {
            softwareNativeVisible = false
            softwareNativeSuppressed = false
            softwareShowAttempts = 0
-           softwareKeyboardRecoveryUsed = false
+           softwareKeyboardHideInProgress = false
+           softwareKeyboardRecoveryAttemptedForHide = false
            softwareKeyboardRecoveryGeneration = generation
            softwareRequested = false
            applyRemoteKeyboardMode(.none)
@@ -387,6 +392,8 @@ public final class ConnectedPresentationContainer: UIView {
         keyboardMode = mode
         if mode == .softwareOpen { softwareRequested = true }
         if mode != .softwareOpen {
+            softwareKeyboardHideInProgress = false
+            softwareKeyboardRecoveryAttemptedForHide = false
             softwareNativeVisible = false
             softwareNativeSuppressed = false
             softwareRequested = false
@@ -425,7 +432,8 @@ public final class ConnectedPresentationContainer: UIView {
        updateKeyboardAuthority()
        if softwareRequested {
            softwareShowAttempts += 1
-           softwareKeyboardRecoveryUsed = false
+           softwareKeyboardHideInProgress = false
+           softwareKeyboardRecoveryAttemptedForHide = false
            softwareKeyboardRecoveryGeneration = keyboardGeneration
            softwareTextView.reloadInputViews()
            let acquired = acquireSoftwareKeyboardResponder()
@@ -478,13 +486,17 @@ public final class ConnectedPresentationContainer: UIView {
            keyboardFrame = nil
            softwareNativeVisible = false
            if preserveRequestedSoftwareKeyboard {
+               if !softwareKeyboardHideInProgress {
+                   softwareKeyboardHideInProgress = true
+                   softwareKeyboardRecoveryAttemptedForHide = false
+                   softwareKeyboardRecoveryGeneration = keyboardGeneration
+               }
                softwareNativeSuppressed = true
                if note.name == UIResponder.keyboardDidHideNotification,
-                  !hardwareMonitor.isConnected,
                   !softwareTextView.isFirstResponder,
-                  !softwareKeyboardRecoveryUsed,
+                  !softwareKeyboardRecoveryAttemptedForHide,
                   softwareKeyboardRecoveryGeneration == keyboardGeneration {
-                   softwareKeyboardRecoveryUsed = true
+                   softwareKeyboardRecoveryAttemptedForHide = true
                    let acquired = acquireSoftwareKeyboardResponder()
                    lastSoftwareResponderResult = acquired
                    reconcileKeyboardResponderOwnershipAfterSoftwareShowAttempt(softwareResponderAcquired: acquired)
@@ -495,6 +507,8 @@ public final class ConnectedPresentationContainer: UIView {
                applyRemoteKeyboardMode(.softwareAvailable)
            }
         } else if note.name == UIResponder.keyboardDidShowNotification {
+            softwareKeyboardHideInProgress = false
+            softwareKeyboardRecoveryAttemptedForHide = false
             softwareNativeVisible = true
             softwareNativeSuppressed = false
         } else if
@@ -503,6 +517,8 @@ public final class ConnectedPresentationContainer: UIView {
             keyboardFrame = convert(window.convert(frame, from: window.screen.coordinateSpace), from: window)
             softwareNativeVisible = keyboardFrame?.intersection(bounds).isEmpty == false
             if softwareNativeVisible {
+                softwareKeyboardHideInProgress = false
+                softwareKeyboardRecoveryAttemptedForHide = false
                 softwareNativeSuppressed = false
             }
         }
