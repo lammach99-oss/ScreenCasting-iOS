@@ -4449,6 +4449,109 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         XCTAssertTrue(container.touchView.passiveKeyboardCaptureEnabled)
     }
 
+    @MainActor func testDidShowWithoutGeometryDoesNotResetHideRecoveryBudget() throws {
+        let (window, container) = try sceneBackedInitialKeyboardFixture()
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        var attempts = 0
+        var lines: [String] = []
+        container.softwareResponderAcquisitionForTesting = { attempts += 1; return false }
+        container.touchView.diagnosticSink = { lines.append($0) }
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertEqual(attempts, 1)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertEqual(attempts, 2)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidShowNotification, object: nil)
+        XCTAssertTrue(lines.last?.contains("native_keyboard_visible=0") == true)
+        XCTAssertTrue(lines.last?.contains("native_keyboard_suppressed=1") == true)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertEqual(attempts, 2, "DidShow alone must not rearm a consumed recovery budget")
+    }
+
+    @MainActor func testOffscreenDidShowDoesNotResetHideRecoveryBudget() throws {
+        let (window, container) = try sceneBackedInitialKeyboardFixture()
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        var attempts = 0
+        var lines: [String] = []
+        container.softwareResponderAcquisitionForTesting = { attempts += 1; return false }
+        container.touchView.diagnosticSink = { lines.append($0) }
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertEqual(attempts, 2)
+        let outside = window.convert(container.convert(
+            CGRect(x: 0, y: container.bounds.height + 100, width: container.bounds.width, height: 200),
+            to: window), to: window.screen.coordinateSpace)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidShowNotification, object: nil,
+            userInfo: [UIResponder.keyboardFrameEndUserInfoKey: outside])
+        XCTAssertTrue(lines.last?.contains("native_keyboard_visible=0") == true)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertEqual(attempts, 2, "Offscreen geometry must not rearm recovery")
+    }
+
+    @MainActor func testGeometryProvenVisibleKeyboardResetsHideRecoveryBudget() throws {
+        let (window, container) = try sceneBackedInitialKeyboardFixture()
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        var attempts = 0
+        var lines: [String] = []
+        container.softwareResponderAcquisitionForTesting = { attempts += 1; return false }
+        container.touchView.diagnosticSink = { lines.append($0) }
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertEqual(attempts, 2)
+        let inside = window.convert(container.convert(
+            CGRect(x: 0, y: container.bounds.height - 200, width: container.bounds.width, height: 200),
+            to: window), to: window.screen.coordinateSpace)
+        for (index, name) in [UIResponder.keyboardWillShowNotification,
+                              UIResponder.keyboardWillChangeFrameNotification,
+                              UIResponder.keyboardDidShowNotification].enumerated() {
+            NotificationCenter.default.post(name: name, object: nil,
+                userInfo: [UIResponder.keyboardFrameEndUserInfoKey: inside])
+            NotificationCenter.default.post(name: UIResponder.keyboardDidShowNotification, object: nil)
+            XCTAssertTrue(lines.last?.contains("native_keyboard_visible=1") == true)
+            XCTAssertTrue(lines.last?.contains("native_keyboard_suppressed=0") == true)
+            NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+            NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+            XCTAssertEqual(attempts, 3 + index)
+            NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+            XCTAssertEqual(attempts, 3 + index, "One recovery per genuine visible-to-hidden episode")
+        }
+    }
+
+    @MainActor func testMinimizedKeyboardHideShowLoopCannotTriggerRepeatedRecovery() throws {
+        let (window, container) = try sceneBackedInitialKeyboardFixture()
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        var attempts = 0
+        container.softwareResponderAcquisitionForTesting = { attempts += 1; return false }
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertEqual(attempts, 2)
+        let minimized = window.convert(container.convert(
+            CGRect(x: 0, y: container.bounds.height, width: container.bounds.width, height: 0),
+            to: window), to: window.screen.coordinateSpace)
+        let outside = window.convert(container.convert(
+            CGRect(x: 0, y: container.bounds.height + 100, width: container.bounds.width, height: 100),
+            to: window), to: window.screen.coordinateSpace)
+        for frame: CGRect? in [nil, minimized, outside, nil] {
+            let info = frame.map { [UIResponder.keyboardFrameEndUserInfoKey: $0] }
+            NotificationCenter.default.post(name: UIResponder.keyboardDidShowNotification, object: nil, userInfo: info)
+            NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+            XCTAssertEqual(attempts, 2, "Never-visible hide/show loops get only one recovery")
+        }
+        let inside = window.convert(container.convert(
+            CGRect(x: 0, y: container.bounds.height - 200, width: container.bounds.width, height: 200),
+            to: window), to: window.screen.coordinateSpace)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidShowNotification, object: nil,
+            userInfo: [UIResponder.keyboardFrameEndUserInfoKey: inside])
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertEqual(attempts, 3, "A real visible presentation permits exactly one new recovery")
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertEqual(attempts, 3)
+    }
+
     @MainActor func testTwoDistinctHideEpisodesEachReceiveOneRecoveryAttempt() throws {
         let (window, container) = try sceneBackedInitialKeyboardFixture()
         defer { container.retireRemoteKeyboard(); window.isHidden = true }
