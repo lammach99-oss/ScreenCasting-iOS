@@ -401,6 +401,8 @@ public final class DecoderManager {
     #if targetEnvironment(simulator)
     private var testingSessionBeganCount = 0
     private var testingInvalidateCount = 0
+    private var testingInvalidateWaitModes: [Bool] = []
+    var invalidateWaitModesForTesting: [Bool] { testingInvalidateWaitModes }
     private var testingLifecycleEvents: [String] = []
     var lifecycleEventsForTesting: [String] { testingLifecycleEvents }
     var sessionBeganCountForTesting: Int { testingSessionBeganCount }
@@ -944,6 +946,7 @@ public final class DecoderManager {
     public func invalidate(waitForCompletion: Bool = true) {
         #if targetEnvironment(simulator)
         testingInvalidateCount += 1
+        testingInvalidateWaitModes.append(waitForCompletion)
         testingLifecycleEvents.append("invalidate-begin")
         #endif
         mailboxStateLock.lock()

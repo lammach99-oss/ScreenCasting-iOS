@@ -2096,6 +2096,53 @@ final class WifiShortBackgroundSameSessionTests: XCTestCase {
         XCTAssertEqual(manager.decoderForTesting.invalidateCountForTesting, invalidations)
     }
 
+    func testPreservedWifiResumeDoesNotBlockNetworkQueueAndKeepsCleanupFIFO() async {
+        let session = backgroundWaiting()
+        manager.applicationWillEnterForeground()
+        manager.networkQueueForTesting.sync { }
+        let decoder = manager.decoderForTesting
+        let entered = expectation(description: "decoder barrier entered")
+        let released = DispatchSemaphore(value: 0)
+        decoder.sessionQueueForTesting.async {
+            entered.fulfill()
+            released.wait()
+        }
+        await fulfillment(of: [entered], timeout: 1)
+        let progressed = expectation(description: "network resume progresses while decoder is blocked")
+        let callback = session.connection.stateUpdateHandler
+        manager.networkQueueForTesting.async {
+            callback?(.ready)
+            progressed.fulfill()
+        }
+        await fulfillment(of: [progressed], timeout: 1)
+        released.signal()
+        manager.networkQueueForTesting.sync { }
+        XCTAssertEqual(decoder.invalidateWaitModesForTesting.last, false)
+        let cleanup = expectation(description: "old decoder cleanup precedes subsequent decoder work")
+        decoder.sessionQueueForTesting.async {
+            XCTAssertEqual(decoder.lifecycleEventsForTesting.last, "invalidate-end")
+            cleanup.fulfill()
+        }
+        await fulfillment(of: [cleanup], timeout: 1)
+        let snap = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(snap.connection === session.connection)
+        XCTAssertEqual(snap.authenticatedGeneration, session.generation)
+        XCTAssertEqual(snap.committedGeneration, session.generation)
+    }
+
+    func testRetiredWifiReadyCannotQueueDecoderCleanupForReplacement() {
+        let old = backgroundWaiting()
+        let callback = old.connection.stateUpdateHandler
+        let current = manager.simulateCommittedWifiSessionForTesting()
+        manager.networkQueueForTesting.sync { }
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+        manager.networkQueueForTesting.sync { callback?(.ready) }
+        let snap = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(snap.connection === current.connection)
+        XCTAssertEqual(snap.committedGeneration, current.generation)
+        XCTAssertEqual(manager.decoderForTesting.invalidateCountForTesting, invalidations)
+    }
+
     func testSameReadyResumesWithoutReplayingInitialHandshake() {
         let session = backgroundWaiting()
         manager.applicationDidBecomeActive()
