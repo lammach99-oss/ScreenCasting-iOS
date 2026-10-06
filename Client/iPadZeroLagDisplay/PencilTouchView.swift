@@ -1208,6 +1208,33 @@ final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate, UISc
         deliveryEnabled = false; discardBuffer(); resignFirstResponder()
     }
     var preserveOnSystemResign: (() -> Bool)?
+    func recyclePreservingComposition(acquire: () -> Bool) -> Bool {
+        let savedText = text ?? ""
+        let savedSelection = selectedRange
+        let marked = markedTextRange.map { range in
+            (NSRange(location: offset(from: beginningOfDocument, to: range.start),
+                     length: offset(from: range.start, to: range.end)), text(in: range) ?? "")
+        }
+        let wasConsuming = consuming
+        consuming = true
+        defer { consuming = wasConsuming }
+        _ = resignFirstResponder()
+        reloadInputViews()
+        let acquired = acquire()
+        guard deliveryEnabled, preserveOnSystemResign?() == true else { return false }
+        // UIKit may commit marked text when resigning; keep that transition local.
+        text = savedText
+        if let (range, markedText) = marked {
+            selectedRange = range
+            let selectionStart = max(0, min(range.length, savedSelection.location - range.location))
+            let selection = NSRange(location: selectionStart,
+                                    length: min(savedSelection.length, range.length - selectionStart))
+            setMarkedText(markedText, selectedRange: selection)
+        } else {
+            selectedRange = savedSelection
+        }
+        return acquired
+    }
     override func resignFirstResponder() -> Bool {
         if !deliveryEnabled || preserveOnSystemResign?() != true {
             deliveryEnabled = false; discardBuffer()

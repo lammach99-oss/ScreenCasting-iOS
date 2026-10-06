@@ -493,11 +493,17 @@ public final class ConnectedPresentationContainer: UIView {
                }
                softwareNativeSuppressed = true
                if note.name == UIResponder.keyboardDidHideNotification,
-                  !softwareTextView.isFirstResponder,
                   !softwareKeyboardRecoveryAttemptedForHide,
                   softwareKeyboardRecoveryGeneration == keyboardGeneration {
                    softwareKeyboardRecoveryAttemptedForHide = true
-                   let acquired = acquireSoftwareKeyboardResponder()
+                   let acquired: Bool
+                   if softwareTextView.isFirstResponder {
+                       acquired = softwareTextView.recyclePreservingComposition {
+                           self.acquireSoftwareKeyboardResponder()
+                       }
+                   } else {
+                       acquired = acquireSoftwareKeyboardResponder()
+                   }
                    lastSoftwareResponderResult = acquired
                    reconcileKeyboardResponderOwnershipAfterSoftwareShowAttempt(softwareResponderAcquired: acquired)
                    recordKeyboardAuthority(reason: acquired ? "software_post_hide_recovery" : "software_post_hide_recovery_failed")
