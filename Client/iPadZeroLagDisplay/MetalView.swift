@@ -512,16 +512,21 @@ public final class ConnectedPresentationContainer: UIView {
                softwareRequested = false
                applyRemoteKeyboardMode(.softwareAvailable)
            }
-        } else if note.name == UIResponder.keyboardDidShowNotification {
-            softwareKeyboardHideInProgress = false
-            softwareKeyboardRecoveryAttemptedForHide = false
-            softwareNativeVisible = true
-            softwareNativeSuppressed = false
-        } else if
-                  let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect,
-                  let window {
-            keyboardFrame = convert(window.convert(frame, from: window.screen.coordinateSpace), from: window)
-            softwareNativeVisible = keyboardFrame?.intersection(bounds).isEmpty == false
+        } else {
+            if let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect,
+               let window {
+                keyboardFrame = convert(window.convert(frame, from: window.screen.coordinateSpace), from: window)
+            }
+            softwareNativeVisible = keyboardFrame.map { frame in
+                let visible = frame.intersection(bounds)
+                return frame.origin.x.isFinite && frame.origin.y.isFinite &&
+                    frame.width.isFinite && frame.height.isFinite &&
+                    !visible.isNull && !visible.isEmpty
+            } ?? false
+            if note.name == UIResponder.keyboardDidShowNotification {
+                softwareKeyboardHideInProgress = false
+                softwareKeyboardRecoveryAttemptedForHide = false
+            }
             if softwareNativeVisible {
                 softwareKeyboardHideInProgress = false
                 softwareKeyboardRecoveryAttemptedForHide = false
