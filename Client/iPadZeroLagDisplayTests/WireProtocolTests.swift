@@ -4123,6 +4123,65 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         XCTAssertTrue(emissions.isEmpty)
     }
 
+    @MainActor func testResponderRetainedButNativeKeyboardHiddenGetsOneBoundedPresentationRecovery() throws {
+        let (window, container) = try sceneBackedKeyboardGapFixture()
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        XCTAssertTrue(container.softwareTextView.becomeFirstResponder())
+        XCTAssertTrue(container.softwareTextView.isFirstResponder)
+        var attempts = 0
+        container.softwareResponderAcquisitionForTesting = { attempts += 1; return true }
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertEqual(attempts, 1)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertEqual(attempts, 1)
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+    }
+
+    @MainActor func testPostHideRecoveryPreservesVietnameseMarkedComposition() throws {
+        let (window, container) = try sceneBackedKeyboardGapFixture()
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        XCTAssertTrue(container.softwareTextView.becomeFirstResponder())
+        var emissions: [SoftwareKeyboardEmission] = []
+        container.softwareTextView.onEmission = { emissions.append($0) }
+        container.softwareTextView.setMarkedText("đẹp", selectedRange: NSRange(location: 3, length: 0))
+        var attempts = 0
+        container.softwareResponderAcquisitionForTesting = { attempts += 1; return container.softwareTextView.becomeFirstResponder() }
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertEqual(attempts, 1)
+        XCTAssertTrue(container.softwareTextView.isFirstResponder)
+        XCTAssertEqual(container.softwareTextView.text, "đẹp")
+        XCTAssertNotNil(container.softwareTextView.markedTextRange)
+        XCTAssertTrue(emissions.isEmpty)
+    }
+
+    @MainActor func testExplicitSoftwareDismissCancelsPendingRecovery() throws {
+        let (window, container) = try sceneBackedInitialKeyboardFixture()
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        var attempts = 0
+        container.softwareResponderAcquisitionForTesting = { attempts += 1; return false }
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertEqual(attempts, 1)
+        XCTAssertEqual(container.keyboardMode, .softwareAvailable)
+    }
+
+    @MainActor func testGenerationReplacementCancelsPendingRecovery() throws {
+        let (window, container) = try sceneBackedInitialKeyboardFixture()
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        var attempts = 0
+        container.softwareResponderAcquisitionForTesting = { attempts += 1; return false }
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        container.configureRemoteKeyboard(active: true, generation: 309)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertEqual(attempts, 1)
+        XCTAssertEqual(container.keyboardMode, .softwareAvailable)
+    }
+
     @MainActor func testRecoveryOccursAfterSystemHideHasCompletedWithoutUnboundedLoop() throws {
         let (window, container) = try sceneBackedInitialKeyboardFixture()
         defer { container.retireRemoteKeyboard(); window.isHidden = true }
