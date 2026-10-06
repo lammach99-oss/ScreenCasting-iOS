@@ -4731,7 +4731,7 @@ public class NetworkManager: ObservableObject {
             "action=decoder_invalidate_begin"
         print(begin)
         recordDiagnosticLine(begin)
-        decoder.invalidate(waitForCompletion: true)
+        decoder.invalidate(waitForCompletion: false)
         guard connection === expectedConnection,
               isCurrentCommittedWifiRtpStreamingSessionOnQueue(
                 generation: generation) else {
