@@ -1624,8 +1624,13 @@ final class WifiForegroundDecoderRecoveryTests: XCTestCase {
                        invalidations + 1)
         XCTAssertEqual(manager.decoderForTesting.sessionBeganCountForTesting,
                        begins + 1)
-        XCTAssertEqual(manager.decoderForTesting.lifecycleEventsForTesting,
-                       ["invalidate-begin", "invalidate-end", "begin-\(session.generation)"])
+        manager.decoderForTesting.sessionQueueForTesting.sync { }
+        let events = manager.decoderForTesting.lifecycleEventsForTesting
+        XCTAssertEqual(events.first, "invalidate-begin")
+        XCTAssertEqual(events.count, 3)
+        XCTAssertEqual(events.filter { $0.hasPrefix("begin-") }, ["begin-\(session.generation)"])
+        XCTAssertEqual(events.filter { $0 == "invalidate-end" }, ["invalidate-end"])
+        XCTAssertEqual(manager.decoderForTesting.invalidateWaitModesForTesting.last, false)
     }
 
     func testDuplicateActiveDoesNotRearmWifiDecoderAgain() {
@@ -1803,8 +1808,13 @@ final class WifiForegroundDecoderRecoveryTests: XCTestCase {
                        invalidations + 1)
         XCTAssertEqual(manager.decoderForTesting.sessionBeganCountForTesting,
                        begins + 1)
-        XCTAssertEqual(manager.decoderForTesting.lifecycleEventsForTesting,
-                       ["invalidate-begin", "invalidate-end", "begin-\(current.generation)"])
+        manager.decoderForTesting.sessionQueueForTesting.sync { }
+        let events = manager.decoderForTesting.lifecycleEventsForTesting
+        XCTAssertEqual(events.first, "invalidate-begin")
+        XCTAssertEqual(events.count, 3)
+        XCTAssertEqual(events.filter { $0.hasPrefix("begin-") }, ["begin-\(current.generation)"])
+        XCTAssertEqual(events.filter { $0 == "invalidate-end" }, ["invalidate-end"])
+        XCTAssertEqual(manager.decoderForTesting.invalidateWaitModesForTesting.last, false)
     }
 
     func testLegacyWifiSessionDoesNotForceRtpDecoderRearm() {
