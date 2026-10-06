@@ -28,7 +28,7 @@ struct AudioPlayoutDiagnostics {
     var lastPcmRejection: (generation: UInt64, epoch: UInt64, incoming: Int, queued: Int, cap: Int, playing: Bool, engine: Bool)?
     var pcmRejectionContext: String {
         guard let sample = lastPcmRejection else { return "pcm_reject_context=none" }
-        return "pcm_reject_generation=\(sample.generation) pcm_reject_epoch=\(sample.epoch) pcm_reject_incoming_frames=\(sample.incoming) pcm_reject_queued_before=\(sample.queued) pcm_reject_cap=\(sample.cap) pcm_reject_player_playing=\(sample.playing ? 1 : 0) pcm_reject_engine_started=\(sample.engine ? 1 : 0)"
+        return "pcm_reject_generation=\(sample.generation) pcm_reject_epoch=\(sample.epoch) pcm_reject_incoming_frames=\(sample.incoming) pcm_reject_queued_before=\(sample.queued) pcm_reject_cap=\(sample.cap) pcm_reject_player_playing=\(sample.playing ? 1 : 0) pcm_reject_engine_running=\(sample.engine ? 1 : 0)"
     }
     var playerRestarts: Int { max(0, playerStarts - 1) }
     mutating func record(_ event: AudioPlayoutDiagnosticEvent, frames: Int = 0) {
@@ -99,7 +99,7 @@ public final class AudioManager {
     private var playoutRecoveryCount: UInt64 = 0
     private var realtimeProfile: RealtimeAudioTransportProfile?
     private var lastPcmProgressAt: TimeInterval?
-    private var lastAutomaticRecoveryAt: TimeInterval?
+    private var lastAnyRecoveryAt: TimeInterval?
     private var pendingRecoveryDiagnostic: String?
     private var engineObservers: [NSObjectProtocol] = []
     private let recoveryOwnerLock = NSLock()
@@ -269,8 +269,8 @@ public final class AudioManager {
               realtimeGeneration == generation, case .wifi? = realtimeProfile,
               opusDecoder != nil, !playbackInterrupted else { return }
         let now = playoutNow
-        if automatic, let last = lastAutomaticRecoveryAt, now - last < 1 { return }
-        if automatic { lastAutomaticRecoveryAt = now }
+        if automatic, let last = lastAnyRecoveryAt, now - last < 1 { return }
+        lastAnyRecoveryAt = now
         let queued = queuedFrames
         let age = lastPcmProgressAt.map { max(0, now - $0) * 1000 } ?? 0
         playbackEpoch &+= 1
@@ -317,7 +317,7 @@ public final class AudioManager {
             do {
                 self.realtimeProfile = profile
                 self.lastPcmProgressAt = nil
-                self.lastAutomaticRecoveryAt = nil
+                self.lastAnyRecoveryAt = nil
                 self.pendingRecoveryDiagnostic = nil
                 self.pcmCompletionCount = 0
                 self.playoutRecoveryCount = 0
@@ -353,7 +353,7 @@ public final class AudioManager {
             self.realtimeGeneration = nil
             self.realtimeProfile = nil
             self.lastPcmProgressAt = nil
-            self.lastAutomaticRecoveryAt = nil
+            self.lastAnyRecoveryAt = nil
             self.pendingRecoveryDiagnostic = nil
             self.pcmCompletionCount = 0
             self.playoutRecoveryCount = 0
@@ -422,7 +422,7 @@ public final class AudioManager {
                 self.playoutDiagnostics.lastPcmRejection = (
                     self.activePlaybackGeneration ?? 0, self.playbackEpoch,
                     frameCount, self.queuedFrames, self.maxQueuedFrames,
-                    self.playerNode.isPlaying, self.engineStarted)
+                    self.playerNode.isPlaying, self.engineIsRunning)
                 return
             }
 
@@ -498,7 +498,7 @@ public final class AudioManager {
             self.realtimeGeneration = nil
             self.realtimeProfile = nil
             self.lastPcmProgressAt = nil
-            self.lastAutomaticRecoveryAt = nil
+            self.lastAnyRecoveryAt = nil
             self.pendingRecoveryDiagnostic = nil
             self.pcmCompletionCount = 0
             self.playoutRecoveryCount = 0
