@@ -533,6 +533,85 @@ final class AudioInterruptionOwnershipTests: XCTestCase {
         XCTAssertNil(f.audio.playbackStateForTesting.generation)
     }
 
+    func testManualWifiResumeCoalescesImmediateEngineConfigurationRecovery() {
+        let f = LivenessFixture(); f.resume()
+        let before = f.audio.playbackStateForTesting
+        f.now += 0.01
+        NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: f.audio.engineForTesting)
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.playbackStateForTesting.recoveries, 1)
+        XCTAssertEqual(f.audio.playbackStateForTesting.epoch, before.epoch)
+    }
+
+    func testManualWifiResumeCoalescesImmediateRouteChangeRecovery() {
+        let f = LivenessFixture(); f.resume()
+        f.now += 0.01
+        NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil)
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.playbackStateForTesting.recoveries, 1)
+    }
+
+    func testRealLaterRouteChangeStillRecoversAfterCooldown() {
+        let f = LivenessFixture(); f.resume()
+        f.now += 1.01
+        NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil)
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.playbackStateForTesting.recoveries, 2)
+    }
+
+    func testCoalescedNotificationDoesNotIncrementEpochTwice() {
+        let f = LivenessFixture(); f.resume()
+        let epoch = f.audio.playbackStateForTesting.epoch
+        for name in [AVAudioSession.routeChangeNotification, .AVAudioEngineConfigurationChange] {
+            NotificationCenter.default.post(name: name,
+                object: name == .AVAudioEngineConfigurationChange ? f.audio.engineForTesting : nil)
+            f.audio.audioQueueForTesting.sync { }
+        }
+        XCTAssertEqual(f.audio.playbackStateForTesting.epoch, epoch)
+    }
+
+    func testCoalescedNotificationDoesNotDiscardFreshQueuedFrames() {
+        let f = LivenessFixture(); f.resume()
+        f.audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 40)
+        f.audio.audioQueueForTesting.sync { }
+        NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil)
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.playbackStateForTesting.queued, 480)
+    }
+
+    func testCoalescedRecoveryPreservesCurrentGenerationOwnership() {
+        let f = LivenessFixture(); f.resume()
+        let before = f.audio.playbackStateForTesting
+        NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil)
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.playbackStateForTesting.generation, before.generation)
+        XCTAssertEqual(f.audio.playbackStateForTesting.epoch, before.epoch)
+        // A real replacement must not inherit the preceding generation's cooldown.
+        f.audio.beginRealtimeSession(generation: 41, profile: .wifi)
+        f.audio.audioQueueForTesting.sync { }
+        let replacement = f.audio.playbackStateForTesting
+        NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil)
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.playbackStateForTesting.generation, 41)
+        XCTAssertEqual(f.audio.playbackStateForTesting.epoch, replacement.epoch + 1)
+    }
+
+    func testPcmRejectionReportsActualEngineStateNotCachedStartedFlag() {
+        let audio = AudioManager.makeForTesting()
+        audio.manualPlayoutForTesting = true
+        audio.engineStartForTesting = { }
+        audio.engineRunningForTesting = { false }
+        defer { audio.reset(); audio.audioQueueForTesting.sync { } }
+        audio.beginLegacySession(generation: 130)
+        audio.audioQueueForTesting.sync { }
+        audio.cachedEngineStartedForTesting = true
+        audio.playPCMData(Data(repeating: 0, count: 9_601 * 4), generation: 130)
+        var records: [String] = []
+        audio.publishDiagnostics(generation: 130, profile: "usb", opus: false, receiveRejects: "", sink: { records.append($0) })
+        audio.audioQueueForTesting.sync { }
+        XCTAssertTrue(records.first?.contains("pcm_reject_engine_running=0") == true)
+    }
+
     func testPreservedWifiResumeClearsQueuedFramesAndStaleJitter() {
         let f = LivenessFixture(); f.fill()
         f.audio.playOpusData(Data([1]), sequence: 1, timestamp: 480, generation: 40)
