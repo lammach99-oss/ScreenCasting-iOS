@@ -3956,6 +3956,89 @@ final class PointerV2WireRegistrationTests: XCTestCase {
     }
 }
 
+final class TouchpadGestureTests: XCTestCase {
+    func testCumulativeMotionAndTap() {
+        var g = TouchpadGestureStateMachine()
+        XCTAssertEqual(g.begin(id: 1, point: .zero, timestamp: 0), [.motionBegin])
+        XCTAssertEqual(g.move(id: 1, point: CGPoint(x: 10, y: 4), timestamp: 0.1), [.motionUpdate(CGPoint(x: 10, y: 4))])
+        XCTAssertEqual(g.move(id: 1, point: CGPoint(x: 20, y: 9), timestamp: 0.2), [.motionUpdate(CGPoint(x: 20, y: 9))])
+        XCTAssertEqual(g.end(id: 1, point: CGPoint(x: 20, y: 9), timestamp: 0.22), [.motionEnd])
+        XCTAssertEqual(g.begin(id: 2, point: .zero, timestamp: 1), [.motionBegin])
+        XCTAssertEqual(g.end(id: 2, point: .zero, timestamp: 1.1), [.motionEnd, .leftClick])
+    }
+    func testHoldDragAndEarlyMovementExclusion() {
+        var g = TouchpadGestureStateMachine()
+        _ = g.begin(id: 1, point: .zero, timestamp: 0)
+        XCTAssertEqual(g.move(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.51), [.leftDown, .motionUpdate(CGPoint(x: 7, y: 0))])
+        XCTAssertEqual(g.end(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.6), [.leftUp, .motionEnd])
+        _ = g.begin(id: 2, point: .zero, timestamp: 1)
+        _ = g.move(id: 2, point: CGPoint(x: 9, y: 0), timestamp: 1.1)
+        XCTAssertEqual(g.move(id: 2, point: CGPoint(x: 30, y: 0), timestamp: 1.6), [.motionUpdate(CGPoint(x: 30, y: 0))])
+    }
+    func testSecondContactAndRetirementReleaseExactlyOnce() {
+        var g = TouchpadGestureStateMachine()
+        _ = g.begin(id: 1, point: .zero, timestamp: 0)
+        _ = g.move(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.6)
+        XCTAssertEqual(g.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.61), [.leftUp, .motionEnd])
+        XCTAssertTrue(g.move(id: 1, point: CGPoint(x: 50, y: 0), timestamp: 0.7).isEmpty)
+        XCTAssertTrue(g.retire().isEmpty)
+        _ = g.begin(id: 3, point: .zero, timestamp: 1)
+        _ = g.move(id: 3, point: CGPoint(x: 7, y: 0), timestamp: 1.6)
+        XCTAssertEqual(g.retire(), [.leftUp, .motionEnd])
+        XCTAssertTrue(g.retire().isEmpty)
+        XCTAssertTrue(g.end(id: 3, point: .zero, timestamp: 2).isEmpty)
+    }
+    func testTwoFingerDiagonalScrollAndRemainders() {
+        var g = TouchpadGestureStateMachine()
+        _ = g.begin(id: 1, point: .zero, timestamp: 0)
+        XCTAssertEqual(g.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01), [.motionEnd])
+        XCTAssertTrue(g.moveBatch([(1, CGPoint(x: 12, y: 12), 0.1), (2, CGPoint(x: 112, y: 12), 0.1)]).isEmpty)
+        XCTAssertEqual(g.moveBatch([(1, CGPoint(x: 24, y: 24), 0.2), (2, CGPoint(x: 124, y: 24), 0.2)]), [.verticalWheel(120), .horizontalWheel(120)])
+        XCTAssertTrue(g.end(id: 1, point: CGPoint(x: 24, y: 24), timestamp: 0.21).isEmpty)
+        XCTAssertTrue(g.end(id: 2, point: CGPoint(x: 124, y: 24), timestamp: 0.22).isEmpty)
+    }
+    func testPinchIsOneStepAndPrecedesScroll() {
+        var g = TouchpadGestureStateMachine()
+        _ = g.begin(id: 1, point: .zero, timestamp: 0)
+        _ = g.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01)
+        XCTAssertEqual(g.moveBatch([(1, CGPoint(x: -10, y: 30), 0.1), (2, CGPoint(x: 110, y: 30), 0.1)]), [.zoomWheel(120)])
+        XCTAssertTrue(g.moveBatch([(1, CGPoint(x: -20, y: 60), 0.2), (2, CGPoint(x: 120, y: 60), 0.2)]).isEmpty)
+    }
+    func testRightClickRequiresBothContactsWithinExcursion() {
+        var g = TouchpadGestureStateMachine()
+        _ = g.begin(id: 1, point: .zero, timestamp: 0)
+        _ = g.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01)
+        XCTAssertTrue(g.end(id: 1, point: .zero, timestamp: 0.1).isEmpty)
+        XCTAssertEqual(g.end(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.11), [.rightClick])
+        _ = g.begin(id: 3, point: .zero, timestamp: 1)
+        _ = g.begin(id: 4, point: CGPoint(x: 100, y: 0), timestamp: 1.01)
+        _ = g.moveBatch([(3, CGPoint(x: 0, y: 13), 1.05), (4, CGPoint(x: 100, y: 13), 1.05)])
+        _ = g.end(id: 3, point: .zero, timestamp: 1.1)
+        XCTAssertTrue(g.end(id: 4, point: CGPoint(x: 100, y: 0), timestamp: 1.11).isEmpty)
+    }
+    func testThreeFingerSettingsAndFourContactSuppression() {
+        var g = TouchpadGestureStateMachine()
+        for id in 1...3 { _ = g.begin(id: UInt64(id), point: CGPoint(x: id * 30, y: 0), timestamp: Double(id) * 0.01) }
+        for id in 1...2 { XCTAssertTrue(g.end(id: UInt64(id), point: CGPoint(x: id * 30, y: 0), timestamp: 0.2).isEmpty) }
+        XCTAssertEqual(g.end(id: 3, point: CGPoint(x: 90, y: 0), timestamp: 0.21), [.openSettings])
+        for id in 1...4 { _ = g.begin(id: UInt64(id), point: CGPoint(x: id * 30, y: 0), timestamp: 1 + Double(id) * 0.01) }
+        for id in 1...4 { XCTAssertTrue(g.end(id: UInt64(id), point: CGPoint(x: id * 30, y: 0), timestamp: 1.2).isEmpty) }
+    }
+    func testPencilExclusiveAndGuardBeginRemainsSuppressed() {
+        var g = TouchpadGestureStateMachine()
+        _ = g.begin(id: 1, point: .zero, timestamp: 0)
+        _ = g.move(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.6)
+        XCTAssertEqual(g.pencilBegan(timestamp: 0.7), [.leftUp, .motionEnd])
+        XCTAssertTrue(g.begin(id: 2, point: .zero, timestamp: 0.8).isEmpty)
+        g.pencilEnded(timestamp: 1)
+        XCTAssertTrue(g.begin(id: 3, point: .zero, timestamp: 1.1).isEmpty)
+        XCTAssertTrue(g.move(id: 3, point: CGPoint(x: 20, y: 0), timestamp: 1.3).isEmpty)
+        _ = g.end(id: 2, point: .zero, timestamp: 1.4)
+        _ = g.end(id: 3, point: .zero, timestamp: 1.4)
+        XCTAssertEqual(g.begin(id: 4, point: .zero, timestamp: 1.5), [.motionBegin])
+    }
+}
+
 final class TouchGestureV2ContractTests: XCTestCase {
     func testOneMoveCallbackParallelTranslationHasNoIntermediatePinch() {
         for reversed in [false, true] {
