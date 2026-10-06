@@ -1208,7 +1208,11 @@ final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate, UISc
         deliveryEnabled = false; discardBuffer(); resignFirstResponder()
     }
     var preserveOnSystemResign: (() -> Bool)?
+    private var controlledSoftwareResponderRecycleInProgress = false
     func recyclePreservingComposition(acquire: () -> Bool) -> Bool {
+        let wasRecycling = controlledSoftwareResponderRecycleInProgress
+        controlledSoftwareResponderRecycleInProgress = true
+        defer { controlledSoftwareResponderRecycleInProgress = wasRecycling }
         let savedText = text ?? ""
         let savedSelection = selectedRange
         let marked = markedTextRange.map { range in
@@ -1243,6 +1247,7 @@ final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate, UISc
     }
     func textViewDidEndEditing(_ textView: UITextView) {
         if deliveryEnabled && preserveOnSystemResign?() == true {
+            guard !controlledSoftwareResponderRecycleInProgress else { return }
             onPreservedSystemResponderLoss?()
             return
         }
