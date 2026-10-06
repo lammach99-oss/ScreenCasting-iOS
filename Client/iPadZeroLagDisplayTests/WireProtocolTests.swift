@@ -3829,6 +3829,31 @@ final class PostKeyboardV2CorrectiveTests: XCTestCase {
 }
 
 final class PointerV2WireRegistrationTests: XCTestCase {
+    func testTouchpadAdditiveRegistrationAndMalformedDrain() {
+        XCTAssertNotNil(WireMessageType(rawValue: 43))
+        for size in [0, 7, 9] {
+            let parser = WireStreamParser(generation: 4)
+            var discarded = 0
+            var pings = 0
+            var failures = 0
+            var input = packet(raw: 43, payload: Data(repeating: 0, count: size))
+            input.append(packet(raw: WireMessageType.ping.rawValue, payload: Data(repeating: 0, count: 16)))
+            parser.consume(input, generation: 4) { event in
+                switch event {
+                case .discardedFixedControl(let header):
+                    if header.type.rawValue == 43 { discarded += 1 }
+                case .message(let message):
+                    if message.header.type == .ping { pings += 1 }
+                case .failure: failures += 1
+                default: break
+                }
+            }
+            XCTAssertEqual(discarded, 1)
+            XCTAssertEqual(pings, 1)
+            XCTAssertEqual(failures, 0)
+        }
+    }
+
     func testDirectTouchExactLittleEndianAndMalformedPayloads() {
         for phase: DirectTouchPhase in [.down, .update, .up, .cancel] {
             let command = DirectTouchContactCommand(phase: phase, pressure: 255,
