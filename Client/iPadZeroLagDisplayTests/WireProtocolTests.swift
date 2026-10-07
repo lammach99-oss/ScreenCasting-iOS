@@ -549,6 +549,67 @@ final class OptionalUsbAudioBindingTests: XCTestCase {
     }
 }
 
+final class UsbAudioRuntimeRetirementTests: XCTestCase {
+    func testCurrentAudioLaneLossPreservesSessionAndDesiredAudio() throws {
+        for reason in ["receive_error", "eof", "unexpected_type"] {
+            try withManager { manager, actions in
+                manager.commitAudioTransportForTesting(mode: RealtimeTransportMode.usbSplitTLS, audioAvailable: true)
+                let lane = manager.installUsbAudioLaneForTesting()
+                let before = manager.usbSessionSnapshot()
+                manager.failUsbAudioLaneForTesting(lane, generation: before.generation, reason: reason)
+                let after = manager.usbSessionSnapshot()
+                XCTAssertEqual(after.generation, before.generation)
+                XCTAssertEqual(after.authenticatedGeneration, before.authenticatedGeneration)
+                XCTAssertEqual(after.committedGeneration, before.committedGeneration)
+                XCTAssertTrue(manager.desiredAudioEnabled)
+                XCTAssertEqual(actions(), [true, false])
+                manager.failUsbAudioLaneForTesting(lane, generation: before.generation, reason: reason)
+                XCTAssertEqual(actions(), [true, false])
+            }
+        }
+    }
+
+    func testStaleLaneAndStaleGenerationCannotRetireReplacement() throws {
+        try withManager { manager, actions in
+            manager.commitAudioTransportForTesting(mode: RealtimeTransportMode.usbSplitTLS, audioAvailable: true)
+            let old = manager.installUsbAudioLaneForTesting()
+            let generation = manager.usbSessionSnapshot().generation
+            let current = manager.installUsbAudioLaneForTesting()
+            manager.failUsbAudioLaneForTesting(old, generation: generation, reason: "eof")
+            manager.failUsbAudioLaneForTesting(current, generation: generation &+ 1, reason: "eof")
+            XCTAssertEqual(actions(), [true])
+            manager.failUsbAudioLaneForTesting(current, generation: generation, reason: "eof")
+            XCTAssertEqual(actions(), [true, false])
+        }
+    }
+
+    func testNewCommitRestoresAudioAfterRetirement() throws {
+        try withManager { manager, actions in
+            manager.commitAudioTransportForTesting(mode: RealtimeTransportMode.usbSplitTLS, audioAvailable: true)
+            let lane = manager.installUsbAudioLaneForTesting()
+            let oldGeneration = manager.usbSessionSnapshot().generation
+            manager.failUsbAudioLaneForTesting(lane, generation: oldGeneration, reason: "eof")
+            manager.stopForTesting()
+            manager.commitAudioTransportForTesting(mode: RealtimeTransportMode.usbSplitTLS, audioAvailable: true)
+            XCTAssertGreaterThan(manager.usbSessionSnapshot().generation, oldGeneration)
+            XCTAssertEqual(actions(), [true, false, true])
+        }
+    }
+
+    private func withManager(_ body: (NetworkManager, () -> [Bool]) throws -> Void) throws {
+        let suite = "UsbAudioRuntimeRetirementTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        ClientStreamSettingsStore.save(.normalized(bitrateMbps: 20, audioEnabled: true), defaults: defaults)
+        let manager = NetworkManager(userDefaults: defaults)
+        var actions: [Bool] = []
+        manager.realtimeAudioPlaybackForTesting = { actions.append($0) }
+        manager.controlSendForAudioTesting = { _, completion in completion(nil) }
+        defer { manager.stopForTesting() }
+        try body(manager, { manager.networkQueueForTesting.sync { actions } })
+    }
+}
+
 final class CommittedAudioAvailabilityTests: XCTestCase {
     func testSettingsCannotStartPlaybackForVideoOnlyUsbCommit() throws {
         try withManager { manager, actions in
