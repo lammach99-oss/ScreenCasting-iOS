@@ -4897,6 +4897,7 @@ public class NetworkManager: ObservableObject {
               let appliedPreference = pendingDisplayPreference else {
             return
         }
+        decoder.configureRefreshRate(ready.refreshHz)
         pendingDisplayPreference = nil
         latestDisplayPreference = nil
         activeDisplayPreference = appliedPreference

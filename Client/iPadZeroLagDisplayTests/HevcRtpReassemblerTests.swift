@@ -44,6 +44,26 @@ final class HevcRtpReassemblerTests: XCTestCase {
         }
     }
 
+    func testFragmentedCraIsNotIdrInAuthenticatedObserverOrCompletedAccessUnit() {
+        for type: UInt8 in [19, 20, 21] {
+            var decoded: [Bool] = []
+            var observed: [Bool] = []
+            let processor = WifiAuthenticatedMediaProcessor(mtu: 1_200, initialSequence: 10,
+                unprotect: { _ in true }, decoder: { _, _, idr, _ in decoded.append(idr) },
+                framePacketObserver: { _, _, idr, _, _ in observed.append(idr) })
+            let picture = nal(type: type, count: 40, fill: 1)
+            processor.consume(packet(sequence: 10, timestamp: 1, frame: 1, capture: 1,
+                marker: false, payload: fu(picture, bytes: picture.subdata(in: 2..<20),
+                    start: true, end: false)), arrivalTime: 0)
+            processor.consume(packet(sequence: 11, timestamp: 1, frame: 1, capture: 1,
+                marker: true, payload: fu(picture, bytes: picture.subdata(in: 20..<40),
+                    start: false, end: true)), arrivalTime: 0.001)
+            let idr = type == 19 || type == 20
+            XCTAssertEqual(decoded, [idr])
+            XCTAssertEqual(observed, [idr, idr])
+        }
+    }
+
     func testFixedHeaderAndReorderedFuReassembleCanonicalBytes() {
         let vps = nal(type: 32, count: 20, fill: 0x11)
         let sps = nal(type: 33, count: 20, fill: 0x12)

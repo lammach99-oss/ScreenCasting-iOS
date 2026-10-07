@@ -386,7 +386,7 @@ final class HevcRtpReassembler {
 
     private static func isIDR(_ payload: Data) -> Bool {
         guard let nalType = nalType(payload) else { return false }
-        return nalType == 19 || nalType == 20 || nalType == 21
+        return nalType == 19 || nalType == 20
     }
 
     private static func isRandomAccessPayloadType(_ payload: Data) -> Bool {

@@ -9,7 +9,7 @@ final class AccessUnitMailboxTests: XCTestCase {
             var now: TimeInterval = 0
             let mailbox = AccessUnitMailbox(clock: { now })
             mailbox.beginSession(generation: 1)
-            XCTAssertTrue(mailbox.configureRefreshRate(hz))
+            XCTAssertTrue(mailbox.configureRefreshRate(UInt32(hz)))
             let held = unwrap(mailbox.publish(simpleUnit(1, idr: true)))
             now = within
             XCTAssertNil(mailbox.expireIfNeeded(held))
@@ -29,7 +29,7 @@ final class AccessUnitMailboxTests: XCTestCase {
         let held = unwrap(mailbox.publish(simpleUnit(1, idr: true)))
         XCTAssertNil(mailbox.publish(simpleUnit(2, idr: true)))
         for unsupported in [0, 30, 90, 144, 240] {
-            XCTAssertFalse(mailbox.configureRefreshRate(unsupported))
+            XCTAssertFalse(mailbox.configureRefreshRate(UInt32(unsupported)))
         }
         now = 0.012
         XCTAssertNil(mailbox.expireIfNeeded(held))

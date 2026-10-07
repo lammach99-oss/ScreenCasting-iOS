@@ -429,6 +429,14 @@ public final class DecoderManager {
         onSessionBegan?(generation)
     }
 
+    /// Changes only the bounded decode age policy; never waits for the decoder queue.
+    @discardableResult
+    public func configureRefreshRate(_ refreshHz: UInt32) -> Bool {
+        mailboxStateLock.lock()
+        defer { mailboxStateLock.unlock() }
+        return mailbox.configureRefreshRate(refreshHz)
+    }
+
     public var currentSessionGeneration: UInt64 {
         mailboxStateLock.lock()
         defer { mailboxStateLock.unlock() }

@@ -2550,18 +2550,32 @@ final class WifiShortBackgroundSameSessionTests: XCTestCase {
         let decoder = manager.decoderForTesting
         let entered = expectation(description: "decoder barrier entered")
         let released = DispatchSemaphore(value: 0)
+        defer { released.signal() }
         decoder.sessionQueueForTesting.async {
             entered.fulfill()
             released.wait()
         }
-        await fulfillment(of: [entered], timeout: 1)
-        let progressed = expectation(description: "network resume progresses while decoder is blocked")
+        await fulfillment(of: [entered], timeout: 5)
+        let started = expectation(description: "network resume closure starts")
+        let returned = expectation(description: "ready callback returns with decoder blocked")
+        let runtime = VisualCallbackRuntime()
         let callback = session.connection.stateUpdateHandler
         manager.networkQueueForTesting.async {
+            let began = ProcessInfo.processInfo.systemUptime
+            started.fulfill()
             callback?(.ready)
-            progressed.fulfill()
+            runtime.record(ProcessInfo.processInfo.systemUptime - began)
+            returned.fulfill()
         }
-        await fulfillment(of: [progressed], timeout: 1)
+        // Scheduler delay is independent of the callback's strict execution budget.
+        await fulfillment(of: [started], timeout: 5)
+        await fulfillment(of: [returned], timeout: 1)
+        if let seconds = runtime.seconds {
+            print("[VISUAL_Q1] callback_ms=\(seconds * 1_000) budget_ms=250")
+            XCTAssertLessThanOrEqual(seconds, 0.250, "ready callback synchronously blocked decoder cleanup")
+        } else {
+            XCTFail("ready callback did not return while decoder was blocked")
+        }
         released.signal()
         manager.networkQueueForTesting.sync { }
         XCTAssertEqual(decoder.invalidateWaitModesForTesting.last, false)
@@ -2570,7 +2584,7 @@ final class WifiShortBackgroundSameSessionTests: XCTestCase {
             XCTAssertEqual(decoder.lifecycleEventsForTesting.last, "invalidate-end")
             cleanup.fulfill()
         }
-        await fulfillment(of: [cleanup], timeout: 1)
+        await fulfillment(of: [cleanup], timeout: 5)
         let snap = manager.wifiLifecycleSnapshotForTesting()
         XCTAssertTrue(snap.connection === session.connection)
         XCTAssertEqual(snap.authenticatedGeneration, session.generation)
@@ -5473,8 +5487,17 @@ final class VisualProductionSourceClosureTests: XCTestCase {
         XCTAssertLessThan(gate.lowerBound, budget.lowerBound)
         let decoder = try source("DecoderManager.swift")
         let configure = try XCTUnwrap(decoder.range(of: "public func configureRefreshRate"))
-        let methodBody = String(decoder[configure.lowerBound...].prefix(650))
+        let configureEnd = try XCTUnwrap(decoder.range(of: "public var currentSessionGeneration",
+            range: configure.upperBound..<decoder.endIndex))
+        let methodBody = String(decoder[configure.lowerBound..<configureEnd.lowerBound])
         XCTAssertFalse(methodBody.contains("queue.sync"))
         XCTAssertTrue(methodBody.contains("mailbox.configureRefreshRate"))
     }
+}
+
+private final class VisualCallbackRuntime {
+    private let lock = NSLock()
+    private var value: TimeInterval?
+    func record(_ seconds: TimeInterval) { lock.lock(); value = seconds; lock.unlock() }
+    var seconds: TimeInterval? { lock.lock(); defer { lock.unlock() }; return value }
 }

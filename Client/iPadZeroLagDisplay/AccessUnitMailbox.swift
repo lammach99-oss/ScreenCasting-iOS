@@ -139,7 +139,7 @@ final class AccessUnitMailbox {
     typealias DropHandler = (UInt32, UInt64, AccessUnitDropReason) -> Void
 
     private let lock = NSLock()
-    private let maximumAge: TimeInterval
+    private var maximumAge: TimeInterval
     private let clock: Clock
     private let onRecoveryNeeded: () -> Void
     private let onDrop: DropHandler
@@ -176,6 +176,15 @@ final class AccessUnitMailbox {
         lock.lock()
         defer { lock.unlock() }
         return waitingForIDRStorage
+    }
+
+    @discardableResult
+    func configureRefreshRate(_ refreshHz: UInt32) -> Bool {
+        guard refreshHz == 60 || refreshHz == 120 else { return false }
+        lock.lock()
+        maximumAge = refreshHz == 120 ? 0.00833 : 0.01667
+        lock.unlock()
+        return true
     }
 
     func beginSession(generation: UInt64) {

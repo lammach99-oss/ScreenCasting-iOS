@@ -468,7 +468,7 @@ final class WifiAuthenticatedMediaProcessor {
                 return false
             }
             let type = (accessUnit[offset + 4] >> 1) & 0x3f
-            if type == 19 || type == 20 || type == 21 { return true }
+            if type == 19 || type == 20 { return true }
             offset += 4 + count
         }
         return false
@@ -477,12 +477,11 @@ final class WifiAuthenticatedMediaProcessor {
     private static func isIDRPacketPayload(_ payload: Data) -> Bool {
         guard payload.count >= 2 else { return false }
         let type = (payload[0] >> 1) & 0x3f
-        if type == 19 || type == 20 || type == 21 { return true }
+        if type == 19 || type == 20 { return true }
         guard type == 49, payload.count >= 3 else { return false }
         let fragmentedType = payload[2] & 0x3f
         return fragmentedType == 19 ||
-            fragmentedType == 20 ||
-            fragmentedType == 21
+            fragmentedType == 20
     }
 }
 
