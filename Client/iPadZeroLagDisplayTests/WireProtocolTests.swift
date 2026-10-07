@@ -2555,36 +2555,49 @@ final class WifiShortBackgroundSameSessionTests: XCTestCase {
             entered.fulfill()
             released.wait()
         }
-        await fulfillment(of: [entered], timeout: 5)
-        let started = expectation(description: "network resume closure starts")
-        let returned = expectation(description: "ready callback returns with decoder blocked")
+        // Watchdogs bound a hung test; they are not production latency requirements.
+        let barrier = await XCTWaiter.fulfillment(of: [entered], timeout: 10)
+        XCTAssertEqual(barrier, .completed)
+        guard barrier == .completed else { return }
+        let networkClosureStarted = expectation(description: "network resume closure starts")
+        let callbackReturned = expectation(description: "ready callback returns with decoder blocked")
+        let networkQueueProgressed = expectation(description: "subsequent network work progresses with decoder blocked")
         let runtime = VisualCallbackRuntime()
-        let callback = session.connection.stateUpdateHandler
+        guard let callback = session.connection.stateUpdateHandler else {
+            XCTFail("preserved session has no ready callback")
+            return
+        }
         manager.networkQueueForTesting.async {
+            networkClosureStarted.fulfill()
             let began = ProcessInfo.processInfo.systemUptime
-            started.fulfill()
-            callback?(.ready)
-            runtime.record(ProcessInfo.processInfo.systemUptime - began)
-            returned.fulfill()
+            callback(.ready)
+            let elapsed = ProcessInfo.processInfo.systemUptime - began
+            callbackReturned.fulfill()
+            runtime.record(elapsed)
         }
-        // Scheduler delay is independent of the callback's strict execution budget.
-        await fulfillment(of: [started], timeout: 5)
-        await fulfillment(of: [returned], timeout: 1)
+        manager.networkQueueForTesting.async {
+            networkQueueProgressed.fulfill()
+        }
+        let started = await XCTWaiter.fulfillment(of: [networkClosureStarted], timeout: 10)
+        XCTAssertEqual(started, .completed)
+        guard started == .completed else { return }
+        let progress = await XCTWaiter.fulfillment(
+            of: [callbackReturned, networkQueueProgressed], timeout: 10, enforceOrder: true)
+        XCTAssertEqual(progress, .completed, "resume depends on the blocked decoder queue")
+        guard progress == .completed else { return }
         if let seconds = runtime.seconds {
-            print("[VISUAL_Q1] callback_ms=\(seconds * 1_000) budget_ms=250")
-            XCTAssertLessThanOrEqual(seconds, 0.250, "ready callback synchronously blocked decoder cleanup")
-        } else {
-            XCTFail("ready callback did not return while decoder was blocked")
+            print("[VISUAL_Q1] callback_ms=\(seconds * 1_000) diagnostic_only=true")
         }
+        print("[VISUAL_Q1] callback_returned=true network_sentinel=true decoder_barrier_held=true")
+        XCTAssertEqual(decoder.invalidateWaitModesForTesting.last, false)
         released.signal()
         manager.networkQueueForTesting.sync { }
-        XCTAssertEqual(decoder.invalidateWaitModesForTesting.last, false)
         let cleanup = expectation(description: "old decoder cleanup precedes subsequent decoder work")
         decoder.sessionQueueForTesting.async {
             XCTAssertEqual(decoder.lifecycleEventsForTesting.last, "invalidate-end")
             cleanup.fulfill()
         }
-        await fulfillment(of: [cleanup], timeout: 5)
+        await fulfillment(of: [cleanup], timeout: 10)
         let snap = manager.wifiLifecycleSnapshotForTesting()
         XCTAssertTrue(snap.connection === session.connection)
         XCTAssertEqual(snap.authenticatedGeneration, session.generation)
