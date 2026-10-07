@@ -1,7 +1,44 @@
 import XCTest
+import Metal
 @testable import iPadCasting
 
 final class AccessUnitMailboxTests: XCTestCase {
+
+    func testCommittedRefreshRateControlsInFlightExpiryWithoutResettingOwnership() {
+        for (hz, within, beyond) in [(60, 0.012, 0.01668), (120, 0.008, 0.00834)] {
+            var now: TimeInterval = 0
+            let mailbox = AccessUnitMailbox(clock: { now })
+            mailbox.beginSession(generation: 1)
+            XCTAssertTrue(mailbox.configureRefreshRate(hz))
+            let held = unwrap(mailbox.publish(simpleUnit(1, idr: true)))
+            now = within
+            XCTAssertNil(mailbox.expireIfNeeded(held))
+            XCTAssertEqual(mailbox.retainedOwnerCount, 1)
+            now = beyond
+            XCTAssertNotNil(mailbox.expireIfNeeded(held))
+            held.unit.owner.release()
+            mailbox.invalidate()
+        }
+    }
+
+    func testUnsupportedRefreshRatePreservesAcceptedBudgetAndPendingOwnership() {
+        var now: TimeInterval = 0
+        let mailbox = AccessUnitMailbox(clock: { now })
+        mailbox.beginSession(generation: 1)
+        XCTAssertTrue(mailbox.configureRefreshRate(60))
+        let held = unwrap(mailbox.publish(simpleUnit(1, idr: true)))
+        XCTAssertNil(mailbox.publish(simpleUnit(2, idr: true)))
+        for unsupported in [0, 30, 90, 144, 240] {
+            XCTAssertFalse(mailbox.configureRefreshRate(unsupported))
+        }
+        now = 0.012
+        XCTAssertNil(mailbox.expireIfNeeded(held))
+        XCTAssertEqual(mailbox.retainedOwnerCount, 2)
+        XCTAssertEqual(mailbox.complete(held, succeeded: true).next?.unit.sequence, 2)
+        held.unit.owner.release()
+        mailbox.invalidate()
+    }
+
     func testCallbackHeldFloodRetainsOnlyInFlightAndLatestPending() {
         let releases = ReleaseCounter()
         let mailbox = AccessUnitMailbox(maximumAge: 1, clock: { 0 })
@@ -840,5 +877,44 @@ final class PresentationCadencePolicyTests: XCTestCase {
                 policy.targetFPS(maximumPanelFPS: 120, mode: .game),
                 120)
         }
+    }
+}
+
+final class VisualRendererClosureTests: XCTestCase {
+    private let key = RendererGeometryPublishKey(
+        decodedFrameSize: CGSize(width: 120, height: 60),
+        drawableSize: CGSize(width: 120, height: 60),
+        contentViewport: VideoContentViewport(rect: CGRect(x: 0, y: 0, width: 1, height: 1)))
+
+    func testDelayedGeometryTokenCannotPublishAfterReplacementOrReset() throws {
+        var gate = RendererGeometryPublishGate()
+        let first = RenderFrameIdentity(generation: 1, sequence: 1)
+        let second = RenderFrameIdentity(generation: 1, sequence: 2)
+        let old = try XCTUnwrap(gate.schedule(key, identity: first))
+        let current = try XCTUnwrap(gate.schedule(key, identity: second))
+        XCTAssertFalse(gate.authorize(old, identity: first))
+        XCTAssertTrue(gate.authorize(current, identity: second))
+        XCTAssertFalse(gate.authorize(current, identity: second))
+        XCTAssertNil(gate.schedule(key, identity: first))
+        let pending = try XCTUnwrap(gate.schedule(key, identity: second, force: true))
+        gate.reset()
+        XCTAssertFalse(gate.authorize(pending, identity: second))
+    }
+
+    func testSessionAndMediaResetIdentityArePartOfPublicationAuthority() throws {
+        var gate = RendererGeometryPublishGate()
+        let old = RenderFrameIdentity(generation: 1, sequence: 10)
+        let token = try XCTUnwrap(gate.schedule(key, identity: old))
+        XCTAssertFalse(gate.authorize(token,
+            identity: RenderFrameIdentity(generation: 2, sequence: 10)))
+        XCTAssertFalse(gate.authorize(token,
+            identity: RenderFrameIdentity(generation: 1, sequence: 10, mediaResetIdentity: 1)))
+    }
+
+    func testMetalCompletionRequiresCompletedStatus() {
+        for status: MTLCommandBufferStatus in [.notEnqueued, .enqueued, .committed, .scheduled, .error] {
+            XCTAssertFalse(RenderCommandCompletionPolicy.succeeded(status))
+        }
+        XCTAssertTrue(RenderCommandCompletionPolicy.succeeded(.completed))
     }
 }

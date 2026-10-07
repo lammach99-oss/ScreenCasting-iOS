@@ -5431,3 +5431,50 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         }
     }
 }
+
+final class VisualProductionSourceClosureTests: XCTestCase {
+    private func source(_ name: String) throws -> String {
+        let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("iPadZeroLagDisplay/" + name)
+        return try String(contentsOf: url, encoding: .utf8).replacingOccurrences(of: "\r\n", with: "\n")
+    }
+
+    func testActualMetalCompletionUsesStatusBeforePresentationAndRepeatState() throws {
+        let renderer = try source("Renderer.swift")
+        let callback = try XCTUnwrap(renderer.range(of: "commandBuffer.addCompletedHandler"))
+        let body = String(renderer[callback.lowerBound...])
+        let status = try XCTUnwrap(body.range(of: "RenderCommandCompletionPolicy.succeeded"))
+        let presented = try XCTUnwrap(body.range(of: "freshness.markPresented"))
+        let repeated = try XCTUnwrap(body.range(of: "gameLastPresentedFrame ="))
+        XCTAssertLessThan(status.lowerBound, presented.lowerBound)
+        XCTAssertLessThan(status.lowerBound, repeated.lowerBound)
+    }
+
+    func testAspectRatioBufferIsRequiredBeforeEncodingAndPublicationIsIdentityBound() throws {
+        let renderer = try source("Renderer.swift")
+        let draw = try XCTUnwrap(renderer.range(of: "public func draw(in view: MTKView)"))
+        let body = String(renderer[draw.lowerBound...])
+        let aspect = try XCTUnwrap(body.range(of: "let aspectRatioBuffer = aspectRatioBuffer"))
+        let encoder = try XCTUnwrap(body.range(of: "makeRenderCommandEncoder"))
+        XCTAssertLessThan(aspect.lowerBound, encoder.lowerBound)
+        XCTAssertFalse(body.contains("aspectRatioBuffer?.contents()"))
+        XCTAssertTrue(renderer.contains("geometryPublishGate.authorize"))
+        XCTAssertTrue(renderer.contains("freshness.isCurrent(token.identity)"))
+    }
+
+    func testAcceptedDisplayReadyConfiguresDecodeBudgetWithoutSynchronizingDecoderQueue() throws {
+        let network = try source("NetworkManager.swift")
+        let method = try XCTUnwrap(network.range(of: "private func receiveDisplayReady"))
+        let end = try XCTUnwrap(network.range(of: "private func receiveDisplayConfigurationFailure",
+            range: method.upperBound..<network.endIndex))
+        let body = String(network[method.lowerBound..<end.lowerBound])
+        let gate = try XCTUnwrap(body.range(of: "guard displayRequestGate.effective != nil"))
+        let budget = try XCTUnwrap(body.range(of: "decoder.configureRefreshRate"))
+        XCTAssertLessThan(gate.lowerBound, budget.lowerBound)
+        let decoder = try source("DecoderManager.swift")
+        let configure = try XCTUnwrap(decoder.range(of: "public func configureRefreshRate"))
+        let methodBody = String(decoder[configure.lowerBound...].prefix(650))
+        XCTAssertFalse(methodBody.contains("queue.sync"))
+        XCTAssertTrue(methodBody.contains("mailbox.configureRefreshRate"))
+    }
+}
