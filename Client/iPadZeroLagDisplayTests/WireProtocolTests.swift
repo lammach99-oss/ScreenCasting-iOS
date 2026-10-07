@@ -2,6 +2,7 @@ import XCTest
 import Network
 import UIKit
 import AVFoundation
+import CryptoKit
 @testable import iPadCasting
 
 final class ExternalPointerInputTests: XCTestCase {
@@ -128,6 +129,73 @@ final class ExternalPointerInputTests: XCTestCase {
         container.retireRemotePointerInputs()
         XCTAssertEqual(buttons.map(\.action), [.leftDown, .leftUp])
         XCTAssertEqual(contacts.map(\.phase), [.down, .cancel])
+    }
+
+    func testVerticalAndHorizontalAccumulateIndependentlyAt24Points() {
+        var state = ExternalPointerInputState()
+        _ = state.configure(active: true, generation: 7)
+        _ = state.hover(point: point, generation: 7)
+        XCTAssertTrue(state.scroll(delta: CGPoint(x: 12, y: 12), generation: 7).isEmpty)
+        let vertical = state.scroll(delta: CGPoint(x: 0, y: 12), generation: 7)
+        XCTAssertEqual(vertical.map(\.action), [.verticalWheel])
+        XCTAssertEqual(vertical.first?.value, 120)
+        let horizontal = state.scroll(delta: CGPoint(x: 12, y: 0), generation: 7)
+        XCTAssertEqual(horizontal.map(\.action), [.horizontalWheel])
+        XCTAssertEqual(horizontal.first?.value, -120)
+    }
+
+    func testWheelTargetsMostRecentValidPointerAndRetainsOverflow() {
+        var state = ExternalPointerInputState()
+        _ = state.configure(active: true, generation: 7)
+        _ = state.hover(point: point, generation: 7)
+        _ = state.hover(point: CGPoint(x: 0.75, y: 0.25), generation: 7)
+        let first = state.scroll(delta: CGPoint(x: 0, y: 24 * 10), generation: 7)
+        XCTAssertEqual(first.count, 8)
+        XCTAssertTrue(first.allSatisfy { $0.x == 49_151 && $0.y == 16_384 })
+        XCTAssertEqual(state.scroll(delta: .zero, generation: 7).count, 2)
+    }
+
+    @MainActor func testWindowRetirementReleasesLivePrimaryExactlyOnce() {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        let view = PencilUIKitView(frame: window.bounds)
+        window.addSubview(view)
+        view.contentViewport = VideoContentViewport(rect: CGRect(x: 0, y: 0, width: 1, height: 1))
+        view.configureExternalPointer(active: true, generation: 7)
+        var commands: [PointerInputCommand] = []
+        view.onPointerInput = { commands.append($0) }
+        view.handleExternalPointer(id: 1, phase: 1, point: CGPoint(x: 200, y: 150), primary: true, generation: 7)
+        view.removeFromSuperview()
+        view.retireExternalPointer()
+        view.handleExternalPointer(id: 1, phase: 4, point: .zero, generation: 7)
+        XCTAssertEqual(commands.map(\.action), [.leftDown, .leftUp])
+    }
+
+    func testNoRaw43RegistrationRemains() {
+        XCTAssertNil(WireMessageType(rawValue: 43))
+    }
+
+    private func clientSource(_ file: String) throws -> String {
+        let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("iPadZeroLagDisplay/" + file)
+        return try String(contentsOf: url, encoding: .utf8).replacingOccurrences(of: "\r\n", with: "\n")
+    }
+
+    func testFrozenDirectTouchHelpersMatchQualifiedBaseline() throws {
+        let source = try clientSource("PencilTouchView.swift")
+        let boundary = try XCTUnwrap(source.range(of: "struct ExternalPointerInputState"))
+        let digest = SHA256.hash(data: Data(source[..<boundary.lowerBound].utf8))
+        XCTAssertEqual(digest.map { String(format: "%02x", $0) }.joined(),
+                       "72d7fe3f8164388d339bf32aacc8a754c9c396c3a0a025b7e6fc19bcd4824b1e")
+    }
+
+    func testInactiveSettingsAndDismantleRetireBothPointerPaths() throws {
+        let source = try clientSource("MetalView.swift")
+        XCTAssertTrue(source.contains("if note.name == UIApplication.willResignActiveNotification {\n            retireRemotePointerInputs()"))
+        XCTAssertTrue(source.contains("uiView.retireRemotePointerInputs()"))
+        XCTAssertTrue(source.contains("container?.retireRemotePointerInputs()"))
+        XCTAssertTrue(source.contains("touchView.configureExternalPointer(active: remoteKeyboardActive"))
+        XCTAssertTrue(source.contains("touchView.configureDirectTouch(active: remoteKeyboardActive"))
+        XCTAssertFalse(source.contains("touchpadModeEnabled"))
     }
 }
 
