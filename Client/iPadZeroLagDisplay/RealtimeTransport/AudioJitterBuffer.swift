@@ -1,6 +1,6 @@
 import Foundation
 
-enum RealtimeAudioTransportProfile {
+enum RealtimeAudioTransportProfile: Equatable {
     case wifi
     case usb
 

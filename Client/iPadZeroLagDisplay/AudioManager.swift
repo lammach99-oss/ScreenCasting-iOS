@@ -103,7 +103,7 @@ public final class AudioManager {
     private var pendingRecoveryDiagnostic: String?
     private var engineObservers: [NSObjectProtocol] = []
     private let recoveryOwnerLock = NSLock()
-    private var recoveryOwner: (generation: UInt64, epoch: UInt64)?
+    private var recoveryOwner: (generation: UInt64, epoch: UInt64, profile: RealtimeAudioTransportProfile)?
 
     #if targetEnvironment(simulator)
     var interruptionResumeForTesting: (() -> Void)?
@@ -167,7 +167,7 @@ public final class AudioManager {
             engineObservers.append(NotificationCenter.default.addObserver(forName: name, object: object, queue: nil) { [weak self] _ in
                 guard let self, let owner = self.captureRecoveryOwner() else { return }
                 self.audioQueue.async { [weak self] in
-                    self?.reprimeRealtimeOnQueue(generation: owner.generation, epoch: owner.epoch, reason: reason, automatic: true)
+                    self?.reprimeRealtimeOnQueue(generation: owner.generation, epoch: owner.epoch, profile: owner.profile, reason: reason, automatic: true)
                 }
             })
         }
@@ -227,9 +227,10 @@ public final class AudioManager {
     // MARK: - Public API
 
     func resumeCurrentRealtimeSession(generation: UInt64, profile: RealtimeAudioTransportProfile) {
-        guard case .wifi = profile, let owner = captureRecoveryOwner(), owner.generation == generation else { return }
+        guard case .wifi = profile, let owner = captureRecoveryOwner(), owner.generation == generation,
+              owner.profile == profile else { return }
         audioQueue.async { [weak self] in
-            self?.reprimeRealtimeOnQueue(generation: generation, epoch: owner.epoch, reason: "preserved_wifi_resume", automatic: false)
+            self?.reprimeRealtimeOnQueue(generation: generation, epoch: owner.epoch, profile: owner.profile, reason: "preserved_wifi_resume", automatic: false)
         }
     }
 
@@ -247,7 +248,7 @@ public final class AudioManager {
         return ProcessInfo.processInfo.systemUptime
     }
 
-    private func captureRecoveryOwner() -> (generation: UInt64, epoch: UInt64)? {
+    private func captureRecoveryOwner() -> (generation: UInt64, epoch: UInt64, profile: RealtimeAudioTransportProfile)? {
         recoveryOwnerLock.lock()
         defer { recoveryOwnerLock.unlock() }
         return recoveryOwner
@@ -256,17 +257,17 @@ public final class AudioManager {
     private func publishRecoveryOwner() {
         recoveryOwnerLock.lock()
         defer { recoveryOwnerLock.unlock() }
-        if case .wifi? = realtimeProfile, let generation = realtimeGeneration,
+        if let profile = realtimeProfile, let generation = realtimeGeneration,
            activePlaybackGeneration == generation, opusDecoder != nil, !playbackInterrupted {
-            recoveryOwner = (generation, playbackEpoch)
+            recoveryOwner = (generation, playbackEpoch, profile)
         } else {
             recoveryOwner = nil
         }
     }
 
-    private func reprimeRealtimeOnQueue(generation: UInt64, epoch: UInt64, reason: String, automatic: Bool) {
+    private func reprimeRealtimeOnQueue(generation: UInt64, epoch: UInt64, profile: RealtimeAudioTransportProfile, reason: String, automatic: Bool) {
         guard playbackEpoch == epoch, activePlaybackGeneration == generation,
-              realtimeGeneration == generation, case .wifi? = realtimeProfile,
+              realtimeGeneration == generation, realtimeProfile == profile,
               opusDecoder != nil, !playbackInterrupted else { return }
         let now = playoutNow
         if automatic, let last = lastAnyRecoveryAt, now - last < 1 { return }
@@ -279,7 +280,7 @@ public final class AudioManager {
         playerNode.reset()
         queuedFrames = 0
         lastPcmProgressAt = nil
-        jitterBuffer.reset(profile: .wifi)
+        jitterBuffer.reset(profile: profile)
         configureAudioSession()
         startEngineIfNeeded()
         if playoutTimer == nil { startPlayoutTimer() }
@@ -527,9 +528,9 @@ public final class AudioManager {
     private func playoutTick() {
         guard !playbackInterrupted else { return }
         if let generation = realtimeGeneration, activePlaybackGeneration == generation,
-           case .wifi? = realtimeProfile, queuedFrames >= maxQueuedFrames - 480,
+           let profile = realtimeProfile, queuedFrames >= maxQueuedFrames - 480,
            let progress = lastPcmProgressAt, playoutNow - progress >= 0.250 {
-            reprimeRealtimeOnQueue(generation: generation, epoch: playbackEpoch, reason: "stalled_playout", automatic: true)
+            reprimeRealtimeOnQueue(generation: generation, epoch: playbackEpoch, profile: profile, reason: "stalled_playout", automatic: true)
         }
         playoutDiagnostics.record(.tick)
         guard let opusDecoder,
