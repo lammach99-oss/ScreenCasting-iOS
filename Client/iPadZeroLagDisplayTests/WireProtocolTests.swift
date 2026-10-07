@@ -705,6 +705,69 @@ final class CommittedAudioAvailabilityTests: XCTestCase {
     }
 }
 
+final class AudioReceiveTimingOwnershipTests: XCTestCase {
+    private func stream() -> AudioReceiveDiagnostics {
+        var result = AudioReceiveDiagnostics()
+        result.record(sequence: 100, timestamp: 0, arrivedAt: 1)
+        result.record(sequence: 102, timestamp: 960, arrivedAt: 1.020)
+        return result
+    }
+
+    func testReorderedPacketDoesNotMoveJitterTimingBaseline() {
+        var result = stream()
+        let before = result
+        result.record(sequence: 101, timestamp: 480, arrivedAt: 1.025)
+        XCTAssertEqual(result.jitterMs, before.jitterMs)
+        XCTAssertEqual(result.interarrivalP95Ms, before.interarrivalP95Ms)
+        XCTAssertEqual(result.interarrivalMaxMs, before.interarrivalMaxMs)
+        XCTAssertEqual(result.reorderedPackets, 1)
+    }
+
+    func testDuplicatePacketDoesNotMoveJitterTimingBaseline() {
+        var result = stream()
+        let before = result
+        result.record(sequence: 102, timestamp: 960, arrivedAt: 1.100)
+        XCTAssertEqual(result.jitterMs, before.jitterMs)
+        XCTAssertEqual(result.interarrivalMaxMs, before.interarrivalMaxMs)
+        XCTAssertEqual(result.duplicateOrStalePackets, 1)
+    }
+
+    func testForwardPacketAfterReorderUsesPreviousForwardTimestamp() {
+        var result = stream()
+        var reference = result
+        result.record(sequence: 101, timestamp: 480, arrivedAt: 1.025)
+        result.record(sequence: 102, timestamp: 960, arrivedAt: 1.028)
+        result.record(sequence: 103, timestamp: 1440, arrivedAt: 1.030)
+        reference.record(sequence: 103, timestamp: 1440, arrivedAt: 1.030)
+        XCTAssertEqual(result.jitterMs, reference.jitterMs, accuracy: 0.000001)
+        XCTAssertEqual(result.interarrivalMaxMs, reference.interarrivalMaxMs)
+        XCTAssertEqual(result.interarrivalP95Ms, reference.interarrivalP95Ms)
+    }
+
+    func testForwardTimingWrapRemainsCorrect() {
+        var result = AudioReceiveDiagnostics()
+        result.record(sequence: 65535, timestamp: UInt32.max - 479, arrivedAt: 1)
+        result.record(sequence: 0, timestamp: 0, arrivedAt: 1.010)
+        XCTAssertEqual(result.jitterMs, 0, accuracy: 0.000001)
+        XCTAssertEqual(result.interarrivalMaxMs, 10, accuracy: 0.000001)
+        XCTAssertEqual(result.missingPacketUnits, 0)
+        XCTAssertEqual(result.reorderedPackets, 0)
+    }
+
+    func testGapRepairCountersRemainUnchangedByTelemetryFix() {
+        var result = stream()
+        result.record(sequence: 101, timestamp: 480, arrivedAt: 1.025)
+        result.record(sequence: 101, timestamp: 480, arrivedAt: 1.027)
+        XCTAssertEqual(result.packets, 4)
+        XCTAssertEqual(result.forwardGaps, 1)
+        XCTAssertEqual(result.missingPacketUnits, 1)
+        XCTAssertEqual(result.repairedPacketUnits, 1)
+        XCTAssertEqual(result.reorderedPackets, 1)
+        XCTAssertEqual(result.duplicateOrStalePackets, 1)
+        XCTAssertEqual(AudioJitterDiagnostics().targetPolicyDrops, 0)
+    }
+}
+
 final class AudioInterruptionOwnershipTests: XCTestCase {
     private final class LivenessFixture {
         let audio = AudioManager.makeForTesting()
