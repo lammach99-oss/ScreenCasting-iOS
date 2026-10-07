@@ -1680,21 +1680,90 @@ final class USBListenerLifetimeTests: XCTestCase {
         try reconnect(from: .portrait, to: .landscape, loss: .cancelled)
     }
 
-    func testRepeatedFailedCandidatesKeepTheListener() throws {
+    func testRepeatedFailedCandidatesKeepTheListener() async throws {
         let listener = try XCTUnwrap(manager.usbSessionSnapshot().listener)
+        // Network.framework cancellation is not injectable. Pair its observed terminal
+        // event with one ownership retirement and the audited single-cancel boundary.
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/NetworkManager.swift"), encoding: .utf8)
+            .replacingOccurrences(of: "\r\n", with: "\n")
+        let begin = try XCTUnwrap(source.range(of: "    private func teardownCurrentSession()"))
+        let end = try XCTUnwrap(source.range(of: "    private func reconcileRealtimeAudioPlayback", range: begin.upperBound..<source.endIndex))
+        let retirement = String(source[begin.lowerBound..<end.lowerBound])
+        XCTAssertEqual(retirement.components(separatedBy: "connection?.cancel()").count - 1, 1)
+        XCTAssertFalse(retirement.contains("usbListener?.cancel()"))
+        XCTAssertFalse(retirement.contains("usbListener = nil"))
+        var retiredCallbacks: [(NWConnection.State) -> Void] = []
+        var retiredProbes: [CandidateProbe] = []
         for state in [NWConnection.State.failed(.posix(.ECONNRESET)), .cancelled] {
-            let candidate = try connect()
-            try deliver(state, to: candidate)
-            let snap = manager.usbSessionSnapshot()
-            XCTAssertTrue(snap.listener === listener)
-            XCTAssertNil(snap.connection)
+            let probe = try await connectCausally(listener: listener)
+            let candidate = probe.connection
+            let active = manager.usbSessionSnapshot()
+            XCTAssertTrue(active.connection === candidate)
+            XCTAssertNil(active.authenticatedGeneration)
+            XCTAssertNil(active.committedGeneration)
+            let invalidations = manager.networkQueueForTesting.sync {
+                manager.decoderForTesting.invalidateWaitModesForTesting.count
+            }
+            let oldCallback = probe.stateHandler
+            manager.networkQueueForTesting.sync { oldCallback(state) }
+            let retired = manager.usbSessionSnapshot()
+            XCTAssertTrue(retired.listener === listener)
+            XCTAssertTrue(retired.listenerIntent)
+            XCTAssertTrue(listener.state == .ready)
+            XCTAssertNotNil(listener.newConnectionHandler)
+            XCTAssertNil(retired.connection)
+            XCTAssertNil(retired.authenticatedGeneration)
+            XCTAssertNil(retired.committedGeneration)
+            XCTAssertEqual(retired.generation, active.generation + 1)
+            try await waitForUSB([probe.cancelled], stage: "failed candidate native cancellation")
+            XCTAssertEqual(probe.cancellationCount, 1)
+            manager.networkQueueForTesting.sync {
+                oldCallback(.failed(.posix(.ECONNRESET)))
+                oldCallback(.cancelled)
+                oldCallback(.ready)
+                XCTAssertEqual(manager.decoderForTesting.invalidateWaitModesForTesting.count, invalidations + 1)
+                XCTAssertEqual(manager.decoderForTesting.invalidateWaitModesForTesting.last, false)
+            }
+            let fenced = manager.usbSessionSnapshot()
+            XCTAssertTrue(fenced.listener === listener)
+            XCTAssertNil(fenced.connection)
+            XCTAssertEqual(fenced.generation, retired.generation)
+            let networkQueueProgressed = expectation(description: "retired candidate cannot hold accept queue")
+            manager.networkQueueForTesting.async { networkQueueProgressed.fulfill() }
+            try await waitForUSB([networkQueueProgressed], stage: "listener accept queue remains live")
+            retiredCallbacks.append(oldCallback)
+            retiredProbes.append(probe)
+            print("[VISUAL_USB_LIFETIME] listener_alive=true accept_armed=true retirement_count=1 cancellation_count=1 stale_fenced=true")
         }
-        let successful = try connect()
+        let successful = try await connectCausally(listener: listener)
+        let ready = manager.usbSessionSnapshot()
+        XCTAssertTrue(ready.listener === listener)
+        XCTAssertTrue(ready.connection === successful.connection)
+        XCTAssertTrue(successful.connection.state == .ready)
+        XCTAssertNil(ready.authenticatedGeneration)
+        XCTAssertNil(ready.committedGeneration)
+        manager.networkQueueForTesting.sync {
+            for callback in retiredCallbacks {
+                callback(.failed(.posix(.ECONNRESET)))
+                callback(.cancelled)
+                callback(.ready)
+            }
+        }
+        let protected = manager.usbSessionSnapshot()
+        XCTAssertTrue(protected.listener === listener)
+        XCTAssertTrue(protected.connection === successful.connection)
+        XCTAssertEqual(protected.generation, ready.generation)
+        XCTAssertNil(protected.authenticatedGeneration)
+        XCTAssertNil(protected.committedGeneration)
+        XCTAssertTrue(retiredProbes.allSatisfy { $0.cancellationCount == 1 })
         manager.simulateSessionAuthenticatedAndCommitted()
-        let snap = manager.usbSessionSnapshot()
-        XCTAssertTrue(snap.listener === listener)
-        XCTAssertTrue(snap.connection === successful)
-        XCTAssertNotNil(snap.committedGeneration)
+        let committed = manager.usbSessionSnapshot()
+        XCTAssertTrue(committed.listener === listener)
+        XCTAssertTrue(committed.connection === successful.connection)
+        XCTAssertEqual(committed.authenticatedGeneration, ready.generation)
+        XCTAssertEqual(committed.committedGeneration, ready.generation)
+        print("[VISUAL_USB_LIFETIME] subsequent_native_accept_ready=true stale_replacement_fenced=true current_generation_committed=true")
     }
 
     func testLateOldStateCallbacksCannotClearReplacement() throws {
@@ -1962,6 +2031,108 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertTrue(manager.usbSessionSnapshot().listener === listener)
         XCTAssertTrue(manager.usbSessionSnapshot().connection === replacement)
         XCTAssertEqual(manager.usbSessionSnapshot().orientation, desired)
+    }
+
+    private enum USBQualificationFailure: Error { case watchdog(String) }
+
+    private final class CandidateProbe {
+        let connection: NWConnection
+        let stateHandler: (NWConnection.State) -> Void
+        let cancelled: XCTestExpectation
+        private let lock = NSLock()
+        private var cancellations = 0
+        init(connection: NWConnection, stateHandler: @escaping (NWConnection.State) -> Void,
+             cancelled: XCTestExpectation) {
+            self.connection = connection
+            self.stateHandler = stateHandler
+            self.cancelled = cancelled
+        }
+        func recordCancellation() {
+            lock.lock()
+            cancellations += 1
+            let first = cancellations == 1
+            lock.unlock()
+            if first { cancelled.fulfill() }
+        }
+        var cancellationCount: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancellations
+        }
+    }
+
+    private func waitForUSB(_ expectations: [XCTestExpectation], stage: String) async throws {
+        // Each watchdog only bounds a hung causal stage; none is a readiness SLA.
+        let result = await XCTWaiter.fulfillment(of: expectations, timeout: 10)
+        XCTAssertEqual(result, .completed, "USB qualification watchdog: \(stage)")
+        guard result == .completed else { throw USBQualificationFailure.watchdog(stage) }
+    }
+
+    private func connectCausally(listener: NWListener) async throws -> CandidateProbe {
+        let acceptHandler = try XCTUnwrap(listener.newConnectionHandler)
+        let listenerReady = expectation(description: "owned listener becomes ready")
+        let listenerStateHandler = listener.stateUpdateHandler
+        manager.networkQueueForTesting.sync {
+            if listener.state == .ready {
+                listenerReady.fulfill()
+            } else {
+                listener.stateUpdateHandler = { state in
+                    listenerStateHandler?(state)
+                    if state == .ready { listenerReady.fulfill() }
+                }
+            }
+        }
+        defer {
+            manager.networkQueueForTesting.async {
+                listener.stateUpdateHandler = listenerStateHandler
+                listener.newConnectionHandler = acceptHandler
+            }
+        }
+        try await waitForUSB([listenerReady], stage: "listener startup")
+        let port = try XCTUnwrap(listener.port)
+        let acceptLoopEntered = expectation(description: "native accept loop delivers candidate")
+        let candidateOwned = expectation(description: "production owns accepted candidate")
+        let candidateReady = expectation(description: "owned candidate reaches native ready")
+        let cancelled = expectation(description: "candidate native cancellation")
+        var probe: CandidateProbe?
+        manager.networkQueueForTesting.sync {
+            listener.newConnectionHandler = { connection in
+                acceptLoopEntered.fulfill()
+                acceptHandler(connection)
+                let snapshot = self.manager.usbSessionSnapshot()
+                XCTAssertTrue(snapshot.listener === listener)
+                XCTAssertTrue(snapshot.listenerIntent)
+                XCTAssertTrue(snapshot.connection === connection)
+                guard let handler = connection.stateUpdateHandler else {
+                    XCTFail("accepted candidate lacks generation-owned state handler")
+                    return
+                }
+                let observation = CandidateProbe(connection: connection, stateHandler: handler, cancelled: cancelled)
+                probe = observation
+                var readyObserved = false
+                connection.stateUpdateHandler = { state in
+                    handler(state)
+                    if state == .ready && !readyObserved {
+                        readyObserved = true
+                        candidateReady.fulfill()
+                    }
+                    if state == .cancelled { observation.recordCancellation() }
+                }
+                candidateOwned.fulfill()
+                if connection.state == .ready {
+                    readyObserved = true
+                    candidateReady.fulfill()
+                }
+            }
+        }
+        let client = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
+        peers.append(client)
+        client.start(queue: manager.networkQueueForTesting)
+        // Wait independently for native delivery, ownership publication, then ready.
+        try await waitForUSB([acceptLoopEntered], stage: "native accept delivery")
+        try await waitForUSB([candidateOwned], stage: "candidate ownership publication")
+        try await waitForUSB([candidateReady], stage: "candidate native ready")
+        return try manager.networkQueueForTesting.sync { try XCTUnwrap(probe) }
     }
 
     private func connect() throws -> NWConnection {
