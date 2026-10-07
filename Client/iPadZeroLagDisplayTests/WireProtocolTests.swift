@@ -5457,6 +5457,7 @@ final class VisualProductionSourceClosureTests: XCTestCase {
         let renderer = try source("Renderer.swift")
         let callback = try XCTUnwrap(renderer.range(of: "commandBuffer.addCompletedHandler"))
         let body = String(renderer[callback.lowerBound...])
+        XCTAssertTrue(body.contains("guard RenderCommandCompletionPolicy.succeeded(completedBuffer.status) else {"))
         let status = try XCTUnwrap(body.range(of: "RenderCommandCompletionPolicy.succeeded"))
         let presented = try XCTUnwrap(body.range(of: "freshness.markPresented"))
         let repeated = try XCTUnwrap(body.range(of: "gameLastPresentedFrame ="))
