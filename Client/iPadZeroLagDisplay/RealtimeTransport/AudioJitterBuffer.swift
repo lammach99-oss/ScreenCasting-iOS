@@ -64,16 +64,13 @@ struct AudioReceiveDiagnostics {
 
     mutating func record(sequence: UInt16, timestamp: UInt32, arrivedAt: TimeInterval) {
         packets += 1
-        if let lastArrival {
-            let elapsedMs = max(0, arrivedAt - lastArrival) * 1000
-            if intervals.count < 256 { intervals.append(elapsedMs) }
-            else { intervals[intervalIndex] = elapsedMs; intervalIndex = (intervalIndex + 1) % 256 }
-            let mediaMs = Double(Int32(bitPattern: timestamp &- lastTimestamp)) / 48
-            jitterMs += (abs(elapsedMs - mediaMs) - jitterMs) / 16
+        guard let highest else {
+            self.highest = sequence
+            history = 1
+            lastArrival = arrivedAt
+            lastTimestamp = timestamp
+            return
         }
-        lastArrival = arrivedAt
-        lastTimestamp = timestamp
-        guard let highest else { self.highest = sequence; history = 1; return }
         let forward = sequence &- highest
         if forward > 0 && forward < 0x8000 {
             if forward > 1 { forwardGaps += 1; missingPacketUnits += Int(forward) - 1 }
@@ -86,7 +83,17 @@ struct AudioReceiveDiagnostics {
                 reorderedPackets += 1
                 repairedPacketUnits += 1
             } else { duplicateOrStalePackets += 1 }
+            return
         }
+        if let lastArrival {
+            let elapsedMs = max(0, arrivedAt - lastArrival) * 1000
+            if intervals.count < 256 { intervals.append(elapsedMs) }
+            else { intervals[intervalIndex] = elapsedMs; intervalIndex = (intervalIndex + 1) % 256 }
+            let mediaMs = Double(Int32(bitPattern: timestamp &- lastTimestamp)) / 48
+            jitterMs += (abs(elapsedMs - mediaMs) - jitterMs) / 16
+        }
+        lastArrival = arrivedAt
+        lastTimestamp = timestamp
     }
 }
 
