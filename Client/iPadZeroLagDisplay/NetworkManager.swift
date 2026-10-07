@@ -3682,6 +3682,21 @@ public class NetworkManager: ObservableObject {
         startTelemetryTimer()
     }
 
+    private func retireUsbAudioLane(_ connection: NWConnection, generation: UInt64, reason: String) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard generation == connectionGeneration,
+              committedTransportGeneration == generation,
+              committedRealtimeMode == RealtimeTransportMode.usbSplitTLS,
+              usbLaneConnections[.audio] === connection else { return }
+        usbLaneConnections.removeValue(forKey: .audio)
+        connection.cancel()
+        committedTransportAudioAvailable = false
+        reconcileRealtimeAudioPlayback(generation: generation,
+            mode: RealtimeTransportMode.usbSplitTLS,
+            audioEnabled: clientSettingsState.effective.audioEnabled)
+        recordDiagnosticLine("[USB_AUDIO_RUNTIME] generation=\(generation) available=0 reason=\(reason)")
+    }
+
     private func startUsbLaneReceiveLoop(
         _ connection: NWConnection,
         lane: UsbLaneKind)
@@ -3700,6 +3715,9 @@ public class NetworkManager: ObservableObject {
                       self.usbLaneConnections[lane] === connection
                 else { return }
                 if let error {
+                    if lane == .audio {
+                        self.retireUsbAudioLane(connection, generation: generation, reason: "receive_error")
+                    }
                     if lane == .video {
                         self.handleStreamError(
                             "USB video lane failed: \(error.localizedDescription)")
@@ -3712,10 +3730,15 @@ public class NetworkManager: ObservableObject {
                         generation: generation,
                         receivedAt: CACurrentMediaTime())
                     { event in
+                        if lane == .audio && self.usbLaneConnections[.audio] !== connection { return }
                         guard case .message(let message) = event else { return }
                         let expected: WireMessageType =
                             lane == .video ? .video : .audio
                         guard message.header.type == expected else {
+                            if lane == .audio {
+                                self.retireUsbAudioLane(connection, generation: generation, reason: "unexpected_type")
+                                return
+                            }
                             connection.cancel()
                             if lane == .video {
                                 self.handleStreamError(
@@ -3729,11 +3752,15 @@ public class NetworkManager: ObservableObject {
                     }
                 }
                 if isComplete {
+                    if lane == .audio {
+                        self.retireUsbAudioLane(connection, generation: generation, reason: "eof")
+                    }
                     if lane == .video {
                         self.handleStreamError("USB video lane closed.")
                     }
                     return
                 }
+                if lane == .audio && self.usbLaneConnections[.audio] !== connection { return }
                 receiveNext()
             }
         }
@@ -5352,6 +5379,19 @@ public class NetworkManager: ObservableObject {
     #if targetEnvironment(simulator)
     var realtimeAudioPlaybackForTesting: ((Bool) -> Void)?
     var controlSendForAudioTesting: ((Data, @escaping (NWError?) -> Void) -> Void)?
+
+    func installUsbAudioLaneForTesting() -> NWConnection {
+        networkQueue.sync {
+            let lane = NWConnection(host: "127.0.0.1", port: 27015, using: .tcp)
+            usbLaneConnections[.audio]?.cancel()
+            usbLaneConnections[.audio] = lane
+            return lane
+        }
+    }
+
+    func failUsbAudioLaneForTesting(_ connection: NWConnection, generation: UInt64, reason: String) {
+        networkQueue.sync { retireUsbAudioLane(connection, generation: generation, reason: reason) }
+    }
 
     func commitAudioTransportForTesting(mode: UInt8, audioAvailable: Bool) {
         networkQueue.sync {
