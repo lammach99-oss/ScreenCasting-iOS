@@ -2110,13 +2110,13 @@ final class USBListenerLifetimeTests: XCTestCase {
                 let observation = CandidateProbe(connection: connection, stateHandler: handler, cancelled: cancelled)
                 probe = observation
                 var readyObserved = false
-                connection.stateUpdateHandler = { state in
+                connection.stateUpdateHandler = { [weak observation] state in
                     handler(state)
                     if state == .ready && !readyObserved {
                         readyObserved = true
                         candidateReady.fulfill()
                     }
-                    if state == .cancelled { observation.recordCancellation() }
+                    if state == .cancelled { observation?.recordCancellation() }
                 }
                 candidateOwned.fulfill()
                 if connection.state == .ready {
