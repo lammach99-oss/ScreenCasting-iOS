@@ -712,13 +712,13 @@ final class AudioInterruptionOwnershipTests: XCTestCase {
         var running = false
         var starts = 0
         var completions: [() -> Void] = []
-        init() {
+        init(profile: RealtimeAudioTransportProfile = .wifi) {
             audio.manualPlayoutForTesting = true
             audio.engineRunningForTesting = { [weak self] in self?.running == true }
             audio.engineStartForTesting = { [weak self] in self?.starts += 1; self?.running = true }
             audio.clockForTesting = { [weak self] in self?.now ?? 0 }
             audio.pcmScheduleForTesting = { [weak self] _, completion in self?.completions.append(completion) }
-            audio.beginRealtimeSession(generation: 40, profile: .wifi)
+            audio.beginRealtimeSession(generation: 40, profile: profile)
             audio.audioQueueForTesting.sync { }
         }
         deinit { audio.reset(); audio.audioQueueForTesting.sync { } }
@@ -733,6 +733,86 @@ final class AudioInterruptionOwnershipTests: XCTestCase {
             audio.audioQueueForTesting.sync { }
         }
         func tick(_ time: TimeInterval) { now = time; audio.playoutTickForTesting() }
+    }
+
+    func testUsbEngineConfigurationChangeFencesOldPlaybackEpoch() {
+        let f = LivenessFixture(profile: .usb); f.fill()
+        let before = f.audio.playbackStateForTesting
+        NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: f.audio.engineForTesting)
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.playbackStateForTesting.epoch, before.epoch + 1)
+        XCTAssertEqual(f.audio.playbackStateForTesting.queued, 0)
+        XCTAssertEqual(f.audio.playbackStateForTesting.generation, 40)
+    }
+
+    func testUsbRouteChangeRecoversCurrentGenerationAndKeepsUsbJitterProfile() {
+        let f = LivenessFixture(profile: .usb)
+        NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil)
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.playbackStateForTesting.recoveries, 1)
+        XCTAssertEqual(f.audio.playbackStateForTesting.generation, 40)
+        var records: [String] = []
+        f.audio.publishDiagnostics(generation: 40, profile: "usb", opus: true, receiveRejects: "", sink: { records.append($0) })
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertTrue(records.first?.contains("target_ms=20") == true)
+    }
+
+    func testUsbStalledQueueTriggersOneRecoveryAndCooldownPreventsLoop() {
+        let f = LivenessFixture(profile: .usb); f.fill()
+        f.tick(10.249)
+        XCTAssertEqual(f.audio.playbackStateForTesting.recoveries, 0)
+        f.tick(10.251)
+        XCTAssertEqual(f.audio.playbackStateForTesting.recoveries, 1)
+        XCTAssertEqual(f.audio.playbackStateForTesting.queued, 0)
+        f.now = 10.3; f.fill()
+        f.tick(10.8)
+        XCTAssertEqual(f.audio.playbackStateForTesting.recoveries, 1)
+        f.tick(11.3)
+        XCTAssertEqual(f.audio.playbackStateForTesting.recoveries, 2)
+    }
+
+    func testUsbOldEpochCompletionCannotMutateNewQueuedFrames() {
+        let f = LivenessFixture(profile: .usb); f.fill()
+        let oldCompletion = f.completions[0]
+        NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: f.audio.engineForTesting)
+        f.audio.audioQueueForTesting.sync { }
+        f.audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 40)
+        f.audio.audioQueueForTesting.sync { }
+        oldCompletion()
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.playbackStateForTesting.queued, 480)
+        XCTAssertEqual(f.audio.playbackStateForTesting.completions, 0)
+    }
+
+    func testRetiredUsbGenerationCannotRecoverFromLateRouteChange() {
+        let f = LivenessFixture(profile: .usb)
+        f.audio.reset(); f.audio.audioQueueForTesting.sync { }
+        let before = f.audio.playbackStateForTesting
+        NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil)
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.playbackStateForTesting.epoch, before.epoch)
+        XCTAssertNil(f.audio.playbackStateForTesting.generation)
+    }
+
+    func testReplacementUsbGenerationDoesNotInheritRecoveryCooldown() {
+        let f = LivenessFixture(profile: .usb)
+        NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil)
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.playbackStateForTesting.recoveries, 1)
+        f.audio.beginRealtimeSession(generation: 41, profile: .usb)
+        f.audio.audioQueueForTesting.sync { }
+        let before = f.audio.playbackStateForTesting
+        NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil)
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.playbackStateForTesting.epoch, before.epoch + 1)
+        XCTAssertEqual(f.audio.playbackStateForTesting.generation, 41)
+    }
+
+    func testUsbPreservedResumeDoesNotEnterWifiOnlyManualRecovery() {
+        let f = LivenessFixture(profile: .usb)
+        f.audio.resumeCurrentRealtimeSession(generation: 40, profile: .usb)
+        f.audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(f.audio.playbackStateForTesting.recoveries, 0)
     }
 
     func testEngineStartUsesActualEngineRunningStateNotOnlyCachedFlag() {
