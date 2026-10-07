@@ -77,7 +77,8 @@ final class TransportTelemetryTests: XCTestCase {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent()
         let source = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/Renderer.swift"), encoding: .utf8)
-        XCTAssertTrue(source.contains("if drawKind != .gameRepeated {\n            onDrawableCommitted?"))
+        XCTAssertTrue(source.replacingOccurrences(of: "\r\n", with: "\n")
+            .contains("if drawKind != .gameRepeated {\n            onDrawableCommitted?"))
     }
 
     func testDeleteStoredLogsRemovesOnlyManagedFiles() throws {
