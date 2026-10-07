@@ -2093,7 +2093,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         let acceptLoopEntered = expectation(description: "native accept loop delivers candidate")
         let candidateOwned = expectation(description: "production owns accepted candidate")
         let candidateReady = expectation(description: "owned candidate reaches native ready")
-        let cancelled = expectation(description: "candidate native cancellation")
+        let cancelled = XCTestExpectation(description: "candidate native cancellation")
         var probe: CandidateProbe?
         manager.networkQueueForTesting.sync {
             listener.newConnectionHandler = { connection in
