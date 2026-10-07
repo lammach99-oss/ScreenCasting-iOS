@@ -754,7 +754,9 @@ final class AudioInterruptionOwnershipTests: XCTestCase {
         var records: [String] = []
         f.audio.publishDiagnostics(generation: 40, profile: "usb", opus: true, receiveRejects: "", sink: { records.append($0) })
         f.audio.audioQueueForTesting.sync { }
-        XCTAssertTrue(records.first?.contains("target_ms=20") == true)
+        let playoutRecord = records.first { $0.hasPrefix("[AUDIO_PLAYOUT] ") }
+        XCTAssertNotNil(playoutRecord)
+        XCTAssertTrue(playoutRecord?.contains("target_ms=20") == true)
     }
 
     func testUsbStalledQueueTriggersOneRecoveryAndCooldownPreventsLoop() {
