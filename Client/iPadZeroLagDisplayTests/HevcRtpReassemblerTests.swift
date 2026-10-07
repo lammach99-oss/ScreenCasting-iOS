@@ -2,6 +2,48 @@ import XCTest
 @testable import iPadCasting
 
 final class HevcRtpReassemblerTests: XCTestCase {
+
+    func testCraNeverResetsLifecycleDependencyAnchorButRetainsRandomAccessDeadline() {
+        for type: UInt8 in [19, 20, 21] {
+            let receiver = HevcRtpReassembler(mtu: 1_200)
+            receiver.prepareForFreshIDRAnchor()
+            let configuration = [nal(type: 32, count: 20, fill: 1),
+                nal(type: 33, count: 20, fill: 2), nal(type: 34, count: 20, fill: 3)]
+            for (index, payload) in configuration.enumerated() {
+                _ = receiver.consume(packet(sequence: UInt16(100 + index), timestamp: 1,
+                    frame: 1, capture: 1, marker: false, payload: payload),
+                    authentication: .authenticated, arrivalTime: 0, rttP95Ms: 0)
+            }
+            let picture = nal(type: type, count: 20, fill: 4)
+            let result = receiver.consume(packet(sequence: 103, timestamp: 1,
+                frame: 1, capture: 1, marker: true, payload: picture),
+                authentication: .authenticated, arrivalTime: 0.001, rttP95Ms: 0)
+            if type == 21 {
+                XCTAssertEqual(result, .accepted)
+                XCTAssertFalse(receiver.expire(at: 0.035).contains(.expired(frameSequence: 1)))
+                XCTAssertTrue(receiver.expire(at: 0.050).contains(.expired(frameSequence: 1)))
+            } else {
+                XCTAssertEqual(result, .completed(accessUnit:
+                    canonical(configuration[0], configuration[1], configuration[2], picture),
+                    frameSequence: 1, captureTime90k: 1))
+            }
+        }
+    }
+
+    func testAuthenticatedMediaClassifiesOnlyNal19And20AsDependencyResetIdr() {
+        for type: UInt8 in [19, 20, 21, 1] {
+            var decoded: [Bool] = []
+            var observed: [Bool] = []
+            let processor = WifiAuthenticatedMediaProcessor(mtu: 1_200, initialSequence: 10,
+                unprotect: { _ in true }, decoder: { _, _, idr, _ in decoded.append(idr) },
+                framePacketObserver: { _, _, idr, _, _ in observed.append(idr) })
+            processor.consume(packet(sequence: 10, timestamp: 1, frame: 1,
+                capture: 1, marker: true, payload: nal(type: type, count: 20, fill: 1)), arrivalTime: 0)
+            XCTAssertEqual(decoded, [type == 19 || type == 20])
+            XCTAssertEqual(observed, [type == 19 || type == 20])
+        }
+    }
+
     func testFixedHeaderAndReorderedFuReassembleCanonicalBytes() {
         let vps = nal(type: 32, count: 20, fill: 0x11)
         let sps = nal(type: 33, count: 20, fill: 0x12)
