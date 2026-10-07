@@ -6,7 +6,6 @@ import UIKit
 enum ClientPreferenceKeys {
     static let showPerformanceHUD = "ScreenCasting.client.showPerformanceHUD"
     static let gameModeEnabled = "ScreenCasting.client.gameModeEnabled.v1"
-    static let touchpadModeEnabled = "ScreenCasting.client.touchpadModeEnabled.v1"
     static let clientDebugLoggingEnabled =
         "ScreenCasting.client.debugLoggingEnabled.v1"
 }
@@ -284,8 +283,6 @@ public struct ContentView: View {
     private var isHudVisible: Bool = true
     @AppStorage(ClientPreferenceKeys.gameModeEnabled)
     private var gameModeEnabled: Bool = false
-    @AppStorage(ClientPreferenceKeys.touchpadModeEnabled)
-    private var touchpadModeEnabled = false
     @State private var renderedContentViewport: VideoContentViewport?
     @State private var rendererGeometrySnapshot: RendererGeometrySnapshot?
     @State private var presentationGeometry: PresentationSurfaceGeometry?
@@ -480,7 +477,6 @@ public struct ContentView: View {
             ConnectedPresentationSurface(
                 networkManager: networkManager,
                 gameModeEnabled: gameModeEnabled,
-                touchpadModeEnabled: touchpadModeEnabled,
                 remoteKeyboardActive: streamManager.isConnected && scenePhase == .active && !isSettingsPresented,
                 onKeyboardInput: { command in
                     networkManager.sendKeyboardInput(command)
@@ -520,9 +516,6 @@ public struct ContentView: View {
                 },
                 onPointerInput: { command in
                     networkManager.sendPointerInput(command)
-                },
-                onTouchpadInput: { command in
-                    networkManager.sendTouchpadInput(command)
                 },
                 onOpenSettings: {
                     isSettingsPresented = true

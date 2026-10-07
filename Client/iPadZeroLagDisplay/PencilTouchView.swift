@@ -117,193 +117,6 @@ private func touchEventType(for flags: UInt8) -> TouchEventType {
 private let kTouchMagic: UInt16 = 0x5449
 private let kTouchPacketSize    = 8
 
-enum TouchpadGestureOutput: Equatable {
-    case motionBegin, motionUpdate(CGPoint), motionEnd
-    case leftClick, leftDown, leftUp, rightClick
-    case verticalWheel(Int16), horizontalWheel(Int16), zoomWheel(Int16), openSettings
-}
-
-struct TouchpadGestureStateMachine {
-    private struct Contact {
-        let start: CGPoint
-        var point: CGPoint
-        let beganAt: TimeInterval
-        var excursion: CGFloat = 0
-        var ended = false
-        var duration: TimeInterval = 0
-    }
-    private enum Mode { case idle, one, two, three, suppressed }
-    private var contacts: [UInt64: Contact] = [:]
-    private var mode: Mode = .idle
-    private var motionActive = false
-    private var dragging = false
-    private var movedBeforeHold = false
-    private var holdPoint: CGPoint?
-    private var centroid: CGPoint = .zero
-    private var initialSpan: CGFloat = 0
-    private var remainder: CGPoint = .zero
-    private var scrolled = false
-    private var pinched = false
-    private var pencilExclusive = false
-    private var palmGuardUntil: TimeInterval = 0
-
-    mutating func begin(id: UInt64, point: CGPoint, timestamp: TimeInterval) -> [TouchpadGestureOutput] {
-        guard contacts[id] == nil else { return [] }
-        contacts[id] = Contact(start: point, point: point, beganAt: timestamp)
-        if pencilExclusive || timestamp < palmGuardUntil || mode == .suppressed {
-            mode = .suppressed
-            return []
-        }
-        switch contacts.count {
-        case 1:
-            mode = .one; motionActive = true; movedBeforeHold = false; holdPoint = nil
-            return [.motionBegin]
-        case 2:
-            let terminal = releaseMotion()
-            if terminal.contains(.leftUp) { mode = .suppressed; return terminal }
-            mode = .two; remainder = .zero; scrolled = false; pinched = false
-            let pair = orderedContacts
-            centroid = midpoint(pair[0].point, pair[1].point)
-            initialSpan = distance(pair[0].point, pair[1].point)
-            return terminal
-        case 3:
-            guard !scrolled, !pinched,
-                  let first = contacts.values.map(\.beganAt).min(), timestamp - first <= 0.15,
-                  contacts.values.allSatisfy({ !$0.ended && $0.excursion <= 15 }) else {
-                mode = .suppressed; return []
-            }
-            mode = .three
-            return []
-        default:
-            mode = .suppressed
-            return releaseMotion()
-        }
-    }
-
-    mutating func move(id: UInt64, point: CGPoint, timestamp: TimeInterval) -> [TouchpadGestureOutput] {
-        moveBatch([(id, point, timestamp)])
-    }
-
-    mutating func moveBatch(_ updates: [(UInt64, CGPoint, TimeInterval)]) -> [TouchpadGestureOutput] {
-        var now: TimeInterval = 0
-        var changed = false
-        for (id, point, timestamp) in updates {
-            guard var contact = contacts[id], !contact.ended else { continue }
-            contact.point = point
-            contact.excursion = max(contact.excursion, distance(point, contact.start))
-            contacts[id] = contact
-            now = max(now, timestamp)
-            changed = true
-        }
-        guard changed, !pencilExclusive else { return [] }
-        switch mode {
-        case .one:
-            guard let c = contacts.values.first, !c.ended else { return [] }
-            var output: [TouchpadGestureOutput] = []
-            if now - c.beganAt < 0.5 {
-                if c.excursion > 8 { movedBeforeHold = true }
-                holdPoint = c.point
-            } else if !movedBeforeHold, !dragging,
-                      distance(c.point, holdPoint ?? c.start) >= 6 {
-                dragging = true; output.append(.leftDown)
-            }
-            output.append(.motionUpdate(CGPoint(x: c.point.x - c.start.x, y: c.point.y - c.start.y)))
-            return output
-        case .two:
-            let pair = orderedContacts
-            guard pair.count == 2, pair.allSatisfy({ !$0.ended }), !pinched else { return [] }
-            let span = distance(pair[0].point, pair[1].point)
-            if !scrolled, initialSpan > 0, span > 0,
-               abs(span - initialSpan) >= 11, abs(log(span / initialSpan)) >= 0.05 {
-                pinched = true
-                return [.zoomWheel(span > initialSpan ? 120 : -120)]
-            }
-            let next = midpoint(pair[0].point, pair[1].point)
-            remainder.x += next.x - centroid.x
-            remainder.y += next.y - centroid.y
-            centroid = next
-            var output: [TouchpadGestureOutput] = []
-            while abs(remainder.y) >= 24 {
-                let sign: CGFloat = remainder.y > 0 ? 1 : -1
-                output.append(.verticalWheel(sign > 0 ? 120 : -120)); remainder.y -= sign * 24
-            }
-            while abs(remainder.x) >= 24 {
-                let sign: CGFloat = remainder.x > 0 ? 1 : -1
-                output.append(.horizontalWheel(sign > 0 ? 120 : -120)); remainder.x -= sign * 24
-            }
-            if !output.isEmpty { scrolled = true }
-            return output
-        default: return []
-        }
-    }
-
-    mutating func end(id: UInt64, point: CGPoint, timestamp: TimeInterval,
-                      cancelled: Bool = false) -> [TouchpadGestureOutput] {
-        guard var c = contacts[id], !c.ended else { return [] }
-        c.point = point; c.excursion = max(c.excursion, distance(c.start, point))
-        c.ended = true; c.duration = timestamp - c.beganAt
-        contacts[id] = c
-        if cancelled { mode = .suppressed }
-        if mode == .one {
-            let wasDragging = dragging
-            var output = releaseMotion()
-            if !wasDragging, !cancelled, c.duration <= 0.25, c.excursion <= 12 { output.append(.leftClick) }
-            clearContacts()
-            return output
-        }
-        // Completed contacts remain until all lift, preserving excursion and tap ownership.
-        guard contacts.values.allSatisfy(\.ended) else { return [] }
-        var output: [TouchpadGestureOutput] = []
-        if mode == .two, !scrolled, !pinched,
-           contacts.values.allSatisfy({ $0.duration <= 0.25 && $0.excursion <= 12 }) {
-            output = [.rightClick]
-        } else if mode == .three,
-                  let first = contacts.values.map(\.beganAt).min(), timestamp - first <= 0.3,
-                  contacts.values.allSatisfy({ $0.excursion <= 15 }) { output = [.openSettings] }
-        output += releaseMotion()
-        clearContacts()
-        return output
-    }
-
-    mutating func pencilBegan(timestamp: TimeInterval) -> [TouchpadGestureOutput] {
-        let output = retire()
-        pencilExclusive = true
-        return output
-    }
-    mutating func pencilEnded(timestamp: TimeInterval) {
-        pencilExclusive = false; palmGuardUntil = timestamp + 0.15
-    }
-    mutating func retire() -> [TouchpadGestureOutput] {
-        let output = releaseMotion()
-        clearContacts()
-        return output
-    }
-    private mutating func releaseMotion() -> [TouchpadGestureOutput] {
-        var output: [TouchpadGestureOutput] = []
-        if dragging { output.append(.leftUp); dragging = false }
-        if motionActive { output.append(.motionEnd); motionActive = false }
-        return output
-    }
-    private mutating func clearContacts() {
-        contacts.removeAll(); mode = .idle; remainder = .zero
-        scrolled = false; pinched = false; holdPoint = nil; movedBeforeHold = false
-    }
-    private var orderedContacts: [Contact] { contacts.keys.sorted().compactMap { contacts[$0] } }
-    private func distance(_ a: CGPoint, _ b: CGPoint) -> CGFloat { hypot(a.x - b.x, a.y - b.y) }
-    private func midpoint(_ a: CGPoint, _ b: CGPoint) -> CGPoint { CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2) }
-}
-
-enum TouchpadMotionEncoder {
-    static func command(delta: CGPoint, bounds: CGSize) -> TouchpadInputCommand {
-        func q15(_ displacement: CGFloat, _ extent: CGFloat) -> Int16 {
-            guard displacement.isFinite, extent.isFinite else { return 0 }
-            return Int16((min(1, max(-1, displacement / max(extent, 1))) * 32767).rounded())
-        }
-        return TouchpadInputCommand(action: .motionUpdate,
-            cumulativeXQ15: q15(delta.x, bounds.width), cumulativeYQ15: q15(delta.y, bounds.height))
-    }
-}
-
 enum DirectTouchGestureOutput: Equatable {
     case directTouch(DirectTouchPhase, UInt64, CGPoint, UInt8)
     case pointer(PointerInputAction, CGPoint, Int16)
@@ -815,7 +628,7 @@ public class PencilUIKitView: UIView {
     override public func didMoveToWindow() {
         super.didMoveToWindow()
         updateKeyboardCapture()
-        if window == nil { retireDirectTouch(); directTouchEnabled = false; configureTouchpad(active: false, generation: touchpadGeneration ?? 0) }
+        if window == nil { retireDirectTouch(); directTouchEnabled = false }
     }
 
     // Kept separate from UIPress construction so key lifetime can be tested
@@ -884,17 +697,11 @@ public class PencilUIKitView: UIView {
     public var onNetworkSend:    ((Data) -> Void)?
     public var onDirectTouchContact: ((DirectTouchContactCommand) -> Void)?
     public var onPointerInput: ((PointerInputCommand) -> Void)?
-    var onTouchpadInput: ((TouchpadInputCommand) -> Void)?
     public var onOpenSettings: (() -> Void)?
     public var contentViewport: VideoContentViewport? {
-        willSet { if newValue != contentViewport { retireDirectTouch(); retireTouchpad() } }
+        willSet { if newValue != contentViewport { retireDirectTouch() } }
     }
     private var directTouchEnabled = false
-    private(set) var touchpadEnabled = false
-    private var touchpadGeneration: UInt64?
-    private var touchpadGesture = TouchpadGestureStateMachine()
-    private var touchpadIDs = LifetimeIdentityMap<ObjectIdentifier>()
-    private var lastTouchpadMotionDiagnosticAt: TimeInterval = -.infinity
     private var directTouchGeneration: UInt64?
     var inputGeometryContext: InputGeometryDiagnosticContext?
     var diagnosticSink: ((String) -> Void)?
@@ -922,7 +729,7 @@ public class PencilUIKitView: UIView {
     override public func layoutSubviews() {
         super.layoutSubviews()
         guard bounds != lastReportedBounds else { return }
-        if lastReportedBounds != nil { retireDirectTouch(); retireTouchpad() }
+        if lastReportedBounds != nil { retireDirectTouch() }
         lastReportedBounds = bounds
         onBoundsChanged?(bounds)
     }
@@ -961,38 +768,14 @@ public class PencilUIKitView: UIView {
 
         if let pencil = pencilTouches.first, flags == 1 {
             emit(directGesture.pencilBegan(timestamp: pencil.timestamp))
-            emitTouchpadOutputs(touchpadGesture.pencilBegan(timestamp: pencil.timestamp))
         }
         if !pencilTouches.isEmpty {
             handlePencilTouches(pencilTouches, flags: flags, event: event)
             if flags == 4, let pencil = pencilTouches.first {
                 directGesture.pencilEnded(timestamp: pencil.timestamp)
-                touchpadGesture.pencilEnded(timestamp: pencil.timestamp)
             }
         }
 
-        if touchpadEnabled {
-            if flags == 2 {
-                let movements = directTouches.compactMap { touch -> (UInt64, CGPoint, TimeInterval)? in
-                    guard let id = touchpadIDs.existing(ObjectIdentifier(touch)) else { return nil }
-                    return (id, touch.location(in: self), touch.timestamp)
-                }
-                moveTouchpadContacts(movements)
-            } else {
-                for touch in directTouches {
-                    let key = ObjectIdentifier(touch)
-                    if flags == 1 {
-                        beginTouchpadContact(id: touchpadIDs.begin(key),
-                            point: touch.location(in: self), timestamp: touch.timestamp)
-                    } else if let id = touchpadIDs.existing(key) {
-                        endTouchpadContact(id: id, point: touch.location(in: self),
-                            timestamp: touch.timestamp, cancelled: cancelled)
-                        touchpadIDs.end(key)
-                    }
-                }
-            }
-            return
-        }
         guard directTouchEnabled else { return }
         if flags == 2 {
             let movements = directTouches.compactMap { touch -> (id: UInt64, point: CGPoint, timestamp: TimeInterval)? in
@@ -1030,61 +813,9 @@ public class PencilUIKitView: UIView {
     }
 
     func configureDirectTouch(active: Bool, generation: UInt64) {
-        if active { configureTouchpad(active: false, generation: generation) }
         if directTouchGeneration != generation || !active { retireDirectTouch() }
         directTouchGeneration = generation
         directTouchEnabled = active
-    }
-
-    func configureTouchpad(active: Bool, generation: UInt64) {
-        if touchpadGeneration != generation || !active { retireTouchpad() }
-        if active { retireDirectTouch(); directTouchEnabled = false }
-        touchpadGeneration = generation
-        touchpadEnabled = active
-    }
-
-    func retireTouchpad() {
-        emitTouchpadOutputs(touchpadGesture.retire())
-        touchpadIDs.removeAll()
-        if touchpadEnabled { diagnosticSink?("[TOUCHPAD_GESTURE] action=retire generation=\(touchpadGeneration ?? 0) mode=touchpad") }
-    }
-
-    func beginTouchpadContact(id: UInt64, point: CGPoint, timestamp: TimeInterval) {
-        guard touchpadEnabled else { return }
-        emitTouchpadOutputs(touchpadGesture.begin(id: id, point: point, timestamp: timestamp))
-    }
-    func moveTouchpadContacts(_ updates: [(UInt64, CGPoint, TimeInterval)]) {
-        guard touchpadEnabled else { return }
-        emitTouchpadOutputs(touchpadGesture.moveBatch(updates))
-    }
-    func endTouchpadContact(id: UInt64, point: CGPoint, timestamp: TimeInterval, cancelled: Bool = false) {
-        guard touchpadEnabled else { return }
-        emitTouchpadOutputs(touchpadGesture.end(id: id, point: point, timestamp: timestamp, cancelled: cancelled))
-    }
-
-    func emitTouchpadOutputs(_ outputs: [TouchpadGestureOutput]) {
-        for output in outputs {
-            let command: TouchpadInputCommand
-            switch output {
-            case .motionBegin: command = TouchpadInputCommand(action: .motionBegin)
-            case .motionUpdate(let delta): command = TouchpadMotionEncoder.command(delta: delta, bounds: bounds.size)
-            case .motionEnd: command = TouchpadInputCommand(action: .motionEnd)
-            case .leftClick: command = TouchpadInputCommand(action: .leftClick)
-            case .leftDown: command = TouchpadInputCommand(action: .leftDown)
-            case .leftUp: command = TouchpadInputCommand(action: .leftUp)
-            case .rightClick: command = TouchpadInputCommand(action: .rightClick)
-            case .verticalWheel(let value): command = TouchpadInputCommand(action: .verticalWheel, value: value)
-            case .horizontalWheel(let value): command = TouchpadInputCommand(action: .horizontalWheel, value: value)
-            case .zoomWheel(let value): command = TouchpadInputCommand(action: .zoomWheel, value: value)
-            case .openSettings: onOpenSettings?(); continue
-            }
-            onTouchpadInput?(command)
-            let now = CACurrentMediaTime()
-            if command.action != .motionUpdate || now - lastTouchpadMotionDiagnosticAt >= 0.25 {
-                if command.action == .motionUpdate { lastTouchpadMotionDiagnosticAt = now }
-                diagnosticSink?("[TOUCHPAD_GESTURE] action=\(command.action.diagnosticName) generation=\(touchpadGeneration ?? 0) cumulative_q15=(\(command.cumulativeXQ15),\(command.cumulativeYQ15)) mode=touchpad")
-            }
-        }
     }
 
     func retireDirectTouch() {

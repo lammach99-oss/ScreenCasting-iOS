@@ -4,6 +4,82 @@ import UIKit
 import AVFoundation
 @testable import iPadCasting
 
+final class ExternalPointerInputTests: XCTestCase {
+    private let point = CGPoint(x: 0.25, y: 0.75)
+
+    func testAbsoluteHoverAndLetterboxRejection() {
+        var state = ExternalPointerInputState()
+        XCTAssertTrue(state.configure(active: true, generation: 7).isEmpty)
+        let move = state.hover(point: point, generation: 7)
+        XCTAssertEqual(move?.action, .move)
+        XCTAssertEqual(move?.x, 16_384)
+        XCTAssertEqual(move?.y, 49_151)
+        XCTAssertNil(state.hover(point: nil, generation: 7))
+        XCTAssertNil(state.hover(point: point, generation: 6))
+    }
+
+    func testPrimaryOwnershipDuplicateAndOutsideTerminalRelease() {
+        var state = ExternalPointerInputState()
+        _ = state.configure(active: true, generation: 7)
+        XCTAssertEqual(state.begin(id: 1, point: point, primary: true, secondary: false, generation: 7)?.action, .leftDown)
+        XCTAssertNil(state.begin(id: 1, point: point, primary: true, secondary: false, generation: 7))
+        XCTAssertNil(state.end(id: 2, point: nil, generation: 7))
+        XCTAssertEqual(state.end(id: 1, point: nil, generation: 7)?.action, .leftUp)
+        XCTAssertNil(state.end(id: 1, point: nil, generation: 7))
+    }
+
+    func testSecondaryClickNeverOwnsPrimaryButton() {
+        var state = ExternalPointerInputState()
+        _ = state.configure(active: true, generation: 7)
+        XCTAssertEqual(state.begin(id: 2, point: point, primary: false, secondary: true, generation: 7)?.action, .rightClick)
+        XCTAssertNil(state.end(id: 2, point: point, generation: 7))
+        XCTAssertTrue(state.retire().isEmpty)
+    }
+
+    func testGenerationReplacementReleasesOnceAndFencesOldOwner() {
+        var state = ExternalPointerInputState()
+        _ = state.configure(active: true, generation: 7)
+        _ = state.begin(id: 1, point: point, primary: true, secondary: false, generation: 7)
+        XCTAssertEqual(state.configure(active: true, generation: 8).map(\.action), [.leftUp])
+        XCTAssertNil(state.end(id: 1, point: point, generation: 7))
+        XCTAssertTrue(state.retire().isEmpty)
+    }
+
+    func testIndependentScrollRemaindersAndNoSyntheticCenter() {
+        var state = ExternalPointerInputState()
+        _ = state.configure(active: true, generation: 7)
+        XCTAssertTrue(state.scroll(delta: CGPoint(x: 24, y: 24), generation: 7).isEmpty)
+        _ = state.hover(point: point, generation: 7)
+        XCTAssertTrue(state.scroll(delta: CGPoint(x: 12, y: 12), generation: 7).isEmpty)
+        let wheels = state.scroll(delta: CGPoint(x: 12, y: 12), generation: 7)
+        XCTAssertEqual(Set(wheels.map { $0.action.rawValue }), Set([PointerInputAction.verticalWheel.rawValue, PointerInputAction.horizontalWheel.rawValue]))
+        XCTAssertTrue(wheels.allSatisfy { abs(Int($0.value)) == 120 && $0.x == 16_384 && $0.y == 49_151 })
+        XCTAssertTrue(state.scroll(delta: CGPoint(x: 24, y: 24), generation: 6).isEmpty)
+    }
+
+    @MainActor func testRecognizersCannotConsumeDirectFingerInput() {
+        let view = PencilUIKitView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        let hover = (view.gestureRecognizers ?? []).compactMap { $0 as? UIHoverGestureRecognizer }
+        let scroll = (view.gestureRecognizers ?? []).compactMap { $0 as? UIPanGestureRecognizer }.filter { $0.allowedScrollTypesMask == .continuous }
+        XCTAssertEqual(hover.count, 1)
+        XCTAssertEqual(scroll.count, 1)
+        XCTAssertFalse(hover.first?.cancelsTouchesInView ?? true)
+        XCTAssertFalse(scroll.first?.cancelsTouchesInView ?? true)
+        XCTAssertEqual(scroll.first?.allowedTouchTypes, [])
+        view.configureDirectTouch(active: true, generation: 7)
+        view.configureExternalPointer(active: true, generation: 7)
+        var contacts: [DirectTouchContactCommand] = []
+        view.onDirectTouchContact = { contacts.append($0) }
+        view.contentViewport = VideoContentViewport(rect: CGRect(x: 0, y: 0, width: 1, height: 1))
+        view.emitDirectOutputs([.directTouch(.down, 1, CGPoint(x: 200, y: 150), 255), .directTouch(.up, 1, CGPoint(x: 200, y: 150), 255)])
+        XCTAssertEqual(contacts.map(\.phase), [.down, .up])
+    }
+
+    func testAppExplicitlySupportsIndirectInputEvents() {
+        XCTAssertEqual(Bundle(for: PencilUIKitView.self).object(forInfoDictionaryKey: "UIApplicationSupportsIndirectInputEvents") as? Bool, true)
+    }
+}
+
 final class UsbSplitCommitGateTests: XCTestCase {
     func testFeedbackWindowUnknownHistoryIsNotLoss() {
         var window = WifiFeedbackWindow()
@@ -2558,27 +2634,6 @@ final class WifiShortBackgroundSameSessionTests: XCTestCase {
 }
 
 final class ControlChannelWriterTests: XCTestCase {
-    func testTouchpadCumulativeMovementSurvivesLatestWinsBeforeEnd() {
-        let queue = DispatchQueue(label: "control.writer.touchpad")
-        let sender = ManualSender()
-        let writer = ControlChannelWriter(queue: queue, sender: sender.send)
-        let begin = TouchpadInputCommand(action: .motionBegin).encode()
-        let end = TouchpadInputCommand(action: .motionEnd).encode()
-        queue.sync {
-            writer.begin(generation: 1)
-            XCTAssertTrue(writer.enqueue(begin))
-            for x: Int16 in [3277, 6553, 9830] {
-                writer.enqueueMovement(TouchpadInputCommand(action: .motionUpdate, cumulativeXQ15: x).encode())
-            }
-            XCTAssertTrue(writer.enqueue(end))
-        }
-        for _ in 0..<3 { sender.completeNext(); queue.sync {} }
-        XCTAssertEqual(sender.sent.count, 3)
-        XCTAssertEqual(sender.sent.first, begin)
-        XCTAssertEqual(TouchpadInputCommand.decode(sender.sent[1])?.cumulativeXQ15, 9830)
-        XCTAssertEqual(sender.sent.last, end)
-    }
-
     func testNetworkManagerReportsMissingControlConnectionAsNotConnected() {
         let manager = NetworkManager()
         let completed = expectation(description: "control completion")
@@ -3850,52 +3905,6 @@ final class PostKeyboardV2CorrectiveTests: XCTestCase {
 }
 
 final class PointerV2WireRegistrationTests: XCTestCase {
-    func testTouchpadStrictEightByteCodecAndDelivery() {
-        let motion = TouchpadInputCommand(action: .motionUpdate, cumulativeXQ15: 0x1234, cumulativeYQ15: -1234)
-        XCTAssertEqual(Array(motion.encode()), [1, 1, 0x34, 0x12, 0x2e, 0xfb, 0, 0])
-        for action in TouchpadInputAction.allCases {
-            let command = TouchpadInputCommand(action: action,
-                value: action.rawValue >= 7 ? -120 : 0)
-            XCTAssertEqual(TouchpadInputCommand.decode(command.encode()), command)
-            XCTAssertEqual(TouchpadInputDeliveryPolicy.isMovement(action), action == .motionUpdate)
-            XCTAssertEqual(TouchpadInputDeliveryPolicy.allows(action, inputSuppressed: true),
-                action == .leftUp || action == .motionEnd)
-        }
-        for bytes: [UInt8] in [
-            [2, 0, 0, 0, 0, 0, 0, 0], [1, 10, 0, 0, 0, 0, 0, 0],
-            [1, 1, 0, 128, 0, 0, 0, 0], [1, 1, 0, 0, 0, 128, 0, 0], [1, 1, 0, 0, 0, 0, 1, 0],
-            [1, 0, 1, 0, 0, 0, 0, 0], [1, 3, 0, 0, 0, 0, 1, 0],
-            [1, 7, 1, 0, 0, 0, 120, 0], [1, 8, 0, 0, 0, 0, 60, 0], [1, 9, 0, 0, 0, 0, 0, 0]
-        ] { XCTAssertNil(TouchpadInputCommand.decode(Data(bytes))) }
-        XCTAssertNil(TouchpadInputCommand.decode(Data(repeating: 0, count: 7)))
-        XCTAssertNil(TouchpadInputCommand.decode(Data(repeating: 0, count: 9)))
-    }
-
-    func testTouchpadAdditiveRegistrationAndMalformedDrain() {
-        XCTAssertNotNil(WireMessageType(rawValue: 43))
-        for size in [0, 7, 9] {
-            let parser = WireStreamParser(generation: 4)
-            var discarded = 0
-            var pings = 0
-            var failures = 0
-            var input = packet(raw: 43, payload: Data(repeating: 0, count: size))
-            input.append(packet(raw: WireMessageType.ping.rawValue, payload: Data(repeating: 0, count: 16)))
-            parser.consume(input, generation: 4) { event in
-                switch event {
-                case .discardedFixedControl(let header):
-                    if header.type.rawValue == 43 { discarded += 1 }
-                case .message(let message):
-                    if message.header.type == .ping { pings += 1 }
-                case .failure: failures += 1
-                default: break
-                }
-            }
-            XCTAssertEqual(discarded, 1)
-            XCTAssertEqual(pings, 1)
-            XCTAssertEqual(failures, 0)
-        }
-    }
-
     func testDirectTouchExactLittleEndianAndMalformedPayloads() {
         for phase: DirectTouchPhase in [.down, .update, .up, .cancel] {
             let command = DirectTouchContactCommand(phase: phase, pressure: 255,
@@ -3974,198 +3983,6 @@ final class PointerV2WireRegistrationTests: XCTestCase {
         }
         data.append(payload)
         return data
-    }
-}
-
-@MainActor
-final class TouchpadModeTests: XCTestCase {
-    func testDirectContactIsCancelledBeforeTouchpadActivation() {
-        let view = PencilUIKitView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
-        view.contentViewport = VideoContentViewport(rect: CGRect(x: 0, y: 0, width: 1, height: 1))
-        view.configureDirectTouch(active: true, generation: 1)
-        var phases: [DirectTouchPhase] = []
-        view.onDirectTouchContact = { phases.append($0.phase) }
-        view.emitDirectOutputs([.directTouch(.down, 1, CGPoint(x: 100, y: 100), 255)])
-        view.configureTouchpad(active: true, generation: 1)
-        view.emitDirectOutputs([.directTouch(.down, 2, CGPoint(x: 100, y: 100), 255)])
-        XCTAssertEqual(phases, [.down, .cancel])
-    }
-    func testModeSwitchReleasesDragAndFencesOldMoves() {
-        let view = PencilUIKitView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
-        var actions: [TouchpadInputAction] = []
-        view.onTouchpadInput = { actions.append($0.action) }
-        view.configureTouchpad(active: true, generation: 1)
-        view.beginTouchpadContact(id: 1, point: .zero, timestamp: 0)
-        view.moveTouchpadContacts([(1, CGPoint(x: 7, y: 0), 0.6)])
-        view.configureDirectTouch(active: true, generation: 1)
-        view.moveTouchpadContacts([(1, CGPoint(x: 20, y: 0), 0.7)])
-        XCTAssertEqual(actions, [.motionBegin, .leftDown, .motionUpdate, .leftUp, .motionEnd])
-    }
-    func testGenerationChangeAndGeometryReplacementReleaseOnce() {
-        let view = PencilUIKitView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
-        var actions: [TouchpadInputAction] = []
-        view.onTouchpadInput = { actions.append($0.action) }
-        view.configureTouchpad(active: true, generation: 1)
-        view.beginTouchpadContact(id: 1, point: .zero, timestamp: 0)
-        view.moveTouchpadContacts([(1, CGPoint(x: 7, y: 0), 0.6)])
-        view.configureTouchpad(active: true, generation: 2)
-        view.moveTouchpadContacts([(1, CGPoint(x: 20, y: 0), 0.7)])
-        XCTAssertEqual(actions.suffix(2), [.leftUp, .motionEnd])
-        view.beginTouchpadContact(id: 2, point: .zero, timestamp: 1)
-        view.moveTouchpadContacts([(2, CGPoint(x: 7, y: 0), 1.6)])
-        view.contentViewport = VideoContentViewport(rect: CGRect(x: 0.25, y: 0, width: 0.5, height: 1))
-        view.moveTouchpadContacts([(2, CGPoint(x: 20, y: 0), 1.7)])
-        XCTAssertEqual(actions.filter { $0 == .leftUp }.count, 2)
-    }
-    func testModeSwitchIsMutuallyExclusiveAndDefaultOff() {
-        let view = PencilUIKitView()
-        XCTAssertFalse(view.touchpadEnabled)
-        view.configureDirectTouch(active: true, generation: 1)
-        XCTAssertFalse(view.touchpadEnabled)
-        view.configureTouchpad(active: true, generation: 1)
-        XCTAssertTrue(view.touchpadEnabled)
-        view.configureDirectTouch(active: true, generation: 1)
-        XCTAssertFalse(view.touchpadEnabled)
-        view.configureTouchpad(active: true, generation: 2)
-        view.configureTouchpad(active: false, generation: 2)
-        XCTAssertFalse(view.touchpadEnabled)
-    }
-    func testSurfaceRetirementDisablesTouchpad() {
-        let surface = ConnectedPresentationContainer(frame: .zero)
-        surface.touchView.configureTouchpad(active: true, generation: 5)
-        surface.retireRemotePointerInputs()
-        XCTAssertFalse(surface.touchView.touchpadEnabled)
-    }
-}
-
-final class TouchpadGestureTests: XCTestCase {
-    func testCancelledDragReleasesBeforeEndOnce() {
-        var g = TouchpadGestureStateMachine()
-        _ = g.begin(id: 1, point: .zero, timestamp: 0)
-        _ = g.move(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.6)
-        XCTAssertEqual(g.end(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.7, cancelled: true), [.leftUp, .motionEnd])
-        XCTAssertTrue(g.retire().isEmpty)
-    }
-    func testLateUnknownContactCannotMoveLiveGesture() {
-        var g = TouchpadGestureStateMachine()
-        _ = g.begin(id: 1, point: .zero, timestamp: 1)
-        XCTAssertTrue(g.move(id: 99, point: CGPoint(x: 100, y: 0), timestamp: 2).isEmpty)
-        XCTAssertTrue(g.end(id: 99, point: .zero, timestamp: 2).isEmpty)
-    }
-    func testLateThirdFingerCannotOpenSettings() {
-        var g = TouchpadGestureStateMachine()
-        _ = g.begin(id: 1, point: .zero, timestamp: 0)
-        _ = g.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01)
-        _ = g.begin(id: 3, point: CGPoint(x: 200, y: 0), timestamp: 0.16)
-        for id in 1...3 { XCTAssertTrue(g.end(id: UInt64(id), point: CGPoint(x: (id - 1) * 100, y: 0), timestamp: 0.2).isEmpty) }
-    }
-    func testScrollCommitPreventsPinchAndThirdFingerSettings() {
-        var g = TouchpadGestureStateMachine()
-        _ = g.begin(id: 1, point: .zero, timestamp: 0)
-        _ = g.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01)
-        XCTAssertEqual(g.moveBatch([(1, CGPoint(x: 0, y: 24), 0.05), (2, CGPoint(x: 100, y: 24), 0.05)]), [.verticalWheel(120)])
-        XCTAssertFalse(g.moveBatch([(1, CGPoint(x: -10, y: 24), 0.07), (2, CGPoint(x: 110, y: 24), 0.07)]).contains(.zoomWheel(120)))
-        XCTAssertTrue(g.begin(id: 3, point: CGPoint(x: 200, y: 24), timestamp: 0.08).isEmpty)
-        for id in 1...3 { XCTAssertTrue(g.end(id: UInt64(id), point: CGPoint(x: (id - 1) * 100, y: 24), timestamp: 0.1).isEmpty) }
-    }
-    func testHoldDragDownIsNotRepeated() {
-        var g = TouchpadGestureStateMachine()
-        _ = g.begin(id: 1, point: .zero, timestamp: 0)
-        _ = g.move(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.6)
-        XCTAssertEqual(g.move(id: 1, point: CGPoint(x: 10, y: 0), timestamp: 0.7), [.motionUpdate(CGPoint(x: 10, y: 0))])
-    }
-    func testQ15WholeSurfaceAndSymmetricClamp() {
-        for (delta, expected): (CGPoint, (Int16, Int16)) in [
-            (CGPoint(x: 100, y: 200), (32767, 32767)),
-            (CGPoint(x: -100, y: -200), (-32767, -32767)),
-            (CGPoint(x: 1000, y: -2000), (32767, -32767)),
-            (.zero, (0, 0))
-        ] {
-            let command = TouchpadMotionEncoder.command(delta: delta, bounds: CGSize(width: 100, height: 200))
-            XCTAssertEqual(command.cumulativeXQ15, expected.0)
-            XCTAssertEqual(command.cumulativeYQ15, expected.1)
-        }
-    }
-
-    func testCumulativeMotionAndTap() {
-        var g = TouchpadGestureStateMachine()
-        XCTAssertEqual(g.begin(id: 1, point: .zero, timestamp: 0), [.motionBegin])
-        XCTAssertEqual(g.move(id: 1, point: CGPoint(x: 10, y: 4), timestamp: 0.1), [.motionUpdate(CGPoint(x: 10, y: 4))])
-        XCTAssertEqual(g.move(id: 1, point: CGPoint(x: 20, y: 9), timestamp: 0.2), [.motionUpdate(CGPoint(x: 20, y: 9))])
-        XCTAssertEqual(g.end(id: 1, point: CGPoint(x: 20, y: 9), timestamp: 0.22), [.motionEnd])
-        XCTAssertEqual(g.begin(id: 2, point: .zero, timestamp: 1), [.motionBegin])
-        XCTAssertEqual(g.end(id: 2, point: .zero, timestamp: 1.1), [.motionEnd, .leftClick])
-    }
-    func testHoldDragAndEarlyMovementExclusion() {
-        var g = TouchpadGestureStateMachine()
-        _ = g.begin(id: 1, point: .zero, timestamp: 0)
-        XCTAssertEqual(g.move(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.51), [.leftDown, .motionUpdate(CGPoint(x: 7, y: 0))])
-        XCTAssertEqual(g.end(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.6), [.leftUp, .motionEnd])
-        _ = g.begin(id: 2, point: .zero, timestamp: 1)
-        _ = g.move(id: 2, point: CGPoint(x: 9, y: 0), timestamp: 1.1)
-        XCTAssertEqual(g.move(id: 2, point: CGPoint(x: 30, y: 0), timestamp: 1.6), [.motionUpdate(CGPoint(x: 30, y: 0))])
-    }
-    func testSecondContactAndRetirementReleaseExactlyOnce() {
-        var g = TouchpadGestureStateMachine()
-        _ = g.begin(id: 1, point: .zero, timestamp: 0)
-        _ = g.move(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.6)
-        XCTAssertEqual(g.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.61), [.leftUp, .motionEnd])
-        XCTAssertTrue(g.move(id: 1, point: CGPoint(x: 50, y: 0), timestamp: 0.7).isEmpty)
-        XCTAssertTrue(g.retire().isEmpty)
-        _ = g.begin(id: 3, point: .zero, timestamp: 1)
-        _ = g.move(id: 3, point: CGPoint(x: 7, y: 0), timestamp: 1.6)
-        XCTAssertEqual(g.retire(), [.leftUp, .motionEnd])
-        XCTAssertTrue(g.retire().isEmpty)
-        XCTAssertTrue(g.end(id: 3, point: .zero, timestamp: 2).isEmpty)
-    }
-    func testTwoFingerDiagonalScrollAndRemainders() {
-        var g = TouchpadGestureStateMachine()
-        _ = g.begin(id: 1, point: .zero, timestamp: 0)
-        XCTAssertEqual(g.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01), [.motionEnd])
-        XCTAssertTrue(g.moveBatch([(1, CGPoint(x: 12, y: 12), 0.1), (2, CGPoint(x: 112, y: 12), 0.1)]).isEmpty)
-        XCTAssertEqual(g.moveBatch([(1, CGPoint(x: 24, y: 24), 0.2), (2, CGPoint(x: 124, y: 24), 0.2)]), [.verticalWheel(120), .horizontalWheel(120)])
-        XCTAssertTrue(g.end(id: 1, point: CGPoint(x: 24, y: 24), timestamp: 0.21).isEmpty)
-        XCTAssertTrue(g.end(id: 2, point: CGPoint(x: 124, y: 24), timestamp: 0.22).isEmpty)
-    }
-    func testPinchIsOneStepAndPrecedesScroll() {
-        var g = TouchpadGestureStateMachine()
-        _ = g.begin(id: 1, point: .zero, timestamp: 0)
-        _ = g.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01)
-        XCTAssertEqual(g.moveBatch([(1, CGPoint(x: -10, y: 30), 0.1), (2, CGPoint(x: 110, y: 30), 0.1)]), [.zoomWheel(120)])
-        XCTAssertTrue(g.moveBatch([(1, CGPoint(x: -20, y: 60), 0.2), (2, CGPoint(x: 120, y: 60), 0.2)]).isEmpty)
-    }
-    func testRightClickRequiresBothContactsWithinExcursion() {
-        var g = TouchpadGestureStateMachine()
-        _ = g.begin(id: 1, point: .zero, timestamp: 0)
-        _ = g.begin(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.01)
-        XCTAssertTrue(g.end(id: 1, point: .zero, timestamp: 0.1).isEmpty)
-        XCTAssertEqual(g.end(id: 2, point: CGPoint(x: 100, y: 0), timestamp: 0.11), [.rightClick])
-        _ = g.begin(id: 3, point: .zero, timestamp: 1)
-        _ = g.begin(id: 4, point: CGPoint(x: 100, y: 0), timestamp: 1.01)
-        _ = g.moveBatch([(3, CGPoint(x: 0, y: 13), 1.05), (4, CGPoint(x: 100, y: 13), 1.05)])
-        _ = g.end(id: 3, point: .zero, timestamp: 1.1)
-        XCTAssertTrue(g.end(id: 4, point: CGPoint(x: 100, y: 0), timestamp: 1.11).isEmpty)
-    }
-    func testThreeFingerSettingsAndFourContactSuppression() {
-        var g = TouchpadGestureStateMachine()
-        for id in 1...3 { _ = g.begin(id: UInt64(id), point: CGPoint(x: id * 30, y: 0), timestamp: Double(id) * 0.01) }
-        for id in 1...2 { XCTAssertTrue(g.end(id: UInt64(id), point: CGPoint(x: id * 30, y: 0), timestamp: 0.2).isEmpty) }
-        XCTAssertEqual(g.end(id: 3, point: CGPoint(x: 90, y: 0), timestamp: 0.21), [.openSettings])
-        for id in 1...4 { _ = g.begin(id: UInt64(id), point: CGPoint(x: id * 30, y: 0), timestamp: 1 + Double(id) * 0.01) }
-        for id in 1...4 { XCTAssertTrue(g.end(id: UInt64(id), point: CGPoint(x: id * 30, y: 0), timestamp: 1.2).isEmpty) }
-    }
-    func testPencilExclusiveAndGuardBeginRemainsSuppressed() {
-        var g = TouchpadGestureStateMachine()
-        _ = g.begin(id: 1, point: .zero, timestamp: 0)
-        _ = g.move(id: 1, point: CGPoint(x: 7, y: 0), timestamp: 0.6)
-        XCTAssertEqual(g.pencilBegan(timestamp: 0.7), [.leftUp, .motionEnd])
-        XCTAssertTrue(g.begin(id: 2, point: .zero, timestamp: 0.8).isEmpty)
-        g.pencilEnded(timestamp: 1)
-        XCTAssertTrue(g.begin(id: 3, point: .zero, timestamp: 1.1).isEmpty)
-        XCTAssertTrue(g.move(id: 3, point: CGPoint(x: 20, y: 0), timestamp: 1.3).isEmpty)
-        _ = g.end(id: 2, point: .zero, timestamp: 1.4)
-        _ = g.end(id: 3, point: .zero, timestamp: 1.4)
-        XCTAssertEqual(g.begin(id: 4, point: .zero, timestamp: 1.5), [.motionBegin])
     }
 }
 

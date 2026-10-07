@@ -36,8 +36,6 @@ public struct SettingsView: View {
     private var showPerformanceHUD: Bool = true
     @AppStorage(ClientPreferenceKeys.gameModeEnabled)
     private var gameModeEnabled: Bool = false
-    @AppStorage(ClientPreferenceKeys.touchpadModeEnabled)
-    private var touchpadModeEnabled = false
     @AppStorage(ClientPreferenceKeys.clientDebugLoggingEnabled)
     private var clientDebugLoggingEnabled: Bool = false
 
@@ -152,20 +150,6 @@ public struct SettingsView: View {
                                     .tint(Color(hex: "#0EA5E9"))
 
                                 Text("Shows FPS and frame receive timing while streaming.")
-                                    .font(.system(size: 11))
-                                    .foregroundColor(.white.opacity(0.55))
-                            }
-                        }
-
-                        settingsCard {
-                            VStack(alignment: .leading, spacing: 14) {
-                                Label("Input", systemImage: "cursorarrow.motionlines")
-                                    .font(.system(size: 15, weight: .bold))
-                                    .foregroundColor(.white)
-                                Divider().background(Color.white.opacity(0.12))
-                                Toggle("Touchpad Mode", isOn: $touchpadModeEnabled)
-                                    .tint(Color(hex: "#0EA5E9"))
-                                Text("Off: touch directly controls the remote screen. On: one finger moves the Windows pointer, tap clicks, hold-and-move drags, two fingers scroll/right-click, pinch zooms, and three fingers open settings. Apple Pencil remains direct.")
                                     .font(.system(size: 11))
                                     .foregroundColor(.white.opacity(0.55))
                             }

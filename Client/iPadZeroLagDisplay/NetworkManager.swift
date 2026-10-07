@@ -87,7 +87,6 @@ enum WireMessageType: UInt8 {
     case textCommit = 40
     case directTouchContact = 41
     case cursorOwnership = 42
-    case touchpadInput = 43
 }
 
 public enum DirectTouchPhase: UInt8 { case down = 0, update = 1, up = 2, cancel = 3 }
@@ -263,79 +262,6 @@ public struct PointerInputCommand: Equatable {
                 y: UInt16(littleEndian: bytes.loadUnaligned(fromByteOffset: 4, as: UInt16.self)),
                 value: Int16(littleEndian: bytes.loadUnaligned(fromByteOffset: 6, as: Int16.self)))
         }
-    }
-}
-
-public enum TouchpadInputAction: UInt8, CaseIterable {
-    case motionBegin = 0, motionUpdate, motionEnd, leftClick, leftDown, leftUp, rightClick
-    case verticalWheel, horizontalWheel, zoomWheel
-
-    var diagnosticName: String {
-        switch self {
-        case .motionBegin: return "motion_begin"
-        case .motionUpdate: return "motion_update"
-        case .motionEnd: return "motion_end"
-        case .leftClick: return "left_click"
-        case .leftDown: return "left_down"
-        case .leftUp: return "left_up"
-        case .rightClick: return "right_click"
-        case .verticalWheel: return "vertical_wheel"
-        case .horizontalWheel: return "horizontal_wheel"
-        case .zoomWheel: return "zoom_wheel"
-        }
-    }
-}
-
-public struct TouchpadInputCommand: Equatable {
-    static let encodedSize = 8
-    public let action: TouchpadInputAction
-    public let cumulativeXQ15: Int16
-    public let cumulativeYQ15: Int16
-    public let value: Int16
-
-    public init(action: TouchpadInputAction, cumulativeXQ15: Int16 = 0,
-                cumulativeYQ15: Int16 = 0, value: Int16 = 0) {
-        self.action = action
-        self.cumulativeXQ15 = cumulativeXQ15
-        self.cumulativeYQ15 = cumulativeYQ15
-        self.value = value
-    }
-
-    func encode() -> Data {
-        var bytes: [UInt8] = [1, action.rawValue]
-        for field in [cumulativeXQ15, cumulativeYQ15, value] {
-            let unsigned = UInt16(bitPattern: field)
-            bytes.append(UInt8(truncatingIfNeeded: unsigned))
-            bytes.append(UInt8(unsigned >> 8))
-        }
-        return Data(bytes)
-    }
-
-    static func decode(_ payload: Data) -> TouchpadInputCommand? {
-        guard payload.count == encodedSize, payload[0] == 1,
-              let action = TouchpadInputAction(rawValue: payload[1]) else { return nil }
-        func field(_ offset: Int) -> Int16 {
-            Int16(bitPattern: UInt16(payload[offset]) | UInt16(payload[offset + 1]) << 8)
-        }
-        let x = field(2), y = field(4), value = field(6)
-        if action == .motionUpdate {
-            guard x != .min, y != .min, value == 0 else { return nil }
-        } else {
-            guard x == 0, y == 0 else { return nil }
-            if action.rawValue >= 7 {
-                guard value == -120 || value == 120 else { return nil }
-            } else {
-                guard value == 0 else { return nil }
-            }
-        }
-        return TouchpadInputCommand(action: action, cumulativeXQ15: x, cumulativeYQ15: y, value: value)
-    }
-}
-
-enum TouchpadInputDeliveryPolicy {
-    static func isMovement(_ action: TouchpadInputAction) -> Bool { action == .motionUpdate }
-    static func allows(_ action: TouchpadInputAction, inputSuppressed: Bool) -> Bool {
-        !inputSuppressed || action == .leftUp || action == .motionEnd
     }
 }
 
@@ -1678,8 +1604,6 @@ final class WireStreamParser {
             fixedLength = CursorOwnershipCommand.encodedSize
         case .pointerInput:
             fixedLength = PointerInputCommand.encodedSize
-        case .touchpadInput:
-            fixedLength = TouchpadInputCommand.encodedSize
         case .clientCapabilities:
             fixedLength = ClientCapabilities.encodedSize
         case .transportOffer:
@@ -2766,20 +2690,6 @@ public class NetworkManager: ObservableObject {
                 payload: command.encode(),
                 sequence: 0,
                 movement: command.action == .move)
-        }
-    }
-
-    public func sendTouchpadInput(_ command: TouchpadInputCommand) {
-        networkQueue.async { [weak self] in
-            guard let self else { return }
-            let generation = self.connectionGeneration
-            guard self.transportState == .streaming,
-                  self.committedTransportGeneration == generation,
-                  TouchpadInputCommand.decode(command.encode()) != nil,
-                  TouchpadInputDeliveryPolicy.allows(command.action,
-                    inputSuppressed: self.displayRequestGate.isInputSuppressed) else { return }
-            self.sendWireMessage(type: .touchpadInput, payload: command.encode(), sequence: 0,
-                movement: TouchpadInputDeliveryPolicy.isMovement(command.action))
         }
     }
 
@@ -4383,7 +4293,7 @@ public class NetworkManager: ObservableObject {
             }
             return
 
-        case .directTouchContact, .pointerInput, .keyboardInput, .textCommit, .touchpadInput:
+        case .directTouchContact, .pointerInput, .keyboardInput, .textCommit:
             return
 
         case .video:
