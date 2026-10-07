@@ -78,6 +78,57 @@ final class ExternalPointerInputTests: XCTestCase {
     func testAppExplicitlySupportsIndirectInputEvents() {
         XCTAssertEqual(Bundle(for: PencilUIKitView.self).object(forInfoDictionaryKey: "UIApplicationSupportsIndirectInputEvents") as? Bool, true)
     }
+
+    func testOutsideHoverPreventsScrollButKeepsFailSafeRelease() {
+        var state = ExternalPointerInputState()
+        _ = state.configure(active: true, generation: 7)
+        _ = state.begin(id: 1, point: point, primary: true, secondary: false, generation: 7)
+        XCTAssertEqual(state.move(id: 1, point: point, generation: 7)?.action, .move)
+        XCTAssertNil(state.hover(point: nil, generation: 7))
+        XCTAssertTrue(state.scroll(delta: CGPoint(x: 24, y: 24), generation: 7).isEmpty)
+        XCTAssertEqual(state.retire().map(\.action), [.leftUp])
+        XCTAssertNil(state.hover(point: point, generation: 7))
+    }
+
+    @MainActor func testViewportAndGenerationRetirementFenceOldButtonOwner() {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        let view = PencilUIKitView(frame: window.bounds)
+        window.addSubview(view)
+        view.contentViewport = VideoContentViewport(rect: CGRect(x: 0, y: 0, width: 1, height: 1))
+        view.configureExternalPointer(active: true, generation: 7)
+        var commands: [PointerInputCommand] = []
+        view.onPointerInput = { commands.append($0) }
+        view.handleExternalPointer(id: 1, phase: 1, point: CGPoint(x: 200, y: 150), primary: true, generation: 7)
+        view.contentViewport = VideoContentViewport(rect: CGRect(x: 0.25, y: 0, width: 0.5, height: 1))
+        view.handleExternalPointer(id: 1, phase: 4, point: .zero, generation: 7)
+        XCTAssertEqual(commands.map(\.action), [.leftDown, .leftUp])
+        view.handleExternalPointer(id: 2, phase: 1, point: CGPoint(x: 200, y: 150), primary: true, generation: 7)
+        view.configureExternalPointer(active: true, generation: 8)
+        view.handleExternalPointer(id: 2, phase: 4, point: .zero, generation: 7)
+        view.removeFromSuperview()
+        XCTAssertEqual(commands.map(\.action), [.leftDown, .leftUp, .leftDown, .leftUp])
+    }
+
+    @MainActor func testAggregateRetirementReleasesExternalAndDirectOwnersOnce() {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        let container = ConnectedPresentationContainer(frame: window.bounds)
+        window.addSubview(container)
+        let view = container.touchView
+        view.frame = window.bounds
+        view.contentViewport = VideoContentViewport(rect: CGRect(x: 0, y: 0, width: 1, height: 1))
+        view.configureDirectTouch(active: true, generation: 7)
+        view.configureExternalPointer(active: true, generation: 7)
+        var buttons: [PointerInputCommand] = []
+        var contacts: [DirectTouchContactCommand] = []
+        view.onPointerInput = { buttons.append($0) }
+        view.onDirectTouchContact = { contacts.append($0) }
+        view.handleExternalPointer(id: 1, phase: 1, point: CGPoint(x: 200, y: 150), primary: true, generation: 7)
+        view.emitDirectOutputs([.directTouch(.down, 1, CGPoint(x: 200, y: 150), 255)])
+        container.retireRemotePointerInputs()
+        container.retireRemotePointerInputs()
+        XCTAssertEqual(buttons.map(\.action), [.leftDown, .leftUp])
+        XCTAssertEqual(contacts.map(\.phase), [.down, .cancel])
+    }
 }
 
 final class UsbSplitCommitGateTests: XCTestCase {

@@ -577,6 +577,112 @@ enum RemoteKeyboardKeyMapper {
     }
 }
 
+struct ExternalPointerInputState {
+    private(set) var generation: UInt64?
+    private(set) var enabled = false
+    private var lastValidPoint: CGPoint?
+    private var pointerInside = false
+    private var primaryOwner: UInt64?
+    private var secondaryOwner: UInt64?
+    private var verticalRemainder: CGFloat = 0
+    private var horizontalRemainder: CGFloat = 0
+
+    mutating func configure(active: Bool, generation: UInt64) -> [PointerInputCommand] {
+        let release = self.generation != generation || !active ? retire() : []
+        self.generation = generation
+        enabled = active
+        return release
+    }
+
+    mutating func hover(point: CGPoint?, generation: UInt64) -> PointerInputCommand? {
+        guard owns(generation) else { return nil }
+        guard let point = accept(point) else { return nil }
+        return command(.move, point)
+    }
+
+    mutating func begin(id: UInt64, point: CGPoint?, primary: Bool, secondary: Bool,
+                        generation: UInt64) -> PointerInputCommand? {
+        guard owns(generation), let point = accept(point) else { return nil }
+        if primary {
+            guard primaryOwner == nil else { return nil }
+            primaryOwner = id
+            return command(.leftDown, point)
+        }
+        if secondary {
+            guard secondaryOwner == nil else { return nil }
+            secondaryOwner = id
+            return command(.rightClick, point)
+        }
+        return nil
+    }
+
+    mutating func move(id: UInt64, point: CGPoint?, generation: UInt64) -> PointerInputCommand? {
+        guard primaryOwner == id else { return nil }
+        return hover(point: point, generation: generation)
+    }
+
+    mutating func end(id: UInt64, point: CGPoint?, generation: UInt64) -> PointerInputCommand? {
+        guard owns(generation) else { return nil }
+        if secondaryOwner == id { secondaryOwner = nil }
+        guard primaryOwner == id else { return nil }
+        primaryOwner = nil
+        return (accept(point) ?? lastValidPoint).map { command(.leftUp, $0) }
+    }
+
+    mutating func scroll(delta: CGPoint, generation: UInt64) -> [PointerInputCommand] {
+        guard owns(generation), pointerInside, let point = lastValidPoint,
+              delta.x.isFinite, delta.y.isFinite else { return [] }
+        horizontalRemainder += delta.x
+        verticalRemainder += delta.y
+        var result: [PointerInputCommand] = []
+        // Bound a single event while retaining unconsumed movement for the next event.
+        for (horizontal, remainder) in [(true, horizontalRemainder), (false, verticalRemainder)] {
+            let steps = Int(max(-8, min(8, (remainder / 24).rounded(.towardZero))))
+            if steps != 0 {
+                for _ in 0..<abs(steps) {
+                    let value: Int16 = steps > 0 ? 120 : -120
+                    result.append(command(horizontal ? .horizontalWheel : .verticalWheel, point,
+                                          value: horizontal ? -value : value))
+                }
+            }
+            if horizontal { horizontalRemainder -= CGFloat(steps) * 24 }
+            else { verticalRemainder -= CGFloat(steps) * 24 }
+        }
+        return result
+    }
+
+    mutating func retire() -> [PointerInputCommand] {
+        let release = primaryOwner != nil ? lastValidPoint.map { command(.leftUp, $0) } : nil
+        enabled = false
+        primaryOwner = nil
+        secondaryOwner = nil
+        lastValidPoint = nil
+        pointerInside = false
+        verticalRemainder = 0
+        horizontalRemainder = 0
+        return release.map { [$0] } ?? []
+    }
+
+    private func owns(_ generation: UInt64) -> Bool { enabled && self.generation == generation }
+
+    private mutating func accept(_ point: CGPoint?) -> CGPoint? {
+        guard let point, point.x.isFinite, point.y.isFinite,
+              (0...1).contains(point.x), (0...1).contains(point.y) else {
+            pointerInside = false
+            return nil
+        }
+        pointerInside = true
+        lastValidPoint = point
+        return point
+    }
+
+    private func command(_ action: PointerInputAction, _ point: CGPoint, value: Int16 = 0) -> PointerInputCommand {
+        PointerInputCommand(action: action,
+            x: UInt16(clamping: Int((point.x * 65_535).rounded())),
+            y: UInt16(clamping: Int((point.y * 65_535).rounded())), value: value)
+    }
+}
+
 public class PencilUIKitView: UIView {
 
     public var onKeyboardInput: ((KeyboardInputCommand) -> Void)?
@@ -628,7 +734,10 @@ public class PencilUIKitView: UIView {
     override public func didMoveToWindow() {
         super.didMoveToWindow()
         updateKeyboardCapture()
-        if window == nil { retireDirectTouch(); directTouchEnabled = false }
+        if window == nil {
+            retireDirectTouch(); directTouchEnabled = false
+            configureExternalPointer(active: false, generation: externalPointer.generation ?? 0)
+        }
     }
 
     // Kept separate from UIPress construction so key lifetime can be tested
@@ -699,7 +808,7 @@ public class PencilUIKitView: UIView {
     public var onPointerInput: ((PointerInputCommand) -> Void)?
     public var onOpenSettings: (() -> Void)?
     public var contentViewport: VideoContentViewport? {
-        willSet { if newValue != contentViewport { retireDirectTouch() } }
+        willSet { if newValue != contentViewport { retireDirectTouch(); retireExternalPointer() } }
     }
     private var directTouchEnabled = false
     private var directTouchGeneration: UInt64?
@@ -715,21 +824,27 @@ public class PencilUIKitView: UIView {
     private var pointerCoordinateState = PointerInputCoordinateState()
     private var directTouchIDs = LifetimeIdentityMap<ObjectIdentifier>()
     private var activeDirectContact: (id: UInt64, point: CGPoint)?
+    private var externalPointer = ExternalPointerInputState()
+    private var externalPointerIDs = LifetimeIdentityMap<ObjectIdentifier>()
+    private var externalScrollTranslation = CGPoint.zero
+    private var lastExternalMoveDiagnosticAt: TimeInterval = -.infinity
 
     override public init(frame: CGRect) {
         super.init(frame: frame)
         isMultipleTouchEnabled = true
         backgroundColor = .clear
+        installExternalPointerRecognizers()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
+        installExternalPointerRecognizers()
     }
 
     override public func layoutSubviews() {
         super.layoutSubviews()
         guard bounds != lastReportedBounds else { return }
-        if lastReportedBounds != nil { retireDirectTouch() }
+        if lastReportedBounds != nil { retireDirectTouch(); retireExternalPointer() }
         lastReportedBounds = bounds
         onBoundsChanged?(bounds)
     }
@@ -776,6 +891,20 @@ public class PencilUIKitView: UIView {
             }
         }
 
+        for touch in touches where touch.type == .indirectPointer {
+            let key = ObjectIdentifier(touch)
+            guard window != nil, let generation = externalPointer.generation else { continue }
+            if flags == 1 {
+                let id = externalPointerIDs.begin(key)
+                handleExternalPointer(id: id, phase: flags, point: touch.location(in: self),
+                    primary: event?.buttonMask.contains(.primary) == true,
+                    secondary: event?.buttonMask.contains(.secondary) == true, generation: generation)
+            } else if let id = externalPointerIDs.existing(key) {
+                handleExternalPointer(id: id, phase: flags, point: touch.location(in: self), generation: generation)
+                if flags == 4 { externalPointerIDs.end(key) }
+            }
+        }
+
         guard directTouchEnabled else { return }
         if flags == 2 {
             let movements = directTouches.compactMap { touch -> (id: UInt64, point: CGPoint, timestamp: TimeInterval)? in
@@ -816,6 +945,84 @@ public class PencilUIKitView: UIView {
         if directTouchGeneration != generation || !active { retireDirectTouch() }
         directTouchGeneration = generation
         directTouchEnabled = active
+    }
+
+    func configureExternalPointer(active: Bool, generation: UInt64) {
+        if externalPointer.generation != generation || !active {
+            retireExternalPointer()
+        }
+        _ = externalPointer.configure(active: active, generation: generation)
+    }
+
+    func handleExternalPointer(id: UInt64, phase: UInt8, point: CGPoint,
+                               primary: Bool = false, secondary: Bool = false, generation: UInt64) {
+        guard window != nil else { return }
+        let mapped = contentViewport?.normalizedPoint(for: point, in: bounds)
+        switch phase {
+        case 1: emitExternal(externalPointer.begin(id: id, point: mapped,
+            primary: primary, secondary: secondary, generation: generation))
+        case 2: emitExternal(externalPointer.move(id: id, point: mapped, generation: generation))
+        case 4: emitExternal(externalPointer.end(id: id, point: mapped, generation: generation))
+        default: break
+        }
+    }
+
+    func retireExternalPointer() {
+        let active = externalPointer.enabled
+        let generation = externalPointer.generation
+        for command in externalPointer.retire() { emitExternal(command, reason: "retire_left_up") }
+        if let generation { _ = externalPointer.configure(active: active, generation: generation) }
+        externalPointerIDs.removeAll()
+        externalScrollTranslation = .zero
+    }
+
+    private func installExternalPointerRecognizers() {
+        let hover = UIHoverGestureRecognizer(target: self, action: #selector(handleExternalPointerHover(_:)))
+        hover.cancelsTouchesInView = false
+        addGestureRecognizer(hover)
+        let scroll = UIPanGestureRecognizer(target: self, action: #selector(handleExternalPointerScroll(_:)))
+        scroll.allowedScrollTypesMask = .continuous
+        scroll.allowedTouchTypes = []
+        scroll.cancelsTouchesInView = false
+        addGestureRecognizer(scroll)
+    }
+
+    @objc private func handleExternalPointerHover(_ recognizer: UIHoverGestureRecognizer) {
+        guard window != nil, let generation = externalPointer.generation else { return }
+        if recognizer.state == .ended || recognizer.state == .cancelled {
+            _ = externalPointer.hover(point: nil, generation: generation)
+            return
+        }
+        guard recognizer.state == .began || recognizer.state == .changed else { return }
+        let point = contentViewport?.normalizedPoint(for: recognizer.location(in: self), in: bounds)
+        emitExternal(externalPointer.hover(point: point, generation: generation))
+    }
+
+    @objc private func handleExternalPointerScroll(_ recognizer: UIPanGestureRecognizer) {
+        guard window != nil, let generation = externalPointer.generation else { return }
+        let translation = recognizer.translation(in: self)
+        switch recognizer.state {
+        case .began:
+            externalScrollTranslation = translation
+        case .changed:
+            let delta = CGPoint(x: translation.x - externalScrollTranslation.x,
+                                y: translation.y - externalScrollTranslation.y)
+            externalScrollTranslation = translation
+            for command in externalPointer.scroll(delta: delta, generation: generation) { emitExternal(command) }
+        case .ended, .cancelled, .failed:
+            externalScrollTranslation = .zero
+        default: break
+        }
+    }
+
+    private func emitExternal(_ command: PointerInputCommand?, reason: String? = nil) {
+        guard let command else { return }
+        onPointerInput?(command)
+        let now = ProcessInfo.processInfo.systemUptime
+        if command.action != .move || now - lastExternalMoveDiagnosticAt >= 0.25 {
+            if command.action == .move { lastExternalMoveDiagnosticAt = now }
+            diagnosticSink?("[EXTERNAL_POINTER] action=\(reason ?? String(describing: command.action)) generation=\(externalPointer.generation) x=\(command.x) y=\(command.y) value=\(command.value) source=indirect_pointer")
+        }
     }
 
     func retireDirectTouch() {

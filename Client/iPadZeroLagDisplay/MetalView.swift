@@ -319,7 +319,7 @@ public final class ConnectedPresentationContainer: UIView {
 
     override public func didMoveToWindow() {
         super.didMoveToWindow()
-        if window == nil { retireDirectPointer(); retireRemoteKeyboard() }
+        if window == nil { retireRemotePointerInputs(); retireRemoteKeyboard() }
         else { hardwareMonitor.refresh(); updateKeyboardAuthority() }
         setNeedsLayout()
     }
@@ -350,6 +350,11 @@ public final class ConnectedPresentationContainer: UIView {
     }
     func retireDirectPointer() {
         touchView.configureDirectTouch(active: false, generation: keyboardGeneration ?? 0)
+    }
+
+    func retireRemotePointerInputs() {
+        retireDirectPointer()
+        touchView.configureExternalPointer(active: false, generation: keyboardGeneration ?? 0)
     }
 
     func configureClientCursor(ownership: CursorOwnershipState?, generation: UInt64, active: Bool) {
@@ -474,7 +479,7 @@ public final class ConnectedPresentationContainer: UIView {
     private func handleKeyboardNotification(_ note: Notification) {
         defer { recordKeyboardAuthority(reason: note.name.rawValue) }
         if note.name == UIApplication.willResignActiveNotification {
-            retireDirectPointer()
+            retireRemotePointerInputs()
             softwareRequested = false; applyRemoteKeyboardMode(.none); return
         }
         if note.name == UIApplication.didBecomeActiveNotification {
@@ -590,7 +595,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     }
 
     public static func dismantleUIView(_ uiView: ConnectedPresentationContainer, coordinator: Coordinator) {
-        uiView.retireDirectPointer()
+        uiView.retireRemotePointerInputs()
         uiView.retireRemoteKeyboard()
     }
 
@@ -666,10 +671,11 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             generation: networkManager.remoteKeyboardGeneration, active: remoteKeyboardActive)
         touchView.onDirectTouchContact = onDirectTouchContact
         touchView.configureDirectTouch(active: remoteKeyboardActive, generation: networkManager.remoteKeyboardGeneration)
+        touchView.configureExternalPointer(active: remoteKeyboardActive, generation: networkManager.remoteKeyboardGeneration)
         touchView.onPointerInput = onPointerInput
         let openSettings = onOpenSettings
         touchView.onOpenSettings = { [weak container] in
-            container?.retireDirectPointer()
+            container?.retireRemotePointerInputs()
             container?.configureRemoteKeyboard(active: false, generation: networkManager.remoteKeyboardGeneration)
             openSettings?()
         }
