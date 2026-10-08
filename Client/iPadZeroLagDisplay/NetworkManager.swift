@@ -2236,6 +2236,14 @@ public class NetworkManager: ObservableObject {
             guard let self else { return }
             let wasForegroundActive = self.isForegroundActive
             self.isForegroundActive = true
+            if !wasForegroundActive,
+               self.connection != nil,
+               self.transportState == .streaming,
+               self.wireAuthenticatedGeneration == self.connectionGeneration,
+               self.committedTransportGeneration == self.connectionGeneration {
+                self.transportTelemetry.beginFreshFrameRate(
+                    generation: self.connectionGeneration, at: self.performanceFeedbackTime())
+            }
             let inactiveGeneration = self.wifiLifecycleTransitionGeneration
             self.wifiLifecycleTransitionGeneration = nil
             if inactiveGeneration == self.connectionGeneration,
@@ -2326,6 +2334,9 @@ public class NetworkManager: ObservableObject {
             guard let self else { return }
             self.cancelActiveDirectTouchOnQueue()
             self.isForegroundActive = false
+            // Foreground eligibility is closed first; discard its old sample window.
+            self.transportTelemetry.beginFreshFrameRate(
+                generation: self.connectionGeneration, at: self.performanceFeedbackTime())
             self.reconnectWorkItem?.cancel()
             self.reconnectWorkItem = nil
             if self.isCurrentCommittedWifiRtpStreamingSessionOnQueue() {
@@ -2344,6 +2355,9 @@ public class NetworkManager: ObservableObject {
         networkQueue.async { [weak self] in
             guard let self else { return }
             self.isForegroundActive = false
+            // Foreground eligibility is closed first; discard its old sample window.
+            self.transportTelemetry.beginFreshFrameRate(
+                generation: self.connectionGeneration, at: self.performanceFeedbackTime())
             self.reconnectWorkItem?.cancel()
             self.reconnectWorkItem = nil
             self.wifiBackgroundDisconnectWorkItem?.cancel()
@@ -3899,7 +3913,8 @@ public class NetworkManager: ObservableObject {
     }
 
     private func sendPerformanceFeedback() {
-        guard wireAuthenticatedGeneration == connectionGeneration,
+        guard isForegroundActive,
+              wireAuthenticatedGeneration == connectionGeneration,
               committedTransportGeneration == connectionGeneration,
               let mode = committedPipelineMode.active,
               mode == desiredPipelineMode,
@@ -5381,27 +5396,27 @@ public class NetworkManager: ObservableObject {
     var realtimeAudioPlaybackForTesting: ((Bool) -> Void)?
     var controlSendForAudioTesting: ((Data, @escaping (NWError?) -> Void) -> Void)?
 
-private var testingPerformanceFeedbackNow: TimeInterval?
-func seedPerformanceWindowForTesting(mode: PipelineMode = .office, at now: TimeInterval) {
-    networkQueue.sync {
-        testingPerformanceFeedbackNow = now
-        desiredPipelineMode = mode
-        committedPipelineMode.request(mode)
-        _ = committedPipelineMode.acknowledge(mode, at: now - 3)
-        transportTelemetry.beginFreshFrameRate(generation: connectionGeneration, at: now - 1.1)
+    private var testingPerformanceFeedbackNow: TimeInterval?
+    func seedPerformanceWindowForTesting(mode: PipelineMode = .office, at now: TimeInterval) {
+        networkQueue.sync {
+            testingPerformanceFeedbackNow = now
+            desiredPipelineMode = mode
+            committedPipelineMode.request(mode)
+            _ = committedPipelineMode.acknowledge(mode, at: now - 3)
+            transportTelemetry.beginFreshFrameRate(generation: connectionGeneration, at: now - 1.1)
+        }
     }
-}
-func advancePerformanceFeedbackClockForTesting(to now: TimeInterval) {
-    networkQueue.sync { testingPerformanceFeedbackNow = now }
-}
-func sendPerformanceFeedbackForTesting() -> UInt32 {
-    networkQueue.sync { sendPerformanceFeedback(); return performanceFeedbackSequence }
-}
-func performanceSampleForTesting(at now: TimeInterval) -> ClientFreshFrameRateSample? {
-    networkQueue.sync {
-        transportTelemetry.freshFrameRateSample(generation: connectionGeneration, at: now)
+    func advancePerformanceFeedbackClockForTesting(to now: TimeInterval) {
+        networkQueue.sync { testingPerformanceFeedbackNow = now }
     }
-}
+    func sendPerformanceFeedbackForTesting() -> UInt32 {
+        networkQueue.sync { sendPerformanceFeedback(); return performanceFeedbackSequence }
+    }
+    func performanceSampleForTesting(at now: TimeInterval) -> ClientFreshFrameRateSample? {
+        networkQueue.sync {
+            transportTelemetry.freshFrameRateSample(generation: connectionGeneration, at: now)
+        }
+    }
 
     func installUsbLaneForParserTesting(_ lane: UsbLaneKind, connection: NWConnection) {
         networkQueue.sync {
