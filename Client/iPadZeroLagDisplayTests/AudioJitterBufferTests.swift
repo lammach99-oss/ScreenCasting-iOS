@@ -556,6 +556,56 @@ final class AudioJitterBufferTests: XCTestCase {
         XCTAssertEqual(buffer.diagnostics.freshReanchorSkipUnits, 0)
     }
 
+    func testFarFutureBufferedGapUsesAtMostTwoConsecutivePlcThenFreshAnchor() {
+        let buffer = AudioJitterBuffer(profile: .wifi)
+        [UInt16(1), 2, 3].forEach { buffer.insert(packet($0)) }
+        for _ in 0..<3 { _ = buffer.dequeue() }
+        [UInt16(100), 101, 102].forEach { buffer.insert(packet($0)) }
+        XCTAssertEqual(buffer.dequeue(), .plc(sequence: 4, timestamp: 1920))
+        XCTAssertEqual(buffer.dequeue(), .plc(sequence: 5, timestamp: 2400))
+        XCTAssertEqual(decodedSequence(buffer.dequeue()), 100)
+        XCTAssertEqual(decodedSequence(buffer.dequeue()), 101)
+        XCTAssertEqual(decodedSequence(buffer.dequeue()), 102)
+        XCTAssertEqual(buffer.diagnostics.plcActions, 2)
+        XCTAssertEqual(buffer.diagnostics.boundedPlcActions, 2)
+        XCTAssertEqual(buffer.diagnostics.rebufferResumes, 1)
+        XCTAssertEqual(buffer.diagnostics.freshReanchorSkipUnits, 94)
+    }
+
+    func testOneAndExactlyTwoMissingPacketsDecodeAlreadyBufferedExpectedWithoutRebuffer() {
+        for gap in 1...2 {
+            let buffer = AudioJitterBuffer(profile: .wifi)
+            [UInt16(1), 2, 3].forEach { buffer.insert(packet($0)) }
+            for _ in 0..<3 { _ = buffer.dequeue() }
+            buffer.insert(packet(UInt16(4 + gap)))
+            for n in 0..<gap { XCTAssertEqual(buffer.dequeue(), .plc(sequence: UInt16(4 + n), timestamp: UInt32(4 + n) * 480)) }
+            XCTAssertEqual(decodedSequence(buffer.dequeue()), UInt16(4 + gap))
+            XCTAssertEqual(buffer.diagnostics.rebufferEntries, 0)
+            XCTAssertEqual(buffer.diagnostics.boundedPlcActions, gap)
+        }
+    }
+
+    func testFarFutureGapBudgetReanchorAndDuplicateRejectionAcrossSequenceWrap() {
+        let buffer = AudioJitterBuffer(profile: .wifi)
+        [UInt16(65533), 65534, 65535].forEach { buffer.insert(packet($0)) }
+        for _ in 0..<3 { _ = buffer.dequeue() }
+        [UInt16(100), 101, 102].forEach { buffer.insert(packet($0)) }
+        XCTAssertEqual(buffer.dequeue(), .plc(sequence: 0, timestamp: UInt32(65535) * 480 + 480))
+        buffer.insert(packet(0)); buffer.insert(packet(100))
+        XCTAssertEqual(buffer.dequeue(), .plc(sequence: 1, timestamp: UInt32(65535) * 480 + 960))
+        XCTAssertEqual(decodedSequence(buffer.dequeue()), 100)
+        XCTAssertEqual(buffer.diagnostics.plcActions, 2)
+        XCTAssertEqual(buffer.diagnostics.boundedPlcActions, 2)
+        XCTAssertEqual(buffer.diagnostics.freshReanchorSkipUnits, 98)
+        XCTAssertEqual(buffer.diagnostics.staleRejects, 1)
+        XCTAssertEqual(buffer.diagnostics.duplicateRejects, 1)
+        buffer.reset(profile: .usb)
+        XCTAssertEqual(buffer.diagnostics.plcActions, 0)
+        for _ in 0..<10 { XCTAssertNil(buffer.dequeue()) }
+        XCTAssertEqual(buffer.targetDurationMs, 20)
+        XCTAssertEqual(AudioJitterBuffer.maximumPacketCount, 6)
+    }
+
     private func packet(
         _ sequence: UInt16,
         timestamp: UInt32? = nil
