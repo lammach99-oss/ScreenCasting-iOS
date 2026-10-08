@@ -2043,6 +2043,64 @@ final class USBListenerLifetimeTests: XCTestCase {
         super.tearDown()
     }
 
+    func testLegacyUsbBackgroundSuspendsPcmWithoutQueueReject() throws {
+        _ = try connect()
+        manager.simulateSessionAuthenticatedAndCommitted()
+        let generation = manager.usbSessionSnapshot().generation
+        let audio = AudioManager.shared
+        audio.engineStartForTesting = { }
+        var completions: [() -> Void] = []
+        audio.pcmScheduleForTesting = { _, completion in completions.append(completion) }
+        defer {
+            audio.reset(); audio.audioQueueForTesting.sync { }
+            audio.engineStartForTesting = nil
+            audio.pcmScheduleForTesting = nil
+        }
+        audio.beginLegacySession(generation: generation)
+        for _ in 0..<5 { audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: generation) }
+        audio.audioQueueForTesting.sync { }
+        let before = audio.playbackStateForTesting
+        XCTAssertEqual(before.queued, 2400)
+        manager.applicationDidEnterBackground()
+        manager.networkQueueForTesting.sync { }
+        audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(audio.playbackStateForTesting.epoch, before.epoch + 1)
+        XCTAssertEqual(audio.playbackStateForTesting.queued, 0)
+        for _ in 0..<100 { audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: generation) }
+        completions.forEach { $0() }
+        audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(completions.count, 5)
+        XCTAssertEqual(audio.playbackStateForTesting.queued, 0)
+        var records: [String] = []
+        audio.publishDiagnostics(generation: generation, profile: "usb", opus: false, receiveRejects: "", sink: { records.append($0) })
+        audio.audioQueueForTesting.sync { }
+        XCTAssertTrue(records.last?.contains("pcm_reject=0") == true)
+        XCTAssertTrue(records.last?.contains("pcm_lifecycle_drop=100") == true)
+    }
+
+    func testLegacyPcmRenderCompletionReleasesQueueCredit() throws {
+        let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("iPadZeroLagDisplay/AudioManager.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertTrue(source.contains("completionCallbackType: .dataRendered"))
+        XCTAssertTrue(source.contains("private let maxQueuedFrames = 9_600"))
+        let audio = AudioManager.makeForTesting()
+        audio.engineStartForTesting = { }
+        var completion: (() -> Void)?
+        audio.pcmScheduleForTesting = { _, callback in completion = callback }
+        defer { audio.reset(); audio.audioQueueForTesting.sync { } }
+        audio.beginLegacySession(generation: 70)
+        for _ in 0..<300 {
+            audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 70)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(audio.playbackStateForTesting.queued, 480)
+            try XCTUnwrap(completion)()
+            audio.audioQueueForTesting.sync { }
+        }
+        XCTAssertEqual(audio.playbackStateForTesting.queued, 0)
+        XCTAssertEqual(audio.playbackStateForTesting.completions, 300)
+    }
+
     func testListenerSurvivesFailureAndImmediatelyAcceptsAnotherSession() throws {
         let listener = try XCTUnwrap(manager.usbSessionSnapshot().listener)
         let firstPeer = try connect()
