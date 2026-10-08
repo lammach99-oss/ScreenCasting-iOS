@@ -207,10 +207,6 @@ final class AudioJitterBuffer {
             diagnostics.decodeActions += 1
             return .decode(packet)
         }
-        // Preserve one-step loss concealment while an ordinary future packet is buffered.
-        if playoutState == .playing && !packets.isEmpty {
-            return conceal(currentExpected, bounded: false)
-        }
         if playoutState == .playing {
             playoutState = .shortStarvation
             diagnostics.shortStarvationEntries += 1
@@ -220,7 +216,9 @@ final class AudioJitterBuffer {
         }
         starvationPlcRemaining -= 1
         let action = conceal(currentExpected, bounded: true)
-        if starvationPlcRemaining == 0 {
+        if starvationPlcRemaining == 0,
+           let nextExpected = self.expectedSequence,
+           packets[nextExpected] == nil {
             playoutState = .rebuffering
             diagnostics.rebufferEntries += 1
         }

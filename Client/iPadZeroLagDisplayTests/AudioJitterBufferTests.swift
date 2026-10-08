@@ -599,6 +599,9 @@ final class AudioJitterBufferTests: XCTestCase {
         XCTAssertEqual(buffer.diagnostics.freshReanchorSkipUnits, 98)
         XCTAssertEqual(buffer.diagnostics.staleRejects, 1)
         XCTAssertEqual(buffer.diagnostics.duplicateRejects, 1)
+        _ = buffer.dequeue(); _ = buffer.dequeue() // Remaining valid 101/102.
+        _ = buffer.dequeue(); _ = buffer.dequeue() // Two misses enter rebuffering.
+        XCTAssertEqual(buffer.diagnostics.rebufferEntries, 2)
         buffer.reset(profile: .usb)
         XCTAssertEqual(buffer.diagnostics.plcActions, 0)
         for _ in 0..<10 { XCTAssertNil(buffer.dequeue()) }

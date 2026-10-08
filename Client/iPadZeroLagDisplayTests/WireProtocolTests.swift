@@ -6,6 +6,37 @@ import CryptoKit
 @testable import iPadCasting
 
 final class SingleLaneUsbProductionTests: XCTestCase {
+    func testSingleLanePacedTenMsPcmCompletionsStayBelowUnchangedHardQueueBound() {
+        let audio = AudioManager.makeForTesting()
+        var now: TimeInterval = 10
+        var completions: [() -> Void] = []
+        var scheduled = 0
+        audio.engineRunningForTesting = { true }
+        audio.engineStartForTesting = { }
+        audio.clockForTesting = { now }
+        audio.pcmScheduleForTesting = { frames, completion in
+            XCTAssertEqual(frames, 480)
+            scheduled += 1
+            completions.append(completion)
+        }
+        audio.beginLegacySession(generation: 70)
+        audio.audioQueueForTesting.sync { }
+        defer { audio.reset(); audio.audioQueueForTesting.sync { } }
+        for tick in 0..<300 {
+            now = 10 + Double(tick) * 0.010
+            audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 70)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(audio.playbackStateForTesting.queued, 480)
+            XCTAssertEqual(completions.count, 1)
+            if !completions.isEmpty { completions.removeFirst()() }
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(audio.playbackStateForTesting.queued, 0)
+        }
+        XCTAssertEqual(scheduled, 300)
+        XCTAssertEqual(audio.playbackStateForTesting.completions, 300)
+        XCTAssertEqual(audio.playbackStateForTesting.generation, 70)
+    }
+
     func testUsbCapabilityAdvertisementIsLegacyTlsPcmOnly() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         let source = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/NetworkManager.swift"), encoding: .utf8)
