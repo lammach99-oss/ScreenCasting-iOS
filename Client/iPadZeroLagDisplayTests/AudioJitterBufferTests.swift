@@ -476,6 +476,74 @@ final class AudioJitterBufferTests: XCTestCase {
             expectedSsrc: audioSsrc))
     }
 
+// Proposed focused additions to AudioJitterBufferTests.swift; no production change yet.
+    func testPostStartEmptyBufferHasExactlyTwoConcealmentTicksThenRebuffers() {
+        let buffer = AudioJitterBuffer(profile: .wifi)
+        [UInt16(1), 2, 3].forEach { buffer.insert(packet($0)) }
+        for expected in UInt16(1)...3 { XCTAssertEqual(decodedSequence(buffer.dequeue()), expected) }
+        XCTAssertEqual(buffer.dequeue(), .plc(sequence: 4, timestamp: 1920))
+        XCTAssertEqual(buffer.dequeue(), .plc(sequence: 5, timestamp: 2400))
+        for _ in 0..<100 { XCTAssertNil(buffer.dequeue()) }
+        XCTAssertEqual(buffer.diagnostics.plcActions, 2)
+    }
+
+    func testRebufferWaitsForFreshTargetAndSkipsUnknownGapWithoutPlcStorm() {
+        let buffer = AudioJitterBuffer(profile: .wifi)
+        [UInt16(1), 2, 3].forEach { buffer.insert(packet($0)) }
+        for _ in 0..<6 { _ = buffer.dequeue() }
+        buffer.insert(packet(100)); XCTAssertNil(buffer.dequeue())
+        buffer.insert(packet(101)); XCTAssertNil(buffer.dequeue())
+        buffer.insert(packet(102)); XCTAssertEqual(decodedSequence(buffer.dequeue()), 100)
+        XCTAssertEqual(decodedSequence(buffer.dequeue()), 101)
+        XCTAssertEqual(decodedSequence(buffer.dequeue()), 102)
+        XCTAssertEqual(buffer.diagnostics.plcActions, 2)
+    }
+
+    func testRebufferRejectsAlreadyConcealedLatePackets() {
+        let buffer = AudioJitterBuffer(profile: .usb)
+        buffer.insert(packet(1)); buffer.insert(packet(2))
+        for _ in 0..<5 { _ = buffer.dequeue() }
+        buffer.insert(packet(3)); buffer.insert(packet(4))
+        XCTAssertEqual(buffer.bufferedPacketCount, 0)
+        XCTAssertEqual(buffer.diagnostics.staleRejects, 2)
+        buffer.insert(packet(10)); XCTAssertNil(buffer.dequeue())
+        buffer.insert(packet(11)); XCTAssertEqual(decodedSequence(buffer.dequeue()), 10)
+        XCTAssertEqual(buffer.targetDurationMs, 20)
+    }
+
+    func testExpectedPacketReturningDuringShortStarvationResumesImmediately() {
+        let buffer = AudioJitterBuffer(profile: .wifi)
+        [UInt16(1), 2, 3].forEach { buffer.insert(packet($0)) }
+        for _ in 0..<3 { _ = buffer.dequeue() }
+        XCTAssertEqual(buffer.dequeue(), .plc(sequence: 4, timestamp: 1920))
+        buffer.insert(packet(5))
+        XCTAssertEqual(decodedSequence(buffer.dequeue()), 5)
+        XCTAssertEqual(buffer.dequeue(), .plc(sequence: 6, timestamp: 2880))
+    }
+
+    func testConcealmentAndRebufferAreWrapSafe() {
+        let buffer = AudioJitterBuffer(profile: .usb)
+        buffer.insert(packet(65534, timestamp: UInt32.max - 959))
+        buffer.insert(packet(65535, timestamp: UInt32.max - 479))
+        _ = buffer.dequeue(); _ = buffer.dequeue()
+        XCTAssertEqual(buffer.dequeue(), .plc(sequence: 0, timestamp: 0))
+        XCTAssertEqual(buffer.dequeue(), .plc(sequence: 1, timestamp: 480))
+        XCTAssertNil(buffer.dequeue())
+        buffer.insert(packet(4, timestamp: 1920)); XCTAssertNil(buffer.dequeue())
+        buffer.insert(packet(5, timestamp: 2400)); XCTAssertEqual(decodedSequence(buffer.dequeue()), 4)
+    }
+
+    func testDuplicateOrStalePacketsCannotRenewTheStarvationBudget() {
+        let buffer = AudioJitterBuffer(profile: .usb)
+        buffer.insert(packet(1)); buffer.insert(packet(2)); _ = buffer.dequeue(); _ = buffer.dequeue()
+        for _ in 0..<100 { buffer.insert(packet(2)); _ = buffer.dequeue() }
+        XCTAssertEqual(buffer.diagnostics.plcActions, 2)
+        XCTAssertEqual(buffer.bufferedPacketCount, 0)
+        buffer.reset()
+        for _ in 0..<100 { XCTAssertNil(buffer.dequeue()) }
+        XCTAssertEqual(buffer.diagnostics.plcActions, 0)
+    }
+
     private func packet(
         _ sequence: UInt16,
         timestamp: UInt32? = nil
