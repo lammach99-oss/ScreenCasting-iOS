@@ -5,6 +5,20 @@ import AVFoundation
 import CryptoKit
 @testable import iPadCasting
 
+final class SingleLaneUsbProductionTests: XCTestCase {
+    func testUsbCapabilityAdvertisementIsLegacyTlsPcmOnly() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/NetworkManager.swift"), encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "private func sendClientCapabilities(for kind: ActiveTransportKind)"))
+        let tail = source[start.lowerBound...]
+        let end = try XCTUnwrap(tail.range(of: "let baseModes"))
+        let usb = String(tail[..<end.lowerBound])
+        XCTAssertTrue(usb.contains("modes: RealtimeTransportMode.legacyTLS,"))
+        XCTAssertFalse(usb.contains("usbSplitTLS"))
+        XCTAssertEqual(RealtimeAudioNegotiationPolicy.advertisedCodecs(modes: RealtimeTransportMode.legacyTLS), AudioCodecCapabilities.pcm)
+    }
+}
+
 final class ExternalPointerInputTests: XCTestCase {
     private let point = CGPoint(x: 0.25, y: 0.75)
 
