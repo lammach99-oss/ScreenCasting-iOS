@@ -2277,7 +2277,7 @@ public class NetworkManager: ObservableObject {
                 self.recordUsbLifecycleDiagnostic(
                     "[USB_MEDIA_RECOVERY] generation=\(generation) " +
                     "action=decoder_invalidate_begin")
-                self.decoder.invalidate(waitForCompletion: true)
+                self.decoder.invalidate(waitForCompletion: false)
                 guard self.isCurrentCommittedUsbStreamingSessionOnQueue(
                     generation: generation) else {
                     self.recordUsbLifecycleDiagnostic(

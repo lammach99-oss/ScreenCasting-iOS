@@ -573,7 +573,7 @@ final class ForegroundPerformanceFeedbackTests: XCTestCase {
         _ = manager.simulateCommittedWifiSessionForTesting()
         manager.seedPerformanceWindowForTesting(at: 10)
         for cycle in 0..<10 {
-            let resumedAt = 20 + Double(cycle) * 10
+            let resumedAt = 10.5 + Double(cycle) * 2
             manager.applicationWillResignActive()
             manager.advancePerformanceFeedbackClockForTesting(to: resumedAt)
             XCTAssertEqual(manager.sendPerformanceFeedbackForTesting(), UInt32(cycle))
@@ -2248,6 +2248,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         manager.applicationDidBecomeActive()
 
         let after = manager.usbSessionSnapshot()
+        manager.decoderForTesting.sessionQueueForTesting.sync { }
         XCTAssertTrue(after.connection === peer)
         XCTAssertEqual(after.generation, before.generation)
         XCTAssertEqual(after.committedGeneration, before.committedGeneration)
@@ -2258,9 +2259,12 @@ final class USBListenerLifetimeTests: XCTestCase {
             manager.decoderForTesting.sessionBeganCountForTesting,
             sessions + 1)
         XCTAssertEqual(manager.usbForegroundRecoveryFeedbackCountForTesting, feedbacks + 1)
-        XCTAssertEqual(
-            manager.decoderForTesting.lifecycleEventsForTesting,
-            ["invalidate-begin", "invalidate-end", "begin-\(before.generation)"])
+        let events = manager.decoderForTesting.lifecycleEventsForTesting
+        XCTAssertEqual(events.first, "invalidate-begin")
+        XCTAssertEqual(events.count, 3)
+        XCTAssertEqual(events.filter { $0 == "invalidate-end" }, ["invalidate-end"])
+        XCTAssertEqual(events.filter { $0.hasPrefix("begin-") }, ["begin-\(before.generation)"])
+        XCTAssertEqual(manager.decoderForTesting.invalidateWaitModesForTesting.last, false)
 
         manager.applicationDidBecomeActive()
         XCTAssertEqual(
@@ -2269,44 +2273,44 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertEqual(manager.usbForegroundRecoveryFeedbackCountForTesting, feedbacks + 1)
     }
 
-func testUsbForegroundRearmDoesNotDependOnBlockedDecoderAndKeepsCleanupFIFO() async throws {
-    let peer = try connect()
-    manager.simulateSessionAuthenticatedAndCommitted(mode: RealtimeTransportMode.usbSplitTLS)
-    let before = manager.usbSessionSnapshot()
-    manager.applicationDidEnterBackground()
-    manager.networkQueueForTesting.sync { }
-    let decoder = manager.decoderForTesting
-    decoder.resetLifecycleEventsForTesting()
-    let entered = expectation(description: "decoder barrier held")
-    let release = DispatchSemaphore(value: 0)
-    defer { release.signal() }
-    decoder.sessionQueueForTesting.async { entered.fulfill(); release.wait() }
-    let barrier = await XCTWaiter.fulfillment(of: [entered], timeout: 10)
-    XCTAssertEqual(barrier, .completed)
-    guard barrier == .completed else { return }
-    let sentinel = expectation(description: "USB foreground network queue progresses with decoder blocked")
-    manager.applicationDidBecomeActive()
-    manager.networkQueueForTesting.async { sentinel.fulfill() }
-    let progress = await XCTWaiter.fulfillment(of: [sentinel], timeout: 10)
-    XCTAssertEqual(progress, .completed, "USB foreground depends on blocked decoder cleanup")
-    guard progress == .completed else { return }
-    XCTAssertEqual(decoder.invalidateWaitModesForTesting.last, false)
-    release.signal()
-    let cleanup = expectation(description: "decoder cleanup FIFO")
-    decoder.sessionQueueForTesting.async {
-        let events = decoder.lifecycleEventsForTesting
-        XCTAssertEqual(events.first, "invalidate-begin")
-        XCTAssertEqual(events.filter { $0 == "invalidate-end" }.count, 1)
-        XCTAssertEqual(events.last, "invalidate-end")
-        XCTAssertEqual(events.filter { $0 == "begin-\(before.generation)" }.count, 1)
-        cleanup.fulfill()
+    func testUsbForegroundRearmDoesNotDependOnBlockedDecoderAndKeepsCleanupFIFO() async throws {
+        let peer = try connect()
+        manager.simulateSessionAuthenticatedAndCommitted(mode: RealtimeTransportMode.usbSplitTLS)
+        let before = manager.usbSessionSnapshot()
+        manager.applicationDidEnterBackground()
+        manager.networkQueueForTesting.sync { }
+        let decoder = manager.decoderForTesting
+        decoder.resetLifecycleEventsForTesting()
+        let entered = expectation(description: "decoder barrier held")
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        decoder.sessionQueueForTesting.async { entered.fulfill(); release.wait() }
+        let barrier = await XCTWaiter.fulfillment(of: [entered], timeout: 10)
+        XCTAssertEqual(barrier, .completed)
+        guard barrier == .completed else { return }
+        let sentinel = expectation(description: "USB foreground network queue progresses with decoder blocked")
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.async { sentinel.fulfill() }
+        let progress = await XCTWaiter.fulfillment(of: [sentinel], timeout: 10)
+        XCTAssertEqual(progress, .completed, "USB foreground depends on blocked decoder cleanup")
+        guard progress == .completed else { return }
+        XCTAssertEqual(decoder.invalidateWaitModesForTesting.last, false)
+        release.signal()
+        let cleanup = expectation(description: "decoder cleanup FIFO")
+        decoder.sessionQueueForTesting.async {
+            let events = decoder.lifecycleEventsForTesting
+            XCTAssertEqual(events.first, "invalidate-begin")
+            XCTAssertEqual(events.filter { $0 == "invalidate-end" }.count, 1)
+            XCTAssertEqual(events.last, "invalidate-end")
+            XCTAssertEqual(events.filter { $0 == "begin-\(before.generation)" }.count, 1)
+            cleanup.fulfill()
+        }
+        await fulfillment(of: [cleanup], timeout: 10)
+        let after = manager.usbSessionSnapshot()
+        XCTAssertTrue(after.connection === peer)
+        XCTAssertEqual(after.generation, before.generation)
+        XCTAssertEqual(after.committedGeneration, before.committedGeneration)
     }
-    await fulfillment(of: [cleanup], timeout: 10)
-    let after = manager.usbSessionSnapshot()
-    XCTAssertTrue(after.connection === peer)
-    XCTAssertEqual(after.generation, before.generation)
-    XCTAssertEqual(after.committedGeneration, before.committedGeneration)
-}
 
     func testConnectionFailureCleanupIsNotForegroundRecovery() throws {
         let peer = try connect()
