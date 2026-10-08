@@ -2065,6 +2065,7 @@ public class NetworkManager: ObservableObject {
     }
     private var pendingClientPings: [UInt64: PendingClientPing] = [:]
     private var usbLegacyPcmFreshFenceNonce: UInt64?
+    private var usbLegacyPcmFreshFenceGeneration: UInt64?
     private var legacyUsbPlaybackEnabledGeneration: UInt64?
     private var activeDisplayCapabilities: DisplayCapabilities?
     private var desiredPipelineMode: PipelineMode = .office
@@ -2307,6 +2308,12 @@ public class NetworkManager: ObservableObject {
             }
 
             if !wasForegroundActive,
+               self.usbLegacyPcmFreshFenceGeneration == self.connectionGeneration,
+               self.isCurrentCommittedUsbStreamingSessionOnQueue() {
+                self.armLegacyUsbPcmFreshFence(generation: self.connectionGeneration)
+            }
+
+            if !wasForegroundActive,
                self.isCurrentCommittedWifiRtpStreamingSessionOnQueue(),
                let currentConnection = self.connection {
                 if self.resumeCommittedWifiSessionOnQueue(
@@ -2378,6 +2385,7 @@ public class NetworkManager: ObservableObject {
                 if self.isCurrentCommittedUsbStreamingSessionOnQueue() {
                     if self.legacyUsbPlaybackEnabledGeneration == self.connectionGeneration {
                         self.cancelLegacyUsbPcmFreshFence()
+                        self.usbLegacyPcmFreshFenceGeneration = self.connectionGeneration
                         AudioManager.shared.suspendLegacySessionForLifecycle(
                             generation: self.connectionGeneration)
                     }
@@ -4002,6 +4010,7 @@ public class NetworkManager: ObservableObject {
             pendingClientPings.removeValue(forKey: nonce)
         }
         usbLegacyPcmFreshFenceNonce = nil
+        usbLegacyPcmFreshFenceGeneration = nil
     }
 
     private func armLegacyUsbPcmFreshFence(generation: UInt64) {
@@ -4013,6 +4022,7 @@ public class NetworkManager: ObservableObject {
               activeTransportKind == .usb,
               let owner = usbScdpConnection, connection === owner else { return }
         cancelLegacyUsbPcmFreshFence()
+        usbLegacyPcmFreshFenceGeneration = generation
         AudioManager.shared.suspendLegacySessionForLifecycle(generation: generation)
         guard isForegroundActive else { return }
         sendClientPing(force: true, purpose: .usbLegacyPcmFreshFence)
@@ -4477,6 +4487,7 @@ public class NetworkManager: ObservableObject {
                    isCurrentCommittedUsbStreamingSessionOnQueue(generation: generation),
                    committedRealtimeMode == RealtimeTransportMode.legacyTLS {
                     usbLegacyPcmFreshFenceNonce = nil
+                    usbLegacyPcmFreshFenceGeneration = nil
                     AudioManager.shared.resumeLegacySessionAfterFreshFence(generation: generation)
                     recordUsbLifecycleDiagnostic(
                         "[USB_PCM_RESUME_FENCE] generation=\(generation) action=released")
@@ -4503,7 +4514,8 @@ public class NetworkManager: ObservableObject {
                     generation: generation)
             case .legacyPCM:
                 if activeTransportKind == .usb,
-                   usbLegacyPcmFreshFenceNonce != nil {
+                   isForegroundActive,
+                   usbLegacyPcmFreshFenceGeneration == generation {
                     AudioManager.shared.recordLegacyResumeFenceDrop(generation: generation)
                     return
                 }
@@ -5479,6 +5491,16 @@ public class NetworkManager: ObservableObject {
     #if targetEnvironment(simulator)
     var realtimeAudioPlaybackForTesting: ((Bool) -> Void)?
     var controlSendForAudioTesting: ((Data, @escaping (NWError?) -> Void) -> Void)?
+
+    func isLegacyPcmFreshFencePingForTesting(_ data: Data) -> Bool {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard data.count == WireProtocol.headerSize + 16,
+              data[5] == WireMessageType.ping.rawValue else { return false }
+        let nonce = data.withUnsafeBytes {
+            $0.loadUnaligned(fromByteOffset: WireProtocol.headerSize + 8, as: UInt64.self).littleEndian
+        }
+        return usbLegacyPcmFreshFenceNonce == nonce
+    }
 
     func receiveUsbWireForTesting(type: WireMessageType, payload: Data,
                                   generation: UInt64, connection owner: NWConnection) {

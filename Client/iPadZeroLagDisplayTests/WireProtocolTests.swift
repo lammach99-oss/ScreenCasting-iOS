@@ -2149,8 +2149,11 @@ final class USBListenerLifetimeTests: XCTestCase {
         audio.engineStartForTesting = { }
         audio.pcmScheduleForTesting = { _, completion in probe.completions.append(completion) }
         audio.interruptionResumeForTesting = { probe.interruptionResumes += 1 }
-        manager.controlSendForAudioTesting = { data, completion in
-            if data.count == 32, data[5] == WireMessageType.ping.rawValue { probe.recordPing(Data(data.dropFirst(16))) }
+        let sendingManager = try XCTUnwrap(manager)
+        manager.controlSendForAudioTesting = { [weak sendingManager] data, completion in
+            if sendingManager?.isLegacyPcmFreshFencePingForTesting(data) == true {
+                probe.recordPing(Data(data.dropFirst(WireProtocol.headerSize)))
+            }
             completion(nil)
         }
         defer {
