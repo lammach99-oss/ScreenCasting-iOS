@@ -5380,6 +5380,15 @@ public class NetworkManager: ObservableObject {
     var realtimeAudioPlaybackForTesting: ((Bool) -> Void)?
     var controlSendForAudioTesting: ((Data, @escaping (NWError?) -> Void) -> Void)?
 
+    func installUsbLaneForParserTesting(_ lane: UsbLaneKind, connection: NWConnection) {
+        networkQueue.sync {
+            usbLaneConnections[lane]?.cancel()
+            usbLaneConnections[lane] = connection
+            connection.start(queue: networkQueue)
+            startUsbLaneReceiveLoop(connection, lane: lane)
+        }
+    }
+
     func installUsbAudioLaneForTesting() -> NWConnection {
         networkQueue.sync {
             let lane = NWConnection(host: "127.0.0.1", port: 27015, using: .tcp)

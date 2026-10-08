@@ -549,6 +549,133 @@ final class OptionalUsbAudioBindingTests: XCTestCase {
     }
 }
 
+final class UsbLaneParserTerminalTests: XCTestCase {
+    private func receiveSource() throws -> String {
+        let file = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("iPadZeroLagDisplay/NetworkManager.swift")
+        let source = try String(contentsOf: file, encoding: .utf8)
+            .replacingOccurrences(of: "\r\n", with: "\n")
+        let start = try XCTUnwrap(source.range(of: "    private func startUsbLaneReceiveLoop("))
+        let end = try XCTUnwrap(source.range(of: "    // MARK: Telemetry Timer", range: start.upperBound..<source.endIndex))
+        return String(source[start.lowerBound..<end.lowerBound])
+    }
+
+    private func header(type: WireMessageType = .audio, length: UInt32 = 0) -> Data {
+        var data = Data(repeating: 0, count: WireProtocol.headerSize)
+        data.withUnsafeMutableBytes { bytes in
+            bytes.storeBytes(of: WireProtocol.magic.littleEndian, toByteOffset: 0, as: UInt32.self)
+            bytes.storeBytes(of: WireProtocol.version, toByteOffset: 4, as: UInt8.self)
+            bytes.storeBytes(of: type.rawValue, toByteOffset: 5, as: UInt8.self)
+            bytes.storeBytes(of: length.littleEndian, toByteOffset: 8, as: UInt32.self)
+        }
+        return data
+    }
+
+    private func assertAudioLaneRetires(_ bytes: Data) async throws {
+        let suite = "UsbLaneParserTerminalTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        ClientStreamSettingsStore.save(.normalized(bitrateMbps: 20, audioEnabled: true), defaults: defaults)
+        let manager = NetworkManager(userDefaults: defaults)
+        let retired = expectation(description: "parser terminal retires optional audio")
+        var retirementCount = 0
+        manager.realtimeAudioPlaybackForTesting = { enabled in
+            if !enabled { retirementCount += 1; retired.fulfill() }
+        }
+        manager.controlSendForAudioTesting = { _, completion in completion(nil) }
+        manager.commitAudioTransportForTesting(mode: RealtimeTransportMode.usbSplitTLS, audioAvailable: true)
+        let generation = manager.usbSessionSnapshot().generation
+        let listener = try NWListener(using: .tcp)
+        let listening = expectation(description: "test data-lane listener owns a port")
+        var accepted: NWConnection?
+        listener.stateUpdateHandler = { if case .ready = $0 { listening.fulfill() } }
+        listener.newConnectionHandler = { server in
+            accepted = server
+            server.start(queue: manager.networkQueueForTesting)
+            server.send(content: bytes, completion: .contentProcessed { _ in })
+        }
+        listener.start(queue: manager.networkQueueForTesting)
+        defer {
+            manager.networkQueueForTesting.sync { accepted?.cancel(); listener.cancel() }
+            manager.stopForTesting()
+            defaults.removePersistentDomain(forName: suite)
+        }
+        // Hang watchdog only. PASS is terminal ownership, never a latency SLA.
+        await fulfillment(of: [listening], timeout: 10)
+        let port = try XCTUnwrap(listener.port)
+        let client = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
+        manager.installUsbLaneForParserTesting(.audio, connection: client)
+        await fulfillment(of: [retired], timeout: 10)
+        manager.networkQueueForTesting.sync {
+            XCTAssertEqual(retirementCount, 1)
+            // EOF/error following the parser failure must not retire twice.
+            accepted?.cancel()
+        }
+        let after = manager.usbSessionSnapshot()
+        XCTAssertEqual(after.generation, generation)
+        XCTAssertEqual(after.authenticatedGeneration, generation)
+        XCTAssertEqual(after.committedGeneration, generation)
+        manager.failUsbAudioLaneForTesting(client, generation: generation, reason: "late_eof")
+        manager.networkQueueForTesting.sync { XCTAssertEqual(retirementCount, 1) }
+    }
+
+    func testInvalidMagicRetiresRealAudioLaneOnceWithoutSessionLoss() async throws {
+        try await assertAudioLaneRetires(Data(repeating: 0, count: WireProtocol.headerSize))
+    }
+
+    func testOversizedPayloadRetiresRealAudioLaneWithoutReceiveSpin() async throws {
+        try await assertAudioLaneRetires(header(length: UInt32(8 * 1024 * 1024 + 1)))
+    }
+
+    func testInvalidVersionRetiresRealAudioLane() async throws {
+        var bytes = header(length: 1)
+        bytes[4] = WireProtocol.version &+ 1
+        try await assertAudioLaneRetires(bytes)
+    }
+
+    func testMalformedFixedControlOnRealDataLaneIsTerminal() async throws {
+        try await assertAudioLaneRetires(header(type: .keyboardInput, length: 1) + Data([0]))
+    }
+
+    func testProductionReceiveCannotIgnoreParserFailure() throws {
+        let source = try receiveSource()
+        XCTAssertTrue(source.contains("case .failure"), "USB parser failure is currently swallowed")
+        XCTAssertFalse(source.contains("guard case .message(let message) = event else { return }"))
+    }
+
+    func testDataLaneMalformedControlDiscardMustBeTerminal() throws {
+        XCTAssertTrue(try receiveSource().contains("case .discardedFixedControl"),
+                      "Malformed control frames cannot silently persist on a data lane")
+    }
+
+    func testTerminalStateFencesTheNextReceiveAndBatchMessages() throws {
+        let source = try receiveSource()
+        XCTAssertTrue(source.contains("guard !terminated"), "A terminal parser must never re-arm receive")
+        XCTAssertTrue(source.contains("terminated = true"), "Terminal fault must be recorded before retirement")
+    }
+
+    func testInvalidMagicAndOversizeAreActualTerminalParserEvents() {
+        for oversized in [false, true] {
+            let parser = WireStreamParser(generation: 7)
+            var header = Data(repeating: 0, count: WireProtocol.headerSize)
+            if oversized {
+                header.replaceSubrange(0..<4, with: Data("SCST".utf8))
+                header[4] = 1
+                header[5] = WireMessageType.video.rawValue
+                let size = UInt32(8 * 1024 * 1024 + 1)
+                for i in 0..<4 { header[8 + i] = UInt8(truncatingIfNeeded: size >> (i * 8)) }
+            }
+            var failures = 0
+            parser.consume(header, generation: 7) { event in
+                if case .failure = event { failures += 1 }
+            }
+            XCTAssertEqual(failures, 1)
+            parser.consume(Data(repeating: 0, count: 16), generation: 7) { _ in
+                XCTFail("Failed parser must not deliver further messages")
+            }
+        }
+    }
+}
+
 final class UsbAudioRuntimeRetirementTests: XCTestCase {
     func testCurrentAudioLaneLossPreservesSessionAndDesiredAudio() throws {
         for reason in ["receive_error", "eof", "unexpected_type"] {
