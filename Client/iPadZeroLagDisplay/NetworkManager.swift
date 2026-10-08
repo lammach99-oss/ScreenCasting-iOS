@@ -2056,7 +2056,16 @@ public class NetworkManager: ObservableObject {
     private var lastHudSnapshotPublishedAt: TimeInterval = 0
     private var lastClientPingSentAt: TimeInterval = 0
     private var nextClientPingNonce: UInt64 = 1
-    private var pendingClientPings: [UInt64: TimeInterval] = [:]
+    private enum ClientPingPurpose { case telemetry, usbLegacyPcmFreshFence }
+    private struct PendingClientPing {
+        let sentAt: TimeInterval
+        let purpose: ClientPingPurpose
+        let generation: UInt64
+        let connectionID: ObjectIdentifier
+    }
+    private var pendingClientPings: [UInt64: PendingClientPing] = [:]
+    private var usbLegacyPcmFreshFenceNonce: UInt64?
+    private var legacyUsbPlaybackEnabledGeneration: UInt64?
     private var activeDisplayCapabilities: DisplayCapabilities?
     private var desiredPipelineMode: PipelineMode = .office
     private var committedPipelineMode = CommittedPipelineModeState()
@@ -2285,6 +2294,7 @@ public class NetworkManager: ObservableObject {
                         "current_generation=\(self.connectionGeneration) action=skip_stale")
                     return
                 }
+                self.armLegacyUsbPcmFreshFence(generation: generation)
                 self.decoder.beginSession(generation: generation)
                 self.sendVideoFeedback()
                 #if targetEnvironment(simulator)
@@ -2366,6 +2376,11 @@ public class NetworkManager: ObservableObject {
             guard !self.usbListenerExplicitlyStarted else {
                 self.wifiLifecycleTransitionGeneration = nil
                 if self.isCurrentCommittedUsbStreamingSessionOnQueue() {
+                    if self.legacyUsbPlaybackEnabledGeneration == self.connectionGeneration {
+                        self.cancelLegacyUsbPcmFreshFence()
+                        AudioManager.shared.suspendLegacySessionForLifecycle(
+                            generation: self.connectionGeneration)
+                    }
                     self.pendingUsbForegroundDecoderRearmGeneration =
                         self.connectionGeneration
                     print(
@@ -2899,6 +2914,9 @@ public class NetworkManager: ObservableObject {
 
     private func stopOnQueue() {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        cancelLegacyUsbPcmFreshFence()
+        legacyUsbPlaybackEnabledGeneration = nil
+        pendingClientPings.removeAll(keepingCapacity: true)
         let wasUSB = usbListenerExplicitlyStarted
         usbListenerExplicitlyStarted = false
         reconnectEnabled = false
@@ -3779,7 +3797,7 @@ public class NetworkManager: ObservableObject {
 
     private func startTelemetryTimer() {
         stopTelemetryTimer()
-        pendingClientPings.removeAll(keepingCapacity: true)
+        pendingClientPings = pendingClientPings.filter { $0.value.purpose != .telemetry }
         lastClientPingSentAt = 0
         videoPayloadCounter.begin(generation: connectionGeneration)
         videoRxSampler.reset()
@@ -3846,7 +3864,7 @@ public class NetworkManager: ObservableObject {
         telemetryTimer = nil
         adaptiveTelemetryTimer?.cancel()
         adaptiveTelemetryTimer = nil
-        pendingClientPings.removeAll(keepingCapacity: true)
+        pendingClientPings = pendingClientPings.filter { $0.value.purpose != .telemetry }
         transportTelemetry.stopLogging()
     }
 
@@ -3940,17 +3958,26 @@ public class NetworkManager: ObservableObject {
         #if targetEnvironment(simulator)
         testingPingAttempts += 1
         #endif
+        sendClientPing(force: false, purpose: .telemetry)
+    }
+
+    private func sendClientPing(force: Bool, purpose: ClientPingPurpose) {
+        guard let owner = activeControlConnection else { return }
         let now = ProcessInfo.processInfo.systemUptime
-        guard now - lastClientPingSentAt >= 1 else { return }
+        guard force || now - lastClientPingSentAt >= 1 else { return }
         lastClientPingSentAt = now
 
         let nonce = nextClientPingNonce
         nextClientPingNonce &+= 1
         if pendingClientPings.count >= 16,
-           let oldest = pendingClientPings.min(by: { $0.value < $1.value })?.key {
+           let oldest = pendingClientPings.filter({ $0.value.purpose == .telemetry })
+            .min(by: { $0.value.sentAt < $1.value.sentAt })?.key {
             pendingClientPings.removeValue(forKey: oldest)
         }
-        pendingClientPings[nonce] = now
+        pendingClientPings[nonce] = PendingClientPing(
+            sentAt: now, purpose: purpose, generation: connectionGeneration,
+            connectionID: ObjectIdentifier(owner))
+        if purpose == .usbLegacyPcmFreshFence { usbLegacyPcmFreshFenceNonce = nonce }
 
         let sentNanoseconds = UInt64(max(0, now) * 1_000_000_000.0)
         var payload = Data(count: 16)
@@ -3968,6 +3995,29 @@ public class NetworkManager: ObservableObject {
             type: .ping,
             payload: payload,
             sequence: UInt32(truncatingIfNeeded: nonce))
+    }
+
+    private func cancelLegacyUsbPcmFreshFence() {
+        if let nonce = usbLegacyPcmFreshFenceNonce {
+            pendingClientPings.removeValue(forKey: nonce)
+        }
+        usbLegacyPcmFreshFenceNonce = nil
+    }
+
+    private func armLegacyUsbPcmFreshFence(generation: UInt64) {
+        guard generation == connectionGeneration,
+              legacyUsbPlaybackEnabledGeneration == generation,
+              committedRealtimeMode == RealtimeTransportMode.legacyTLS,
+              committedTransportGeneration == generation,
+              wireAuthenticatedGeneration == generation,
+              activeTransportKind == .usb,
+              let owner = usbScdpConnection, connection === owner else { return }
+        cancelLegacyUsbPcmFreshFence()
+        AudioManager.shared.suspendLegacySessionForLifecycle(generation: generation)
+        guard isForegroundActive else { return }
+        sendClientPing(force: true, purpose: .usbLegacyPcmFreshFence)
+        recordUsbLifecycleDiagnostic(
+            "[USB_PCM_RESUME_FENCE] generation=\(generation) action=armed")
     }
 
     private func recordVideoPayloadReceived(_ byteCount: Int, sequence: UInt32) {
@@ -4410,11 +4460,27 @@ public class NetworkManager: ObservableObject {
             let nonce = payload.withUnsafeBytes {
                 $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self).littleEndian
             }
-            if let sentAt = pendingClientPings.removeValue(forKey: nonce) {
+            if let pending = pendingClientPings[nonce],
+               pending.generation == generation,
+               generation == connectionGeneration,
+               let owner = activeControlConnection,
+               pending.connectionID == ObjectIdentifier(owner) {
+                pendingClientPings.removeValue(forKey: nonce)
                 let rttMs = max(
                     0,
-                    (ProcessInfo.processInfo.systemUptime - sentAt) * 1_000.0)
+                    (ProcessInfo.processInfo.systemUptime - pending.sentAt) * 1_000.0)
                 transportTelemetry.recordRtt(durationMs: rttMs)
+                if pending.purpose == .usbLegacyPcmFreshFence,
+                   usbLegacyPcmFreshFenceNonce == nonce,
+                   legacyUsbPlaybackEnabledGeneration == generation,
+                   isForegroundActive,
+                   isCurrentCommittedUsbStreamingSessionOnQueue(generation: generation),
+                   committedRealtimeMode == RealtimeTransportMode.legacyTLS {
+                    usbLegacyPcmFreshFenceNonce = nil
+                    AudioManager.shared.resumeLegacySessionAfterFreshFence(generation: generation)
+                    recordUsbLifecycleDiagnostic(
+                        "[USB_PCM_RESUME_FENCE] generation=\(generation) action=released")
+                }
             }
 
         case .videoFeedback:
@@ -4436,6 +4502,11 @@ public class NetworkManager: ObservableObject {
                     timestamp: audioTimestamp,
                     generation: generation)
             case .legacyPCM:
+                if activeTransportKind == .usb,
+                   usbLegacyPcmFreshFenceNonce != nil {
+                    AudioManager.shared.recordLegacyResumeFenceDrop(generation: generation)
+                    return
+                }
                 AudioManager.shared.playPCMData(payload, generation: generation)
             case .reject:
                 return
@@ -5309,6 +5380,9 @@ public class NetworkManager: ObservableObject {
 
     private func teardownCurrentSession() {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        cancelLegacyUsbPcmFreshFence()
+        legacyUsbPlaybackEnabledGeneration = nil
+        pendingClientPings.removeAll(keepingCapacity: true)
         wifiBackgroundDisconnectWorkItem?.cancel()
         wifiBackgroundDisconnectWorkItem = nil
         wifiLifecycleTransitionGeneration = nil
@@ -5353,7 +5427,18 @@ public class NetworkManager: ObservableObject {
               committedRealtimeMode == mode else { return }
         let playbackEnabled = audioEnabled && clientSettingsState.desired.audioEnabled &&
             committedTransportAudioAvailable
-        if mode == RealtimeTransportMode.legacyTLS, playbackEnabled {
+        if activeTransportKind == .usb, mode == RealtimeTransportMode.legacyTLS {
+            if !playbackEnabled {
+                cancelLegacyUsbPcmFreshFence()
+                legacyUsbPlaybackEnabledGeneration = nil
+            } else if legacyUsbPlaybackEnabledGeneration != generation {
+                legacyUsbPlaybackEnabledGeneration = generation
+                AudioManager.shared.beginLegacySession(generation: generation)
+                armLegacyUsbPcmFreshFence(generation: generation)
+            }
+        }
+        if mode == RealtimeTransportMode.legacyTLS, playbackEnabled,
+           activeTransportKind != .usb {
             AudioManager.shared.beginLegacySession(generation: generation)
         }
         guard RealtimeAudioTimerPolicy.shouldRun(
