@@ -3890,14 +3890,22 @@ public class NetworkManager: ObservableObject {
         publishHudSnapshotIfDue()
     }
 
+    // The simulator seam supplies a deterministic clock; device timing is unchanged.
+    private func performanceFeedbackTime() -> TimeInterval {
+        #if targetEnvironment(simulator)
+        if let testingPerformanceFeedbackNow { return testingPerformanceFeedbackNow }
+        #endif
+        return CACurrentMediaTime()
+    }
+
     private func sendPerformanceFeedback() {
         guard wireAuthenticatedGeneration == connectionGeneration,
               committedTransportGeneration == connectionGeneration,
               let mode = committedPipelineMode.active,
               mode == desiredPipelineMode,
-              let sample = transportTelemetry.freshFrameRateSample(generation: connectionGeneration),
+              let sample = transportTelemetry.freshFrameRateSample(generation: connectionGeneration, at: performanceFeedbackTime()),
               sample.sampleWindowMs <= 2500,
-              committedPipelineMode.readyForFeedback(at: CACurrentMediaTime()) else { return }
+              committedPipelineMode.readyForFeedback(at: performanceFeedbackTime()) else { return }
         func encoded(_ fps: Double) -> UInt16 {
             UInt16(clamping: Int(min(2400, max(0, fps * 10)).rounded()))
         }
@@ -5372,6 +5380,28 @@ public class NetworkManager: ObservableObject {
     #if targetEnvironment(simulator)
     var realtimeAudioPlaybackForTesting: ((Bool) -> Void)?
     var controlSendForAudioTesting: ((Data, @escaping (NWError?) -> Void) -> Void)?
+
+private var testingPerformanceFeedbackNow: TimeInterval?
+func seedPerformanceWindowForTesting(mode: PipelineMode = .office, at now: TimeInterval) {
+    networkQueue.sync {
+        testingPerformanceFeedbackNow = now
+        desiredPipelineMode = mode
+        committedPipelineMode.request(mode)
+        _ = committedPipelineMode.acknowledge(mode, at: now - 3)
+        transportTelemetry.beginFreshFrameRate(generation: connectionGeneration, at: now - 1.1)
+    }
+}
+func advancePerformanceFeedbackClockForTesting(to now: TimeInterval) {
+    networkQueue.sync { testingPerformanceFeedbackNow = now }
+}
+func sendPerformanceFeedbackForTesting() -> UInt32 {
+    networkQueue.sync { sendPerformanceFeedback(); return performanceFeedbackSequence }
+}
+func performanceSampleForTesting(at now: TimeInterval) -> ClientFreshFrameRateSample? {
+    networkQueue.sync {
+        transportTelemetry.freshFrameRateSample(generation: connectionGeneration, at: now)
+    }
+}
 
     func installUsbLaneForParserTesting(_ lane: UsbLaneKind, connection: NWConnection) {
         networkQueue.sync {

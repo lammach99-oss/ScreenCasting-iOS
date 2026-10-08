@@ -549,6 +549,55 @@ final class OptionalUsbAudioBindingTests: XCTestCase {
     }
 }
 
+final class ForegroundPerformanceFeedbackTests: XCTestCase {
+    func testActiveCommittedWifiCanEmitPerformanceFeedback() {
+        for mode in [PipelineMode.office, .game] {
+            let manager = NetworkManager(); defer { manager.stopForTesting() }
+            _ = manager.simulateCommittedWifiSessionForTesting()
+            manager.seedPerformanceWindowForTesting(mode: mode, at: 10)
+            XCTAssertEqual(manager.sendPerformanceFeedbackForTesting(), 1)
+        }
+    }
+    func testInactiveAndBackgroundCannotEmitPerformanceFeedback() {
+        for background in [false, true] {
+            let manager = NetworkManager(); defer { manager.stopForTesting() }
+            _ = manager.simulateCommittedWifiSessionForTesting()
+            manager.seedPerformanceWindowForTesting(at: 10)
+            if background { manager.applicationDidEnterBackground() }
+            else { manager.applicationWillResignActive() }
+            XCTAssertEqual(manager.sendPerformanceFeedbackForTesting(), 0)
+        }
+    }
+    func testForegroundFeedbackWaitsForOneFullFreshSecondAndSurvivesTenCycles() {
+        let manager = NetworkManager(); defer { manager.stopForTesting() }
+        _ = manager.simulateCommittedWifiSessionForTesting()
+        manager.seedPerformanceWindowForTesting(at: 10)
+        for cycle in 0..<10 {
+            let resumedAt = 20 + Double(cycle) * 10
+            manager.applicationWillResignActive()
+            manager.advancePerformanceFeedbackClockForTesting(to: resumedAt)
+            XCTAssertEqual(manager.sendPerformanceFeedbackForTesting(), UInt32(cycle))
+            manager.applicationDidBecomeActive()
+            manager.networkQueueForTesting.sync { }
+            manager.advancePerformanceFeedbackClockForTesting(to: resumedAt + 0.9)
+            XCTAssertEqual(manager.sendPerformanceFeedbackForTesting(), UInt32(cycle))
+            manager.advancePerformanceFeedbackClockForTesting(to: resumedAt + 1)
+            XCTAssertEqual(manager.sendPerformanceFeedbackForTesting(), UInt32(cycle + 1))
+        }
+    }
+
+    func testForegroundStartsFreshWindowInsteadOfPublishingInactiveHistory() {
+        let manager = NetworkManager(); defer { manager.stopForTesting() }
+        _ = manager.simulateCommittedWifiSessionForTesting()
+        manager.seedPerformanceWindowForTesting(at: 10)
+        manager.applicationWillResignActive()
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+        XCTAssertNil(manager.performanceSampleForTesting(at: 10))
+        XCTAssertEqual(manager.sendPerformanceFeedbackForTesting(), 0)
+    }
+}
+
 final class UsbLaneParserTerminalTests: XCTestCase {
     private func receiveSource() throws -> String {
         let file = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
@@ -2144,6 +2193,22 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertGreaterThan(repSnap.generation, oldGen)
     }
 
+    func testUsbInactivePerformanceFeedbackCannotPublishOrReuseOldWindow() throws {
+        _ = try connect()
+        manager.simulateSessionAuthenticatedAndCommitted(mode: RealtimeTransportMode.usbSplitTLS)
+        manager.applicationWillResignActive()
+        manager.networkQueueForTesting.sync { }
+        manager.seedPerformanceWindowForTesting(at: 10)
+        XCTAssertEqual(manager.sendPerformanceFeedbackForTesting(), 0)
+        // Seed again to prove foreground actually retires the old window,
+        // independent of whether the inactive feedback call sampled it.
+        manager.seedPerformanceWindowForTesting(at: 10)
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+        XCTAssertNil(manager.performanceSampleForTesting(at: 10))
+        XCTAssertEqual(manager.sendPerformanceFeedbackForTesting(), 0)
+    }
+
     func testControlCenterAppInactivityDoesNotTearDownUsbSession() throws {
         let peer = try connect()
         manager.simulateSessionAuthenticatedAndCommitted(
@@ -2203,6 +2268,45 @@ final class USBListenerLifetimeTests: XCTestCase {
             invalidations + 1)
         XCTAssertEqual(manager.usbForegroundRecoveryFeedbackCountForTesting, feedbacks + 1)
     }
+
+func testUsbForegroundRearmDoesNotDependOnBlockedDecoderAndKeepsCleanupFIFO() async throws {
+    let peer = try connect()
+    manager.simulateSessionAuthenticatedAndCommitted(mode: RealtimeTransportMode.usbSplitTLS)
+    let before = manager.usbSessionSnapshot()
+    manager.applicationDidEnterBackground()
+    manager.networkQueueForTesting.sync { }
+    let decoder = manager.decoderForTesting
+    decoder.resetLifecycleEventsForTesting()
+    let entered = expectation(description: "decoder barrier held")
+    let release = DispatchSemaphore(value: 0)
+    defer { release.signal() }
+    decoder.sessionQueueForTesting.async { entered.fulfill(); release.wait() }
+    let barrier = await XCTWaiter.fulfillment(of: [entered], timeout: 10)
+    XCTAssertEqual(barrier, .completed)
+    guard barrier == .completed else { return }
+    let sentinel = expectation(description: "USB foreground network queue progresses with decoder blocked")
+    manager.applicationDidBecomeActive()
+    manager.networkQueueForTesting.async { sentinel.fulfill() }
+    let progress = await XCTWaiter.fulfillment(of: [sentinel], timeout: 10)
+    XCTAssertEqual(progress, .completed, "USB foreground depends on blocked decoder cleanup")
+    guard progress == .completed else { return }
+    XCTAssertEqual(decoder.invalidateWaitModesForTesting.last, false)
+    release.signal()
+    let cleanup = expectation(description: "decoder cleanup FIFO")
+    decoder.sessionQueueForTesting.async {
+        let events = decoder.lifecycleEventsForTesting
+        XCTAssertEqual(events.first, "invalidate-begin")
+        XCTAssertEqual(events.filter { $0 == "invalidate-end" }.count, 1)
+        XCTAssertEqual(events.last, "invalidate-end")
+        XCTAssertEqual(events.filter { $0 == "begin-\(before.generation)" }.count, 1)
+        cleanup.fulfill()
+    }
+    await fulfillment(of: [cleanup], timeout: 10)
+    let after = manager.usbSessionSnapshot()
+    XCTAssertTrue(after.connection === peer)
+    XCTAssertEqual(after.generation, before.generation)
+    XCTAssertEqual(after.committedGeneration, before.committedGeneration)
+}
 
     func testConnectionFailureCleanupIsNotForegroundRecovery() throws {
         let peer = try connect()
