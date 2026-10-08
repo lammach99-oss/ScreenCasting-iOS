@@ -2044,9 +2044,18 @@ final class USBListenerLifetimeTests: XCTestCase {
     }
 
     func testLegacyUsbBackgroundSuspendsPcmWithoutQueueReject() throws {
-        _ = try connect()
+        let peer = try connect()
+        var pings: [Data] = []
+        manager.controlSendForAudioTesting = { data, completion in
+            if data.count == 32, data[5] == WireMessageType.ping.rawValue { pings.append(Data(data.dropFirst(16))) }
+            completion(nil)
+        }
         manager.simulateSessionAuthenticatedAndCommitted()
         let generation = manager.usbSessionSnapshot().generation
+        manager.networkQueueForTesting.sync { }
+        if let ping = pings.last {
+            manager.receiveUsbWireForTesting(type: .pong, payload: ping, generation: generation, connection: peer)
+        }
         let audio = AudioManager.shared
         audio.engineStartForTesting = { }
         var completions: [() -> Void] = []
@@ -2099,6 +2108,163 @@ final class USBListenerLifetimeTests: XCTestCase {
         }
         XCTAssertEqual(audio.playbackStateForTesting.queued, 0)
         XCTAssertEqual(audio.playbackStateForTesting.completions, 300)
+    }
+
+    private final class LegacyPcmProbe {
+        var pings: [Data] = []
+        var completions: [() -> Void] = []
+        var interruptionResumes = 0
+    }
+
+    private func withLegacyUsbPcm(_ body: (AudioManager, NWConnection, UInt64, LegacyPcmProbe) throws -> Void) throws {
+        manager.stopForTesting()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "test.usb.pcm.\(UUID().uuidString)"))
+        manager = NetworkManager(userDefaults: defaults)
+        manager.startListening(port: 0)
+        let audio = AudioManager.shared
+        audio.audioQueueForTesting.sync { }
+        let probe = LegacyPcmProbe()
+        audio.engineStartForTesting = { }
+        audio.pcmScheduleForTesting = { _, completion in probe.completions.append(completion) }
+        audio.interruptionResumeForTesting = { probe.interruptionResumes += 1 }
+        manager.controlSendForAudioTesting = { data, completion in
+            if data.count == 32, data[5] == WireMessageType.ping.rawValue { probe.pings.append(Data(data.dropFirst(16))) }
+            completion(nil)
+        }
+        defer {
+            manager.stopForTesting()
+            audio.reset(); audio.audioQueueForTesting.sync { }
+            audio.engineStartForTesting = nil
+            audio.pcmScheduleForTesting = nil
+            audio.interruptionResumeForTesting = nil
+            manager.controlSendForAudioTesting = nil
+        }
+        let peer = try connect()
+        manager.simulateSessionAuthenticatedAndCommitted()
+        let generation = manager.usbSessionSnapshot().generation
+        manager.networkQueueForTesting.sync { }
+        if let ping = probe.pings.last {
+            manager.receiveUsbWireForTesting(type: .pong, payload: ping, generation: generation, connection: peer)
+        }
+        audio.audioQueueForTesting.sync { }
+        probe.pings.removeAll()
+        try body(audio, peer, generation, probe)
+    }
+
+    func testLegacyUsbForegroundDropsPreFencePcmAndMatchingPongReleasesFreshPcm() throws {
+        try withLegacyUsbPcm { audio, peer, generation, probe in
+            manager.applicationDidEnterBackground()
+            manager.applicationDidBecomeActive()
+            manager.networkQueueForTesting.sync { }
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(probe.pings.count, 1)
+            for _ in 0..<100 {
+                manager.receiveUsbWireForTesting(type: .audio, payload: Data(repeating: 0, count: 480 * 4), generation: generation, connection: peer)
+            }
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(probe.completions.count, 0)
+            XCTAssertEqual(audio.playbackStateForTesting.queued, 0)
+            let ping = try XCTUnwrap(probe.pings.last)
+            manager.receiveUsbWireForTesting(type: .pong, payload: ping, generation: generation, connection: peer)
+            for _ in 0..<300 {
+                manager.receiveUsbWireForTesting(type: .audio, payload: Data(repeating: 0, count: 480 * 4), generation: generation, connection: peer)
+                audio.audioQueueForTesting.sync { }
+                try XCTUnwrap(probe.completions.last)()
+                audio.audioQueueForTesting.sync { }
+            }
+            XCTAssertEqual(probe.completions.count, 300)
+            XCTAssertEqual(audio.playbackStateForTesting.queued, 0)
+            var records: [String] = []
+            audio.publishDiagnostics(generation: generation, profile: "usb", opus: false, receiveRejects: "", sink: { records.append($0) })
+            audio.audioQueueForTesting.sync { }
+            XCTAssertTrue(records.last?.contains("pcm_reject=0") == true)
+            XCTAssertTrue(records.last?.contains("pcm_resume_fence_drop=100") == true)
+        }
+    }
+
+    func testLegacyUsbWrongNonceGenerationAndConnectionCannotReleaseFreshFence() throws {
+        try withLegacyUsbPcm { audio, peer, generation, probe in
+            manager.applicationDidEnterBackground(); manager.applicationDidBecomeActive()
+            manager.networkQueueForTesting.sync { }
+            let ping = try XCTUnwrap(probe.pings.last)
+            var wrong = ping; wrong[15] ^= 0x80
+            manager.receiveUsbWireForTesting(type: .pong, payload: wrong, generation: generation, connection: peer)
+            manager.receiveUsbWireForTesting(type: .pong, payload: ping, generation: generation &- 1, connection: peer)
+            let foreign = NWConnection(host: "127.0.0.1", port: 1, using: .tcp)
+            defer { foreign.cancel() }
+            manager.receiveUsbWireForTesting(type: .pong, payload: ping, generation: generation, connection: foreign)
+            manager.receiveUsbWireForTesting(type: .audio, payload: Data(repeating: 0, count: 480 * 4), generation: generation, connection: peer)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(probe.completions.count, 0)
+        }
+    }
+
+    func testLegacyUsbAudioOffCancelsPendingFenceAndAudioOnArmsNewNonce() throws {
+        try withLegacyUsbPcm { audio, peer, generation, probe in
+            manager.reconcileAudioForTesting(generation: generation, mode: RealtimeTransportMode.legacyTLS, audioEnabled: false)
+            manager.reconcileAudioForTesting(generation: generation, mode: RealtimeTransportMode.legacyTLS, audioEnabled: true)
+            manager.networkQueueForTesting.sync { }
+            let old = try XCTUnwrap(probe.pings.last)
+            manager.reconcileAudioForTesting(generation: generation, mode: RealtimeTransportMode.legacyTLS, audioEnabled: false)
+            manager.receiveUsbWireForTesting(type: .pong, payload: old, generation: generation, connection: peer)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertNil(audio.playbackStateForTesting.generation)
+            manager.reconcileAudioForTesting(generation: generation, mode: RealtimeTransportMode.legacyTLS, audioEnabled: true)
+            manager.networkQueueForTesting.sync { }
+            let fresh = try XCTUnwrap(probe.pings.last)
+            XCTAssertNotEqual(old, fresh)
+            manager.receiveUsbWireForTesting(type: .pong, payload: old, generation: generation, connection: peer)
+            manager.receiveUsbWireForTesting(type: .audio, payload: Data(repeating: 0, count: 480 * 4), generation: generation, connection: peer)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(probe.completions.count, 0)
+            manager.receiveUsbWireForTesting(type: .pong, payload: fresh, generation: generation, connection: peer)
+            manager.receiveUsbWireForTesting(type: .audio, payload: Data(repeating: 0, count: 480 * 4), generation: generation, connection: peer)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(probe.completions.count, 1)
+        }
+    }
+
+    func testLegacyLifecycleAndInterruptionCannotResumeBeforeFreshPong() throws {
+        try withLegacyUsbPcm { audio, peer, generation, probe in
+            audio.interruptForTesting(began: true)
+            manager.applicationDidEnterBackground(); manager.networkQueueForTesting.sync { }
+            audio.interruptForTesting(began: false)
+            XCTAssertEqual(probe.interruptionResumes, 0)
+            manager.applicationDidBecomeActive(); manager.networkQueueForTesting.sync { }
+            let ping = try XCTUnwrap(probe.pings.last)
+            audio.interruptForTesting(began: true)
+            manager.receiveUsbWireForTesting(type: .pong, payload: ping, generation: generation, connection: peer)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(probe.interruptionResumes, 0)
+            audio.interruptForTesting(began: false)
+            manager.receiveUsbWireForTesting(type: .audio, payload: Data(repeating: 0, count: 480 * 4), generation: generation, connection: peer)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(probe.completions.count, 1)
+            XCTAssertLessThanOrEqual(probe.interruptionResumes, 1)
+        }
+    }
+
+    func testLegacyReplacementGenerationIgnoresOldPongAndCompletion() throws {
+        try withLegacyUsbPcm { audio, peer, generation, probe in
+            manager.receiveUsbWireForTesting(type: .audio, payload: Data(repeating: 0, count: 480 * 4), generation: generation, connection: peer)
+            audio.audioQueueForTesting.sync { }
+            let completion = try XCTUnwrap(probe.completions.last)
+            manager.applicationDidEnterBackground(); manager.applicationDidBecomeActive()
+            manager.networkQueueForTesting.sync { }
+            let oldPing = try XCTUnwrap(probe.pings.last)
+            try deliver(.failed(.posix(.ECONNRESET)), to: peer)
+            let replacement = try connect()
+            manager.simulateSessionAuthenticatedAndCommitted()
+            manager.networkQueueForTesting.sync { }
+            let next = manager.usbSessionSnapshot().generation
+            let fresh = try XCTUnwrap(probe.pings.last)
+            manager.receiveUsbWireForTesting(type: .pong, payload: oldPing, generation: generation, connection: peer)
+            manager.receiveUsbWireForTesting(type: .pong, payload: fresh, generation: next, connection: replacement)
+            manager.receiveUsbWireForTesting(type: .audio, payload: Data(repeating: 0, count: 480 * 4), generation: next, connection: replacement)
+            completion(); audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(audio.playbackStateForTesting.generation, next)
+            XCTAssertEqual(audio.playbackStateForTesting.queued, 480)
+        }
     }
 
     func testListenerSurvivesFailureAndImmediatelyAcceptsAnotherSession() throws {

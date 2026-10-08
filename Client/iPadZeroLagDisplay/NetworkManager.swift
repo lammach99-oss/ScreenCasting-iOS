@@ -5395,6 +5395,17 @@ public class NetworkManager: ObservableObject {
     var realtimeAudioPlaybackForTesting: ((Bool) -> Void)?
     var controlSendForAudioTesting: ((Data, @escaping (NWError?) -> Void) -> Void)?
 
+    func receiveUsbWireForTesting(type: WireMessageType, payload: Data,
+                                  generation: UInt64, connection owner: NWConnection) {
+        networkQueue.sync {
+            guard generation == connectionGeneration, connection === owner,
+                  usbScdpConnection === owner else { return }
+            handleWireMessage(WireMessage(header: WireHeader(type: type, flags: 0,
+                payloadLength: payload.count, sequence: 0), payload: payload,
+                firstByteAt: ProcessInfo.processInfo.systemUptime), generation: generation)
+        }
+    }
+
     private var testingPerformanceFeedbackNow: TimeInterval?
     func seedPerformanceWindowForTesting(mode: PipelineMode = .office, at now: TimeInterval) {
         networkQueue.sync {
