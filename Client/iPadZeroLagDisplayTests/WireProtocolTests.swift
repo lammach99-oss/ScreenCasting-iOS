@@ -2224,6 +2224,28 @@ final class USBListenerLifetimeTests: XCTestCase {
         }
     }
 
+    func testLegacyUsbAudioOnWhileInactiveGetsFreshFenceOnActive() throws {
+        try withLegacyUsbPcm { audio, peer, generation, probe in
+            manager.reconcileAudioForTesting(generation: generation, mode: RealtimeTransportMode.legacyTLS, audioEnabled: false)
+            manager.applicationWillResignActive()
+            manager.networkQueueForTesting.sync { }
+            manager.reconcileAudioForTesting(generation: generation, mode: RealtimeTransportMode.legacyTLS, audioEnabled: true)
+            manager.networkQueueForTesting.sync { }
+            XCTAssertEqual(probe.pings.count, 0)
+            manager.applicationDidBecomeActive()
+            manager.networkQueueForTesting.sync { }
+            XCTAssertEqual(probe.pings.count, 1)
+            let ping = try XCTUnwrap(probe.pings.last)
+            manager.receiveUsbWireForTesting(type: .audio, payload: Data(repeating: 0, count: 480 * 4), generation: generation, connection: peer)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(probe.completions.count, 0)
+            manager.receiveUsbWireForTesting(type: .pong, payload: ping, generation: generation, connection: peer)
+            manager.receiveUsbWireForTesting(type: .audio, payload: Data(repeating: 0, count: 480 * 4), generation: generation, connection: peer)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(probe.completions.count, 1)
+        }
+    }
+
     func testLegacyLifecycleAndInterruptionCannotResumeBeforeFreshPong() throws {
         try withLegacyUsbPcm { audio, peer, generation, probe in
             audio.interruptForTesting(began: true)
