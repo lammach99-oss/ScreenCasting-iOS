@@ -3704,67 +3704,60 @@ public class NetworkManager: ObservableObject {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         let generation = connectionGeneration
         let parser = WireStreamParser(generation: generation)
+        var terminated = false
 
         func receiveNext() {
+            guard !terminated else { return }
             connection.receive(
                 minimumIncompleteLength: 1,
                 maximumLength: parser.suggestedReceiveLength)
             { [weak self] data, _, isComplete, error in
-                guard let self,
+                guard !terminated, let self,
                       generation == self.connectionGeneration,
-                      self.usbLaneConnections[lane] === connection
-                else { return }
-                if let error {
-                    if lane == .audio {
-                        self.retireUsbAudioLane(connection, generation: generation, reason: "receive_error")
+                      self.usbLaneConnections[lane] === connection else { return }
+                func terminate(_ reason: String) {
+                    guard !terminated else { return }
+                    terminated = true
+                    if lane == .audio,
+                       self.committedTransportGeneration == generation,
+                       self.committedRealtimeMode == RealtimeTransportMode.usbSplitTLS {
+                        self.retireUsbAudioLane(connection, generation: generation, reason: reason)
+                    } else {
+                        connection.cancel()
+                        self.handleStreamError("USB media lane terminal: \(reason)")
                     }
-                    if lane == .video {
-                        self.handleStreamError(
-                            "USB video lane failed: \(error.localizedDescription)")
-                    }
-                    return
                 }
+                if error != nil { terminate("receive_error"); return }
                 if let data, !data.isEmpty {
                     parser.consume(
-                        data,
-                        generation: generation,
+                        data, generation: generation,
                         receivedAt: CACurrentMediaTime())
                     { event in
-                        if lane == .audio && self.usbLaneConnections[.audio] !== connection { return }
-                        guard case .message(let message) = event else { return }
-                        let expected: WireMessageType =
-                            lane == .video ? .video : .audio
-                        guard message.header.type == expected else {
-                            if lane == .audio {
-                                self.retireUsbAudioLane(connection, generation: generation, reason: "unexpected_type")
-                                return
+                        guard !terminated,
+                              generation == self.connectionGeneration,
+                              self.usbLaneConnections[lane] === connection else { return }
+                        switch event {
+                        case .failure:
+                            terminate("wire_parser_failure")
+                        case .discardedFixedControl:
+                            // Only video/audio messages are legal on bound data lanes.
+                            terminate("discarded_fixed_control_on_data_lane")
+                        case .message(let message):
+                            let expected: WireMessageType = lane == .video ? .video : .audio
+                            guard message.header.type == expected else {
+                                terminate("unexpected_type"); return
                             }
-                            connection.cancel()
-                            if lane == .video {
-                                self.handleStreamError(
-                                    "Unexpected message on USB video lane.")
-                            }
-                            return
+                            self.handleWireMessage(message, generation: generation)
                         }
-                        self.handleWireMessage(
-                            message,
-                            generation: generation)
                     }
                 }
-                if isComplete {
-                    if lane == .audio {
-                        self.retireUsbAudioLane(connection, generation: generation, reason: "eof")
-                    }
-                    if lane == .video {
-                        self.handleStreamError("USB video lane closed.")
-                    }
-                    return
-                }
-                if lane == .audio && self.usbLaneConnections[.audio] !== connection { return }
+                guard !terminated,
+                      generation == self.connectionGeneration,
+                      self.usbLaneConnections[lane] === connection else { return }
+                if isComplete { terminate("eof"); return }
                 receiveNext()
             }
         }
-
         receiveNext()
     }
 
