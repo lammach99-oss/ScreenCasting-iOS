@@ -2111,9 +2111,31 @@ final class USBListenerLifetimeTests: XCTestCase {
     }
 
     private final class LegacyPcmProbe {
-        var pings: [Data] = []
+        private let lock = NSLock()
+        private var sentPings: [Data] = []
+        private var pingObserver: (() -> Void)?
+        var pings: [Data] { lock.lock(); defer { lock.unlock() }; return sentPings }
+        func observePing(_ observer: (() -> Void)?) {
+            lock.lock(); pingObserver = observer; lock.unlock()
+        }
+        func recordPing(_ payload: Data) {
+            lock.lock()
+            sentPings.append(payload)
+            let observer = pingObserver
+            lock.unlock()
+            observer?()
+        }
+        func clearPings() { lock.lock(); sentPings.removeAll(); lock.unlock() }
         var completions: [() -> Void] = []
         var interruptionResumes = 0
+    }
+
+    private func awaitLegacyPing(_ probe: LegacyPcmProbe, action: () -> Void) {
+        let sent = expectation(description: "USB legacy PCM fresh Ping sent")
+        probe.observePing { sent.fulfill() }
+        action()
+        wait(for: [sent], timeout: 5)
+        probe.observePing(nil)
     }
 
     private func withLegacyUsbPcm(_ body: (AudioManager, NWConnection, UInt64, LegacyPcmProbe) throws -> Void) throws {
@@ -2128,7 +2150,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         audio.pcmScheduleForTesting = { _, completion in probe.completions.append(completion) }
         audio.interruptionResumeForTesting = { probe.interruptionResumes += 1 }
         manager.controlSendForAudioTesting = { data, completion in
-            if data.count == 32, data[5] == WireMessageType.ping.rawValue { probe.pings.append(Data(data.dropFirst(16))) }
+            if data.count == 32, data[5] == WireMessageType.ping.rawValue { probe.recordPing(Data(data.dropFirst(16))) }
             completion(nil)
         }
         defer {
@@ -2140,21 +2162,21 @@ final class USBListenerLifetimeTests: XCTestCase {
             manager.controlSendForAudioTesting = nil
         }
         let peer = try connect()
-        manager.simulateSessionAuthenticatedAndCommitted()
+        awaitLegacyPing(probe) { manager.simulateSessionAuthenticatedAndCommitted() }
         let generation = manager.usbSessionSnapshot().generation
         manager.networkQueueForTesting.sync { }
         if let ping = probe.pings.last {
             manager.receiveUsbWireForTesting(type: .pong, payload: ping, generation: generation, connection: peer)
         }
         audio.audioQueueForTesting.sync { }
-        probe.pings.removeAll()
+        probe.clearPings()
         try body(audio, peer, generation, probe)
     }
 
     func testLegacyUsbForegroundDropsPreFencePcmAndMatchingPongReleasesFreshPcm() throws {
         try withLegacyUsbPcm { audio, peer, generation, probe in
             manager.applicationDidEnterBackground()
-            manager.applicationDidBecomeActive()
+            awaitLegacyPing(probe) { manager.applicationDidBecomeActive() }
             manager.networkQueueForTesting.sync { }
             audio.audioQueueForTesting.sync { }
             XCTAssertEqual(probe.pings.count, 1)
@@ -2184,7 +2206,8 @@ final class USBListenerLifetimeTests: XCTestCase {
 
     func testLegacyUsbWrongNonceGenerationAndConnectionCannotReleaseFreshFence() throws {
         try withLegacyUsbPcm { audio, peer, generation, probe in
-            manager.applicationDidEnterBackground(); manager.applicationDidBecomeActive()
+            manager.applicationDidEnterBackground()
+            awaitLegacyPing(probe) { manager.applicationDidBecomeActive() }
             manager.networkQueueForTesting.sync { }
             let ping = try XCTUnwrap(probe.pings.last)
             var wrong = ping; wrong[15] ^= 0x80
@@ -2232,7 +2255,7 @@ final class USBListenerLifetimeTests: XCTestCase {
             manager.reconcileAudioForTesting(generation: generation, mode: RealtimeTransportMode.legacyTLS, audioEnabled: true)
             manager.networkQueueForTesting.sync { }
             XCTAssertEqual(probe.pings.count, 0)
-            manager.applicationDidBecomeActive()
+            awaitLegacyPing(probe) { manager.applicationDidBecomeActive() }
             manager.networkQueueForTesting.sync { }
             XCTAssertEqual(probe.pings.count, 1)
             let ping = try XCTUnwrap(probe.pings.last)
@@ -2252,7 +2275,8 @@ final class USBListenerLifetimeTests: XCTestCase {
             manager.applicationDidEnterBackground(); manager.networkQueueForTesting.sync { }
             audio.interruptForTesting(began: false)
             XCTAssertEqual(probe.interruptionResumes, 0)
-            manager.applicationDidBecomeActive(); manager.networkQueueForTesting.sync { }
+            awaitLegacyPing(probe) { manager.applicationDidBecomeActive() }
+            manager.networkQueueForTesting.sync { }
             let ping = try XCTUnwrap(probe.pings.last)
             audio.interruptForTesting(began: true)
             manager.receiveUsbWireForTesting(type: .pong, payload: ping, generation: generation, connection: peer)
