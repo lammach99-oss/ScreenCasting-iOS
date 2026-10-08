@@ -260,8 +260,10 @@ final class AudioJitterBufferTests: XCTestCase {
         let buffer = AudioJitterBuffer(profile: .wifi)
         [UInt16(1), 2, 3].forEach { buffer.insert(packet($0)) }
         for _ in 0..<3 { _ = buffer.dequeue() }
-        for _ in 0..<10 { XCTAssertNil(buffer.dequeue()) }
-        XCTAssertEqual(buffer.diagnostics.plcActions, 0)
+        XCTAssertEqual(buffer.dequeue(), .plc(sequence: 4, timestamp: 1920))
+        XCTAssertEqual(buffer.dequeue(), .plc(sequence: 5, timestamp: 2400))
+        for _ in 0..<100 { XCTAssertNil(buffer.dequeue()) }
+        XCTAssertEqual(buffer.diagnostics.plcActions, 2)
         buffer.reset()
         XCTAssertNil(buffer.dequeue())
         XCTAssertEqual(buffer.bufferedPacketCount, 0)
@@ -476,7 +478,7 @@ final class AudioJitterBufferTests: XCTestCase {
             expectedSsrc: audioSsrc))
     }
 
-// Proposed focused additions to AudioJitterBufferTests.swift; no production change yet.
+    // Finite post-start concealment and fresh same-session rebuffer ownership.
     func testPostStartEmptyBufferHasExactlyTwoConcealmentTicksThenRebuffers() {
         let buffer = AudioJitterBuffer(profile: .wifi)
         [UInt16(1), 2, 3].forEach { buffer.insert(packet($0)) }
@@ -485,6 +487,10 @@ final class AudioJitterBufferTests: XCTestCase {
         XCTAssertEqual(buffer.dequeue(), .plc(sequence: 5, timestamp: 2400))
         for _ in 0..<100 { XCTAssertNil(buffer.dequeue()) }
         XCTAssertEqual(buffer.diagnostics.plcActions, 2)
+        XCTAssertEqual(buffer.diagnostics.boundedPlcActions, 2)
+        XCTAssertEqual(buffer.diagnostics.shortStarvationEntries, 1)
+        XCTAssertEqual(buffer.diagnostics.rebufferEntries, 1)
+        XCTAssertEqual(buffer.diagnostics.rebufferWaitTicks, 100)
     }
 
     func testRebufferWaitsForFreshTargetAndSkipsUnknownGapWithoutPlcStorm() {
@@ -497,6 +503,8 @@ final class AudioJitterBufferTests: XCTestCase {
         XCTAssertEqual(decodedSequence(buffer.dequeue()), 101)
         XCTAssertEqual(decodedSequence(buffer.dequeue()), 102)
         XCTAssertEqual(buffer.diagnostics.plcActions, 2)
+        XCTAssertEqual(buffer.diagnostics.rebufferResumes, 1)
+        XCTAssertEqual(buffer.diagnostics.freshReanchorSkipUnits, 94)
     }
 
     func testRebufferRejectsAlreadyConcealedLatePackets() {
@@ -542,6 +550,10 @@ final class AudioJitterBufferTests: XCTestCase {
         buffer.reset()
         for _ in 0..<100 { XCTAssertNil(buffer.dequeue()) }
         XCTAssertEqual(buffer.diagnostics.plcActions, 0)
+        XCTAssertEqual(buffer.diagnostics.boundedPlcActions, 0)
+        XCTAssertEqual(buffer.diagnostics.rebufferEntries, 0)
+        XCTAssertEqual(buffer.diagnostics.rebufferResumes, 0)
+        XCTAssertEqual(buffer.diagnostics.freshReanchorSkipUnits, 0)
     }
 
     private func packet(

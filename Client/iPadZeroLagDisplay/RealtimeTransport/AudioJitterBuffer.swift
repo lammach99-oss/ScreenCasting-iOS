@@ -35,6 +35,12 @@ struct AudioJitterDiagnostics {
     var targetPolicyDrops = 0
     var overflowDrops = 0
     var startupWaitTicks = 0
+    var shortStarvationEntries = 0
+    var boundedPlcActions = 0
+    var rebufferEntries = 0
+    var rebufferWaitTicks = 0
+    var rebufferResumes = 0
+    var freshReanchorSkipUnits = 0
     private var depthSamples = [Double]()
     private var depthIndex = 0
     var depthPercentiles: LatencyPercentiles { LatencyPercentiles.calculate(depthSamples) }
@@ -107,7 +113,11 @@ final class AudioJitterBuffer {
     private var expectedSequence: UInt16?
     private var expectedTimestamp: UInt32 = 0
     private var startupAnchorSequence: UInt16?
-    private var started = false
+    private enum PlayoutState: Equatable { case prebuffering, playing, shortStarvation, rebuffering }
+    // Provisional 20-ms cap; physical tuning remains pending. Startup targets stay unchanged.
+    private static let starvationPlcBudget = 2
+    private var playoutState: PlayoutState = .prebuffering
+    private var starvationPlcRemaining = 0
     private(set) var droppedPacketCount = 0
     private(set) var diagnostics = AudioJitterDiagnostics()
 
@@ -127,7 +137,8 @@ final class AudioJitterBuffer {
         expectedSequence = nil
         expectedTimestamp = 0
         startupAnchorSequence = nil
-        started = false
+        playoutState = .prebuffering
+        starvationPlcRemaining = 0
         droppedPacketCount = 0
         diagnostics = AudioJitterDiagnostics()
     }
@@ -140,7 +151,7 @@ final class AudioJitterBuffer {
                 guard let startupAnchorSequence else { diagnostics.staleRejects += 1; return }
                 let backwardDistance =
                     startupAnchorSequence &- packet.sequence
-                guard !started,
+                guard playoutState == .prebuffering,
                       backwardDistance <= UInt16(Self.maximumPacketCount) else {
                     diagnostics.staleRejects += 1
                     return
@@ -164,30 +175,65 @@ final class AudioJitterBuffer {
     func dequeue() -> AudioJitterAction? {
         diagnostics.observeDepth(packets.count)
         guard let expectedSequence else { return noPlayout() }
-        if !started {
+        if playoutState == .prebuffering {
             guard packets.count >= profile.targetPacketCount else {
                 diagnostics.startupWaitTicks += 1
                 return noPlayout()
             }
-            started = true
+            playoutState = .playing
+            starvationPlcRemaining = Self.starvationPlcBudget
             startupAnchorSequence = nil
+        } else if playoutState == .rebuffering {
+            guard packets.count >= profile.targetPacketCount,
+                  let anchor = packets.values.min(by: {
+                      ($0.sequence &- expectedSequence) < ($1.sequence &- expectedSequence)
+                  }) else {
+                diagnostics.rebufferWaitTicks += 1
+                return noPlayout()
+            }
+            diagnostics.freshReanchorSkipUnits += Int(anchor.sequence &- expectedSequence)
+            self.expectedSequence = anchor.sequence
+            expectedTimestamp = anchor.timestamp
+            diagnostics.rebufferResumes += 1
+            playoutState = .playing
+            starvationPlcRemaining = Self.starvationPlcBudget
         }
 
         guard let currentExpected = self.expectedSequence else { return noPlayout() }
         if let packet = packets.removeValue(forKey: currentExpected) {
             advance(after: packet)
+            playoutState = .playing
+            starvationPlcRemaining = Self.starvationPlcBudget
             diagnostics.decodeActions += 1
             return .decode(packet)
         }
-
-        if !packets.isEmpty {
-            let timestamp = expectedTimestamp
-            self.expectedSequence = currentExpected &+ 1
-            expectedTimestamp &+= Self.packetDurationSamples
-            diagnostics.plcActions += 1
-            return .plc(sequence: currentExpected, timestamp: timestamp)
+        // Preserve one-step loss concealment while an ordinary future packet is buffered.
+        if playoutState == .playing && !packets.isEmpty {
+            return conceal(currentExpected, bounded: false)
         }
-        return noPlayout()
+        if playoutState == .playing {
+            playoutState = .shortStarvation
+            diagnostics.shortStarvationEntries += 1
+        }
+        guard playoutState == .shortStarvation, starvationPlcRemaining > 0 else {
+            return noPlayout()
+        }
+        starvationPlcRemaining -= 1
+        let action = conceal(currentExpected, bounded: true)
+        if starvationPlcRemaining == 0 {
+            playoutState = .rebuffering
+            diagnostics.rebufferEntries += 1
+        }
+        return action
+    }
+
+    private func conceal(_ sequence: UInt16, bounded: Bool) -> AudioJitterAction {
+        let timestamp = expectedTimestamp
+        expectedSequence = sequence &+ 1
+        expectedTimestamp &+= Self.packetDurationSamples
+        diagnostics.plcActions += 1
+        if bounded { diagnostics.boundedPlcActions += 1 }
+        return .plc(sequence: sequence, timestamp: timestamp)
     }
 
     private func noPlayout() -> AudioJitterAction? {
