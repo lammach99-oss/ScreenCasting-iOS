@@ -4821,8 +4821,7 @@ public class NetworkManager: ObservableObject {
     private func sendClientCapabilities(for kind: ActiveTransportKind) {
         if case .usb = kind {
             publishClientCapabilities(
-                modes: RealtimeTransportMode.legacyTLS |
-                    RealtimeTransportMode.usbSplitTLS,
+                modes: RealtimeTransportMode.legacyTLS,
                 udpPort: 0)
             return
         }
