@@ -182,6 +182,7 @@ def run_test(root,point,derived,xctestrun,udid,selectors,repeats,mode):
 def main():
  repo=pathlib.Path.cwd(); out=pathlib.Path(os.environ['C1_EVIDENCE_ROOT']).resolve();out.mkdir(parents=True,exist_ok=True)
  baseline=os.environ['C1_BASELINE_REF']; udid=os.environ['C1_SIMULATOR_UDID']
+ focused=os.environ.get('C1_FOCUSED_LIFECYCLE')=='true'
  if not re.fullmatch(r'[0-9a-f]{40}',baseline):raise RuntimeError('Exact immutable baseline object ref required')
  helptext=subprocess.run(['xcodebuild','-help'],capture_output=True,text=True).stderr
  (out/'xcodebuild-help.txt').write_text(helptext,encoding='utf-8')
@@ -191,7 +192,7 @@ def main():
  harnesses=[digest((v/'Client/iPadZeroLagDisplayTests/C1LifetimeDiagnosticsTests.swift').read_bytes()) for v in variants.values()]
  if len(set(harnesses))!=1:raise RuntimeError('Neutral harness byte mismatch')
  all_points=[]; builds={}; start=time.monotonic()
- for mode in ['unsanitized','asan','malloc-scribble']:
+ for mode in (['unsanitized'] if focused else ['unsanitized','asan','malloc-scribble']):
   runtime_env={'C1_DIAGNOSTIC_MODE':mode}
   if mode=='asan':runtime_env['ASAN_OPTIONS']='abort_on_error=1:detect_stack_use_after_return=1'
   if mode=='malloc-scribble':runtime_env['MallocScribble']='1'
@@ -207,9 +208,10 @@ def main():
    run=runs[0];patch_environment(run,runtime_env)
    save(point/'environment.json',{'environmentVariables':runtime_env,'defines':defines,'xctestrunSha256':digest(run.read_bytes()),'udid':udid,'sourceVariant':variant})
    builds[(variant,mode)]=(derived,run)
-   count=30 if mode=='unsanitized' else 10
-   result=run_test(root,out/variant/mode/'neutral',derived,run,udid,NEUTRAL,count,mode);result['variant']=variant;all_points.append(result)
-   if variant=='N1':
+   count=20 if focused else (30 if mode=='unsanitized' else 10)
+   selectors=['iPadCastingTests/C1DecoderLifecycleInstrumentationTests/testSingleCallerAndAsyncCleanupPreserveLifecycleMeasurements'] if focused else NEUTRAL
+   result=run_test(root,out/variant/mode/'neutral',derived,run,udid,selectors,count,mode);result['variant']=variant;all_points.append(result)
+   if variant=='N1' and not focused:
     for semantic,selectors in SEMANTIC.items():
      result=run_test(root,out/semantic/mode/'semantic',derived,run,udid,selectors,count,mode);result['variant']=semantic;all_points.append(result)
     if mode=='unsanitized':
@@ -223,13 +225,13 @@ def main():
   one=[p for p in sequences if p['variant']=='SEQUENCE_S1ThenWifi'];two=[p for p in sequences if p['variant']=='SEQUENCE_S2ThenWifi']
   if one and two and one[0]['crash'] and two[0]['clean']:classification='S1_FIXTURE_TEARDOWN_POLLUTION'
  full=[]
- if classification=='NON_REPRODUCIBLE' and len(sequences)==4 and all(p['clean'] for p in sequences) and all(p['clean'] for p in all_points):
+ if not focused and classification=='NON_REPRODUCIBLE' and len(sequences)==4 and all(p['clean'] for p in sequences) and all(p['clean'] for p in all_points):
   derived,run=builds[('N1','unsanitized')]
   for number in [1,2]:full.append(run_test(variants['N1'],out/'full'/str(number),derived,run,udid,[],1,'unsanitized'))
- report={'canonicalHead':CANONICAL_SHA,'candidatePublicSha':CANDIDATE_SHA,'diagnosticPublicSha':os.environ['GITHUB_SHA'],'classification':classification,'aggregate':aggregates,'points':all_points,'fullNative':full,'NATIVE_STABILITY_GREEN':len(full)==2 and all(p['clean'] for p in full),'C1_GREEN':False,'LOCAL_FROZEN_AND_PARITY_CONFIRMATION':'REQUIRED_AFTER_NATIVE_RUNS','C1_COMMITTED':False,'C2_TOUCHED':False,'PRODUCTION_CHANGED':False,'IPA_CREATED':False,'HOST_PACKAGE_CREATED':False,'PHYSICAL':'PENDING','AUDIO_V1_CLOSED':False,'PRODUCTION_FREEZE':False}
+ report={'canonicalHead':CANONICAL_SHA,'candidatePublicSha':CANDIDATE_SHA,'diagnosticPublicSha':os.environ['GITHUB_SHA'],'classification':classification,'focusedLifecycleOnly':focused,'aggregate':aggregates,'points':all_points,'fullNative':full,'NATIVE_STABILITY_GREEN':len(full)==2 and all(p['clean'] for p in full),'C1_GREEN':False,'LOCAL_FROZEN_AND_PARITY_CONFIRMATION':'REQUIRED_AFTER_NATIVE_RUNS','C1_COMMITTED':False,'C2_TOUCHED':False,'PRODUCTION_CHANGED':False,'IPA_CREATED':False,'HOST_PACKAGE_CREATED':False,'PHYSICAL':'PENDING','AUDIO_V1_CLOSED':False,'PRODUCTION_FREEZE':False}
  save(out/'classification.json',report)
  # A clean campaign is evidence, never authorization to commit or package.
- return 0 if report['NATIVE_STABILITY_GREEN'] else 1
+ return 0 if ((len(all_points)==2 and all(p['clean'] for p in all_points)) if focused else report['NATIVE_STABILITY_GREEN']) else 1
 if __name__=='__main__':
  try:sys.exit(main())
  except Exception as error:

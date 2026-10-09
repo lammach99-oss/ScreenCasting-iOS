@@ -12,6 +12,11 @@ on:
         required: false
         default: false
         type: boolean
+      c1_focused_lifecycle:
+        description: Focused baseline/candidate lifecycle instrumentation RED or GREEN only
+        required: false
+        default: false
+        type: boolean
       c1_extract_reports:
         description: Extract only the retained completed C1 diagnostic reports; no tests or IPA
         required: false
@@ -593,6 +598,7 @@ jobs:
     timeout-minutes: 360
     env:
       C1_BASELINE_REF: ${{ inputs.c1_baseline_ref }}
+      C1_FOCUSED_LIFECYCLE: ${{ inputs.c1_focused_lifecycle }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7

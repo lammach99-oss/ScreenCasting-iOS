@@ -242,6 +242,34 @@ final class C1NativeAVAudioLifetimeTests: XCTestCase {
     }
 }
 
+final class C1DecoderLifecycleInstrumentationTests: XCTestCase {
+    func testSingleCallerAndAsyncCleanupPreserveLifecycleMeasurements() {
+        let decoder = DecoderManager()
+        let caller = DispatchQueue(label: "test.c1.lifecycle.caller")
+        let finished = expectation(description: "caller completed lifecycle stress")
+        let iterations = 1000
+        caller.async {
+            for generation in 1...iterations {
+                decoder.invalidate(waitForCompletion: false)
+                decoder.beginSession(generation: UInt64(generation))
+            }
+            finished.fulfill()
+        }
+        // Watchdog bounds a hung test; it is not a production latency requirement.
+        wait(for: [finished], timeout: 30)
+        caller.sync { }
+        decoder.sessionQueueForTesting.sync { }
+        let events = decoder.lifecycleEventsForTesting
+        XCTAssertEqual(decoder.invalidateCountForTesting, iterations)
+        XCTAssertEqual(decoder.sessionBeganCountForTesting, iterations)
+        XCTAssertEqual(decoder.invalidateWaitModesForTesting, Array(repeating: false, count: iterations))
+        XCTAssertEqual(events.count, iterations * 3)
+        XCTAssertEqual(events.filter { $0 == "invalidate-begin" }.count, iterations)
+        XCTAssertEqual(events.filter { $0 == "invalidate-end" }.count, iterations)
+        XCTAssertEqual(events.filter { $0.hasPrefix("begin-") }.count, iterations)
+    }
+}
+
 #if C1_CANDIDATE_SEMANTICS
 private final class C1OneShotPingRecorder {
     private let lock = NSLock()
