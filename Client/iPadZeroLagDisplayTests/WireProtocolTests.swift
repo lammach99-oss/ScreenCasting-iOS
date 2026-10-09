@@ -2298,12 +2298,13 @@ final class USBListenerLifetimeTests: XCTestCase {
             manager.receiveUsbWireForTesting(type: .audio, payload: Data(repeating: 0, count: 480 * 4), generation: generation, connection: peer)
             audio.audioQueueForTesting.sync { }
             let completion = try XCTUnwrap(probe.completions.last)
-            manager.applicationDidEnterBackground(); manager.applicationDidBecomeActive()
+            manager.applicationDidEnterBackground()
+            awaitLegacyPing(probe) { manager.applicationDidBecomeActive() }
             manager.networkQueueForTesting.sync { }
             let oldPing = try XCTUnwrap(probe.pings.last)
             try deliver(.failed(.posix(.ECONNRESET)), to: peer)
             let replacement = try connect()
-            manager.simulateSessionAuthenticatedAndCommitted()
+            awaitLegacyPing(probe) { manager.simulateSessionAuthenticatedAndCommitted() }
             manager.networkQueueForTesting.sync { }
             let next = manager.usbSessionSnapshot().generation
             let fresh = try XCTUnwrap(probe.pings.last)
