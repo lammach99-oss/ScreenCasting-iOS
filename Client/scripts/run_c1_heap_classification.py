@@ -53,6 +53,7 @@ def manifest(root):
  return actual
 
 def prepare_variant(repo,root,variant,baseline_ref):
+ root.parent.mkdir(parents=True,exist_ok=True)
  archive=root.parent/(variant+'.tar')
  with archive.open('wb') as stream:subprocess.run(['git','archive','--format=tar',os.environ['GITHUB_SHA'],'Client'],cwd=repo,stdout=stream,check=True)
  root.mkdir(parents=True,exist_ok=False)
