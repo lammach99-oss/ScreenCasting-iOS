@@ -172,9 +172,14 @@ def execution_counts(text,selectors,repeats):
    verified=verified and pair_numbers==list(range(1,21))
  return {'methodPassCounts':counts,'allMethodPasses':all_passed,'verified':verified,'qualificationSource':'XCTest case completion log; if interleaved/incomplete, remain unqualified pending xcresult review'}
 
+def repetition_arguments(repeats):
+ if repeats<1:raise ValueError('Positive repetition count required')
+ return ['-test-iterations',str(repeats),'-test-repetition-relaunch-enabled','NO'] if repeats>1 else []
+
 def run_test(root,point,derived,xctestrun,udid,selectors,repeats,mode):
  point.mkdir(parents=True,exist_ok=True)
- args=['xcodebuild','test-without-building','-xctestrun',str(xctestrun),'-destination','platform=iOS Simulator,id='+udid+',arch=x86_64','-parallel-testing-enabled','NO','-test-iterations',str(repeats),'-test-repetition-relaunch-enabled','NO','-resultBundlePath',str(point/'result.xcresult')]
+ args=['xcodebuild','test-without-building','-xctestrun',str(xctestrun),'-destination','platform=iOS Simulator,id='+udid+',arch=x86_64','-parallel-testing-enabled','NO','-resultBundlePath',str(point/'result.xcresult')]
+ args+=repetition_arguments(repeats)
  args+=['-only-testing:'+selector for selector in selectors]
  code=command(args,root,point/'xcodebuild.stdout-stderr.log')
  text=(point/'xcodebuild.stdout-stderr.log').read_text(encoding='utf-8',errors='replace')
