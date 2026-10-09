@@ -7,6 +7,16 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      c1_native_stability:
+        description: Run only the matched C1 native stability diagnostics; no IPA
+        required: false
+        default: false
+        type: boolean
+      c1_baseline_ref:
+        description: Exact public object with canonical a48980f AudioManager and NetworkManager bytes
+        required: false
+        default: ''
+        type: string
       build_unsigned_ipa:
         description: Build and upload unsigned iPad IPA
         required: true
@@ -46,6 +56,7 @@ env:
 
 jobs:
   prepare-native-deps:
+    if: ${{ !inputs.c1_native_stability }}
     name: Prepare verified native dependencies
     runs-on: macos-15-intel
     timeout-minutes: 45
@@ -197,6 +208,7 @@ jobs:
           retention-days: 3
 
   build-and-test:
+    if: ${{ !inputs.c1_native_stability }}
     name: Build and XCTest
     needs: prepare-native-deps
     runs-on: macos-15-intel
@@ -566,3 +578,119 @@ jobs:
           echo "DOWNLOADED_IPA_SHA256=$actual_sha256"
           echo "DOWNLOADED_ARTIFACT_REVALIDATION_SECONDS=$(( $(date +%s) - started_epoch ))"
           echo 'DOWNLOADED_ARTIFACT_REVALIDATION=PASS'
+
+  c1-native-stability:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.c1_native_stability }}
+    permissions:
+      contents: read
+      actions: read
+    runs-on: macos-15-intel
+    timeout-minutes: 360
+    env:
+      C1_BASELINE_REF: ${{ inputs.c1_baseline_ref }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Pin and record Xcode 16.4 and simulator runtime 18.5
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${{ inputs.build_unsigned_ipa }}" == false ]]
+          [[ "${{ inputs.run_xctest }}" == false ]]
+          export C1_EVIDENCE_ROOT="$RUNNER_TEMP/c1-native-stability-evidence"
+          echo "C1_EVIDENCE_ROOT=$C1_EVIDENCE_ROOT" >> "$GITHUB_ENV"
+          mkdir -p "$C1_EVIDENCE_ROOT/entry"
+          sudo xcode-select -s /Applications/Xcode_16.4.app
+          xcodebuild -version | tee "$C1_EVIDENCE_ROOT/entry/xcode-version.txt"
+          grep -qx 'Xcode 16.4' "$C1_EVIDENCE_ROOT/entry/xcode-version.txt"
+          xcrun --sdk iphonesimulator --show-sdk-version | tee "$C1_EVIDENCE_ROOT/entry/simulator-sdk-version.txt"
+          grep -qx '18.5' "$C1_EVIDENCE_ROOT/entry/simulator-sdk-version.txt"
+          swift --version > "$C1_EVIDENCE_ROOT/entry/swift-version.txt"
+          xcrun simctl list runtimes -j > "$C1_EVIDENCE_ROOT/entry/runtimes.json"
+          xcrun simctl list devices available -j > "$C1_EVIDENCE_ROOT/entry/devices.json"
+          python3 - <<'PY'
+          import json, os, pathlib
+          entry=pathlib.Path(os.environ['C1_EVIDENCE_ROOT'])/'entry'
+          runtimes=json.loads((entry/'runtimes.json').read_text())['runtimes']
+          runtime=next(x for x in runtimes if x['version']=='18.5' and x.get('isAvailable') and 'iOS' in x['name'])
+          devices=json.loads((entry/'devices.json').read_text())['devices'][runtime['identifier']]
+          device=sorted((x for x in devices if x.get('isAvailable') and 'iPad' in x['name']), key=lambda x:(x['name'],x['udid']))[0]
+          (entry/'selected-simulator.json').write_text(json.dumps({'runtime':runtime,'device':device,'policy':'one UDID; no erase/reboot between variants or repetitions; single test worker'},indent=2))
+          with open(os.environ['GITHUB_ENV'],'a') as env:env.write('C1_SIMULATOR_UDID='+device['udid']+'\n')
+          PY
+      - name: Download and verify the exact retained dependency archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/11587506267" > "$C1_EVIDENCE_ROOT/entry/dependency-artifact.json"
+          python3 - <<'PY'
+          import json, os, pathlib
+          x=json.loads((pathlib.Path(os.environ['C1_EVIDENCE_ROOT'])/'entry/dependency-artifact.json').read_text())
+          assert x['id']==11587506267 and not x['expired']
+          assert x['workflow_run']['id']==37862873695
+          assert x['workflow_run']['head_sha']=='509c54fbb0f5d48bdf59cab71dea90667cbc9e30'
+          assert x['digest']=='sha256:bdcf18ac31b0698e46651087164aaa739ed91c8004d293d8981f612df7583164'
+          PY
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/11587506267/zip" > "$RUNNER_TEMP/c1-native-deps.zip"
+          printf '%s  %s\n' bdcf18ac31b0698e46651087164aaa739ed91c8004d293d8981f612df7583164 "$RUNNER_TEMP/c1-native-deps.zip" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/c1-native-deps"
+          unzip -q "$RUNNER_TEMP/c1-native-deps.zip" -d "$RUNNER_TEMP/c1-native-deps"
+          manifest=$(find "$RUNNER_TEMP/c1-native-deps" -name native-deps.manifest.txt -type f)
+          test "$(printf '%s\n' "$manifest" | wc -l | tr -d ' ')" = 1
+          cp "$manifest" "$C1_EVIDENCE_ROOT/entry/native-deps.manifest.txt"
+          grep -qx 'Native Output Tree SHA-256: 6030659b9b2824340d07692e6b9a4fad68070bb8538bf9e2c36f587763cb11c5' "$manifest"
+          export EXPECTED_PUBLIC_SHA=509c54fbb0f5d48bdf59cab71dea90667cbc9e30
+          export EXPECTED_CACHE_KEY=$(sed -n 's/^Cache Key: //p' "$manifest")
+          export EXPECTED_MANIFEST_SHA256=$(shasum -a 256 "$manifest" | awk '{print $1}')
+          bash Client/scripts/verify_native_dependency_artifact.sh "$RUNNER_TEMP/c1-native-deps" "$GITHUB_WORKSPACE/Client/ThirdPartyBuild" 2>&1 | tee "$C1_EVIDENCE_ROOT/entry/dependency-verification.log"
+          bash Client/scripts/verify_ios_dependency_artifacts.sh "$GITHUB_WORKSPACE/Client/ThirdPartyBuild/xcframeworks" "$GITHUB_WORKSPACE/Client/ThirdPartyBuild/build" 2>&1 | tee "$C1_EVIDENCE_ROOT/entry/dependency-strict-validation.log"
+      - name: Boot the single matched simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          state=$(xcrun simctl list devices -j | python3 -c 'import json,os,sys; d=json.load(sys.stdin); print(next(x["state"] for group in d["devices"].values() for x in group if x["udid"]==os.environ["C1_SIMULATOR_UDID"]))')
+          if [[ "$state" != Booted ]]; then xcrun simctl boot "$C1_SIMULATOR_UDID"; fi
+          xcrun simctl bootstatus "$C1_SIMULATOR_UDID" -b > "$C1_EVIDENCE_ROOT/entry/simulator-boot.log" 2>&1
+      - name: Matched N0 N1 S1 S2 and ordered-pair diagnostics
+        shell: bash
+        timeout-minutes: 300
+        run: |
+          set -euo pipefail
+          python3 Client/scripts/run_c1_heap_classification.py 2>&1 | tee "$C1_EVIDENCE_ROOT/campaign.stdout-stderr.log"
+      - name: Retain final crash and simulator diagnostics even after failure
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          C1_EVIDENCE_ROOT="${C1_EVIDENCE_ROOT:-$RUNNER_TEMP/c1-native-stability-evidence}"
+          mkdir -p "$C1_EVIDENCE_ROOT/final-diagnostics"
+          if [[ -n "${C1_SIMULATOR_UDID:-}" ]]; then
+            xcrun simctl spawn "$C1_SIMULATOR_UDID" log show --last 10m --style compact > "$C1_EVIDENCE_ROOT/final-diagnostics/simulator-unified.log" 2>&1 || true
+            source="$HOME/Library/Developer/CoreSimulator/Devices/$C1_SIMULATOR_UDID/data/Library/Logs"
+            if [[ -d "$source" ]]; then cp -R "$source" "$C1_EVIDENCE_ROOT/final-diagnostics/simulator-logs"; fi
+          fi
+          if [[ -d "$HOME/Library/Logs/DiagnosticReports" ]]; then cp -R "$HOME/Library/Logs/DiagnosticReports" "$C1_EVIDENCE_ROOT/final-diagnostics/host-crash-reports"; fi
+      - name: Always upload native XCTest stability evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: C1-native-stability-${{ github.run_id }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/c1-native-stability-evidence/entry
+            ${{ runner.temp }}/c1-native-stability-evidence/N0
+            ${{ runner.temp }}/c1-native-stability-evidence/N1
+            ${{ runner.temp }}/c1-native-stability-evidence/S1
+            ${{ runner.temp }}/c1-native-stability-evidence/S2
+            ${{ runner.temp }}/c1-native-stability-evidence/sequences
+            ${{ runner.temp }}/c1-native-stability-evidence/full
+            ${{ runner.temp }}/c1-native-stability-evidence/sources/*-source-manifest.json
+            ${{ runner.temp }}/c1-native-stability-evidence/sources/*-test-input-manifest.json
+            ${{ runner.temp }}/c1-native-stability-evidence/final-diagnostics
+            ${{ runner.temp }}/c1-native-stability-evidence/*.json
+            ${{ runner.temp }}/c1-native-stability-evidence/*.txt
+            ${{ runner.temp }}/c1-native-stability-evidence/*.log
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
