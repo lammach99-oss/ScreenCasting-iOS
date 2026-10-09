@@ -22,6 +22,11 @@ on:
         required: false
         default: false
         type: boolean
+      c1_extract_source_run:
+        description: Completed diagnostic run on the validation branch to extract
+        required: false
+        default: '37881608414'
+        type: string
       c1_baseline_ref:
         description: Exact public object with canonical a48980f AudioManager and NetworkManager bytes
         required: false
@@ -719,13 +724,30 @@ jobs:
           BUILD_IPA: ${{ inputs.build_unsigned_ipa }}
           RUN_TESTS: ${{ inputs.run_xctest }}
         run: test "$BUILD_IPA" = false && test "$RUN_TESTS" = false
+      - name: Verify completed diagnostic run identity
+        id: source
+        env:
+          SOURCE_RUN: ${{ inputs.c1_extract_source_run }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$SOURCE_RUN" =~ ^[0-9]+$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" > /tmp/c1-source-run.json
+          python3 - <<'PY'
+          import json, os
+          run=json.load(open('/tmp/c1-source-run.json'))
+          assert str(run['id'])==os.environ['SOURCE_RUN']
+          assert run['status']=='completed' and run['event']=='workflow_dispatch'
+          assert run['head_branch']=='codex/keyboard-v1-validation'
+          assert run['path']=='.github/workflows/ios-public-ci.yml'
+          with open(os.environ['GITHUB_OUTPUT'],'a') as output: output.write('sha='+run['head_sha']+'\n')
+          PY
       - name: Download the exact retained completed native evidence
         uses: actions/download-artifact@v8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
-          run-id: 37881608414
-          name: C1-native-stability-37881608414-0080445114016ab6ee6498565a7833953f55148e
+          run-id: ${{ inputs.c1_extract_source_run }}
+          name: C1-native-stability-${{ inputs.c1_extract_source_run }}-${{ steps.source.outputs.sha }}
           path: /tmp/c1-retained
       - name: Extract exact diagnostic reports and preserve source hashes
         run: |
@@ -761,7 +783,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: C1-extracted-reports-37881608414-${{ github.run_id }}
+          name: C1-extracted-reports-${{ inputs.c1_extract_source_run }}-${{ github.run_id }}
           path: /tmp/c1-reports
           if-no-files-found: error
           retention-days: 14

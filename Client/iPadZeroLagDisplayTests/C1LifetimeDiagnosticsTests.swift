@@ -424,7 +424,7 @@ final class C1OrderedSequenceTests: XCTestCase {
         XCTAssertEqual(cases.count, 1)
         return try XCTUnwrap(cases.first)
     }
-    private func runPair(_ type: XCTestCase.Type, _ method: String, wifiFirst: Bool) throws {
+    private func runOnePair(_ type: XCTestCase.Type, _ method: String, wifiFirst: Bool) throws {
         let semantic = try selected(type, method)
         let wifi = try selected(WifiForegroundDecoderRecoveryTests.self, "testReplacementWifiGenerationCannotRearmStaleSession")
         let suite = XCTestSuite(name: "C1 ordered exact fixture pair")
@@ -441,6 +441,15 @@ final class C1OrderedSequenceTests: XCTestCase {
         let run = try XCTUnwrap(suite.testRun)
         XCTAssertEqual(run.executionCount, 2, "Both original fixtures must actually execute")
         XCTAssertTrue(run.hasSucceeded)
+    }
+    private func runPair(_ type: XCTestCase.Type, _ method: String, wifiFirst: Bool) throws {
+        let semantic = method.contains("testLegacyUsb") ? "S1" : "S2"
+        let scenario = wifiFirst ? "WifiThen\(semantic)" : "\(semantic)ThenWifi"
+        // Global XCTest repetitions also repeat the nested fixtures. Repeat whole pairs here.
+        for repetition in 1...20 {
+            try runOnePair(type, method, wifiFirst: wifiFirst)
+            print("[C1_PAIR_QUALIFIED] scenario=\(scenario) repetition=\(repetition)")
+        }
     }
     func testS1ThenWifi() throws { try runPair(USBListenerLifetimeTests.self, "testLegacyUsbForegroundDropsPreFencePcmAndMatchingPongReleasesFreshPcm", wifiFirst: false) }
     func testWifiThenS1() throws { try runPair(USBListenerLifetimeTests.self, "testLegacyUsbForegroundDropsPreFencePcmAndMatchingPongReleasesFreshPcm", wifiFirst: true) }

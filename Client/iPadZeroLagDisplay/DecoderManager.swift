@@ -399,15 +399,34 @@ public final class DecoderManager {
         [ObjectIdentifier: DecodeCompletionIdentity] = [:]
 
     #if targetEnvironment(simulator)
+    private let testingLifecycleLock = NSLock()
     private var testingSessionBeganCount = 0
     private var testingInvalidateCount = 0
     private var testingInvalidateWaitModes: [Bool] = []
-    var invalidateWaitModesForTesting: [Bool] { testingInvalidateWaitModes }
+    var invalidateWaitModesForTesting: [Bool] {
+        testingLifecycleLock.lock()
+        defer { testingLifecycleLock.unlock() }
+        return testingInvalidateWaitModes
+    }
     private var testingLifecycleEvents: [String] = []
-    var lifecycleEventsForTesting: [String] { testingLifecycleEvents }
-    var sessionBeganCountForTesting: Int { testingSessionBeganCount }
-    var invalidateCountForTesting: Int { testingInvalidateCount }
+    var lifecycleEventsForTesting: [String] {
+        testingLifecycleLock.lock()
+        defer { testingLifecycleLock.unlock() }
+        return testingLifecycleEvents
+    }
+    var sessionBeganCountForTesting: Int {
+        testingLifecycleLock.lock()
+        defer { testingLifecycleLock.unlock() }
+        return testingSessionBeganCount
+    }
+    var invalidateCountForTesting: Int {
+        testingLifecycleLock.lock()
+        defer { testingLifecycleLock.unlock() }
+        return testingInvalidateCount
+    }
     func resetLifecycleEventsForTesting() {
+        testingLifecycleLock.lock()
+        defer { testingLifecycleLock.unlock() }
         testingLifecycleEvents.removeAll()
     }
     #endif
@@ -419,8 +438,10 @@ public final class DecoderManager {
 
     public func beginSession(generation: UInt64) {
         #if targetEnvironment(simulator)
+        testingLifecycleLock.lock()
         testingSessionBeganCount += 1
         testingLifecycleEvents.append("begin-\(generation)")
+        testingLifecycleLock.unlock()
         #endif
         mailboxStateLock.lock()
         mailbox.beginSession(generation: generation)
@@ -953,9 +974,11 @@ public final class DecoderManager {
 
     public func invalidate(waitForCompletion: Bool = true) {
         #if targetEnvironment(simulator)
+        testingLifecycleLock.lock()
         testingInvalidateCount += 1
         testingInvalidateWaitModes.append(waitForCompletion)
         testingLifecycleEvents.append("invalidate-begin")
+        testingLifecycleLock.unlock()
         #endif
         mailboxStateLock.lock()
         mailbox.invalidate()
@@ -975,7 +998,9 @@ public final class DecoderManager {
             self.parameterSetSessionGate.reset()
             self.h264ParameterSetSessionGate.reset()
             #if targetEnvironment(simulator)
+            self.testingLifecycleLock.lock()
             self.testingLifecycleEvents.append("invalidate-end")
+            self.testingLifecycleLock.unlock()
             #endif
         }
         // Invalidation of the mailbox above is immediate. FIFO ordering keeps

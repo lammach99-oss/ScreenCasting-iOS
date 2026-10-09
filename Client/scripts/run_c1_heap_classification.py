@@ -11,7 +11,9 @@ BASELINE_RAW={
  'Client/iPadZeroLagDisplay/AudioManager.swift':'e896047b1496b2f4013817744a8fc4b9cf676a9f3bcf49a700a766bf3b5fc359',
  'Client/iPadZeroLagDisplay/NetworkManager.swift':'231871cde24acda5d02b2d0e8e36bd88168b6c5dee73b50d6fac4c29e50e4924'}
 EXPECTED_PRODUCTION={'Client/iPadZeroLagDisplay/AccessUnitMailbox.swift': '15854cda3a0cd9853e4ef0eb85d560b96e19b10ac522aaffb02dd8d11beb70b0', 'Client/iPadZeroLagDisplay/AudioManager.swift': 'e896047b1496b2f4013817744a8fc4b9cf676a9f3bcf49a700a766bf3b5fc359', 'Client/iPadZeroLagDisplay/ContentView.swift': '8ab88e471beded57341feffea715cc7dd026c228644193c45d8fcefdb9fb613a', 'Client/iPadZeroLagDisplay/DecoderManager.swift': '90b9ff87cdc39521b9c74c55f7b567829151d0f6dc5758f8054e1678f0b7e5c5', 'Client/iPadZeroLagDisplay/DiscoveryManager.swift': '801cc763e873a70f50798f50ed2fb69ee86f1c46888317c720eea51803c5b4e3', 'Client/iPadZeroLagDisplay/H264VideoConfiguration.swift': '313ed1ef0176c8e2ace739f428cb24474318d4f17c3de74ffc5631414e0512b9', 'Client/iPadZeroLagDisplay/Info.plist': 'd3d998da6693593075d92f0edce90ea24c1cda97f229dc916c0c736a15695e1b', 'Client/iPadZeroLagDisplay/InputGeometryDiagnostics.swift': 'c5a0f6ec204713169964d0cde6c02ce131ec69c2e09a40ea60ba1c8e8f3621b0', 'Client/iPadZeroLagDisplay/MetalView.swift': 'ad7dd949e2ecb262a20ce45f973e829c762019e9f1dbe1fa0a59db0e7106860a', 'Client/iPadZeroLagDisplay/NetworkManager.swift': '231871cde24acda5d02b2d0e8e36bd88168b6c5dee73b50d6fac4c29e50e4924', 'Client/iPadZeroLagDisplay/PencilOverlayView.swift': '622ec09122f0d1597f84ccdd37c911077f1a3eafccf045c7b0ab52e51b4e8733', 'Client/iPadZeroLagDisplay/PencilTouchView.swift': '13d05b4fe69dcd398a3b3d61bda11670cf296cf8163d69a3345107491f06630f', 'Client/iPadZeroLagDisplay/RealtimeTransport/AudioJitterBuffer.swift': '993aecd6db2c5821766264420226e745afdc136317315afe4a302f803d0d6f73', 'Client/iPadZeroLagDisplay/RealtimeTransport/ControlChannelWriter.swift': 'a981e3c3338251e9a49007cd7ed4ffbd6c12a17adc26207350ee45ee8519743e', 'Client/iPadZeroLagDisplay/RealtimeTransport/HevcRtpReassembler.swift': '6765517d469ec51d405c2b34bccc3b499a66f3cd49e622b50f56873643a6a420', 'Client/iPadZeroLagDisplay/RealtimeTransport/OpusDecoder.swift': 'bad6dd4d781d1ca838bb3bc8e58e38a403e3a70d3598187a5ac887fa6aee4584', 'Client/iPadZeroLagDisplay/RealtimeTransport/RtpPacket.swift': '541d6e2285bea6fd1c92f2b4a82d81e7c778e5243dc544d1edd7f043086c0c51', 'Client/iPadZeroLagDisplay/RealtimeTransport/SrtpSession.swift': '31299e96ef5b034e8f970a74621e8feb690aa514bb05211b1f6c87397e138fac', 'Client/iPadZeroLagDisplay/RealtimeTransport/TransportNegotiation.swift': '4c19a38d29c7d84de94436b1a702fc0e554b1eb265da6b9e6212fba939bd2895', 'Client/iPadZeroLagDisplay/RealtimeTransport/UsbLaneServer.swift': 'fb87ca3fe21da669e6d3655a3b5cddc412be6648f0038caa865a877a7c75d253', 'Client/iPadZeroLagDisplay/RealtimeTransport/WifiMediaReceiver.swift': 'bccfb3dc86fbd68d88aaec9356f28964cffce350e4c6511c4df6def203770f44', 'Client/iPadZeroLagDisplay/Renderer.swift': 'd240c2c19ab451f3908188aa7c9785a7760eaa0603a0ded50bd7d9276265fd4e', 'Client/iPadZeroLagDisplay/SettingsView.swift': 'cfc9d668c5776342e8f6ba1b801f03558bffbf2dbe465a28da644da6b3d6fef8', 'Client/iPadZeroLagDisplay/Shaders.metal': '743d3db7b8ba7ab1364dc1273207326e145b95c7244103de1c8a908e79166015', 'Client/iPadZeroLagDisplay/StreamManager.swift': '67b0b05f4b881319ef653d2a73359938baf456ecc6f81e1763e89dd278fa564f', 'Client/iPadZeroLagDisplay/TransportTelemetry.swift': '853bea11d4993c6f3bd9f7968a11c6d8a480b236f6b5ba8b7921e5cf490afd1c', 'Client/iPadZeroLagDisplay/USBServerIdentity.swift': '4557847cf629a700ebdbc6b560f330b336b5ddcb577956d4aa380e9bc9dbca10', 'Client/iPadZeroLagDisplay/iPadZeroLagDisplayApp.swift': '53f6c6cb933a83e9fb694134271a41f5fd86860194535d825a46992d893dbafe'}
-NEUTRAL=['iPadCastingTests/C1NeutralLifetimeTests','iPadCastingTests/C1NativeAVAudioLifetimeTests']
+APPROVED_SIMULATOR_DECODER_RAW='9bee1aaa36711e16e6c9b7cb319e30b36078548cd5c6006640f6e4c6854f6992'
+APPROVED_SIMULATOR_DECODER_NORMALIZED='dca09f998e80f791d845cccc4414cd6e39ea7924e66f872436de036d5b692d81'
+NEUTRAL=['iPadCastingTests/C1NeutralLifetimeTests','iPadCastingTests/C1NativeAVAudioLifetimeTests','iPadCastingTests/C1DecoderLifecycleInstrumentationTests']
 SEMANTIC={
  'S1':['iPadCastingTests/USBListenerLifetimeTests/testLegacyUsbForegroundDropsPreFencePcmAndMatchingPongReleasesFreshPcm'],
  'S2':['iPadCastingTests/C1AlternateSemanticTests/testAlternateForegroundPcmFenceWithExplicitOwners']}
@@ -77,6 +79,9 @@ def prepare_variant(repo,root,variant,baseline_ref):
   expected=row['canonicalExpected']
   if variant=='N1' and relative in BASELINE_RAW:
    expected=digest((repo/relative).read_bytes().replace(b'\r\n',b'\n'))
+  if relative=='Client/iPadZeroLagDisplay/DecoderManager.swift' and row['rawSha256']==APPROVED_SIMULATOR_DECODER_RAW:
+   expected=APPROVED_SIMULATOR_DECODER_NORMALIZED
+   row['approvedSimulatorInstrumentationException']=True
   if row['normalizedSha256']!=expected:raise RuntimeError('Frozen production drift: '+relative)
  test_inputs={}
  for file in (root/'Client').rglob('*'):
@@ -155,10 +160,16 @@ def execution_counts(text,selectors,repeats):
  for selector in selectors:
   if selector.endswith('/C1NeutralLifetimeTests'):methods.extend(neutral)
   elif selector.endswith('/C1NativeAVAudioLifetimeTests'):methods.append('test100NativeDataRenderedManualRenderStopResetCycles')
+  elif selector.endswith('/C1DecoderLifecycleInstrumentationTests'):methods.append('testSingleCallerAndAsyncCleanupPreserveLifecycleMeasurements')
   else:methods.append(selector.rsplit('/',1)[-1])
  counts={method:len(re.findall(r'Test Case[^\n]*\b'+re.escape(method)+r'\b[^\n]* passed[ (]',text)) for method in methods}
  all_passed=len(re.findall(r'Test Case[^\n]* passed[ (]',text))
  verified=all(value>=repeats for value in counts.values()) if selectors else all_passed>=628
+ for selector in selectors:
+  if '/C1OrderedSequenceTests/' in selector:
+   scenario=selector.rsplit('/',1)[-1].removeprefix('test')
+   pair_numbers=[int(x) for x in re.findall(r'\[C1_PAIR_QUALIFIED\] scenario='+re.escape(scenario)+r' repetition=(\d+)',text)]
+   verified=verified and pair_numbers==list(range(1,21))
  return {'methodPassCounts':counts,'allMethodPasses':all_passed,'verified':verified,'qualificationSource':'XCTest case completion log; if interleaved/incomplete, remain unqualified pending xcresult review'}
 
 def run_test(root,point,derived,xctestrun,udid,selectors,repeats,mode):
@@ -216,7 +227,7 @@ def main():
      result=run_test(root,out/semantic/mode/'semantic',derived,run,udid,selectors,count,mode);result['variant']=semantic;all_points.append(result)
     if mode=='unsanitized':
      for sequence in ['S1ThenWifi','WifiThenS1','S2ThenWifi','WifiThenS2']:
-      result=run_test(root,out/'sequences'/sequence,derived,run,udid,['iPadCastingTests/C1OrderedSequenceTests/test'+sequence],20,mode);result['variant']='SEQUENCE_'+sequence;all_points.append(result)
+      result=run_test(root,out/'sequences'/sequence,derived,run,udid,['iPadCastingTests/C1OrderedSequenceTests/test'+sequence],1,mode);result['variant']='SEQUENCE_'+sequence;result['orderedPairRepetitions']=20;all_points.append(result)
    save(out/'campaign-points.json',all_points)
  aggregates={v:{'clean':len([p for p in all_points if p.get('variant')==v])==3 and all(p['clean'] for p in all_points if p.get('variant')==v),'crash':any(p.get('crash',False) for p in all_points if p.get('variant')==v)} for v in ['N0','N1','S1','S2']}
  classification=classify(aggregates)
