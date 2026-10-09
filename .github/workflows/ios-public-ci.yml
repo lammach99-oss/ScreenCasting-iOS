@@ -12,6 +12,11 @@ on:
         required: false
         default: false
         type: boolean
+      c1_extract_reports:
+        description: Extract only the retained completed C1 diagnostic reports; no tests or IPA
+        required: false
+        default: false
+        type: boolean
       c1_baseline_ref:
         description: Exact public object with canonical a48980f AudioManager and NetworkManager bytes
         required: false
@@ -580,7 +585,7 @@ jobs:
           echo 'DOWNLOADED_ARTIFACT_REVALIDATION=PASS'
 
   c1-native-stability:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.c1_native_stability }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.c1_native_stability && !inputs.c1_extract_reports }}
     permissions:
       contents: read
       actions: read
@@ -692,5 +697,65 @@ jobs:
             ${{ runner.temp }}/c1-native-stability-evidence/*.txt
             ${{ runner.temp }}/c1-native-stability-evidence/*.log
           include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+  c1-extract-reports:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.c1_native_stability && inputs.c1_extract_reports }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Require diagnostic-only extraction
+        env:
+          BUILD_IPA: ${{ inputs.build_unsigned_ipa }}
+          RUN_TESTS: ${{ inputs.run_xctest }}
+        run: test "$BUILD_IPA" = false && test "$RUN_TESTS" = false
+      - name: Download the exact retained completed native evidence
+        uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 37881608414
+          name: C1-native-stability-37881608414-0080445114016ab6ee6498565a7833953f55148e
+          path: /tmp/c1-retained
+      - name: Extract exact diagnostic reports and preserve source hashes
+        run: |
+          python3 - <<'PY'
+          import pathlib, hashlib, json, shutil
+          root=pathlib.Path('/tmp/c1-retained'); out=pathlib.Path('/tmp/c1-reports'); out.mkdir()
+          manifest=[]; observed=set()
+          for file in sorted(root.rglob('*')):
+              if not file.is_file() or 'symbols' in file.relative_to(root).parts: continue
+              relative=file.relative_to(root)
+              if file.suffix not in ['.json','.log','.txt','.ips','.crash']: continue
+              if file.stat().st_size > 8_000_000: continue
+              data=file.read_bytes(); sha=hashlib.sha256(data).hexdigest()
+              if file.suffix in ['.ips','.crash']:
+                  destination=out/'crashes'/(sha+file.suffix)
+              else: destination=out/relative
+              destination.parent.mkdir(parents=True,exist_ok=True)
+              if not destination.exists(): destination.write_bytes(data)
+              manifest.append({'source':str(relative),'retained':str(destination.relative_to(out)),'sourceSha256':sha,'bytes':len(data)})
+              if file.name in ['classification.json','xcresult-summary.json.log']:
+                  print('=== REPORT '+str(relative)+' ===',flush=True)
+                  print(data.decode('utf-8',errors='replace')[:24000],flush=True)
+              if file.suffix in ['.ips','.crash'] and sha not in observed:
+                  observed.add(sha)
+                  text=data.decode('utf-8',errors='replace')
+                  if 'iPadCasting' in text:
+                      print('=== CRASH '+str(relative)+' SHA256 '+sha+' ===',flush=True)
+                      print(text[:50000],flush=True)
+          (out/'retained-source-manifest.json').write_text(json.dumps(manifest,indent=2))
+          print('Retained',len(manifest),'reports;',len(observed),'unique crash reports',flush=True)
+          PY
+      - name: Retain the small exact diagnostic report bundle
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: C1-extracted-reports-37881608414-${{ github.run_id }}
+          path: /tmp/c1-reports
           if-no-files-found: error
           retention-days: 14
