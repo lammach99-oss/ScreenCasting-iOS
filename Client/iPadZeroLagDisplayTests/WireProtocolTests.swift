@@ -989,6 +989,29 @@ final class AudioReceiveTimingOwnershipTests: XCTestCase {
     }
 }
 
+final class AudioInterruptionDiagnosticTests: XCTestCase {
+    func testInterruptionDiagnosticsCaptureMissingReasonAsAbsent() {
+        let audio = AudioManager.makeForTesting()
+        audio.engineStartForTesting = { }
+        defer { audio.reset(); audio.audioQueueForTesting.sync { } }
+        audio.beginLegacySession(generation: 70)
+        let before = audio.playbackStateForTesting
+        audio.interruptForTesting(began: true)
+        var lines: [String] = []
+        audio.publishDiagnostics(generation: 70, profile: "usb", opus: false,
+                                 receiveRejects: "", sink: { lines.append($0) })
+        audio.audioQueueForTesting.sync { }
+        let events = lines.filter { $0.hasPrefix("[USB_PCM_AUDIO_SESSION] ") }
+        XCTAssertEqual(events.count, 2)
+        XCTAssertTrue(events.first?.contains("phase=received") == true)
+        XCTAssertTrue(events.last?.contains("phase=applied") == true)
+        XCTAssertTrue(events.allSatisfy { $0.contains("reason_key_present=0 reason_raw=none") })
+        XCTAssertEqual(audio.playbackStateForTesting.epoch, before.epoch + 1)
+        XCTAssertEqual(audio.playbackStateForTesting.generation, 70)
+        XCTAssertEqual(audio.playbackStateForTesting.queued, 0)
+    }
+}
+
 final class AudioInterruptionOwnershipTests: XCTestCase {
     private final class LivenessFixture {
         let audio = AudioManager.makeForTesting()
