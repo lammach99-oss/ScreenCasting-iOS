@@ -2044,6 +2044,20 @@ final class USBListenerLifetimeTests: XCTestCase {
     }
 
     func testLegacyUsbBackgroundSuspendsPcmWithoutQueueReject() throws {
+        let audio = AudioManager.shared
+        var completions: [() -> Void] = []
+        audio.audioQueueForTesting.sync {
+            audio.engineStartForTesting = { }
+            audio.pcmScheduleForTesting = { _, completion in completions.append(completion) }
+        }
+        defer {
+            manager.stopForTesting()
+            audio.reset(); audio.audioQueueForTesting.sync { }
+            audio.audioQueueForTesting.sync {
+                audio.engineStartForTesting = nil
+                audio.pcmScheduleForTesting = nil
+            }
+        }
         let peer = try connect()
         var pings: [Data] = []
         manager.controlSendForAudioTesting = { data, completion in
@@ -2055,15 +2069,6 @@ final class USBListenerLifetimeTests: XCTestCase {
         manager.networkQueueForTesting.sync { }
         if let ping = pings.last {
             manager.receiveUsbWireForTesting(type: .pong, payload: ping, generation: generation, connection: peer)
-        }
-        let audio = AudioManager.shared
-        audio.engineStartForTesting = { }
-        var completions: [() -> Void] = []
-        audio.pcmScheduleForTesting = { _, completion in completions.append(completion) }
-        defer {
-            audio.reset(); audio.audioQueueForTesting.sync { }
-            audio.engineStartForTesting = nil
-            audio.pcmScheduleForTesting = nil
         }
         audio.beginLegacySession(generation: generation)
         for _ in 0..<5 { audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: generation) }

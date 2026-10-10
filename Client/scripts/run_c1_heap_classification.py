@@ -6,7 +6,7 @@ CANONICAL_SHA='a48980f5417dff77785d882eea0909f8fc51c5ad'
 CANDIDATE_RAW={
  'Client/iPadZeroLagDisplay/AudioManager.swift':'6a2b2383eaca689eed1e7e5bded06aa6e8804bb3ae0bf41dfedfe045afc6a9c8',
  'Client/iPadZeroLagDisplay/NetworkManager.swift':'924715b9eca00a377cbaa83c5b8a1bd800826bbaad50f70e261de4b143ff3e05',
- 'Client/iPadZeroLagDisplayTests/WireProtocolTests.swift':'9721f1914eed5336f5798f340c4566f8d7c2e8a17a121187b60af3adfb8d51d3'}
+ 'Client/iPadZeroLagDisplayTests/WireProtocolTests.swift':'a82968a1ca69d015659b9cbb2bea3310103eb817b51ab3dc6a964c52f0e34e00'}
 BASELINE_RAW={
  'Client/iPadZeroLagDisplay/AudioManager.swift':'e896047b1496b2f4013817744a8fc4b9cf676a9f3bcf49a700a766bf3b5fc359',
  'Client/iPadZeroLagDisplay/NetworkManager.swift':'231871cde24acda5d02b2d0e8e36bd88168b6c5dee73b50d6fac4c29e50e4924'}
@@ -211,7 +211,7 @@ def main():
  (out/'xcodebuild-help.txt').write_text(helptext,encoding='utf-8')
  for option in ['-test-iterations','-test-repetition-relaunch-enabled']:
   if option not in helptext:raise RuntimeError('Unsupported repetition interface: '+option)
- variants={v:prepare_variant(repo,out/'sources'/v,v,baseline) for v in ['N0','N1']}
+ variants={v:prepare_variant(repo,out/'sources'/v,v,baseline) for v in (['N1'] if focused else ['N0','N1'])}
  harnesses=[digest((v/'Client/iPadZeroLagDisplayTests/C1LifetimeDiagnosticsTests.swift').read_bytes()) for v in variants.values()]
  if len(set(harnesses))!=1:raise RuntimeError('Neutral harness byte mismatch')
  all_points=[]; builds={}; start=time.monotonic()
@@ -233,10 +233,10 @@ def main():
    builds[(variant,mode)]=(derived,run)
    count=20 if focused else (30 if mode=='unsanitized' else 10)
    selectors=['iPadCastingTests/C1FullSuiteCrashClassificationTests/testCrashBoundaryAlone'] if focused else NEUTRAL
-   if focused:count=1
+   if focused:count=30
    result=run_test(root,out/variant/mode/'neutral',derived,run,udid,selectors,count,mode);result['variant']=variant;all_points.append(result)
    if focused:
-    result=run_test(root,out/variant/mode/'predecessors',derived,run,udid,['iPadCastingTests/C1FullSuiteCrashClassificationTests/testPredecessorsThenCrashBoundary'],1,mode)
+    result=run_test(root,out/variant/mode/'predecessors',derived,run,udid,['iPadCastingTests/C1FullSuiteCrashClassificationTests/testPredecessorsThenCrashBoundary'],30,mode)
     result['variant']=variant;all_points.append(result)
    if variant=='N1' and not focused:
     for semantic,selectors in SEMANTIC.items():
@@ -269,7 +269,7 @@ def main():
  report={'canonicalHead':CANONICAL_SHA,'candidatePublicSha':CANDIDATE_SHA,'diagnosticPublicSha':os.environ['GITHUB_SHA'],'classification':classification,'focusedLifecycleOnly':focused,'aggregate':aggregates,'points':all_points,'fullNative':full,'NATIVE_STABILITY_GREEN':len(full)==2 and all(p['clean'] for p in full),'C1_GREEN':False,'LOCAL_FROZEN_AND_PARITY_CONFIRMATION':'REQUIRED_AFTER_NATIVE_RUNS','C1_COMMITTED':False,'C2_TOUCHED':False,'PRODUCTION_CHANGED':False,'IPA_CREATED':False,'HOST_PACKAGE_CREATED':False,'PHYSICAL':'PENDING','AUDIO_V1_CLOSED':False,'PRODUCTION_FREEZE':False}
  save(out/'classification.json',report)
  # A clean campaign is evidence, never authorization to commit or package.
- return 0 if ((len(all_points)==4 and all(p['clean'] for p in all_points)) if focused else report['NATIVE_STABILITY_GREEN']) else 1
+ return 0 if ((len(all_points)==2 and all(p['clean'] for p in all_points)) if focused else report['NATIVE_STABILITY_GREEN']) else 1
 if __name__=='__main__':
  try:sys.exit(main())
  except Exception as error:
