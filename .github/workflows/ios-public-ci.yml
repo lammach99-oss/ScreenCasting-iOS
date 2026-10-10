@@ -610,6 +610,7 @@ jobs:
       C1_BASELINE_REF: ${{ inputs.c1_baseline_ref }}
       C1_FOCUSED_LIFECYCLE: ${{ inputs.c1_focused_lifecycle }}
       C1_FINAL_QUALIFICATION: ${{ inputs.c1_final_qualification }}
+      C1_QUALIFICATION_SELECTORS: ${{ inputs.xctest_filter }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7

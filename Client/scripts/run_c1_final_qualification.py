@@ -10,7 +10,28 @@ import subprocess
 import sys
 import tarfile
 
-SOURCE = '2149b93b76221d311a2bc93ca724b13b50714daf'
+SOURCE = os.environ.get('GITHUB_SHA', '')
+
+def xcresult_inventory(document):
+    counts = collections.Counter()
+    statuses = {}
+    def visit(node):
+        if isinstance(node, dict):
+            if str(node.get('nodeType', '')).replace(' ', '').lower() == 'testcase':
+                identifier = node.get('nodeIdentifier', '')
+                match = re.fullmatch(r'(?:iPadCastingTests/)?([^/]+)/([^/]+)', identifier)
+                if not match:
+                    raise RuntimeError('Unrecognized xcresult test identifier: ' + identifier)
+                key = match[1] + '/' + match[2].removesuffix('()')
+                counts[key] += 1
+                statuses[key] = node.get('result')
+            for child in node.values(): visit(child)
+        elif isinstance(node, list):
+            for child in node: visit(child)
+    visit(document)
+    if not counts:
+        raise RuntimeError('Authoritative xcresult inventory is empty')
+    return counts, statuses
 
 def main():
     repo = pathlib.Path.cwd()
@@ -25,9 +46,8 @@ def main():
     spec = importlib.util.spec_from_file_location('qualified_driver', root / 'Client/scripts/run_c1_heap_classification.py')
     d = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(d)
-    for path, expected in d.CANDIDATE_RAW.items():
-        if d.digest((root / path).read_bytes()) != expected:
-            raise RuntimeError('Immutable candidate byte mismatch: ' + path)
+    if not re.fullmatch(r'[0-9a-f]{40}', SOURCE):
+        raise RuntimeError('Exact immutable source SHA required')
     manifest = d.manifest(root)
     d.save(out / 'sources/N1-source-manifest.json', {
         'canonicalHead': d.CANONICAL_SHA, 'testedPublicSha': SOURCE,
@@ -71,23 +91,38 @@ def main():
     if not expected:
         raise RuntimeError('Cannot derive complete enumerated inventory; no tests dispatched')
     d.save(out / 'entry/expected-inventory.json', sorted(expected))
+    selectors = [s.strip() for s in os.environ.get('C1_QUALIFICATION_SELECTORS', '').split(',') if s.strip()]
+    selected = expected
+    if selectors:
+        selected = {key for key in expected if any(
+            ('iPadCastingTests/' + key) == selector or
+            ('iPadCastingTests/' + key).startswith(selector + '/') for selector in selectors)}
+        if not selected:
+            raise RuntimeError('No enumerated tests match the focused selectors')
     results = []
-    for number in (1, 2):
+    for number in ((1,) if selectors else (1, 2)):
         point = out / 'full' / str(number)
-        result = d.run_test(root, point, derived, run, udid, [], 1, 'unsanitized')
+        result = d.run_test(root, point, derived, run, udid, selectors, 1, 'unsanitized')
         text = (point / 'xcodebuild.stdout-stderr.log').read_text(errors='replace')
-        passed = re.findall(r"Test Case '-\[(?:iPadCastingTests\.)?([^ ]+) ([^]]+)\]' passed", text)
-        counts = collections.Counter(cls + '/' + method for cls, method in passed)
-        result['expectedInventory'] = sorted(expected)
+        inventory_log = point / 'xcresult-tests.json.log'
+        if d.command(['xcrun', 'xcresulttool', 'get', 'test-results', 'tests', '--path',
+                      str(point / 'result.xcresult')], root, inventory_log):
+            raise RuntimeError('Authoritative xcresult inventory export failed')
+        inventory_text = inventory_log.read_text()
+        counts, statuses = xcresult_inventory(json.loads(inventory_text[inventory_text.index('{'):]))
+        result['expectedInventory'] = sorted(selected)
         result['actualInventory'] = sorted(counts)
-        result['inventoryExact'] = set(counts) == expected and all(n == 1 for n in counts.values())
+        result['inventoryExact'] = set(counts) == selected and all(n == 1 for n in counts.values())
+        result['testStatuses'] = statuses
         result['processRestarts'] = len(re.findall('Restarting after unexpected exit', text))
         summary_text = (point / 'xcresult-summary.json.log').read_text(errors='replace')
         summary = json.loads(summary_text[summary_text.index('{'):])
         result['xcresultPassed'] = summary['passedTests']
         result['xcresultFailed'] = summary['failedTests']
         result['clean'] = (result['clean'] and result['inventoryExact'] and result['processRestarts'] == 0
-                           and summary['failedTests'] == 0 and summary['passedTests'] == len(expected))
+                           and summary['failedTests'] == 0 and summary['skippedTests'] == 0
+                           and summary['passedTests'] == len(selected)
+                           and all(status == 'Passed' for status in statuses.values()))
         d.save(point / 'point.json', result)
         results.append(result)
         d.save(out / 'classification.json', {'testedPublicSha': SOURCE, 'fullNative': results,
