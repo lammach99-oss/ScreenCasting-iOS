@@ -53,7 +53,6 @@
 		901111111111111111111001 /* DisplayOrientationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 901211111111111111111001 /* DisplayOrientationTests.swift */; };
 		B001111111111111111111001 /* InputGeometryDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = B002111111111111111111001 /* InputGeometryDiagnostics.swift */; };
 		B001111111111111111111002 /* InputGeometryDiagnosticsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B002111111111111111111002 /* InputGeometryDiagnosticsTests.swift */; };
-		C101111111111111111111001 /* C1LifetimeDiagnosticsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C102111111111111111111001 /* C1LifetimeDiagnosticsTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -116,7 +115,6 @@
 		901211111111111111111001 /* DisplayOrientationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayOrientationTests.swift; sourceTree = "<group>"; };
 		B002111111111111111111001 /* InputGeometryDiagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputGeometryDiagnostics.swift; sourceTree = "<group>"; };
 		B002111111111111111111002 /* InputGeometryDiagnosticsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputGeometryDiagnosticsTests.swift; sourceTree = "<group>"; };
-		C102111111111111111111001 /* C1LifetimeDiagnosticsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = C1LifetimeDiagnosticsTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -187,7 +185,6 @@
 		111111111111111111111122 /* iPadCastingTests */ = {
 			isa = PBXGroup;
 			children = (
-				C102111111111111111111001 /* C1LifetimeDiagnosticsTests.swift */,
 				201711111111111111111117 /* WireProtocolTests.swift */,
 				201811111111111111111118 /* AccessUnitMailboxTests.swift */,
 				201911111111111111111119 /* TransportTelemetryTests.swift */,
@@ -340,7 +337,6 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				C101111111111111111111001 /* C1LifetimeDiagnosticsTests.swift in Sources */,
 				300111111111111111111110 /* WireProtocolTests.swift in Sources */,
 				300111111111111111111111 /* AccessUnitMailboxTests.swift in Sources */,
 				300111111111111111111112 /* TransportTelemetryTests.swift in Sources */,
