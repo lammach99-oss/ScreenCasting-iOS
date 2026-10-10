@@ -415,23 +415,25 @@ final class C1AlternateSemanticTests: XCTestCase {
 }
 
 final class C1OrderedSequenceTests: XCTestCase {
+    private func prepareFixture(_ fixture: XCTestCase) { fixture.setUp() }
+    private func finishFixture(_ fixture: XCTestCase) { fixture.tearDown() }
     private func runBody(_ name: String) async throws {
         if name == "S1" {
             let fixture = USBListenerLifetimeTests(selector: #selector(USBListenerLifetimeTests.testLegacyUsbForegroundDropsPreFencePcmAndMatchingPongReleasesFreshPcm))
-            fixture.setUp()
+            prepareFixture(fixture)
             do { try fixture.c1ForegroundPcmFenceBody() }
-            catch { await fixture.c1RetireFixture(); fixture.tearDown(); throw error }
+            catch { await fixture.c1RetireFixture(); finishFixture(fixture); throw error }
             await fixture.c1RetireFixture()
-            fixture.tearDown()
+            finishFixture(fixture)
         } else if name == "S2" {
             let fixture = C1AlternateSemanticTests(selector: #selector(C1AlternateSemanticTests.testAlternateForegroundPcmFenceWithExplicitOwners))
             try await fixture.c1ForegroundPcmFenceBody()
         } else {
             let fixture = WifiForegroundDecoderRecoveryTests(selector: #selector(WifiForegroundDecoderRecoveryTests.testReplacementWifiGenerationCannotRearmStaleSession))
-            fixture.setUp()
+            prepareFixture(fixture)
             fixture.c1ReplacementWifiGenerationBody()
             await fixture.c1RetireFixture()
-            fixture.tearDown()
+            finishFixture(fixture)
         }
     }
     private func runPair(_ semantic: String, wifiFirst: Bool) async throws {
