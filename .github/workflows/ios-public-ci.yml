@@ -7,6 +7,11 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      c1_final_qualification:
+        description: Two full suites only on immutable corrected C1 source
+        required: false
+        default: false
+        type: boolean
       c1_native_stability:
         description: Run only the matched C1 native stability diagnostics; no IPA
         required: false
@@ -604,6 +609,7 @@ jobs:
     env:
       C1_BASELINE_REF: ${{ inputs.c1_baseline_ref }}
       C1_FOCUSED_LIFECYCLE: ${{ inputs.c1_focused_lifecycle }}
+      C1_FINAL_QUALIFICATION: ${{ inputs.c1_final_qualification }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
@@ -674,7 +680,11 @@ jobs:
         timeout-minutes: 300
         run: |
           set -euo pipefail
-          python3 Client/scripts/run_c1_heap_classification.py 2>&1 | tee "$C1_EVIDENCE_ROOT/campaign.stdout-stderr.log"
+          if [[ "$C1_FINAL_QUALIFICATION" == true ]]; then
+            python3 Client/scripts/run_c1_final_qualification.py 2>&1 | tee "$C1_EVIDENCE_ROOT/campaign.stdout-stderr.log"
+          else
+            python3 Client/scripts/run_c1_heap_classification.py 2>&1 | tee "$C1_EVIDENCE_ROOT/campaign.stdout-stderr.log"
+          fi
       - name: Retain final crash and simulator diagnostics even after failure
         if: always()
         shell: bash
