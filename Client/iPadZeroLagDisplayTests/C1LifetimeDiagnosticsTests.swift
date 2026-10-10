@@ -49,6 +49,61 @@ private final class C1CompletionLedger {
     }
 }
 
+final class C1FullSuiteCrashClassificationTests: XCTestCase {
+    private func prepare(_ fixture: XCTestCase) { fixture.setUp() }
+    private func retire(_ fixture: XCTestCase) { fixture.tearDown() }
+    private func runCrashBoundary() throws {
+        #if C1_CANDIDATE_SEMANTICS
+        print("[C1_CRASH_AB] variant=candidate path=exact_original_test")
+        let fixture = USBListenerLifetimeTests(selector: #selector(USBListenerLifetimeTests.testLegacyUsbBackgroundSuspendsPcmWithoutQueueReject))
+        prepare(fixture)
+        defer { retire(fixture) }
+        try fixture.testLegacyUsbBackgroundSuspendsPcmWithoutQueueReject()
+        #else
+        // Baseline has no fresh-Pong resume or C1 semantic test. Exercise its
+        // existing equivalent unmocked engine-start seam; no C1 assertion parity.
+        print("[C1_CRASH_AB] variant=baseline path=legacy_pcm_unmocked_start_adapter semantic_parity=false")
+        let audio = AudioManager.shared
+        audio.reset(); audio.audioQueueForTesting.sync { }
+        defer { audio.reset(); audio.audioQueueForTesting.sync { } }
+        audio.beginLegacySession(generation: 2)
+        audio.audioQueueForTesting.sync { }
+        print("[C1_CRASH_AB] generation=2 engine_mock=false startup=legacy_pcm")
+        audio.playPCMData(Data(repeating: 0, count: 1920), generation: 2)
+        audio.audioQueueForTesting.sync { }
+        #endif
+    }
+    func testCrashBoundaryAlone() throws { try runCrashBoundary() }
+    func testPredecessorsThenCrashBoundary() throws {
+        #if C1_CANDIDATE_SEMANTICS
+        for name in ["off", "inactive"] {
+            let fixture = USBListenerLifetimeTests(selector: #selector(USBListenerLifetimeTests.testLegacyUsbBackgroundSuspendsPcmWithoutQueueReject))
+            prepare(fixture)
+            do {
+                if name == "off" { try fixture.testLegacyUsbAudioOffCancelsPendingFenceAndAudioOnArmsNewNonce() }
+                else { try fixture.testLegacyUsbAudioOnWhileInactiveGetsFreshFenceOnActive() }
+            } catch { retire(fixture); throw error }
+            retire(fixture)
+            print("[C1_CRASH_AB_PREDECESSOR] completed=\(name)")
+        }
+        #else
+        // Those C1 predecessor methods do not exist on baseline either. Compare
+        // singleton reset/epoch teardown without pretending they are identical.
+        let audio = AudioManager.shared
+        for generation in UInt64(10)...11 {
+            audio.audioQueueForTesting.sync { audio.engineStartForTesting = { } }
+            audio.beginLegacySession(generation: generation)
+            audio.playPCMData(Data(repeating: 0, count: 1920), generation: generation)
+            audio.audioQueueForTesting.sync { }
+            audio.reset(); audio.audioQueueForTesting.sync { }
+            audio.audioQueueForTesting.sync { audio.engineStartForTesting = nil }
+            print("[C1_CRASH_AB_PREDECESSOR] baseline_adapter_generation=\(generation) semantic_parity=false")
+        }
+        #endif
+        try runCrashBoundary()
+    }
+}
+
 final class C1NeutralLifetimeTests: XCTestCase {
     private let pcm = Data(repeating: 0, count: 1920)
     private func install(_ ledger: C1CompletionLedger, _ audio: AudioManager) {

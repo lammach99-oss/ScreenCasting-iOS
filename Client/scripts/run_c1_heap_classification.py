@@ -232,8 +232,12 @@ def main():
    save(point/'environment.json',{'environmentVariables':runtime_env,'defines':defines,'xctestrunSha256':digest(run.read_bytes()),'udid':udid,'sourceVariant':variant})
    builds[(variant,mode)]=(derived,run)
    count=20 if focused else (30 if mode=='unsanitized' else 10)
-   selectors=['iPadCastingTests/C1DecoderLifecycleInstrumentationTests/testSingleCallerAndAsyncCleanupPreserveLifecycleMeasurements'] if focused else NEUTRAL
+   selectors=['iPadCastingTests/C1FullSuiteCrashClassificationTests/testCrashBoundaryAlone'] if focused else NEUTRAL
+   if focused:count=1
    result=run_test(root,out/variant/mode/'neutral',derived,run,udid,selectors,count,mode);result['variant']=variant;all_points.append(result)
+   if focused:
+    result=run_test(root,out/variant/mode/'predecessors',derived,run,udid,['iPadCastingTests/C1FullSuiteCrashClassificationTests/testPredecessorsThenCrashBoundary'],1,mode)
+    result['variant']=variant;all_points.append(result)
    if variant=='N1' and not focused:
     for semantic,selectors in SEMANTIC.items():
      result=run_test(root,out/semantic/mode/'semantic',derived,run,udid,selectors,count,mode);result['variant']=semantic;all_points.append(result)
@@ -265,7 +269,7 @@ def main():
  report={'canonicalHead':CANONICAL_SHA,'candidatePublicSha':CANDIDATE_SHA,'diagnosticPublicSha':os.environ['GITHUB_SHA'],'classification':classification,'focusedLifecycleOnly':focused,'aggregate':aggregates,'points':all_points,'fullNative':full,'NATIVE_STABILITY_GREEN':len(full)==2 and all(p['clean'] for p in full),'C1_GREEN':False,'LOCAL_FROZEN_AND_PARITY_CONFIRMATION':'REQUIRED_AFTER_NATIVE_RUNS','C1_COMMITTED':False,'C2_TOUCHED':False,'PRODUCTION_CHANGED':False,'IPA_CREATED':False,'HOST_PACKAGE_CREATED':False,'PHYSICAL':'PENDING','AUDIO_V1_CLOSED':False,'PRODUCTION_FREEZE':False}
  save(out/'classification.json',report)
  # A clean campaign is evidence, never authorization to commit or package.
- return 0 if ((len(all_points)==2 and all(p['clean'] for p in all_points)) if focused else report['NATIVE_STABILITY_GREEN']) else 1
+ return 0 if ((len(all_points)==4 and all(p['clean'] for p in all_points)) if focused else report['NATIVE_STABILITY_GREEN']) else 1
 if __name__=='__main__':
  try:sys.exit(main())
  except Exception as error:
