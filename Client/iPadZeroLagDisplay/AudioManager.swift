@@ -1,6 +1,24 @@
 import Foundation
 import AVFoundation
 
+struct AudioInterruptionDiagnosticMetadata {
+    let fields: String
+
+    init(userInfo: [AnyHashable: Any]?) {
+        let info = userInfo ?? [:]
+        let type = info[AVAudioSessionInterruptionTypeKey] as? UInt
+        let reason = info[AVAudioSessionInterruptionReasonKey] as? UInt
+        let suspended = info[AVAudioSessionInterruptionWasSuspendedKey] as? Bool
+        let option = info[AVAudioSessionInterruptionOptionKey] as? UInt
+        let event = type == AVAudioSession.InterruptionType.began.rawValue ? "began"
+            : type == AVAudioSession.InterruptionType.ended.rawValue ? "ended" : "unknown"
+        let resume = option.map {
+            AVAudioSession.InterruptionOptions(rawValue: $0).contains(.shouldResume) ? "1" : "0"
+        } ?? "unknown"
+        fields = "event=\(event) interruption_type_present=\(info[AVAudioSessionInterruptionTypeKey] != nil ? 1 : 0) interruption_type_raw=\(type.map { String($0) } ?? "none") reason_key_present=\(info[AVAudioSessionInterruptionReasonKey] != nil ? 1 : 0) reason_raw=\(reason.map { String($0) } ?? "none") was_suspended_key_present=\(info[AVAudioSessionInterruptionWasSuspendedKey] != nil ? 1 : 0) was_suspended_value=\(suspended.map { $0 ? "1" : "0" } ?? "none") option_key_present=\(info[AVAudioSessionInterruptionOptionKey] != nil ? 1 : 0) option_raw=\(option.map { String($0) } ?? "none") should_resume=\(resume)"
+    }
+}
+
 enum RealtimeAudioTimerPolicy {
     static func shouldRun(mode: UInt8, audioEnabled: Bool) -> Bool {
         audioEnabled &&
@@ -96,6 +114,7 @@ public final class AudioManager {
     private var legacyLifecycleSuspendedGeneration: UInt64?
     private var legacyLifecycleFreshFenceSatisfiedGeneration: UInt64?
     private var pendingLegacyLifecycleDiagnostics: [String] = []
+    private var audioDiagnosticEventSequence: UInt64 = 0
     private var legacyLifecycleDropCount: UInt64 = 0
     private var legacyResumeFenceDropCount: UInt64 = 0
     private var receiveDiagnostics = AudioReceiveDiagnostics()
@@ -144,6 +163,11 @@ public final class AudioManager {
                 AVAudioSessionInterruptionOptionKey:
                     shouldResume ? AVAudioSession.InterruptionOptions.shouldResume.rawValue : UInt(0)
             ]))
+        audioQueue.sync { }
+    }
+
+    func interruptionNotificationForTesting(userInfo: [AnyHashable: Any]?) {
+        handleInterruption(Notification(name: AVAudioSession.interruptionNotification, userInfo: userInfo))
         audioQueue.sync { }
     }
     #endif
@@ -430,9 +454,32 @@ public final class AudioManager {
         let suspended = legacyLifecycleSuspendedGeneration.map { String($0) } ?? "none"
         let fence = legacyLifecycleFreshFenceSatisfiedGeneration.map { String($0) } ?? "none"
         let line = "[USB_PCM_LIFECYCLE] generation=\(generation) epoch=\(playbackEpoch) action=\(action) \(detail) playback_interrupted=\(playbackInterrupted ? 1 : 0) suspended_generation=\(suspended) fresh_fence_generation=\(fence) engine_running=\(engineIsRunning ? 1 : 0)"
-        print(line)
-        pendingLegacyLifecycleDiagnostics.append(line)
+        retainAudioLifecycleDiagnostic(line)
+    }
+
+    static var audioSessionDiagnosticFields: String {
+        #if targetEnvironment(simulator)
+        return "session_snapshot=simulator"
+        #else
+        let session = AVAudioSession.sharedInstance()
+        let outputs = session.currentRoute.outputs
+        let types = outputs.map { $0.portType.rawValue }.joined(separator: ",")
+        return "session_category=\(session.category.rawValue) session_mode=\(session.mode.rawValue) session_sample_rate=\(session.sampleRate) session_output_channels=\(session.outputNumberOfChannels) session_output_count=\(outputs.count) session_output_types=\(types.isEmpty ? "none" : types) secondary_audio_should_be_silenced=\(session.secondaryAudioShouldBeSilencedHint ? 1 : 0)"
+        #endif
+    }
+
+    private func retainAudioLifecycleDiagnostic(_ line: String) {
+        audioDiagnosticEventSequence &+= 1
+        let timed = "\(line) audio_event_seq=\(audioDiagnosticEventSequence) uptime_ms=\(Int64(ProcessInfo.processInfo.systemUptime * 1000)) \(Self.audioSessionDiagnosticFields)"
+        print(timed)
+        pendingLegacyLifecycleDiagnostics.append(timed)
         if pendingLegacyLifecycleDiagnostics.count > 16 { pendingLegacyLifecycleDiagnostics.removeFirst() }
+    }
+
+    private func recordInterruptionDiagnostic(_ metadata: AudioInterruptionDiagnosticMetadata,
+                                             receivedAt: Int64, phase: String) {
+        // Audio ownership is observed only on audioQueue, never on the notification thread.
+        retainAudioLifecycleDiagnostic("[USB_PCM_AUDIO_SESSION] phase=\(phase) notification_received_uptime_ms=\(receivedAt) \(metadata.fields) activePlaybackGeneration=\(activePlaybackGeneration.map { String($0) } ?? "none") realtimeGeneration=\(realtimeGeneration.map { String($0) } ?? "none") playbackEpoch=\(playbackEpoch) interruptedPlaybackEpoch=\(interruptedPlaybackEpoch.map { String($0) } ?? "none") playbackInterrupted=\(playbackInterrupted ? 1 : 0) legacyLifecycleSuspendedGeneration=\(legacyLifecycleSuspendedGeneration.map { String($0) } ?? "none") legacyLifecycleFreshFenceSatisfiedGeneration=\(legacyLifecycleFreshFenceSatisfiedGeneration.map { String($0) } ?? "none") engine_running=\(engineIsRunning ? 1 : 0) queued_frames=\(queuedFrames) pcm_scheduled=\(playoutDiagnostics.pcmBuffersScheduled) pcm_completed=\(pcmCompletionCount) pcm_reject=\(playoutDiagnostics.pcmQueueRejects)")
     }
 
     func recordLegacyResumeFenceDrop(generation: UInt64) {
@@ -677,14 +724,24 @@ public final class AudioManager {
     }
 
     @objc private func handleInterruption(_ notification: Notification) {
+        let metadata = AudioInterruptionDiagnosticMetadata(userInfo: notification.userInfo)
+        let receivedAt = Int64(ProcessInfo.processInfo.systemUptime * 1000)
         guard let info = notification.userInfo,
               let typeValue = info[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type = AVAudioSession.InterruptionType(rawValue: typeValue)
-        else { return }
+        else {
+            audioQueue.async { [weak self] in
+                self?.recordInterruptionDiagnostic(metadata, receivedAt: receivedAt, phase: "received")
+                self?.recordInterruptionDiagnostic(metadata, receivedAt: receivedAt, phase: "applied")
+            }
+            return
+        }
 
         switch type {
         case .began:
             audioQueue.async { [weak self] in
+                self?.recordInterruptionDiagnostic(metadata, receivedAt: receivedAt, phase: "received")
+                defer { self?.recordInterruptionDiagnostic(metadata, receivedAt: receivedAt, phase: "applied") }
                 guard let self, self.activePlaybackGeneration != nil,
                       !self.playbackInterrupted else { return }
                 // Retire queued output callbacks without retiring the negotiated session.
@@ -707,6 +764,8 @@ public final class AudioManager {
             let optionsValue = info[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
             let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
             audioQueue.async { [weak self] in
+                self?.recordInterruptionDiagnostic(metadata, receivedAt: receivedAt, phase: "received")
+                defer { self?.recordInterruptionDiagnostic(metadata, receivedAt: receivedAt, phase: "applied") }
                 guard let self, self.activePlaybackGeneration != nil,
                       let epoch = self.interruptedPlaybackEpoch,
                       epoch == self.playbackEpoch, self.playbackInterrupted else { return }
@@ -744,7 +803,10 @@ public final class AudioManager {
             }
 
         @unknown default:
-            break
+            audioQueue.async { [weak self] in
+                self?.recordInterruptionDiagnostic(metadata, receivedAt: receivedAt, phase: "received")
+                self?.recordInterruptionDiagnostic(metadata, receivedAt: receivedAt, phase: "applied")
+            }
         }
     }
 }

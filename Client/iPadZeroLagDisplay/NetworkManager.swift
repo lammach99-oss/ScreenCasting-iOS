@@ -2244,6 +2244,9 @@ public class NetworkManager: ObservableObject {
     public func applicationDidBecomeActive() {
         networkQueue.async { [weak self] in
             guard let self else { return }
+            let diagnosticForegroundBefore = self.isForegroundActive
+            self.recordAppAudioLifecycleDiagnostic(event: "did_become_active", phase: "received", foregroundBefore: diagnosticForegroundBefore)
+            defer { self.recordAppAudioLifecycleDiagnostic(event: "did_become_active", phase: "applied", foregroundBefore: diagnosticForegroundBefore) }
             let wasForegroundActive = self.isForegroundActive
             self.isForegroundActive = true
             if !wasForegroundActive,
@@ -2349,6 +2352,9 @@ public class NetworkManager: ObservableObject {
     public func applicationWillResignActive() {
         networkQueue.async { [weak self] in
             guard let self else { return }
+            let diagnosticForegroundBefore = self.isForegroundActive
+            self.recordAppAudioLifecycleDiagnostic(event: "will_resign_active", phase: "received", foregroundBefore: diagnosticForegroundBefore)
+            defer { self.recordAppAudioLifecycleDiagnostic(event: "will_resign_active", phase: "applied", foregroundBefore: diagnosticForegroundBefore) }
             self.cancelActiveDirectTouchOnQueue()
             self.isForegroundActive = false
             // Foreground eligibility is closed first; discard its old sample window.
@@ -2371,6 +2377,9 @@ public class NetworkManager: ObservableObject {
     public func applicationDidEnterBackground() {
         networkQueue.async { [weak self] in
             guard let self else { return }
+            let diagnosticForegroundBefore = self.isForegroundActive
+            self.recordAppAudioLifecycleDiagnostic(event: "did_enter_background", phase: "received", foregroundBefore: diagnosticForegroundBefore)
+            defer { self.recordAppAudioLifecycleDiagnostic(event: "did_enter_background", phase: "applied", foregroundBefore: diagnosticForegroundBefore) }
             self.isForegroundActive = false
             // Foreground eligibility is closed first; discard its old sample window.
             self.transportTelemetry.beginFreshFrameRate(
@@ -4027,7 +4036,7 @@ public class NetworkManager: ObservableObject {
         guard isForegroundActive else { return }
         sendClientPing(force: true, purpose: .usbLegacyPcmFreshFence)
         recordUsbLifecycleDiagnostic(
-            "[USB_PCM_RESUME_FENCE] generation=\(generation) action=armed")
+            "[USB_PCM_RESUME_FENCE] generation=\(generation) action=armed nonce=\(usbLegacyPcmFreshFenceNonce.map { String($0) } ?? "none")")
     }
 
     private func recordVideoPayloadReceived(_ byteCount: Int, sequence: UInt32) {
@@ -4490,7 +4499,7 @@ public class NetworkManager: ObservableObject {
                     usbLegacyPcmFreshFenceGeneration = nil
                     AudioManager.shared.resumeLegacySessionAfterFreshFence(generation: generation)
                     recordUsbLifecycleDiagnostic(
-                        "[USB_PCM_RESUME_FENCE] generation=\(generation) action=released")
+                        "[USB_PCM_RESUME_FENCE] generation=\(generation) action=released nonce=\(nonce)")
                 }
             }
 
@@ -5481,11 +5490,16 @@ public class NetworkManager: ObservableObject {
     // MARK: - Private: Thread-Safe State Transition
 
     private func recordUsbLifecycleDiagnostic(_ line: String) {
-        let timed = "\(line) uptime=\(ProcessInfo.processInfo.systemUptime)"
+        let uptime = ProcessInfo.processInfo.systemUptime
+        let timed = "\(line) uptime=\(uptime) uptime_ms=\(Int64(uptime * 1000))"
         // The listener also exists between telemetry files; keep these sparse
         // events visible in the device console throughout that interval.
         print(timed)
         recordDiagnosticLine(timed)
+    }
+
+    private func recordAppAudioLifecycleDiagnostic(event: String, phase: String, foregroundBefore: Bool) {
+        recordUsbLifecycleDiagnostic("[APP_AUDIO_LIFECYCLE] event=\(event) phase=\(phase) isForegroundActive_before=\(foregroundBefore ? 1 : 0) isForegroundActive_after=\(isForegroundActive ? 1 : 0) connectionGeneration=\(connectionGeneration) committedTransportGeneration=\(committedTransportGeneration.map { String($0) } ?? "none") wireAuthenticatedGeneration=\(wireAuthenticatedGeneration.map { String($0) } ?? "none") activeTransportKind=\(activeTransportKind == .usb ? "usb" : "wifi") committedRealtimeMode=\(committedRealtimeMode.map { String($0) } ?? "none") legacyUsbPlaybackEnabledGeneration=\(legacyUsbPlaybackEnabledGeneration.map { String($0) } ?? "none") usbLegacyPcmFreshFenceGeneration=\(usbLegacyPcmFreshFenceGeneration.map { String($0) } ?? "none") usbLegacyPcmFreshFenceNonce_present=\(usbLegacyPcmFreshFenceNonce != nil ? 1 : 0) \(AudioManager.audioSessionDiagnosticFields)")
     }
 
     #if targetEnvironment(simulator)

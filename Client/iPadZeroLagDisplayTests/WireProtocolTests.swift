@@ -990,6 +990,19 @@ final class AudioReceiveTimingOwnershipTests: XCTestCase {
 }
 
 final class AudioInterruptionDiagnosticTests: XCTestCase {
+    private func events(_ audio: AudioManager) -> [String] {
+        var lines: [String] = []
+        audio.publishDiagnostics(generation: 70, profile: "usb", opus: false,
+                                 receiveRejects: "", sink: { lines.append($0) })
+        audio.audioQueueForTesting.sync { }
+        return lines.filter { $0.hasPrefix("[USB_PCM_AUDIO_SESSION] ") }
+    }
+
+    private func value(_ field: String, in line: String) -> String? {
+        line.split(separator: " ").first { $0.hasPrefix(field + "=") }
+            .map { String($0.dropFirst(field.count + 1)) }
+    }
+
     func testInterruptionDiagnosticsCaptureMissingReasonAsAbsent() {
         let audio = AudioManager.makeForTesting()
         audio.engineStartForTesting = { }
@@ -1009,6 +1022,117 @@ final class AudioInterruptionDiagnosticTests: XCTestCase {
         XCTAssertEqual(audio.playbackStateForTesting.epoch, before.epoch + 1)
         XCTAssertEqual(audio.playbackStateForTesting.generation, 70)
         XCTAssertEqual(audio.playbackStateForTesting.queued, 0)
+    }
+
+    func testRawUnknownReasonAndSuspendedMetadataDoNotChangeBeganBehavior() {
+        let audio = AudioManager.makeForTesting()
+        audio.engineStartForTesting = { }
+        defer { audio.reset(); audio.audioQueueForTesting.sync { } }
+        audio.beginLegacySession(generation: 70)
+        let before = audio.playbackStateForTesting
+        audio.interruptionNotificationForTesting(userInfo: [
+            AVAudioSessionInterruptionTypeKey: NSNumber(value: 1),
+            AVAudioSessionInterruptionReasonKey: NSNumber(value: 999),
+            AVAudioSessionInterruptionWasSuspendedKey: NSNumber(value: true)
+        ])
+        let records = events(audio)
+        XCTAssertEqual(records.count, 2)
+        XCTAssertTrue(records.allSatisfy { $0.contains("reason_key_present=1 reason_raw=999") })
+        XCTAssertTrue(records.allSatisfy { $0.contains("was_suspended_key_present=1 was_suspended_value=1") })
+        XCTAssertTrue(records.allSatisfy { $0.contains("option_key_present=0 option_raw=none should_resume=unknown") })
+        XCTAssertEqual(value("playbackInterrupted", in: records[0]), "0")
+        XCTAssertEqual(value("playbackInterrupted", in: records[1]), "1")
+        XCTAssertEqual(audio.playbackStateForTesting.epoch, before.epoch + 1)
+        XCTAssertEqual(audio.playbackStateForTesting.generation, 70)
+    }
+
+    func testUnknownAndMissingTypeOnlyEmitReadOnlySnapshots() {
+        let audio = AudioManager.makeForTesting()
+        defer { audio.reset(); audio.audioQueueForTesting.sync { } }
+        let before = audio.playbackStateForTesting
+        audio.interruptionNotificationForTesting(userInfo: [AVAudioSessionInterruptionTypeKey: UInt(999)])
+        audio.interruptionNotificationForTesting(userInfo: nil)
+        let records = events(audio)
+        XCTAssertEqual(records.count, 4)
+        XCTAssertTrue(records.allSatisfy { $0.contains("event=unknown") })
+        XCTAssertTrue(records[0].contains("interruption_type_present=1 interruption_type_raw=999"))
+        XCTAssertTrue(records[2].contains("interruption_type_present=0 interruption_type_raw=none"))
+        XCTAssertEqual(audio.playbackStateForTesting.epoch, before.epoch)
+        XCTAssertNil(audio.playbackStateForTesting.generation)
+        XCTAssertEqual(audio.playbackStateForTesting.queued, before.queued)
+        XCTAssertEqual(audio.playbackStateForTesting.recoveries, before.recoveries)
+    }
+
+    func testMalformedMetadataAndFalseSuspensionAreSafelyDistinguished() {
+        let missing = AudioInterruptionDiagnosticMetadata(userInfo: nil).fields
+        let malformed = AudioInterruptionDiagnosticMetadata(userInfo: [
+            AVAudioSessionInterruptionReasonKey: "unmapped",
+            AVAudioSessionInterruptionWasSuspendedKey: "unmapped",
+            AVAudioSessionInterruptionOptionKey: "unmapped"
+        ]).fields
+        XCTAssertTrue(missing.contains("was_suspended_key_present=0 was_suspended_value=none"))
+        XCTAssertTrue(malformed.contains("reason_key_present=1 reason_raw=none"))
+        XCTAssertTrue(malformed.contains("was_suspended_key_present=1 was_suspended_value=none"))
+        XCTAssertTrue(malformed.contains("option_key_present=1 option_raw=none should_resume=unknown"))
+        let valid = AudioInterruptionDiagnosticMetadata(userInfo: [
+            AVAudioSessionInterruptionWasSuspendedKey: false,
+            AVAudioSessionInterruptionOptionKey: AVAudioSession.InterruptionOptions.shouldResume.rawValue
+        ]).fields
+        XCTAssertTrue(valid.contains("was_suspended_key_present=1 was_suspended_value=0"))
+        XCTAssertTrue(valid.contains("option_key_present=1 option_raw=1 should_resume=1"))
+    }
+
+    func testAbsentEndedOptionsPreserveOrdinaryNoResumeBehavior() {
+        let audio = AudioManager.makeForTesting()
+        audio.engineStartForTesting = { }
+        var resumes = 0
+        audio.interruptionResumeForTesting = { resumes += 1 }
+        defer { audio.reset(); audio.audioQueueForTesting.sync { } }
+        audio.beginLegacySession(generation: 70)
+        audio.interruptForTesting(began: true)
+        let before = audio.playbackStateForTesting
+        audio.interruptionNotificationForTesting(userInfo: [AVAudioSessionInterruptionTypeKey: UInt(0)])
+        let records = events(audio)
+        XCTAssertEqual(records.count, 4)
+        XCTAssertTrue(records[3].contains("event=ended"))
+        XCTAssertTrue(records[3].contains("should_resume=unknown"))
+        XCTAssertEqual(value("playbackInterrupted", in: records[3]), "1")
+        XCTAssertEqual(audio.playbackStateForTesting.epoch, before.epoch)
+        XCTAssertEqual(resumes, 0)
+    }
+
+    func testDuplicateBeganDoesNotMutatePlaybackTwiceAndEventClockAdvances() {
+        let audio = AudioManager.makeForTesting()
+        audio.engineStartForTesting = { }
+        defer { audio.reset(); audio.audioQueueForTesting.sync { } }
+        audio.beginLegacySession(generation: 70)
+        audio.interruptForTesting(began: true)
+        let before = audio.playbackStateForTesting
+        audio.interruptForTesting(began: true)
+        let records = events(audio)
+        XCTAssertEqual(records.count, 4)
+        let sequences = records.compactMap { value("audio_event_seq", in: $0).flatMap(UInt64.init) }
+        let times = records.compactMap { value("uptime_ms", in: $0).flatMap(Int64.init) }
+        XCTAssertEqual(sequences.count, 4)
+        XCTAssertEqual(times.count, 4)
+        XCTAssertTrue(zip(sequences, sequences.dropFirst()).allSatisfy { $0.0 < $0.1 })
+        XCTAssertTrue(zip(times, times.dropFirst()).allSatisfy { $0.0 <= $0.1 })
+        XCTAssertTrue(records.allSatisfy { value("notification_received_uptime_ms", in: $0) != nil })
+        XCTAssertEqual(audio.playbackStateForTesting.epoch, before.epoch)
+        XCTAssertEqual(audio.playbackStateForTesting.queued, before.queued)
+    }
+
+    func testDiagnosticRetentionIsBoundedAndDoesNotOwnInactivePlayback() {
+        let audio = AudioManager.makeForTesting()
+        defer { audio.reset(); audio.audioQueueForTesting.sync { } }
+        let before = audio.playbackStateForTesting
+        for _ in 0..<12 { audio.interruptForTesting(began: true) }
+        let records = events(audio)
+        XCTAssertEqual(records.count, 16)
+        XCTAssertTrue(records.allSatisfy { $0.contains("activePlaybackGeneration=none") })
+        XCTAssertEqual(audio.playbackStateForTesting.epoch, before.epoch)
+        XCTAssertEqual(audio.playbackStateForTesting.recoveries, before.recoveries)
+        XCTAssertTrue(events(audio).isEmpty)
     }
 }
 
