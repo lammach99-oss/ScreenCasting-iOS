@@ -94,6 +94,8 @@ public final class AudioManager {
     private var interruptedPlaybackEpoch: UInt64?
     private var playbackInterrupted = false
     private var legacyLifecycleSuspendedGeneration: UInt64?
+    private var legacyLifecycleFreshFenceSatisfiedGeneration: UInt64?
+    private var pendingLegacyLifecycleDiagnostics: [String] = []
     private var legacyLifecycleDropCount: UInt64 = 0
     private var legacyResumeFenceDropCount: UInt64 = 0
     private var receiveDiagnostics = AudioReceiveDiagnostics()
@@ -348,6 +350,7 @@ public final class AudioManager {
             self.interruptedPlaybackEpoch = nil
             self.playbackInterrupted = false
             self.legacyLifecycleSuspendedGeneration = nil
+            self.legacyLifecycleFreshFenceSatisfiedGeneration = nil
             self.legacyLifecycleDropCount = 0
             self.legacyResumeFenceDropCount = 0
             self.playerNode.stop()
@@ -376,6 +379,7 @@ public final class AudioManager {
                   self.realtimeGeneration == nil,
                   self.legacyLifecycleSuspendedGeneration != generation else { return }
             self.legacyLifecycleSuspendedGeneration = generation
+            self.legacyLifecycleFreshFenceSatisfiedGeneration = nil
             self.playbackEpoch &+= 1
             if self.playbackInterrupted { self.interruptedPlaybackEpoch = self.playbackEpoch }
             self.playerNode.stop()
@@ -384,6 +388,7 @@ public final class AudioManager {
             self.lastPcmProgressAt = nil
             self.engine.pause()
             self.engineStarted = false
+            self.recordLegacyLifecycleTransition(generation: generation, action: "suspend")
         }
     }
 
@@ -392,17 +397,42 @@ public final class AudioManager {
             guard let self, self.activePlaybackGeneration == generation,
                   self.realtimeGeneration == nil,
                   self.legacyLifecycleSuspendedGeneration == generation else { return }
-            self.playbackEpoch &+= 1
-            if self.playbackInterrupted { self.interruptedPlaybackEpoch = self.playbackEpoch }
-            self.playerNode.stop()
-            self.playerNode.reset()
-            self.queuedFrames = 0
-            self.lastPcmProgressAt = nil
-            self.legacyLifecycleSuspendedGeneration = nil
-            guard !self.playbackInterrupted else { return }
-            self.configureAudioSession()
-            self.startEngineIfNeeded()
+            guard self.legacyLifecycleFreshFenceSatisfiedGeneration != generation else { return }
+            self.legacyLifecycleFreshFenceSatisfiedGeneration = generation
+            self.recordLegacyLifecycleTransition(generation: generation, action: "fresh_fence_satisfied")
+            if self.playbackInterrupted {
+                self.recordLegacyLifecycleTransition(generation: generation, action: "resume_deferred", detail: "reason=interruption_active")
+            }
+            self.completeLegacyLifecycleResumeIfReady(generation: generation, reason: "fresh_fence")
         }
+    }
+
+    @discardableResult
+    private func completeLegacyLifecycleResumeIfReady(generation: UInt64, reason: String) -> Bool {
+        guard activePlaybackGeneration == generation, realtimeGeneration == nil,
+              legacyLifecycleSuspendedGeneration == generation,
+              legacyLifecycleFreshFenceSatisfiedGeneration == generation,
+              !playbackInterrupted else { return false }
+        playbackEpoch &+= 1
+        playerNode.stop()
+        playerNode.reset()
+        queuedFrames = 0
+        lastPcmProgressAt = nil
+        legacyLifecycleSuspendedGeneration = nil
+        legacyLifecycleFreshFenceSatisfiedGeneration = nil
+        configureAudioSession()
+        startEngineIfNeeded()
+        recordLegacyLifecycleTransition(generation: generation, action: "resume_complete", detail: "reason=\(reason)")
+        return true
+    }
+
+    private func recordLegacyLifecycleTransition(generation: UInt64, action: String, detail: String = "") {
+        let suspended = legacyLifecycleSuspendedGeneration.map { String($0) } ?? "none"
+        let fence = legacyLifecycleFreshFenceSatisfiedGeneration.map { String($0) } ?? "none"
+        let line = "[USB_PCM_LIFECYCLE] generation=\(generation) epoch=\(playbackEpoch) action=\(action) \(detail) playback_interrupted=\(playbackInterrupted ? 1 : 0) suspended_generation=\(suspended) fresh_fence_generation=\(fence) engine_running=\(engineIsRunning ? 1 : 0)"
+        print(line)
+        pendingLegacyLifecycleDiagnostics.append(line)
+        if pendingLegacyLifecycleDiagnostics.count > 16 { pendingLegacyLifecycleDiagnostics.removeFirst() }
     }
 
     func recordLegacyResumeFenceDrop(generation: UInt64) {
@@ -543,11 +573,13 @@ public final class AudioManager {
     public func reset() {
         audioQueue.async { [weak self] in
             guard let self else { return }
+            let revokedGeneration = self.legacyLifecycleSuspendedGeneration
             self.playbackEpoch &+= 1
             self.activePlaybackGeneration = nil
             self.interruptedPlaybackEpoch = nil
             self.playbackInterrupted = false
             self.legacyLifecycleSuspendedGeneration = nil
+            self.legacyLifecycleFreshFenceSatisfiedGeneration = nil
             self.legacyLifecycleDropCount = 0
             self.legacyResumeFenceDropCount = 0
             self.playerNode.stop()
@@ -569,6 +601,9 @@ public final class AudioManager {
             self.publishRecoveryOwner()
             self.receiveDiagnostics = AudioReceiveDiagnostics()
             self.playoutDiagnostics = AudioPlayoutDiagnostics()
+            if let revokedGeneration {
+                self.recordLegacyLifecycleTransition(generation: revokedGeneration, action: "reset_revoke")
+            }
         }
     }
 
@@ -632,9 +667,11 @@ public final class AudioManager {
                 sink(line)
                 self.pendingRecoveryDiagnostic = nil
             }
+            self.pendingLegacyLifecycleDiagnostics.forEach(sink)
+            self.pendingLegacyLifecycleDiagnostics.removeAll(keepingCapacity: true)
             let packetMetrics = opus
                 ? "packets=\(rx.packets) gaps=\(rx.forwardGaps) missing=\(rx.missingPacketUnits) repaired=\(rx.repairedPacketUnits) reorder=\(rx.reorderedPackets) duplicate_stale=\(rx.duplicateOrStalePackets) jitter_ms=\(rx.jitterMs) interarrival_p95_ms=\(rx.interarrivalP95Ms) interarrival_max_ms=\(rx.interarrivalMaxMs) depth=\(self.jitterBuffer.bufferedPacketCount) depth_max=\(jitter.maximumDepth) depth_p50=\(jitter.depthPercentiles.p50) depth_p95=\(jitter.depthPercentiles.p95) inserted=\(jitter.insertedPackets) duplicate_reject=\(jitter.duplicateRejects) stale_reject=\(jitter.staleRejects) startup_wait=\(jitter.startupWaitTicks) target_ms=\(self.jitterBuffer.targetDurationMs) target_drop=\(jitter.targetPolicyDrops) overflow_drop=\(jitter.overflowDrops) plc=\(play.plcActions) short_starvation_entries=\(jitter.shortStarvationEntries) bounded_plc_actions=\(jitter.boundedPlcActions) rebuffer_entries=\(jitter.rebufferEntries) rebuffer_wait_ticks=\(jitter.rebufferWaitTicks) rebuffer_resumes=\(jitter.rebufferResumes) fresh_reanchor_skip_units=\(jitter.freshReanchorSkipUnits)"
-                : "rtp_jitter_plc=not_applicable pcm_lifecycle_drop=\(self.legacyLifecycleDropCount) pcm_resume_fence_drop=\(self.legacyResumeFenceDropCount) legacy_lifecycle_suspended=\(self.legacyLifecycleSuspendedGeneration == self.activePlaybackGeneration && self.activePlaybackGeneration != nil ? 1 : 0)"
+                : "rtp_jitter_plc=not_applicable pcm_lifecycle_drop=\(self.legacyLifecycleDropCount) pcm_resume_fence_drop=\(self.legacyResumeFenceDropCount) legacy_lifecycle_suspended=\(self.legacyLifecycleSuspendedGeneration == self.activePlaybackGeneration && self.activePlaybackGeneration != nil ? 1 : 0) playback_interrupted=\(self.playbackInterrupted ? 1 : 0) interruption_epoch=\(self.interruptedPlaybackEpoch.map { String($0) } ?? "none") fresh_fence_satisfied=\(self.legacyLifecycleFreshFenceSatisfiedGeneration == self.activePlaybackGeneration && self.activePlaybackGeneration != nil ? 1 : 0) legacy_resume_pending=\(self.legacyLifecycleSuspendedGeneration == self.activePlaybackGeneration && self.legacyLifecycleFreshFenceSatisfiedGeneration == self.activePlaybackGeneration && self.activePlaybackGeneration != nil ? 1 : 0)"
             sink("[AUDIO_PLAYOUT] generation=\(generation) epoch=\(self.playbackEpoch) profile=\(profile) codec=\(opus ? "opus" : "pcm") \(packetMetrics) \(receiveRejects) ticks=\(play.ticks) nil=\(play.nilTicks) decode=\(play.decodeActions) decode_fail=\(play.decodeFailures) pcm_reject=\(play.pcmQueueRejects) \(play.pcmRejectionContext) pcm_scheduled=\(play.pcmBuffersScheduled) pcm_frames=\(play.pcmFramesScheduled) queued_frames=\(self.queuedFrames) pcm_completed=\(self.pcmCompletionCount) playout_recoveries=\(self.playoutRecoveryCount) engine_running=\(self.engineIsRunning ? 1 : 0) player_start=\(play.playerStarts) player_restart=\(play.playerRestarts)")
         }
     }
@@ -674,6 +711,15 @@ public final class AudioManager {
                       let epoch = self.interruptedPlaybackEpoch,
                       epoch == self.playbackEpoch, self.playbackInterrupted else { return }
                 self.interruptedPlaybackEpoch = nil
+                if self.realtimeGeneration == nil,
+                   let generation = self.activePlaybackGeneration,
+                   self.legacyLifecycleSuspendedGeneration == generation {
+                    self.playbackInterrupted = false
+                    if !self.completeLegacyLifecycleResumeIfReady(generation: generation, reason: "interruption_end") {
+                        self.recordLegacyLifecycleTransition(generation: generation, action: "interruption_ended_waiting_fence", detail: "should_resume=\(options.contains(.shouldResume) ? 1 : 0)")
+                    }
+                    return
+                }
                 guard options.contains(.shouldResume) else { return }
                 self.playbackInterrupted = false
                 self.publishRecoveryOwner()

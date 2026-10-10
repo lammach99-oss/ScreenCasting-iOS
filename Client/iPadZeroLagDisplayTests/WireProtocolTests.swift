@@ -2391,6 +2391,132 @@ final class USBListenerLifetimeTests: XCTestCase {
         }
     }
 
+    func testLegacyLifecycleRequiresBothFreshFenceAndInterruptionRetirement() {
+        let audio = AudioManager.makeForTesting()
+        var starts = 0
+        audio.engineStartForTesting = { starts += 1 }
+        defer { audio.reset(); audio.audioQueueForTesting.sync { } }
+        audio.beginLegacySession(generation: 70)
+        for fenceFirst in [true, false] {
+            let before = audio.playbackStateForTesting.epoch
+            let startsBefore = starts
+            audio.interruptForTesting(began: true)
+            audio.suspendLegacySessionForLifecycle(generation: 70)
+            audio.audioQueueForTesting.sync { }
+            if fenceFirst { audio.resumeLegacySessionAfterFreshFence(generation: 70) }
+            else { audio.interruptForTesting(began: false, shouldResume: false) }
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(starts, startsBefore)
+            XCTAssertEqual(audio.playbackStateForTesting.epoch, before + 2)
+            if fenceFirst { audio.interruptForTesting(began: false, shouldResume: false) }
+            else { audio.resumeLegacySessionAfterFreshFence(generation: 70) }
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(starts, startsBefore + 1)
+            XCTAssertEqual(audio.playbackStateForTesting.epoch, before + 3)
+            audio.resumeLegacySessionAfterFreshFence(generation: 70)
+            audio.interruptForTesting(began: false)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(starts, startsBefore + 1)
+            XCTAssertEqual(audio.playbackStateForTesting.epoch, before + 3)
+        }
+    }
+
+    func testLegacyAudioOffRevokesFenceSatisfiedInterruptionDeferredResume() throws {
+        try withLegacyUsbPcm { audio, peer, generation, probe in
+            var starts = 0
+            audio.audioQueueForTesting.sync { audio.engineStartForTesting = { starts += 1 } }
+            audio.interruptForTesting(began: true)
+            manager.applicationDidEnterBackground()
+            manager.networkQueueForTesting.sync { }
+            awaitLegacyPing(probe) { manager.applicationDidBecomeActive() }
+            let ping = try XCTUnwrap(probe.pings.last)
+            manager.receiveUsbWireForTesting(type: .pong, payload: ping, generation: generation, connection: peer)
+            audio.audioQueueForTesting.sync { }
+            manager.reconcileAudioForTesting(generation: generation, mode: RealtimeTransportMode.legacyTLS, audioEnabled: false)
+            audio.audioQueueForTesting.sync { }
+            audio.interruptForTesting(began: false, shouldResume: false)
+            audio.resumeLegacySessionAfterFreshFence(generation: generation)
+            audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: generation)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertNil(audio.playbackStateForTesting.generation)
+            XCTAssertEqual(starts, 0)
+            XCTAssertEqual(probe.completions.count, 0)
+            assertLegacyLifecycleDiagnostics(audio, generation: generation, fields: [
+                "legacy_lifecycle_suspended=0", "fresh_fence_satisfied=0", "legacy_resume_pending=0"
+            ])
+        }
+    }
+
+    func testLegacyReplacementRevokesOldDeferredFenceAndCompletion() {
+        let audio = AudioManager.makeForTesting()
+        var starts = 0
+        var completions: [() -> Void] = []
+        audio.engineStartForTesting = { starts += 1 }
+        audio.pcmScheduleForTesting = { _, completion in completions.append(completion) }
+        defer { audio.reset(); audio.audioQueueForTesting.sync { } }
+        audio.beginLegacySession(generation: 70)
+        audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 70)
+        audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(completions.count, 1)
+        audio.interruptForTesting(began: true)
+        audio.suspendLegacySessionForLifecycle(generation: 70)
+        audio.resumeLegacySessionAfterFreshFence(generation: 70)
+        audio.audioQueueForTesting.sync { }
+        let startsBefore = starts
+        audio.beginLegacySession(generation: 71)
+        audio.suspendLegacySessionForLifecycle(generation: 71)
+        audio.interruptForTesting(began: false, shouldResume: false)
+        audio.resumeLegacySessionAfterFreshFence(generation: 70)
+        completions.first?()
+        audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 70)
+        audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(audio.playbackStateForTesting.generation, 71)
+        XCTAssertEqual(starts, startsBefore)
+        XCTAssertEqual(completions.count, 1)
+        XCTAssertEqual(audio.playbackStateForTesting.completions, 0)
+        assertLegacyLifecycleDiagnostics(audio, generation: 71, fields: [
+            "legacy_lifecycle_suspended=1", "fresh_fence_satisfied=0", "playback_interrupted=0"
+        ])
+        audio.resumeLegacySessionAfterFreshFence(generation: 71)
+        audio.audioQueueForTesting.sync { }
+        XCTAssertEqual(starts, startsBefore + 1)
+    }
+
+    func testLegacyBackgroundForegroundInterruptionOrderingDoesNotLatchPlayback() throws {
+        try withLegacyUsbPcm { audio, peer, generation, probe in
+            var starts = 0
+            audio.audioQueueForTesting.sync { audio.engineStartForTesting = { starts += 1 } }
+            for cycle in 0..<20 {
+                let fenceFirst = cycle % 2 == 0
+                audio.interruptForTesting(began: true)
+                manager.applicationDidEnterBackground()
+                manager.networkQueueForTesting.sync { }
+                if !fenceFirst { audio.interruptForTesting(began: false, shouldResume: false) }
+                awaitLegacyPing(probe) { manager.applicationDidBecomeActive() }
+                manager.receiveUsbWireForTesting(type: .audio, payload: Data(repeating: 0, count: 480 * 4), generation: generation, connection: peer)
+                audio.audioQueueForTesting.sync { }
+                XCTAssertEqual(probe.completions.count, cycle)
+                let ping = try XCTUnwrap(probe.pings.last)
+                manager.receiveUsbWireForTesting(type: .pong, payload: ping, generation: generation, connection: peer)
+                audio.audioQueueForTesting.sync { }
+                XCTAssertEqual(starts, fenceFirst ? cycle : cycle + 1)
+                if fenceFirst { audio.interruptForTesting(began: false, shouldResume: false) }
+                manager.receiveUsbWireForTesting(type: .audio, payload: Data(repeating: 0, count: 480 * 4), generation: generation, connection: peer)
+                audio.audioQueueForTesting.sync { }
+                XCTAssertEqual(starts, cycle + 1)
+                XCTAssertEqual(probe.completions.count, cycle + 1)
+                XCTAssertEqual(manager.usbSessionSnapshot().committedGeneration, generation)
+                try XCTUnwrap(probe.completions.last)()
+                audio.audioQueueForTesting.sync { }
+                XCTAssertEqual(audio.playbackStateForTesting.queued, 0)
+                assertLegacyLifecycleDiagnostics(audio, generation: generation, fields: [
+                    "legacy_lifecycle_suspended=0", "fresh_fence_satisfied=0",
+                    "legacy_resume_pending=0", "playback_interrupted=0", "pcm_reject=0"
+                ])
+            }
+        }
+    }
+
     private func assertLegacyLifecycleDiagnostics(_ audio: AudioManager, generation: UInt64,
                                                  fields: [String], file: StaticString = #filePath,
                                                  line: UInt = #line) {
