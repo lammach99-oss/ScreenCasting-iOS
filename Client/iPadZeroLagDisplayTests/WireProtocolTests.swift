@@ -2331,7 +2331,12 @@ final class USBListenerLifetimeTests: XCTestCase {
     func testLegacyFreshPongDuringInterruptionDefersUntilInterruptionEnds() throws {
         try withLegacyUsbPcm { audio, peer, generation, probe in
             var starts = 0
-            audio.audioQueueForTesting.sync { audio.engineStartForTesting = { starts += 1 } }
+            var running = false
+            audio.audioQueueForTesting.sync {
+                audio.engineRunningForTesting = { running }
+                audio.engineStartForTesting = { starts += 1; running = true }
+            }
+            defer { audio.audioQueueForTesting.sync { audio.engineRunningForTesting = nil } }
             audio.interruptForTesting(began: true)
             manager.applicationDidEnterBackground()
             manager.networkQueueForTesting.sync { }
@@ -2365,7 +2370,12 @@ final class USBListenerLifetimeTests: XCTestCase {
     func testLegacyEndedWithoutShouldResumeWaitsForFreshPongThenResumes() throws {
         try withLegacyUsbPcm { audio, peer, generation, probe in
             var starts = 0
-            audio.audioQueueForTesting.sync { audio.engineStartForTesting = { starts += 1 } }
+            var running = false
+            audio.audioQueueForTesting.sync {
+                audio.engineRunningForTesting = { running }
+                audio.engineStartForTesting = { starts += 1; running = true }
+            }
+            defer { audio.audioQueueForTesting.sync { audio.engineRunningForTesting = nil } }
             audio.interruptForTesting(began: true)
             manager.applicationDidEnterBackground()
             manager.networkQueueForTesting.sync { }
@@ -2485,9 +2495,15 @@ final class USBListenerLifetimeTests: XCTestCase {
     func testLegacyBackgroundForegroundInterruptionOrderingDoesNotLatchPlayback() throws {
         try withLegacyUsbPcm { audio, peer, generation, probe in
             var starts = 0
-            audio.audioQueueForTesting.sync { audio.engineStartForTesting = { starts += 1 } }
+            var running = false
+            audio.audioQueueForTesting.sync {
+                audio.engineRunningForTesting = { running }
+                audio.engineStartForTesting = { starts += 1; running = true }
+            }
+            defer { audio.audioQueueForTesting.sync { audio.engineRunningForTesting = nil } }
             for cycle in 0..<20 {
                 let fenceFirst = cycle % 2 == 0
+                audio.audioQueueForTesting.sync { running = false }
                 audio.interruptForTesting(began: true)
                 manager.applicationDidEnterBackground()
                 manager.networkQueueForTesting.sync { }
