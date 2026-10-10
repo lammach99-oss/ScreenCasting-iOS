@@ -2086,13 +2086,6 @@ public class NetworkManager: ObservableObject {
     #if targetEnvironment(simulator)
     private var testingVideoFeedbackCount = 0
     var videoFeedbackCountForTesting: Int { testingVideoFeedbackCount }
-    private var testingUsbForegroundRecoveryFeedbackCount = 0
-    var usbForegroundRecoveryFeedbackCountForTesting: Int {
-        if DispatchQueue.getSpecific(key: networkQueueKey) != nil {
-            return testingUsbForegroundRecoveryFeedbackCount
-        }
-        return networkQueue.sync { testingUsbForegroundRecoveryFeedbackCount }
-    }
     #endif
 
     public init(userDefaults: UserDefaults = .standard) {
@@ -2298,9 +2291,6 @@ public class NetworkManager: ObservableObject {
                 self.armLegacyUsbPcmFreshFence(generation: generation)
                 self.decoder.beginSession(generation: generation)
                 self.sendVideoFeedback()
-                #if targetEnvironment(simulator)
-                self.testingUsbForegroundRecoveryFeedbackCount += 1
-                #endif
                 self.recordUsbLifecycleDiagnostic(
                     "[USB_MEDIA_RECOVERY] generation=\(generation) " +
                     "action=decoder_rearmed recovery_requested=true")
