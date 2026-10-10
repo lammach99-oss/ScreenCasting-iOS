@@ -2177,6 +2177,10 @@ final class USBListenerLifetimeTests: XCTestCase {
     }
 
     func testLegacyUsbForegroundDropsPreFencePcmAndMatchingPongReleasesFreshPcm() throws {
+        try c1ForegroundPcmFenceBody()
+    }
+
+    func c1ForegroundPcmFenceBody() throws {
         try withLegacyUsbPcm { audio, peer, generation, probe in
             manager.applicationDidEnterBackground()
             awaitLegacyPing(probe) { manager.applicationDidBecomeActive() }
@@ -2204,6 +2208,53 @@ final class USBListenerLifetimeTests: XCTestCase {
             audio.audioQueueForTesting.sync { }
             XCTAssertTrue(records.last?.contains("pcm_reject=0") == true)
             XCTAssertTrue(records.last?.contains("pcm_resume_fence_drop=100") == true)
+        }
+    }
+
+    func c1RetireFixture() async {
+        let owner = manager!
+        let snapshot = owner.usbSessionSnapshot()
+        var terminals: [XCTestExpectation] = []
+        owner.networkQueueForTesting.sync {
+            if let listener = snapshot.listener, listener.state != .cancelled {
+                let terminal = XCTestExpectation(description: "C1 S1 listener retired")
+                terminals.append(terminal)
+                let previous = listener.stateUpdateHandler
+                var seen = false
+                listener.stateUpdateHandler = { state in
+                    previous?(state)
+                    if state == .cancelled && !seen { seen = true; terminal.fulfill() }
+                }
+            }
+            for peer in peers + [snapshot.connection].compactMap({ $0 }) where peer.state != .cancelled {
+                let terminal = XCTestExpectation(description: "C1 S1 peer retired")
+                terminals.append(terminal)
+                let previous = peer.stateUpdateHandler
+                var seen = false
+                peer.stateUpdateHandler = { state in
+                    previous?(state)
+                    if state == .cancelled && !seen { seen = true; terminal.fulfill() }
+                }
+            }
+        }
+        owner.stopForTesting()
+        peers.forEach { $0.cancel() }
+        if !terminals.isEmpty {
+            let result = await XCTWaiter.fulfillment(of: terminals, timeout: 10)
+            XCTAssertEqual(result, .completed)
+        }
+        owner.networkQueueForTesting.sync { }
+        owner.decoderForTesting.sessionQueueForTesting.sync { }
+        AudioManager.shared.audioQueueForTesting.sync { }
+        let drained = XCTestExpectation(description: "C1 S1 main publications retired")
+        DispatchQueue.main.async { drained.fulfill() }
+        let result = await XCTWaiter.fulfillment(of: [drained], timeout: 10)
+        XCTAssertEqual(result, .completed)
+        owner.networkQueueForTesting.sync {
+            snapshot.listener?.stateUpdateHandler = nil
+            snapshot.listener?.newConnectionHandler = nil
+            peers.forEach { $0.stateUpdateHandler = nil }
+            snapshot.connection?.stateUpdateHandler = nil
         }
     }
 
@@ -3159,6 +3210,10 @@ final class WifiForegroundDecoderRecoveryTests: XCTestCase {
     }
 
     func testReplacementWifiGenerationCannotRearmStaleSession() {
+        c1ReplacementWifiGenerationBody()
+    }
+
+    func c1ReplacementWifiGenerationBody() {
         let retired = manager.simulateCommittedWifiSessionForTesting()
         manager.applicationWillResignActive()
         let current = manager.simulateCommittedWifiSessionForTesting()
@@ -3183,6 +3238,18 @@ final class WifiForegroundDecoderRecoveryTests: XCTestCase {
         XCTAssertEqual(events.filter { $0.hasPrefix("begin-") }, ["begin-\(current.generation)"])
         XCTAssertEqual(events.filter { $0 == "invalidate-end" }, ["invalidate-end"])
         XCTAssertEqual(manager.decoderForTesting.invalidateWaitModesForTesting.last, false)
+    }
+
+    func c1RetireFixture() async {
+        let owner = manager!
+        owner.stopForTesting()
+        owner.networkQueueForTesting.sync { }
+        owner.decoderForTesting.sessionQueueForTesting.sync { }
+        AudioManager.shared.audioQueueForTesting.sync { }
+        let drained = XCTestExpectation(description: "C1 Wi-Fi main publications retired")
+        DispatchQueue.main.async { drained.fulfill() }
+        let result = await XCTWaiter.fulfillment(of: [drained], timeout: 10)
+        XCTAssertEqual(result, .completed)
     }
 
     func testLegacyWifiSessionDoesNotForceRtpDecoderRearm() {

@@ -6,7 +6,7 @@ CANONICAL_SHA='a48980f5417dff77785d882eea0909f8fc51c5ad'
 CANDIDATE_RAW={
  'Client/iPadZeroLagDisplay/AudioManager.swift':'6a2b2383eaca689eed1e7e5bded06aa6e8804bb3ae0bf41dfedfe045afc6a9c8',
  'Client/iPadZeroLagDisplay/NetworkManager.swift':'924715b9eca00a377cbaa83c5b8a1bd800826bbaad50f70e261de4b143ff3e05',
- 'Client/iPadZeroLagDisplayTests/WireProtocolTests.swift':'02a7b1788cd050c4a38a68ea3ee5ab2ec8084af23c84cad8cf79e1bf4e192239'}
+ 'Client/iPadZeroLagDisplayTests/WireProtocolTests.swift':'9721f1914eed5336f5798f340c4566f8d7c2e8a17a121187b60af3adfb8d51d3'}
 BASELINE_RAW={
  'Client/iPadZeroLagDisplay/AudioManager.swift':'e896047b1496b2f4013817744a8fc4b9cf676a9f3bcf49a700a766bf3b5fc359',
  'Client/iPadZeroLagDisplay/NetworkManager.swift':'231871cde24acda5d02b2d0e8e36bd88168b6c5dee73b50d6fac4c29e50e4924'}
@@ -170,6 +170,13 @@ def execution_counts(text,selectors,repeats):
    scenario=selector.rsplit('/',1)[-1].removeprefix('test')
    pair_numbers=[int(x) for x in re.findall(r'\[C1_PAIR_QUALIFIED\] scenario='+re.escape(scenario)+r' repetition=(\d+)',text)]
    verified=verified and pair_numbers==list(range(1,21))
+   semantic='S1' if 'S1' in scenario else 'S2'
+   expected=['WiFi',semantic] if scenario.startswith('Wifi') else [semantic,'WiFi']
+   retired=re.findall(r'\[C1_BODY_RETIRED\] scenario='+re.escape(scenario)+r' repetition=(\d+) body=(\w+) pid=(\d+)',text)
+   order=re.findall(r'\[C1_OBSERVED_ORDER\] scenario='+re.escape(scenario)+r' repetition=(\d+) first=(\w+) second=(\w+) pid=(\d+)',text)
+   verified=verified and [(int(n),body) for n,body,pid in retired]==[(n,body) for n in range(1,21) for body in expected]
+   verified=verified and [(int(n),first,second) for n,first,second,pid in order]==[(n,*expected) for n in range(1,21)]
+   verified=verified and len({row[-1] for row in retired+order})==1
  return {'methodPassCounts':counts,'allMethodPasses':all_passed,'verified':verified,'qualificationSource':'XCTest case completion log; if interleaved/incomplete, remain unqualified pending xcresult review'}
 
 def repetition_arguments(repeats):
@@ -243,7 +250,18 @@ def main():
  full=[]
  if not focused and classification=='NON_REPRODUCIBLE' and len(sequences)==4 and all(p['clean'] for p in sequences) and all(p['clean'] for p in all_points):
   derived,run=builds[('N1','unsanitized')]
-  for number in [1,2]:full.append(run_test(variants['N1'],out/'full'/str(number),derived,run,udid,[],1,'unsanitized'))
+  for number in [1,2]:
+   point=out/'full'/str(number)
+   result=run_test(variants['N1'],point,derived,run,udid,[],1,'unsanitized')
+   text=(point/'xcodebuild.stdout-stderr.log').read_text(encoding='utf-8',errors='replace')
+   result['passedInventory']=sorted(re.findall(r"Test Case '([^']+)' passed",text))
+   result['processRestarts']=len(re.findall(r'Restarting after unexpected exit',text))
+   save(point/'point.json',result)
+   full.append(result)
+   if not result['clean']:break
+  if len(full)==2 and full[0]['passedInventory']!=full[1]['passedInventory']:
+   full[1]['clean']=False;full[1]['inventoryMismatch']=True
+   save(out/'full'/'2'/'point.json',full[1])
  report={'canonicalHead':CANONICAL_SHA,'candidatePublicSha':CANDIDATE_SHA,'diagnosticPublicSha':os.environ['GITHUB_SHA'],'classification':classification,'focusedLifecycleOnly':focused,'aggregate':aggregates,'points':all_points,'fullNative':full,'NATIVE_STABILITY_GREEN':len(full)==2 and all(p['clean'] for p in full),'C1_GREEN':False,'LOCAL_FROZEN_AND_PARITY_CONFIRMATION':'REQUIRED_AFTER_NATIVE_RUNS','C1_COMMITTED':False,'C2_TOUCHED':False,'PRODUCTION_CHANGED':False,'IPA_CREATED':False,'HOST_PACKAGE_CREATED':False,'PHYSICAL':'PENDING','AUDIO_V1_CLOSED':False,'PRODUCTION_FREEZE':False}
  save(out/'classification.json',report)
  # A clean campaign is evidence, never authorization to commit or package.

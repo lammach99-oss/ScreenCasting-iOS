@@ -287,6 +287,10 @@ private final class C1OneShotPingRecorder {
 
 final class C1AlternateSemanticTests: XCTestCase {
     func testAlternateForegroundPcmFenceWithExplicitOwners() async throws {
+        try await c1ForegroundPcmFenceBody()
+    }
+
+    func c1ForegroundPcmFenceBody() async throws {
         print("[C1_PATH] TEST_SEAM_ONLY semantic=S2")
         let domain = "test.c1.s2.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
@@ -410,51 +414,48 @@ final class C1AlternateSemanticTests: XCTestCase {
     }
 }
 
-private final class C1SequenceObserver: NSObject, XCTestObservation {
-    private let lock = NSLock()
-    private var started: [String] = []
-    func testCaseWillStart(_ testCase: XCTestCase) { lock.lock(); started.append(testCase.name); lock.unlock() }
-    var names: [String] { lock.lock(); defer { lock.unlock() }; return started }
-}
-
 final class C1OrderedSequenceTests: XCTestCase {
-    private func selected(_ type: XCTestCase.Type, _ method: String) throws -> XCTestCase {
-        // Obtain XCTest's own invocation, including its async-method adaptation.
-        let cases = type.defaultTestSuite.tests.compactMap { $0 as? XCTestCase }.filter { $0.name.contains(method) }
-        XCTAssertEqual(cases.count, 1)
-        return try XCTUnwrap(cases.first)
+    private func runBody(_ name: String) async throws {
+        if name == "S1" {
+            let fixture = USBListenerLifetimeTests(selector: #selector(USBListenerLifetimeTests.testLegacyUsbForegroundDropsPreFencePcmAndMatchingPongReleasesFreshPcm))
+            fixture.setUp()
+            do { try fixture.c1ForegroundPcmFenceBody() }
+            catch { await fixture.c1RetireFixture(); fixture.tearDown(); throw error }
+            await fixture.c1RetireFixture()
+            fixture.tearDown()
+        } else if name == "S2" {
+            let fixture = C1AlternateSemanticTests(selector: #selector(C1AlternateSemanticTests.testAlternateForegroundPcmFenceWithExplicitOwners))
+            try await fixture.c1ForegroundPcmFenceBody()
+        } else {
+            let fixture = WifiForegroundDecoderRecoveryTests(selector: #selector(WifiForegroundDecoderRecoveryTests.testReplacementWifiGenerationCannotRearmStaleSession))
+            fixture.setUp()
+            fixture.c1ReplacementWifiGenerationBody()
+            await fixture.c1RetireFixture()
+            fixture.tearDown()
+        }
     }
-    private func runOnePair(_ type: XCTestCase.Type, _ method: String, wifiFirst: Bool) throws {
-        let semantic = try selected(type, method)
-        let wifi = try selected(WifiForegroundDecoderRecoveryTests.self, "testReplacementWifiGenerationCannotRearmStaleSession")
-        let suite = XCTestSuite(name: "C1 ordered exact fixture pair")
-        if wifiFirst { suite.addTest(wifi); suite.addTest(semantic) }
-        else { suite.addTest(semantic); suite.addTest(wifi) }
-        print("[C1_ORDER] first=\(wifiFirst ? wifi.name : semantic.name) second=\(wifiFirst ? semantic.name : wifi.name)")
-        let observer = C1SequenceObserver()
-        XCTestObservationCenter.shared.addTestObserver(observer)
-        defer { XCTestObservationCenter.shared.removeTestObserver(observer) }
-        suite.run()
-        let expected = wifiFirst ? [wifi.name, semantic.name] : [semantic.name, wifi.name]
-        XCTAssertEqual(observer.names, expected, "Verify actual start order, not just insertion intent")
-        print("[C1_OBSERVED_ORDER] \(observer.names)")
-        let run = try XCTUnwrap(suite.testRun)
-        XCTAssertEqual(run.executionCount, 2, "Both original fixtures must actually execute")
-        XCTAssertTrue(run.hasSucceeded)
-    }
-    private func runPair(_ type: XCTestCase.Type, _ method: String, wifiFirst: Bool) throws {
-        let semantic = method.contains("testLegacyUsb") ? "S1" : "S2"
+    private func runPair(_ semantic: String, wifiFirst: Bool) async throws {
         let scenario = wifiFirst ? "WifiThen\(semantic)" : "\(semantic)ThenWifi"
-        // Global XCTest repetitions also repeat the nested fixtures. Repeat whole pairs here.
+        let expected = wifiFirst ? ["WiFi", semantic] : [semantic, "WiFi"]
+        let pid = ProcessInfo.processInfo.processIdentifier
         for repetition in 1...20 {
-            try runOnePair(type, method, wifiFirst: wifiFirst)
+            print("[C1_ORDER] scenario=\(scenario) repetition=\(repetition) first=\(expected[0]) second=\(expected[1]) pid=\(pid)")
+            var completed: [String] = []
+            for name in expected {
+                try await runBody(name)
+                completed.append(name)
+                print("[C1_BODY_RETIRED] scenario=\(scenario) repetition=\(repetition) body=\(name) pid=\(ProcessInfo.processInfo.processIdentifier)")
+            }
+            XCTAssertEqual(completed, expected)
+            XCTAssertEqual(ProcessInfo.processInfo.processIdentifier, pid)
+            print("[C1_OBSERVED_ORDER] scenario=\(scenario) repetition=\(repetition) first=\(completed[0]) second=\(completed[1]) pid=\(pid)")
             print("[C1_PAIR_QUALIFIED] scenario=\(scenario) repetition=\(repetition)")
         }
     }
-    func testS1ThenWifi() throws { try runPair(USBListenerLifetimeTests.self, "testLegacyUsbForegroundDropsPreFencePcmAndMatchingPongReleasesFreshPcm", wifiFirst: false) }
-    func testWifiThenS1() throws { try runPair(USBListenerLifetimeTests.self, "testLegacyUsbForegroundDropsPreFencePcmAndMatchingPongReleasesFreshPcm", wifiFirst: true) }
-    func testS2ThenWifi() throws { try runPair(C1AlternateSemanticTests.self, "testAlternateForegroundPcmFenceWithExplicitOwners", wifiFirst: false) }
-    func testWifiThenS2() throws { try runPair(C1AlternateSemanticTests.self, "testAlternateForegroundPcmFenceWithExplicitOwners", wifiFirst: true) }
+    func testS1ThenWifi() async throws { try await runPair("S1", wifiFirst: false) }
+    func testWifiThenS1() async throws { try await runPair("S1", wifiFirst: true) }
+    func testS2ThenWifi() async throws { try await runPair("S2", wifiFirst: false) }
+    func testWifiThenS2() async throws { try await runPair("S2", wifiFirst: true) }
 }
 #endif
 #endif
