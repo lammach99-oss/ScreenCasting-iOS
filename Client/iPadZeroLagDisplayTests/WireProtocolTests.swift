@@ -3638,15 +3638,13 @@ final class USBListenerLifetimeTests: XCTestCase {
     }
 
     func testCommittedCandidateBeforeTerminalIsHeldThenPromoted() throws {
+        manager.manualUsbCandidateDeadlineForTesting = true
         let firstPeer = try connect()
         guard case .ready = firstPeer.state else { return XCTFail("Incumbent must be ready") }
         manager.simulateSessionAuthenticatedAndCommitted()
         let committed = manager.usbSessionSnapshot()
         let listener = try XCTUnwrap(committed.listener)
-        let accept = try XCTUnwrap(listener.newConnectionHandler)
-        let candidate = NWConnection(host: "127.0.0.1", port: 42042, using: .tcp)
-        peers.append(candidate)
-        manager.networkQueueForTesting.sync { accept(candidate) }
+        let candidate = try connect()
         let snap = manager.usbSessionSnapshot()
         XCTAssertTrue(snap.connection === firstPeer)
         XCTAssertTrue(snap.listener === listener)
@@ -3661,6 +3659,7 @@ final class USBListenerLifetimeTests: XCTestCase {
     }
 
     func testHealthyCommittedSessionRejectsCandidateOnlyAfterMatchingLivenessPong() throws {
+        manager.manualUsbCandidateDeadlineForTesting = true
         let incumbent = try connect()
         manager.simulateSessionAuthenticatedAndCommitted()
         let generation = manager.usbSessionSnapshot().generation
@@ -3673,11 +3672,7 @@ final class USBListenerLifetimeTests: XCTestCase {
                 completion(nil)
             }
         }
-        let listener = try XCTUnwrap(manager.usbSessionSnapshot().listener)
-        let accept = try XCTUnwrap(listener.newConnectionHandler)
-        let candidate = NWConnection(host: "127.0.0.1", port: 42042, using: .tcp)
-        peers.append(candidate)
-        manager.networkQueueForTesting.sync { accept(candidate) }
+        let candidate = try connect()
         manager.networkQueueForTesting.sync { }
         XCTAssertEqual(pings.count, 1, "Committed owner must prove liveness, not merely report ready")
         let challenge = try XCTUnwrap(pings.first)
@@ -3690,6 +3685,175 @@ final class USBListenerLifetimeTests: XCTestCase {
         try deliver(.failed(.posix(.ECONNRESET)), to: incumbent)
         XCTAssertNil(manager.usbSessionSnapshot().connection,
                      "Candidate rejected by proven liveness must not later promote")
+    }
+
+    private func withC2Candidate(committed: Bool,
+        _ body: (NWConnection, NWConnection, UInt64, () -> [Data]) throws -> Void) throws {
+        manager.manualUsbCandidateDeadlineForTesting = true
+        let incumbent = try connect()
+        if committed { manager.simulateSessionAuthenticatedAndCommitted() }
+        var pings: [Data] = []
+        manager.networkQueueForTesting.sync {
+            manager.controlSendForAudioTesting = { data, completion in
+                if data.count == 32, data[5] == WireMessageType.ping.rawValue {
+                    pings.append(Data(data.dropFirst(16)))
+                }
+                completion(nil)
+            }
+        }
+        let generation = manager.usbSessionSnapshot().generation
+        let candidate = try connect()
+        manager.networkQueueForTesting.sync { }
+        try body(incumbent, candidate, generation, { self.manager.networkQueueForTesting.sync { pings } })
+    }
+
+    private func c2Pong(_ nonce: UInt64) -> Data {
+        var result = Data(count: 16)
+        result.withUnsafeMutableBytes { $0.storeBytes(of: nonce.littleEndian, toByteOffset: 8, as: UInt64.self) }
+        return result
+    }
+
+    func testC2CommittedTimeoutPromotesAndFencesLateTerminalPongAndDeadline() throws {
+        try withC2Candidate(committed: true) { incumbent, candidate, generation, _ in
+            let pending = try XCTUnwrap(manager.usbCandidateArbitrationForTesting)
+            let nonce = try XCTUnwrap(pending.nonce)
+            let oldHandler = try XCTUnwrap(incumbent.stateUpdateHandler)
+            manager.expireUsbCandidateForTesting(id: pending.id)
+            let next = manager.usbSessionSnapshot().generation
+            XCTAssertTrue(manager.usbSessionSnapshot().connection === candidate)
+            XCTAssertGreaterThan(next, generation)
+            manager.receiveUsbWireForTesting(type: .pong, payload: c2Pong(nonce), generation: generation, connection: incumbent)
+            manager.networkQueueForTesting.sync { oldHandler(.cancelled) }
+            manager.expireUsbCandidateForTesting(id: pending.id)
+            XCTAssertTrue(manager.usbSessionSnapshot().connection === candidate)
+            XCTAssertEqual(manager.usbSessionSnapshot().generation, next)
+            XCTAssertNil(manager.usbCandidateArbitrationForTesting)
+        }
+    }
+
+    func testC2ProvisionalHoldNeverSendsClientPingAndTerminalPromotes() throws {
+        try withC2Candidate(committed: false) { incumbent, candidate, generation, pings in
+            let pending = try XCTUnwrap(manager.usbCandidateArbitrationForTesting)
+            XCTAssertTrue(pending.candidate === candidate)
+            XCTAssertNil(pending.nonce)
+            XCTAssertTrue(pings().isEmpty)
+            XCTAssertNil(candidate.stateUpdateHandler)
+            XCTAssertEqual(manager.usbSessionSnapshot().generation, generation)
+            XCTAssertNil(manager.usbSessionSnapshot().committedGeneration)
+            try deliver(.cancelled, to: incumbent)
+            XCTAssertTrue(manager.usbSessionSnapshot().connection === candidate)
+        }
+    }
+
+    func testC2ProvisionalDeadlinePromotesWithoutClientPing() throws {
+        try withC2Candidate(committed: false) { _, candidate, _, pings in
+            let pending = try XCTUnwrap(manager.usbCandidateArbitrationForTesting)
+            XCTAssertTrue(pings().isEmpty)
+            manager.expireUsbCandidateForTesting(id: pending.id)
+            XCTAssertTrue(manager.usbSessionSnapshot().connection === candidate)
+            XCTAssertNil(manager.usbCandidateArbitrationForTesting)
+            XCTAssertTrue(pings().isEmpty)
+        }
+    }
+
+    func testC2ProvisionalCommitChallengesWithoutExtendingDeadlineAndPongRejects() throws {
+        try withC2Candidate(committed: false) { incumbent, candidate, generation, pings in
+            let before = try XCTUnwrap(manager.usbCandidateArbitrationForTesting)
+            XCTAssertTrue(pings().isEmpty)
+            manager.commitAudioTransportForTesting(mode: RealtimeTransportMode.legacyTLS, audioAvailable: false)
+            manager.networkQueueForTesting.sync { }
+            let after = try XCTUnwrap(manager.usbCandidateArbitrationForTesting)
+            XCTAssertEqual(after.id, before.id)
+            XCTAssertEqual(after.deadline, before.deadline)
+            let nonce = try XCTUnwrap(after.nonce)
+            XCTAssertTrue(pings().contains { $0 == c2Pong(nonce) || $0.suffix(8) == c2Pong(nonce).suffix(8) })
+            manager.receiveUsbWireForTesting(type: .pong, payload: c2Pong(nonce), generation: generation, connection: incumbent)
+            XCTAssertNil(manager.usbCandidateArbitrationForTesting)
+            manager.expireUsbCandidateForTesting(id: before.id)
+            XCTAssertTrue(manager.usbSessionSnapshot().connection === incumbent)
+            XCTAssertNil(candidate.stateUpdateHandler)
+        }
+    }
+
+    func testC2WrongNonceConnectionAndGenerationCannotResolveArbitration() throws {
+        try withC2Candidate(committed: true) { incumbent, candidate, generation, _ in
+            let pending = try XCTUnwrap(manager.usbCandidateArbitrationForTesting)
+            let nonce = try XCTUnwrap(pending.nonce)
+            manager.receiveUsbWireForTesting(type: .pong, payload: c2Pong(nonce &+ 1), generation: generation, connection: incumbent)
+            manager.receiveUsbWireForTesting(type: .pong, payload: c2Pong(nonce), generation: generation &+ 1, connection: incumbent)
+            manager.receiveUsbWireForTesting(type: .pong, payload: c2Pong(nonce), generation: generation, connection: candidate)
+            XCTAssertEqual(manager.usbCandidateArbitrationForTesting?.id, pending.id)
+            manager.receiveUsbWireForTesting(type: .pong, payload: c2Pong(nonce), generation: generation, connection: incumbent)
+            XCTAssertNil(manager.usbCandidateArbitrationForTesting)
+        }
+    }
+
+    func testC2FirstPendingCandidateOwnsSlotAndExtrasCannotExtendDeadline() throws {
+        try withC2Candidate(committed: true) { _, candidate, _, _ in
+            let first = try XCTUnwrap(manager.usbCandidateArbitrationForTesting)
+            let extra = try connect()
+            let current = try XCTUnwrap(manager.usbCandidateArbitrationForTesting)
+            XCTAssertTrue(current.candidate === candidate)
+            XCTAssertEqual(current.id, first.id)
+            XCTAssertEqual(current.deadline, first.deadline)
+            XCTAssertEqual(current.nonce, first.nonce)
+            XCTAssertNil(extra.stateUpdateHandler)
+            manager.expireUsbCandidateForTesting(id: first.id)
+            XCTAssertTrue(manager.usbSessionSnapshot().connection === candidate)
+        }
+    }
+
+    func testC2ExplicitStopAndListenerRestartCancelPendingPromotion() throws {
+        try withC2Candidate(committed: true) { incumbent, candidate, generation, _ in
+            let old = try XCTUnwrap(manager.usbCandidateArbitrationForTesting)
+            let nonce = try XCTUnwrap(old.nonce)
+            let terminal = try XCTUnwrap(incumbent.stateUpdateHandler)
+            manager.stopForTesting()
+            XCTAssertNil(manager.usbCandidateArbitrationForTesting)
+            XCTAssertNil(manager.usbSessionSnapshot().connection)
+            manager.startListening(port: 0)
+            let replacement = try connect()
+            let next = manager.usbSessionSnapshot().generation
+            manager.expireUsbCandidateForTesting(id: old.id)
+            manager.receiveUsbWireForTesting(type: .pong, payload: c2Pong(nonce), generation: generation, connection: incumbent)
+            manager.networkQueueForTesting.sync { terminal(.cancelled) }
+            XCTAssertTrue(manager.usbSessionSnapshot().connection === replacement)
+            XCTAssertEqual(manager.usbSessionSnapshot().generation, next)
+            XCTAssertNil(candidate.stateUpdateHandler)
+        }
+    }
+
+    func testC2TenAlternatingTerminalAndDeadlineCyclesFenceRetiredOwners() throws {
+        manager.manualUsbCandidateDeadlineForTesting = true
+        var incumbent = try connect()
+        for cycle in 0..<10 {
+            manager.commitAudioTransportForTesting(mode: RealtimeTransportMode.legacyTLS, audioAvailable: false)
+            let oldGeneration = manager.usbSessionSnapshot().generation
+            let oldHandler = try XCTUnwrap(incumbent.stateUpdateHandler)
+            let candidate = try connect()
+            let pending = try XCTUnwrap(manager.usbCandidateArbitrationForTesting)
+            if cycle.isMultiple(of: 2) {
+                try deliver(.failed(.posix(.ECONNRESET)), to: incumbent)
+            } else {
+                manager.expireUsbCandidateForTesting(id: pending.id)
+            }
+            XCTAssertTrue(manager.usbSessionSnapshot().connection === candidate)
+            XCTAssertGreaterThan(manager.usbSessionSnapshot().generation, oldGeneration)
+            manager.expireUsbCandidateForTesting(id: pending.id)
+            manager.networkQueueForTesting.sync { oldHandler(.cancelled) }
+            XCTAssertTrue(manager.usbSessionSnapshot().connection === candidate)
+            incumbent = candidate
+            let ready = expectation(description: "promoted candidate ready")
+            manager.networkQueueForTesting.async {
+                if case .ready = candidate.state { ready.fulfill(); return }
+                let callback = candidate.stateUpdateHandler
+                candidate.stateUpdateHandler = { state in
+                    callback?(state)
+                    if case .ready = state { candidate.stateUpdateHandler = callback; ready.fulfill() }
+                }
+            }
+            wait(for: [ready], timeout: 5)
+        }
     }
 
     func testExplicitStopRejectsLateAcceptUntilExplicitStart() throws {

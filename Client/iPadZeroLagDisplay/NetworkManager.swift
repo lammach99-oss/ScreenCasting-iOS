@@ -1879,6 +1879,23 @@ public class NetworkManager: ObservableObject {
     }
     var remoteKeyboardGeneration: UInt64 { connectionGenerationClock.current }
     private var listenerGeneration: UInt64 = 0
+    private struct PendingUsbCandidate {
+        let id: UInt64
+        let candidate: NWConnection
+        let candidateID: ObjectIdentifier
+        let listenerGeneration: UInt64
+        let incumbent: NWConnection
+        let incumbentGeneration: UInt64
+        let deadline: TimeInterval
+        var livenessNonce: UInt64?
+    }
+    private var pendingUsbCandidate: PendingUsbCandidate?
+    private var usbCandidateDeadlineWork: DispatchWorkItem?
+    private var nextUsbCandidateID: UInt64 = 1
+    private static let usbCandidateArbitrationTimeout: TimeInterval = 0.75
+    #if targetEnvironment(simulator)
+    var manualUsbCandidateDeadlineForTesting = false
+    #endif
     private let networkQueueKey = DispatchSpecificKey<Bool>()
     private let networkQueue = DispatchQueue(label: "com.iPadCasting.network", qos: .userInteractive)
     private lazy var controlChannelWriter = ControlChannelWriter(
@@ -2056,7 +2073,7 @@ public class NetworkManager: ObservableObject {
     private var lastHudSnapshotPublishedAt: TimeInterval = 0
     private var lastClientPingSentAt: TimeInterval = 0
     private var nextClientPingNonce: UInt64 = 1
-    private enum ClientPingPurpose { case telemetry, usbLegacyPcmFreshFence }
+    private enum ClientPingPurpose { case telemetry, usbLegacyPcmFreshFence, usbCandidateLiveness }
     private struct PendingClientPing {
         let sentAt: TimeInterval
         let purpose: ClientPingPurpose
@@ -2921,6 +2938,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func stopOnQueue() {
+        cancelUsbCandidateArbitration(reason: "explicit_stop")
         dispatchPrecondition(condition: .onQueue(networkQueue))
         cancelLegacyUsbPcmFreshFence()
         legacyUsbPlaybackEnabledGeneration = nil
@@ -3099,6 +3117,11 @@ public class NetworkManager: ObservableObject {
                     newConnection.cancel()
                     return
                 }
+                if self.pendingUsbCandidate != nil {
+                    self.recordUsbLifecycleDiagnostic("[USB_CANDIDATE_ARBITRATION] action=reject_extra_pending candidate=\(ObjectIdentifier(newConnection))")
+                    newConnection.cancel()
+                    return
+                }
                 let currentConnectionId = self.usbScdpConnection.map {
                     String(describing: ObjectIdentifier($0))
                 } ?? "none"
@@ -3120,9 +3143,7 @@ public class NetworkManager: ObservableObject {
                     let isHealthy = isCommitted && (current.state == .ready || current.state == .setup)
                     let isConnecting = (self.transportState == .connecting && self.committedTransportGeneration == nil && (current.state == .setup || current.state == .preparing || current.state == .ready))
                     if isHealthy || isConnecting {
-                        self.recordUsbLifecycleDiagnostic(
-                            "[USB_RECOVERY_CANDIDATE] attempt=\(self.connectionGeneration &+ 1) generation=\(self.connectionGeneration) state=rejected_stale")
-                        newConnection.cancel()
+                        self.holdUsbCandidate(newConnection, incumbent: current)
                         return
                     }
                     self.teardownUsbSession(
@@ -3130,19 +3151,7 @@ public class NetworkManager: ObservableObject {
                         generation: self.connectionGeneration,
                         reason: "replacement_candidate_accepted")
                 }
-                _ = self.connectionGenerationClock.advance()
-                self.resetDirectTouchSessionOnQueue()
-                self.clientSettingsState.resetHostGeneration()
-                self.settingsReconciliationGate.reset()
-                self.usbScdpConnection = newConnection
-                self.connection = newConnection
-                self.recordUsbLifecycleDiagnostic(
-                    "[USB_RECOVERY_CANDIDATE] attempt=\(self.connectionGeneration) generation=\(self.connectionGeneration) state=start")
-                self.recordUsbLifecycleDiagnostic(
-                    "[USB_SESSION_ACCEPT] generation=\(self.connectionGeneration) connectionId=\(ObjectIdentifier(newConnection))")
-                self.setupStateHandler(for: newConnection)
-                self.setState(.connecting)
-                newConnection.start(queue: self.networkQueue)
+                self.installUsbCandidate(newConnection)
             }
             listener.start(queue: networkQueue)
         } catch {
@@ -3151,6 +3160,81 @@ public class NetworkManager: ObservableObject {
             setState(.disconnected(
                 reason: "Unable to start USB listener: \(error.localizedDescription)"))
         }
+    }
+
+    private func installUsbCandidate(_ candidate: NWConnection) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        _ = connectionGenerationClock.advance()
+        resetDirectTouchSessionOnQueue()
+        clientSettingsState.resetHostGeneration()
+        settingsReconciliationGate.reset()
+        usbScdpConnection = candidate
+        connection = candidate
+        recordUsbLifecycleDiagnostic("[USB_RECOVERY_CANDIDATE] attempt=\(connectionGeneration) generation=\(connectionGeneration) state=start")
+        recordUsbLifecycleDiagnostic("[USB_SESSION_ACCEPT] generation=\(connectionGeneration) connectionId=\(ObjectIdentifier(candidate))")
+        setupStateHandler(for: candidate)
+        setState(.connecting)
+        candidate.start(queue: networkQueue)
+    }
+
+    private func ownsUsbCandidate(_ pending: PendingUsbCandidate) -> Bool {
+        usbListenerExplicitlyStarted && usbListener != nil &&
+        listenerGeneration == pending.listenerGeneration &&
+        connectionGeneration == pending.incumbentGeneration &&
+        usbScdpConnection === pending.incumbent && connection === pending.incumbent &&
+        ObjectIdentifier(pending.candidate) == pending.candidateID
+    }
+
+    private func holdUsbCandidate(_ candidate: NWConnection, incumbent: NWConnection) {
+        let id = nextUsbCandidateID
+        nextUsbCandidateID &+= 1
+        pendingUsbCandidate = PendingUsbCandidate(id: id, candidate: candidate,
+            candidateID: ObjectIdentifier(candidate), listenerGeneration: listenerGeneration,
+            incumbent: incumbent, incumbentGeneration: connectionGeneration,
+            deadline: ProcessInfo.processInfo.systemUptime + Self.usbCandidateArbitrationTimeout)
+        let work = DispatchWorkItem { [weak self] in self?.expireUsbCandidate(id: id) }
+        usbCandidateDeadlineWork = work
+        recordUsbLifecycleDiagnostic("[USB_CANDIDATE_ARBITRATION] arbitration=\(id) action=hold generation=\(connectionGeneration) committed=\(committedTransportGeneration == connectionGeneration) candidate=\(ObjectIdentifier(candidate))")
+        #if targetEnvironment(simulator)
+        if !manualUsbCandidateDeadlineForTesting {
+            networkQueue.asyncAfter(deadline: .now() + Self.usbCandidateArbitrationTimeout, execute: work)
+        }
+        #else
+        networkQueue.asyncAfter(deadline: .now() + Self.usbCandidateArbitrationTimeout, execute: work)
+        #endif
+        challengeUsbCandidateIfCommitted()
+    }
+
+    private func challengeUsbCandidateIfCommitted() {
+        guard var pending = pendingUsbCandidate, ownsUsbCandidate(pending),
+              pending.livenessNonce == nil,
+              committedTransportGeneration == pending.incumbentGeneration,
+              wireAuthenticatedGeneration == pending.incumbentGeneration else { return }
+        pending.livenessNonce = sendClientPing(force: true, purpose: .usbCandidateLiveness)
+        pendingUsbCandidate = pending
+        recordUsbLifecycleDiagnostic("[USB_CANDIDATE_ARBITRATION] arbitration=\(pending.id) action=challenge nonce=\(pending.livenessNonce.map { String($0) } ?? "none")")
+    }
+
+    @discardableResult
+    private func takeUsbCandidate() -> PendingUsbCandidate? {
+        let pending = pendingUsbCandidate
+        pendingUsbCandidate = nil
+        usbCandidateDeadlineWork?.cancel()
+        usbCandidateDeadlineWork = nil
+        if let nonce = pending?.livenessNonce { pendingClientPings.removeValue(forKey: nonce) }
+        return pending
+    }
+
+    private func cancelUsbCandidateArbitration(reason: String) {
+        guard let pending = takeUsbCandidate() else { return }
+        pending.candidate.cancel()
+        recordUsbLifecycleDiagnostic("[USB_CANDIDATE_ARBITRATION] arbitration=\(pending.id) action=reject_candidate reason=\(reason)")
+    }
+
+    private func expireUsbCandidate(id: UInt64) {
+        guard let pending = pendingUsbCandidate, pending.id == id, ownsUsbCandidate(pending) else { return }
+        teardownUsbSession(connection: pending.incumbent, generation: pending.incumbentGeneration,
+                           reason: "candidate_arbitration_deadline")
     }
 
     private func nextUsbTouchDiagnostic(
@@ -3969,10 +4053,11 @@ public class NetworkManager: ObservableObject {
         sendClientPing(force: false, purpose: .telemetry)
     }
 
-    private func sendClientPing(force: Bool, purpose: ClientPingPurpose) {
-        guard let owner = activeControlConnection else { return }
+    @discardableResult
+    private func sendClientPing(force: Bool, purpose: ClientPingPurpose) -> UInt64? {
+        guard let owner = activeControlConnection else { return nil }
         let now = ProcessInfo.processInfo.systemUptime
-        guard force || now - lastClientPingSentAt >= 1 else { return }
+        guard force || now - lastClientPingSentAt >= 1 else { return nil }
         lastClientPingSentAt = now
 
         let nonce = nextClientPingNonce
@@ -4003,6 +4088,7 @@ public class NetworkManager: ObservableObject {
             type: .ping,
             payload: payload,
             sequence: UInt32(truncatingIfNeeded: nonce))
+        return nonce
     }
 
     private func cancelLegacyUsbPcmFreshFence() {
@@ -4480,6 +4566,11 @@ public class NetworkManager: ObservableObject {
                     0,
                     (ProcessInfo.processInfo.systemUptime - pending.sentAt) * 1_000.0)
                 transportTelemetry.recordRtt(durationMs: rttMs)
+                if pending.purpose == .usbCandidateLiveness,
+                   let candidate = pendingUsbCandidate, ownsUsbCandidate(candidate),
+                   candidate.livenessNonce == nonce {
+                    cancelUsbCandidateArbitration(reason: "incumbent_liveness_pong")
+                }
                 if pending.purpose == .usbLegacyPcmFreshFence,
                    usbLegacyPcmFreshFenceNonce == nonce,
                    legacyUsbPlaybackEnabledGeneration == generation,
@@ -5119,6 +5210,7 @@ public class NetworkManager: ObservableObject {
             recordUsbLifecycleDiagnostic(
                 "[USB_RECOVERY_CANDIDATE] attempt=\(generation) generation=\(generation) state=committed")
             recordUsbLifecycleDiagnostic("[USB_SESSION_COMMIT] generation=\(generation)")
+            challengeUsbCandidateIfCommitted()
         }
     }
 
@@ -5379,6 +5471,12 @@ public class NetworkManager: ObservableObject {
             "[USB_SESSION_LOST] generation=\(generation) connectionId=\(ObjectIdentifier(connection)) listenerStillReady=\(listenerStillReady) reason=\(reason)")
         recordUsbLifecycleDiagnostic(
             "[USB_RECOVERY_CANDIDATE] attempt=\(generation) generation=\(generation) state=failed")
+        let replacement: PendingUsbCandidate?
+        if let pending = pendingUsbCandidate, ownsUsbCandidate(pending) {
+            replacement = takeUsbCandidate()
+        } else {
+            replacement = nil
+        }
         teardownCurrentSession()
         // Sends are serialized per socket. A retired socket must not hold the
         // replacement socket behind a completion that may never arrive.
@@ -5388,10 +5486,18 @@ public class NetworkManager: ObservableObject {
         recordUsbLifecycleDiagnostic(
             "[USB_RECOVERY_CANDIDATE] attempt=\(generation) generation=\(generation) state=retired")
         setState(.listening)
+        if let replacement, usbListenerExplicitlyStarted,
+           listenerGeneration == replacement.listenerGeneration, usbListener != nil {
+            recordUsbLifecycleDiagnostic("[USB_CANDIDATE_ARBITRATION] arbitration=\(replacement.id) action=promote_candidate reason=\(reason)")
+            installUsbCandidate(replacement.candidate)
+        } else {
+            replacement?.candidate.cancel()
+        }
     }
 
     private func teardownCurrentSession() {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        cancelUsbCandidateArbitration(reason: "session_teardown")
         cancelLegacyUsbPcmFreshFence()
         legacyUsbPlaybackEnabledGeneration = nil
         pendingClientPings.removeAll(keepingCapacity: true)
@@ -5516,6 +5622,16 @@ public class NetworkManager: ObservableObject {
                 payloadLength: payload.count, sequence: 0), payload: payload,
                 firstByteAt: ProcessInfo.processInfo.systemUptime), generation: generation)
         }
+    }
+
+    var usbCandidateArbitrationForTesting: (id: UInt64, candidate: NWConnection, generation: UInt64, nonce: UInt64?, deadline: TimeInterval)? {
+        networkQueue.sync {
+            pendingUsbCandidate.map { ($0.id, $0.candidate, $0.incumbentGeneration, $0.livenessNonce, $0.deadline) }
+        }
+    }
+
+    func expireUsbCandidateForTesting(id: UInt64) {
+        networkQueue.sync { expireUsbCandidate(id: id) }
     }
 
     private var testingPerformanceFeedbackNow: TimeInterval?
