@@ -2,7 +2,32 @@ import XCTest
 import Network
 import UIKit
 import AVFoundation
+import CryptoKit
 @testable import iPadCasting
+
+
+// Validation-only adapter: count the existing foreground-rearm diagnostic,
+// not all video feedback. No NetworkManager source or runtime hook is changed.
+private extension NetworkManager {
+    var usbForegroundRecoveryFeedbackCountForTesting: Int {
+        let telemetry = Mirror(reflecting: self).children.first { $0.label == "transportTelemetry" }!.value as! TransportTelemetry
+        let queue = Mirror(reflecting: telemetry).children.first { $0.label == "fileQueue" }!.value as! DispatchQueue
+        func diagnosticURL() -> URL? {
+            Mirror(reflecting: telemetry).children.first { $0.label == "diagnosticExportFileURL" }!.value as! URL?
+        }
+        if queue.sync(execute: { diagnosticURL() == nil }) {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("pcm-credit-validation-" + UUID().uuidString)
+            try! FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            telemetry.startLogging(directoryURL: directory)
+        }
+        return queue.sync {
+            guard let url = diagnosticURL(), let text = try? String(contentsOf: url, encoding: .utf8) else { return 0 }
+            return text.components(separatedBy: "\n").filter {
+                $0.contains("[USB_MEDIA_RECOVERY]") && $0.contains("action=decoder_rearmed recovery_requested=true")
+            }.count
+        }
+    }
+}
 
 final class LegacyPcmRenderedCreditTests: XCTestCase {
     private func withResumedAudio(_ body: (AudioManager) -> Void) {
@@ -592,6 +617,73 @@ final class ExternalPointerInputTests: XCTestCase {
         container.retireRemotePointerInputs()
         XCTAssertEqual(buttons.map(\.action), [.leftDown, .leftUp])
         XCTAssertEqual(contacts.map(\.phase), [.down, .cancel])
+    }
+
+    func testVerticalAndHorizontalAccumulateIndependentlyAt24Points() {
+        var state = ExternalPointerInputState()
+        _ = state.configure(active: true, generation: 7)
+        _ = state.hover(point: point, generation: 7)
+        XCTAssertTrue(state.scroll(delta: CGPoint(x: 12, y: 12), generation: 7).isEmpty)
+        let vertical = state.scroll(delta: CGPoint(x: 0, y: 12), generation: 7)
+        XCTAssertEqual(vertical.map(\.action), [.verticalWheel])
+        XCTAssertEqual(vertical.first?.value, 120)
+        let horizontal = state.scroll(delta: CGPoint(x: 12, y: 0), generation: 7)
+        XCTAssertEqual(horizontal.map(\.action), [.horizontalWheel])
+        XCTAssertEqual(horizontal.first?.value, -120)
+    }
+
+    func testWheelTargetsMostRecentValidPointerAndRetainsOverflow() {
+        var state = ExternalPointerInputState()
+        _ = state.configure(active: true, generation: 7)
+        _ = state.hover(point: point, generation: 7)
+        _ = state.hover(point: CGPoint(x: 0.75, y: 0.25), generation: 7)
+        let first = state.scroll(delta: CGPoint(x: 0, y: 24 * 10), generation: 7)
+        XCTAssertEqual(first.count, 8)
+        XCTAssertTrue(first.allSatisfy { $0.x == 49_151 && $0.y == 16_384 })
+        XCTAssertEqual(state.scroll(delta: .zero, generation: 7).count, 2)
+    }
+
+    @MainActor func testWindowRetirementReleasesLivePrimaryExactlyOnce() {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        let view = PencilUIKitView(frame: window.bounds)
+        window.addSubview(view)
+        view.contentViewport = VideoContentViewport(rect: CGRect(x: 0, y: 0, width: 1, height: 1))
+        view.configureExternalPointer(active: true, generation: 7)
+        var commands: [PointerInputCommand] = []
+        view.onPointerInput = { commands.append($0) }
+        view.handleExternalPointer(id: 1, phase: 1, point: CGPoint(x: 200, y: 150), primary: true, generation: 7)
+        view.removeFromSuperview()
+        view.retireExternalPointer()
+        view.handleExternalPointer(id: 1, phase: 4, point: .zero, generation: 7)
+        XCTAssertEqual(commands.map(\.action), [.leftDown, .leftUp])
+    }
+
+    func testNoRaw43RegistrationRemains() {
+        XCTAssertNil(WireMessageType(rawValue: 43))
+    }
+
+    private func clientSource(_ file: String) throws -> String {
+        let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("iPadZeroLagDisplay/" + file)
+        return try String(contentsOf: url, encoding: .utf8).replacingOccurrences(of: "\r\n", with: "\n")
+    }
+
+    func testFrozenDirectTouchHelpersMatchQualifiedBaseline() throws {
+        let source = try clientSource("PencilTouchView.swift")
+        let boundary = try XCTUnwrap(source.range(of: "struct ExternalPointerInputState"))
+        let digest = SHA256.hash(data: Data(source[..<boundary.lowerBound].utf8))
+        XCTAssertEqual(digest.map { String(format: "%02x", $0) }.joined(),
+                       "72d7fe3f8164388d339bf32aacc8a754c9c396c3a0a025b7e6fc19bcd4824b1e")
+    }
+
+    func testInactiveSettingsAndDismantleRetireBothPointerPaths() throws {
+        let source = try clientSource("MetalView.swift")
+        XCTAssertTrue(source.contains("if note.name == UIApplication.willResignActiveNotification {\n            retireRemotePointerInputs()"))
+        XCTAssertTrue(source.contains("uiView.retireRemotePointerInputs()"))
+        XCTAssertTrue(source.contains("container?.retireRemotePointerInputs()"))
+        XCTAssertTrue(source.contains("touchView.configureExternalPointer(active: remoteKeyboardActive"))
+        XCTAssertTrue(source.contains("touchView.configureDirectTouch(active: remoteKeyboardActive"))
+        XCTAssertFalse(source.contains("touchpadModeEnabled"))
     }
 }
 
@@ -3376,7 +3468,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         let listener = try XCTUnwrap(manager.usbSessionSnapshot().listener)
         let snapBefore = manager.usbSessionSnapshot()
         let decoderInvalidations = manager.decoderForTesting.invalidateCountForTesting
-        let feedbacks = manager.videoFeedbackCountForTesting
+        let feedbacks = manager.usbForegroundRecoveryFeedbackCountForTesting
 
         manager.applicationWillResignActive()
         manager.applicationDidBecomeActive()
@@ -3388,17 +3480,20 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertEqual(
             manager.decoderForTesting.invalidateCountForTesting,
             decoderInvalidations)
-        XCTAssertEqual(manager.videoFeedbackCountForTesting, feedbacks)
+        XCTAssertEqual(manager.usbForegroundRecoveryFeedbackCountForTesting, feedbacks)
     }
 
     func testUsbBackgroundForegroundRearmsDecoderOnceForSameGeneration() throws {
         let peer = try connect()
+        guard case .ready = peer.state else {
+            return XCTFail("Foreground recovery requires a healthy accepted socket")
+        }
         manager.simulateSessionAuthenticatedAndCommitted(
             mode: RealtimeTransportMode.usbSplitTLS)
         let before = manager.usbSessionSnapshot()
         let invalidations = manager.decoderForTesting.invalidateCountForTesting
         let sessions = manager.decoderForTesting.sessionBeganCountForTesting
-        let feedbacks = manager.videoFeedbackCountForTesting
+        let feedbacks = manager.usbForegroundRecoveryFeedbackCountForTesting
         manager.decoderForTesting.resetLifecycleEventsForTesting()
 
         manager.applicationDidEnterBackground()
@@ -3415,7 +3510,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertEqual(
             manager.decoderForTesting.sessionBeganCountForTesting,
             sessions + 1)
-        XCTAssertEqual(manager.videoFeedbackCountForTesting, feedbacks + 1)
+        XCTAssertEqual(manager.usbForegroundRecoveryFeedbackCountForTesting, feedbacks + 1)
         let events = manager.decoderForTesting.lifecycleEventsForTesting
         XCTAssertEqual(events.first, "invalidate-begin")
         XCTAssertEqual(events.count, 3)
@@ -3427,7 +3522,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertEqual(
             manager.decoderForTesting.invalidateCountForTesting,
             invalidations + 1)
-        XCTAssertEqual(manager.videoFeedbackCountForTesting, feedbacks + 1)
+        XCTAssertEqual(manager.usbForegroundRecoveryFeedbackCountForTesting, feedbacks + 1)
     }
 
     func testUsbForegroundRearmDoesNotDependOnBlockedDecoderAndKeepsCleanupFIFO() async throws {
@@ -3469,6 +3564,18 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertEqual(after.committedGeneration, before.committedGeneration)
     }
 
+    func testConnectionFailureCleanupIsNotForegroundRecovery() throws {
+        let peer = try connect()
+        manager.simulateSessionAuthenticatedAndCommitted(mode: RealtimeTransportMode.usbSplitTLS)
+        let invalidations = manager.decoderForTesting.invalidateCountForTesting
+        let recoveries = manager.usbForegroundRecoveryFeedbackCountForTesting
+        try deliver(.failed(.posix(.ECONNRESET)), to: peer)
+        manager.decoderForTesting.sessionQueueForTesting.sync { }
+        XCTAssertNil(manager.usbSessionSnapshot().connection)
+        XCTAssertEqual(manager.decoderForTesting.invalidateCountForTesting, invalidations + 1)
+        XCTAssertEqual(manager.usbForegroundRecoveryFeedbackCountForTesting, recoveries)
+    }
+
     func testStaleUsbBackgroundTokenCannotRearmReplacementGeneration() throws {
         let first = try connect()
         manager.simulateSessionAuthenticatedAndCommitted(
@@ -3480,7 +3587,7 @@ final class USBListenerLifetimeTests: XCTestCase {
             mode: RealtimeTransportMode.usbSplitTLS)
         let before = manager.usbSessionSnapshot()
         let invalidations = manager.decoderForTesting.invalidateCountForTesting
-        let feedbacks = manager.videoFeedbackCountForTesting
+        let feedbacks = manager.usbForegroundRecoveryFeedbackCountForTesting
 
         manager.applicationDidBecomeActive()
 
@@ -3490,7 +3597,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertEqual(
             manager.decoderForTesting.invalidateCountForTesting,
             invalidations)
-        XCTAssertEqual(manager.videoFeedbackCountForTesting, feedbacks)
+        XCTAssertEqual(manager.usbForegroundRecoveryFeedbackCountForTesting, feedbacks)
     }
 
     func testUsbBackgroundStopRevokesDecoderRearm() throws {
@@ -3499,7 +3606,7 @@ final class USBListenerLifetimeTests: XCTestCase {
             mode: RealtimeTransportMode.usbSplitTLS)
         manager.applicationDidEnterBackground()
         let invalidations = manager.decoderForTesting.invalidateCountForTesting
-        let feedbacks = manager.videoFeedbackCountForTesting
+        let feedbacks = manager.usbForegroundRecoveryFeedbackCountForTesting
 
         manager.stopForTesting()
         manager.applicationDidBecomeActive()
@@ -3508,7 +3615,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertEqual(
             manager.decoderForTesting.invalidateCountForTesting,
             invalidations + 1)
-        XCTAssertEqual(manager.videoFeedbackCountForTesting, feedbacks)
+        XCTAssertEqual(manager.usbForegroundRecoveryFeedbackCountForTesting, feedbacks)
         _ = peer
     }
 
@@ -3516,7 +3623,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         let snapshot = manager.usbSessionSnapshot()
         let listener = try XCTUnwrap(snapshot.listener)
         let invalidations = manager.decoderForTesting.invalidateCountForTesting
-        let feedbacks = manager.videoFeedbackCountForTesting
+        let feedbacks = manager.usbForegroundRecoveryFeedbackCountForTesting
 
         manager.applicationDidEnterBackground()
         manager.applicationDidBecomeActive()
@@ -3527,28 +3634,62 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertEqual(
             manager.decoderForTesting.invalidateCountForTesting,
             invalidations)
-        XCTAssertEqual(manager.videoFeedbackCountForTesting, feedbacks)
+        XCTAssertEqual(manager.usbForegroundRecoveryFeedbackCountForTesting, feedbacks)
     }
 
-    func testHealthyCommittedSessionRejectsLateCandidate() throws {
+    func testCommittedCandidateBeforeTerminalIsHeldThenPromoted() throws {
         let firstPeer = try connect()
+        guard case .ready = firstPeer.state else { return XCTFail("Incumbent must be ready") }
         manager.simulateSessionAuthenticatedAndCommitted()
-        manager.updateInterfaceOrientation(.landscape)
-        let listener = manager.usbSessionSnapshot().listener
         let committed = manager.usbSessionSnapshot()
-
-        let latePeer = try connect()
+        let listener = try XCTUnwrap(committed.listener)
+        let accept = try XCTUnwrap(listener.newConnectionHandler)
+        let candidate = NWConnection(host: "127.0.0.1", port: 42042, using: .tcp)
+        peers.append(candidate)
+        manager.networkQueueForTesting.sync { accept(candidate) }
         let snap = manager.usbSessionSnapshot()
         XCTAssertTrue(snap.connection === firstPeer)
         XCTAssertTrue(snap.listener === listener)
         XCTAssertEqual(snap.generation, committed.generation)
         XCTAssertEqual(snap.committedGeneration, committed.committedGeneration)
-        XCTAssertNil(latePeer.stateUpdateHandler)
-
+        XCTAssertNil(candidate.stateUpdateHandler, "Held candidate must not install production handlers")
         try deliver(.failed(.posix(.ECONNRESET)), to: firstPeer)
-        let replacement = try connect()
-        XCTAssertTrue(manager.usbSessionSnapshot().connection === replacement)
+        XCTAssertTrue(manager.usbSessionSnapshot().connection === candidate,
+                      "Candidate arriving before old terminal must survive and become the replacement")
         XCTAssertGreaterThan(manager.usbSessionSnapshot().generation, committed.generation)
+        XCTAssertNotNil(candidate.stateUpdateHandler)
+    }
+
+    func testHealthyCommittedSessionRejectsCandidateOnlyAfterMatchingLivenessPong() throws {
+        let incumbent = try connect()
+        manager.simulateSessionAuthenticatedAndCommitted()
+        let generation = manager.usbSessionSnapshot().generation
+        var pings: [Data] = []
+        manager.networkQueueForTesting.sync {
+            manager.controlSendForAudioTesting = { data, completion in
+                if data.count == 32, data[5] == WireMessageType.ping.rawValue {
+                    pings.append(Data(data.dropFirst(16)))
+                }
+                completion(nil)
+            }
+        }
+        let listener = try XCTUnwrap(manager.usbSessionSnapshot().listener)
+        let accept = try XCTUnwrap(listener.newConnectionHandler)
+        let candidate = NWConnection(host: "127.0.0.1", port: 42042, using: .tcp)
+        peers.append(candidate)
+        manager.networkQueueForTesting.sync { accept(candidate) }
+        manager.networkQueueForTesting.sync { }
+        XCTAssertEqual(pings.count, 1, "Committed owner must prove liveness, not merely report ready")
+        let challenge = try XCTUnwrap(pings.first)
+        manager.receiveUsbWireForTesting(type: .pong, payload: challenge,
+                                        generation: generation, connection: incumbent)
+        manager.networkQueueForTesting.sync { }
+        XCTAssertTrue(manager.usbSessionSnapshot().connection === incumbent)
+        XCTAssertEqual(manager.usbSessionSnapshot().generation, generation)
+        XCTAssertNil(candidate.stateUpdateHandler)
+        try deliver(.failed(.posix(.ECONNRESET)), to: incumbent)
+        XCTAssertNil(manager.usbSessionSnapshot().connection,
+                     "Candidate rejected by proven liveness must not later promote")
     }
 
     func testExplicitStopRejectsLateAcceptUntilExplicitStart() throws {
@@ -3725,12 +3866,52 @@ final class USBListenerLifetimeTests: XCTestCase {
         let snapshot = manager.usbSessionSnapshot()
         let listener = try XCTUnwrap(snapshot.listener)
         let acceptHandler = try XCTUnwrap(listener.newConnectionHandler)
-        let peer = NWConnection(host: "127.0.0.1", port: 42042, using: .tcp)
-        peers.append(peer)
+        let listenerReady = expectation(description: "ephemeral USB listener ready")
         manager.networkQueueForTesting.sync {
-            acceptHandler(peer)
+            if case .ready = listener.state {
+                listenerReady.fulfill()
+            } else {
+                let stateHandler = listener.stateUpdateHandler
+                listener.stateUpdateHandler = { state in
+                    stateHandler?(state)
+                    if case .ready = state {
+                        listener.stateUpdateHandler = stateHandler
+                        listenerReady.fulfill()
+                    }
+                }
+            }
         }
-        return peer
+        wait(for: [listenerReady], timeout: 5)
+        let port = try XCTUnwrap(listener.port)
+        let acceptedReady = expectation(description: "USB candidate ready or rejected")
+        var acceptedPeer: NWConnection?
+        manager.networkQueueForTesting.sync {
+            listener.newConnectionHandler = { connection in
+                acceptHandler(connection)
+                acceptedPeer = connection
+                guard self.manager.usbSessionSnapshot().connection === connection else {
+                    acceptedReady.fulfill()
+                    return
+                }
+                let stateHandler = connection.stateUpdateHandler
+                connection.stateUpdateHandler = { state in
+                    stateHandler?(state)
+                    if case .ready = state {
+                        connection.stateUpdateHandler = stateHandler
+                        acceptedReady.fulfill()
+                    }
+                }
+            }
+        }
+        let client = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
+        peers.append(client)
+        client.start(queue: manager.networkQueueForTesting)
+        wait(for: [acceptedReady], timeout: 5)
+        let accepted = try manager.networkQueueForTesting.sync {
+            listener.newConnectionHandler = acceptHandler
+            return try XCTUnwrap(acceptedPeer)
+        }
+        return accepted
     }
 
     private func deliver(_ state: NWConnection.State, to connection: NWConnection) throws {
@@ -6220,6 +6401,22 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         return (window, container)
     }
 
+    @MainActor private func sceneBackedInitialKeyboardFixture() throws -> (UIWindow, ConnectedPresentationContainer) {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let controller = UIViewController()
+        window.rootViewController = controller
+        controller.view.frame = window.bounds
+        window.addSubview(controller.view)
+        let container = ConnectedPresentationContainer(frame: window.bounds)
+        controller.view.addSubview(container)
+        window.isHidden = false
+        XCTAssertTrue(container.window === window)
+        container.configureRemoteKeyboard(active: true, generation: 308)
+        return (window, container)
+    }
+
     @MainActor func testVisibleKeyboardMovingOutsideClearsNativeVisibility() throws {
         let (window, container) = try sceneBackedKeyboardGapFixture()
         defer { container.retireRemoteKeyboard(); window.isHidden = true }
@@ -6251,7 +6448,7 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
     }
 
     @MainActor func testPostHideSoftwareResponderLossPreservesSoftwareRequestAndReconcilesCapture() throws {
-        let (window, container) = try sceneBackedKeyboardGapFixture()
+        let (window, container) = try sceneBackedInitialKeyboardFixture()
         defer { container.retireRemoteKeyboard(); window.isHidden = true }
         var responderAcquired = true
         var acquisitionAttempts = 0
@@ -6277,28 +6474,90 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
     }
 
     @MainActor func testPencilBTPresenceAfterResponderLossDoesNotBecomeHardwareAuthority() throws {
-        let (window, container) = try sceneBackedKeyboardGapFixture()
+        let (window, container) = try sceneBackedInitialKeyboardFixture()
         defer { container.retireRemoteKeyboard(); window.isHidden = true }
         var responderAcquired = true
         container.softwareResponderAcquisitionForTesting = { responderAcquired }
         var diagnostics: [String] = []
         container.touchView.diagnosticSink = { diagnostics.append($0) }
         container.keyboardButton.sendActions(for: .touchUpInside)
-        container.softwareTextView.setMarkedText(#�u���yp", selectedRange: NSRange(location: 3, length: 0))
+        container.softwareTextView.setMarkedText("đẹp", selectedRange: NSRange(location: 3, length: 0))
 
         responderAcquired = false
         NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
         NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
 
         NotificationCenter.default.post(name: Notification.Name.GCKeyboardDidConnect, object: nil)
-        container.touchView.onPencilInput?(PencilPacket(x: 100, y: 100, pressure: 1, tiltX: 0, tiltY: 0, buttonFlags: 0, pointerFlags: 1))
+        container.touchView.onPencilInput?(PencilPacket(xRatio: 0.5, yRatio: 0.5, pressure: 1.0, tiltX: 0, tiltY: 0, pointerFlags: 1))
 
         XCTAssertEqual(container.keyboardMode, .softwareOpen)
         XCTAssertFalse(container.keyboardButton.isHidden)
         XCTAssertNotNil(container.softwareTextView.markedTextRange)
-        XCTAssertEqual(container.softwareTextView.text, #�w^~)�up")
+        XCTAssertEqual(container.softwareTextView.text, "đẹp")
         XCTAssertFalse(container.touchView.softwareResponderOwnsInput)
         XCTAssertTrue(container.touchView.passiveKeyboardCaptureEnabled)
+    }
+
+    @MainActor private func controlledRecycleFixture(acquired: Bool) throws -> (losses: Int, passiveDuring: Bool, ownsAfter: Bool, passiveAfter: Bool, marked: Bool, emissions: Int, reconciliations: Int) {
+        let (window, container) = try sceneBackedInitialKeyboardFixture()
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        container.softwareResponderAcquisitionForTesting = { container.softwareTextView.becomeFirstResponder() }
+        container.keyboardButton.sendActions(for: .touchUpInside)
+        XCTAssertTrue(container.softwareTextView.isFirstResponder)
+        XCTAssertTrue(container.touchView.softwareResponderOwnsInput)
+        container.softwareTextView.setMarkedText("đẹp", selectedRange: NSRange(location: 3, length: 0))
+        var losses = 0, emissions = 0
+        var passiveDuring = false
+        var lines: [String] = []
+        let originalLoss = container.softwareTextView.onPreservedSystemResponderLoss
+        container.softwareTextView.onPreservedSystemResponderLoss = { losses += 1; originalLoss?() }
+        container.softwareTextView.onEmission = { _ in emissions += 1 }
+        container.touchView.diagnosticSink = { lines.append($0) }
+        container.softwareResponderAcquisitionForTesting = {
+            // Model a UIKit end-edit callback delivered inside the controlled acquire boundary.
+            container.softwareTextView.textViewDidEndEditing(container.softwareTextView)
+            passiveDuring = container.touchView.passiveKeyboardCaptureEnabled
+            return acquired && container.softwareTextView.becomeFirstResponder()
+        }
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertEqual(container.softwareTextView.text, "đẹp")
+        return (losses, passiveDuring, container.touchView.softwareResponderOwnsInput,
+                container.touchView.passiveKeyboardCaptureEnabled,
+                container.softwareTextView.markedTextRange != nil, emissions,
+                lines.filter { $0.contains("reason=software_post_hide_recovery") }.count)
+    }
+
+    @MainActor func testControlledSoftwareRecycleDoesNotActivatePassiveCaptureMidRecycle() throws {
+        let result = try controlledRecycleFixture(acquired: true)
+        XCTAssertFalse(result.passiveDuring)
+        XCTAssertEqual(result.losses, 0)
+    }
+
+    @MainActor func testControlledSoftwareRecycleReconcilesOwnershipExactlyOnceAfterAcquire() throws {
+        let result = try controlledRecycleFixture(acquired: true)
+        XCTAssertEqual(result.losses, 0)
+        XCTAssertEqual(result.reconciliations, 1)
+    }
+
+    @MainActor func testFailedControlledRecycleEnablesPassiveCaptureAfterAcquireFailure() throws {
+        let result = try controlledRecycleFixture(acquired: false)
+        XCTAssertFalse(result.passiveDuring)
+        XCTAssertFalse(result.ownsAfter)
+        XCTAssertTrue(result.passiveAfter)
+        XCTAssertEqual(result.reconciliations, 1)
+    }
+
+    @MainActor func testSuccessfulControlledRecycleLeavesSoftwareResponderOwnership() throws {
+        let result = try controlledRecycleFixture(acquired: true)
+        XCTAssertTrue(result.ownsAfter)
+        XCTAssertFalse(result.passiveAfter)
+    }
+
+    @MainActor func testControlledRecyclePreservesMarkedCompositionAndEmitsNoRemoteText() throws {
+        let result = try controlledRecycleFixture(acquired: true)
+        XCTAssertTrue(result.marked)
+        XCTAssertEqual(result.emissions, 0)
     }
 
     @MainActor func testRemoteSoftwareKeyboardSuppressesScribble() throws {
@@ -6479,68 +6738,6 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
         XCTAssertEqual(attempts, 1)
         NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
-    @MainActor private func controlledRecycleFixture(acquired: Bool) throws -> (losses: Int, passiveDuring: Bool, ownsAfter: Bool, passiveAfter: Bool, marked: Bool, emissions: Int, reconciliations: Int) {
-        let (window, container) = try sceneBackedInitialKeyboardFixture()
-        defer { container.retireRemoteKeyboard(); window.isHidden = true }
-        container.softwareResponderAcquisitionForTesting = { container.softwareTextView.becomeFirstResponder() }
-        container.keyboardButton.sendActions(for: .touchUpInside)
-        XCTAssertTrue(container.softwareTextView.isFirstResponder)
-        XCTAssertTrue(container.touchView.softwareResponderOwnsInput)
-        container.softwareTextView.setMarkedText("đẹp", selectedRange: NSRange(location: 3, length: 0))
-        var losses = 0, emissions = 0
-        var passiveDuring = false
-        var lines: [String] = []
-        let originalLoss = container.softwareTextView.onPreservedSystemResponderLoss
-        container.softwareTextView.onPreservedSystemResponderLoss = { losses += 1; originalLoss?() }
-        container.softwareTextView.onEmission = { _ in emissions += 1 }
-        container.touchView.diagnosticSink = { lines.append($0) }
-        container.softwareResponderAcquisitionForTesting = {
-            // Model a UIKit end-edit callback delivered inside the controlled acquire boundary.
-            container.softwareTextView.textViewDidEndEditing(container.softwareTextView)
-            passiveDuring = container.touchView.passiveKeyboardCaptureEnabled
-            return acquired && container.softwareTextView.becomeFirstResponder()
-        }
-        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
-        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
-        XCTAssertEqual(container.softwareTextView.text, "đẹp")
-        return (losses, passiveDuring, container.touchView.softwareResponderOwnsInput,
-                container.touchView.passiveKeyboardCaptureEnabled,
-                container.softwareTextView.markedTextRange != nil, emissions,
-                lines.filter { $0.contains("reason=software_post_hide_recovery") }.count)
-    }
-
-    @MainActor func testControlledSoftwareRecycleDoesNotActivatePassiveCaptureMidRecycle() throws {
-        let result = try controlledRecycleFixture(acquired: true)
-        XCTAssertFalse(result.passiveDuring)
-        XCTAssertEqual(result.losses, 0)
-    }
-
-    @MainActor func testControlledSoftwareRecycleReconcilesOwnershipExactlyOnceAfterAcquire() throws {
-        let result = try controlledRecycleFixture(acquired: true)
-        XCTAssertEqual(result.losses, 0)
-        XCTAssertEqual(result.reconciliations, 1)
-    }
-
-    @MainActor func testFailedControlledRecycleEnablesPassiveCaptureAfterAcquireFailure() throws {
-        let result = try controlledRecycleFixture(acquired: false)
-        XCTAssertFalse(result.passiveDuring)
-        XCTAssertFalse(result.ownsAfter)
-        XCTAssertTrue(result.passiveAfter)
-        XCTAssertEqual(result.reconciliations, 1)
-    }
-
-    @MainActor func testSuccessfulControlledRecycleLeavesSoftwareResponderOwnership() throws {
-        let result = try controlledRecycleFixture(acquired: true)
-        XCTAssertTrue(result.ownsAfter)
-        XCTAssertFalse(result.passiveAfter)
-    }
-
-    @MainActor func testControlledRecyclePreservesMarkedCompositionAndEmitsNoRemoteText() throws {
-        let result = try controlledRecycleFixture(acquired: true)
-        XCTAssertTrue(result.marked)
-        XCTAssertEqual(result.emissions, 0)
-    }
-
         XCTAssertEqual(attempts, 1)
         XCTAssertEqual(container.keyboardMode, .softwareOpen)
     }
@@ -6590,7 +6787,7 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
     }
 
     @MainActor func testRecoveryOccursAfterSystemHideHasCompletedWithoutUnboundedLoop() throws {
-        let (window, container) = try sceneBackedKeyboardGapFixture()
+        let (window, container) = try sceneBackedInitialKeyboardFixture()
         defer { container.retireRemoteKeyboard(); window.isHidden = true }
         var responderAcquired = true
         var recoveryAttempts = 0
@@ -6691,6 +6888,65 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         XCTAssertTrue(lines.last?.contains("show_attempt=1") == true)
     }
 
+    @MainActor private func keyboardVisibilityAfterDidShow(frame: CGRect?, preceding: CGRect? = nil, hide: Bool = false) throws -> String {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let container = ConnectedPresentationContainer(frame: window.bounds)
+        controller.view.addSubview(container)
+        window.isHidden = false
+        defer { container.retireRemoteKeyboard(); window.isHidden = true }
+        var lines: [String] = []
+        container.touchView.diagnosticSink = { lines.append($0) }
+        container.configureRemoteKeyboard(active: true, generation: 801)
+        container.applyRemoteKeyboardMode(.softwareOpen)
+        func info(_ local: CGRect?) -> [AnyHashable: Any]? {
+            guard let local else { return nil }
+            return [UIResponder.keyboardFrameEndUserInfoKey:
+                window.convert(container.convert(local, to: window), to: window.screen.coordinateSpace)]
+        }
+        if let preceding {
+            NotificationCenter.default.post(name: UIResponder.keyboardWillChangeFrameNotification, object: nil, userInfo: info(preceding))
+        }
+        NotificationCenter.default.post(name: UIResponder.keyboardDidShowNotification, object: nil, userInfo: info(frame))
+        if hide { NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil) }
+        return try XCTUnwrap(lines.last)
+    }
+
+    @MainActor func testKeyboardDidShowWithoutFrameDoesNotProveNativeVisibility() throws {
+        let line = try keyboardVisibilityAfterDidShow(frame: nil)
+        XCTAssertTrue(line.contains("native_keyboard_visible=0"), line)
+        XCTAssertTrue(line.contains("native_keyboard_suppressed=0"), line)
+    }
+
+    @MainActor func testKeyboardDidShowWithOffscreenFrameRemainsNotVisible() throws {
+        let line = try keyboardVisibilityAfterDidShow(frame: CGRect(x: 0, y: 900, width: 1000, height: 100))
+        XCTAssertTrue(line.contains("native_keyboard_visible=0"), line)
+    }
+
+    @MainActor func testKeyboardDidShowWithIntersectingFrameBecomesVisible() throws {
+        let line = try keyboardVisibilityAfterDidShow(frame: CGRect(x: 0, y: 600, width: 1000, height: 200))
+        XCTAssertTrue(line.contains("native_keyboard_visible=1"), line)
+        XCTAssertTrue(line.contains("native_keyboard_suppressed=0"), line)
+    }
+
+    @MainActor func testKeyboardDidShowWithoutFramePreservesPreviouslyProvenVisibleGeometry() throws {
+        let line = try keyboardVisibilityAfterDidShow(frame: nil, preceding: CGRect(x: 0, y: 600, width: 1000, height: 200))
+        XCTAssertTrue(line.contains("native_keyboard_visible=1"), line)
+    }
+
+    @MainActor func testMinimizedKeyboardCannotBeMarkedVisibleByDidShowOnly() throws {
+        let line = try keyboardVisibilityAfterDidShow(frame: nil, preceding: CGRect(x: 0, y: 800, width: 1000, height: 0))
+        XCTAssertTrue(line.contains("native_keyboard_visible=0"), line)
+    }
+
+    @MainActor func testNativeVisibilityStillClearsOnDidHide() throws {
+        let line = try keyboardVisibilityAfterDidShow(frame: CGRect(x: 0, y: 600, width: 1000, height: 200), hide: true)
+        XCTAssertTrue(line.contains("native_keyboard_visible=0"), line)
+    }
+
     @MainActor func testKeyboardDidShowAndDidHideTrackNativeVisibility() {
         let container = ConnectedPresentationContainer(frame: .zero)
         var lines: [String] = []
@@ -6762,65 +7018,6 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardA, action: .keyDown))
         XCTAssertEqual(container.keyboardMode, .softwareOpen)
         XCTAssertFalse(container.keyboardButton.isHidden)
-    @MainActor private func keyboardVisibilityAfterDidShow(frame: CGRect?, preceding: CGRect? = nil, hide: Bool = false) throws -> String {
-        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-        let window = UIWindow(windowScene: scene)
-        window.frame = CGRect(x: 0, y: 0, width: 1000, height: 800)
-        let controller = UIViewController()
-        window.rootViewController = controller
-        let container = ConnectedPresentationContainer(frame: window.bounds)
-        controller.view.addSubview(container)
-        window.isHidden = false
-        defer { container.retireRemoteKeyboard(); window.isHidden = true }
-        var lines: [String] = []
-        container.touchView.diagnosticSink = { lines.append($0) }
-        container.configureRemoteKeyboard(active: true, generation: 801)
-        container.applyRemoteKeyboardMode(.softwareOpen)
-        func info(_ local: CGRect?) -> [AnyHashable: Any]? {
-            guard let local else { return nil }
-            return [UIResponder.keyboardFrameEndUserInfoKey:
-                window.convert(container.convert(local, to: window), to: window.screen.coordinateSpace)]
-        }
-        if let preceding {
-            NotificationCenter.default.post(name: UIResponder.keyboardWillChangeFrameNotification, object: nil, userInfo: info(preceding))
-        }
-        NotificationCenter.default.post(name: UIResponder.keyboardDidShowNotification, object: nil, userInfo: info(frame))
-        if hide { NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil) }
-        return try XCTUnwrap(lines.last)
-    }
-
-    @MainActor func testKeyboardDidShowWithoutFrameDoesNotProveNativeVisibility() throws {
-        let line = try keyboardVisibilityAfterDidShow(frame: nil)
-        XCTAssertTrue(line.contains("native_keyboard_visible=0"), line)
-        XCTAssertTrue(line.contains("native_keyboard_suppressed=0"), line)
-    }
-
-    @MainActor func testKeyboardDidShowWithOffscreenFrameRemainsNotVisible() throws {
-        let line = try keyboardVisibilityAfterDidShow(frame: CGRect(x: 0, y: 900, width: 1000, height: 100))
-        XCTAssertTrue(line.contains("native_keyboard_visible=0"), line)
-    }
-
-    @MainActor func testKeyboardDidShowWithIntersectingFrameBecomesVisible() throws {
-        let line = try keyboardVisibilityAfterDidShow(frame: CGRect(x: 0, y: 600, width: 1000, height: 200))
-        XCTAssertTrue(line.contains("native_keyboard_visible=1"), line)
-        XCTAssertTrue(line.contains("native_keyboard_suppressed=0"), line)
-    }
-
-    @MainActor func testKeyboardDidShowWithoutFramePreservesPreviouslyProvenVisibleGeometry() throws {
-        let line = try keyboardVisibilityAfterDidShow(frame: nil, preceding: CGRect(x: 0, y: 600, width: 1000, height: 200))
-        XCTAssertTrue(line.contains("native_keyboard_visible=1"), line)
-    }
-
-    @MainActor func testMinimizedKeyboardCannotBeMarkedVisibleByDidShowOnly() throws {
-        let line = try keyboardVisibilityAfterDidShow(frame: nil, preceding: CGRect(x: 0, y: 800, width: 1000, height: 0))
-        XCTAssertTrue(line.contains("native_keyboard_visible=0"), line)
-    }
-
-    @MainActor func testNativeVisibilityStillClearsOnDidHide() throws {
-        let line = try keyboardVisibilityAfterDidShow(frame: CGRect(x: 0, y: 600, width: 1000, height: 200), hide: true)
-        XCTAssertTrue(line.contains("native_keyboard_visible=0"), line)
-    }
-
         XCTAssertTrue(diagnostics.last?.contains("software_requested=1") == true)
     }
 
@@ -7175,6 +7372,7 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         }
     }
 }
+
 final class VisualProductionSourceClosureTests: XCTestCase {
     private func source(_ name: String) throws -> String {
         let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
