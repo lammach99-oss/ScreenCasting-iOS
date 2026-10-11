@@ -184,6 +184,7 @@ final class LegacyAudioSessionOwnershipTests: XCTestCase {
             audio.resumeLegacySessionAfterFreshFence(generation: 70, cycle: old)
             audio.suspendLegacySessionForLifecycle(generation: 70)
             let current = audio.legacyOwnershipForTesting.cycle
+            audio.engineRunningForTesting = { false }
             XCTAssertGreaterThan(current, old)
             audio.resumeLegacySessionAfterFreshFence(generation: 70, cycle: old)
             audio.audioQueueForTesting.sync { }
