@@ -912,8 +912,8 @@ public final class AudioManager {
                     }
                     return
                 }
-                guard let epoch = self.interruptedPlaybackEpoch,
-                      epoch == self.playbackEpoch else {
+                guard let epoch = self.interruptedPlaybackEpoch else { return }
+                guard epoch == self.playbackEpoch else {
                     self.playbackInterrupted = false
                     self.interruptedPlaybackEpoch = nil
                     return

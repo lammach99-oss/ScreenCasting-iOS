@@ -108,6 +108,21 @@ final class LegacyAudioSessionOwnershipTests: XCTestCase {
         }
     }
 
+    func testOrdinaryEndedWithoutShouldResumeAndDuplicateEndedCannotUnblockPcm() {
+        withAudio { audio, starts, scheduled in
+            audio.beginLegacySession(generation: 70)
+            audio.audioQueueForTesting.sync { }
+            defaultInterruption(audio)
+            audio.interruptForTesting(began: false, shouldResume: false)
+            audio.interruptForTesting(began: false, shouldResume: true)
+            audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 70)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(starts(), 0)
+            XCTAssertEqual(scheduled(), 0)
+            XCTAssertEqual(audio.legacyOwnershipForTesting.owner, "none")
+        }
+    }
+
     func testActivationFailureRetainsFenceAndExplicitRetryResumesOnce() {
         withAudio { audio, starts, scheduled in
             var allowActivation = false
@@ -2856,6 +2871,33 @@ final class USBListenerLifetimeTests: XCTestCase {
             audio.audioQueueForTesting.sync { }
             XCTAssertEqual(starts, startsBefore + 1)
             XCTAssertEqual(audio.playbackStateForTesting.epoch, before + 3)
+        }
+    }
+
+    func testNewBackgroundAfterFailedActivationRevokesPreviousCycleFence() throws {
+        try withLegacyUsbPcm { audio, peer, generation, probe in
+            audio.legacyAudioSessionSetActiveForTesting = { !$0 }
+            defer { audio.audioQueueForTesting.sync { audio.legacyAudioSessionSetActiveForTesting = nil } }
+            manager.applicationDidEnterBackground()
+            manager.networkQueueForTesting.sync { }
+            let oldCycle = audio.legacyOwnershipForTesting.cycle
+            awaitLegacyPing(probe) { manager.applicationDidBecomeActive() }
+            let oldPing = try XCTUnwrap(probe.pings.last)
+            manager.receiveUsbWireForTesting(type: .pong, payload: oldPing, generation: generation, connection: peer)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(audio.legacyOwnershipForTesting.fenceCycle, oldCycle)
+            manager.applicationDidEnterBackground()
+            manager.networkQueueForTesting.sync { }
+            let newCycle = audio.legacyOwnershipForTesting.cycle
+            XCTAssertGreaterThan(newCycle, oldCycle)
+            XCTAssertNil(audio.legacyOwnershipForTesting.fenceCycle)
+            audio.resumeLegacySessionAfterFreshFence(generation: generation, cycle: oldCycle)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertNil(audio.legacyOwnershipForTesting.fenceCycle)
+            manager.applicationDidEnterBackground()
+            manager.networkQueueForTesting.sync { }
+            XCTAssertEqual(audio.legacyOwnershipForTesting.cycle, newCycle,
+                           "Duplicate background must not manufacture another cycle")
         }
     }
 
