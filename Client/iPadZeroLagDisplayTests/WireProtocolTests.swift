@@ -15,7 +15,7 @@ final class LegacyAudioSessionOwnershipTests: XCTestCase {
         audio.engineStartForTesting = { starts += 1; running = true }
         audio.pcmScheduleForTesting = { _, _ in scheduled += 1 }
         defer {
-            audio.interruptForTesting(began: false)
+            audio.clearInterruptionOwnershipForTesting()
             audio.reset()
             audio.audioQueueForTesting.sync { }
         }
@@ -105,6 +105,150 @@ final class LegacyAudioSessionOwnershipTests: XCTestCase {
             audio.audioQueueForTesting.sync { }
             XCTAssertEqual(starts(), 1)
             XCTAssertEqual(scheduled(), 1)
+        }
+    }
+
+    func testActivationFailureRetainsFenceAndExplicitRetryResumesOnce() {
+        withAudio { audio, starts, scheduled in
+            var allowActivation = false
+            var requests: [Bool] = []
+            audio.legacyAudioSessionSetActiveForTesting = { active in
+                requests.append(active)
+                return !active || allowActivation
+            }
+            audio.beginLegacySession(generation: 70)
+            audio.suspendLegacySessionForLifecycle(generation: 70)
+            audio.audioQueueForTesting.sync { }
+            defaultInterruption(audio)
+            audio.resumeLegacySessionAfterFreshFence(generation: 70)
+            audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 70)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(starts(), 0)
+            XCTAssertEqual(scheduled(), 0)
+            XCTAssertEqual(requests, [false, true])
+            let pending = audio.legacyOwnershipForTesting
+            XCTAssertEqual(pending.owner, "legacy_lifecycle")
+            XCTAssertEqual(pending.suspended, 70)
+            XCTAssertEqual(pending.fenceCycle, pending.cycle)
+            allowActivation = true
+            audio.resumeLegacySessionAfterFreshFence(generation: 70)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(starts(), 1)
+            XCTAssertEqual(requests, [false, true, true])
+            XCTAssertEqual(audio.legacyOwnershipForTesting.owner, "none")
+            XCTAssertNil(audio.legacyOwnershipForTesting.inactiveCycle)
+        }
+    }
+
+    func testDeactivationFailureStillAllowsFreshFenceActivation() {
+        withAudio { audio, starts, _ in
+            var requests: [Bool] = []
+            audio.legacyAudioSessionSetActiveForTesting = { active in requests.append(active); return active }
+            audio.beginLegacySession(generation: 70)
+            audio.suspendLegacySessionForLifecycle(generation: 70)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(audio.legacyOwnershipForTesting.suspended, 70)
+            audio.resumeLegacySessionAfterFreshFence(generation: 70)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(requests, [false, true])
+            XCTAssertEqual(starts(), 1)
+        }
+    }
+
+    func testExternalOwnerPreventsActivationDespiteSatisfiedFreshFence() {
+        withAudio { audio, starts, _ in
+            var requests: [Bool] = []
+            audio.legacyAudioSessionSetActiveForTesting = { active in requests.append(active); return true }
+            audio.beginLegacySession(generation: 70)
+            audio.audioQueueForTesting.sync { }
+            defaultInterruption(audio)
+            audio.suspendLegacySessionForLifecycle(generation: 70)
+            audio.resumeLegacySessionAfterFreshFence(generation: 70)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(requests, [false])
+            XCTAssertEqual(starts(), 0)
+            XCTAssertEqual(audio.legacyOwnershipForTesting.owner, "external")
+            audio.interruptForTesting(began: false, shouldResume: false)
+            XCTAssertEqual(requests, [false, true])
+            XCTAssertEqual(starts(), 1)
+        }
+    }
+
+    func testOldCycleFenceCannotActivateNewSuspension() {
+        withAudio { audio, starts, _ in
+            var requests: [Bool] = []
+            audio.legacyAudioSessionSetActiveForTesting = { active in requests.append(active); return true }
+            audio.beginLegacySession(generation: 70)
+            audio.suspendLegacySessionForLifecycle(generation: 70)
+            let old = audio.legacyOwnershipForTesting.cycle
+            audio.resumeLegacySessionAfterFreshFence(generation: 70, cycle: old)
+            audio.suspendLegacySessionForLifecycle(generation: 70)
+            let current = audio.legacyOwnershipForTesting.cycle
+            XCTAssertGreaterThan(current, old)
+            audio.resumeLegacySessionAfterFreshFence(generation: 70, cycle: old)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(starts(), 1)
+            XCTAssertEqual(requests, [false, true, false])
+            XCTAssertNil(audio.legacyOwnershipForTesting.fenceCycle)
+            audio.resumeLegacySessionAfterFreshFence(generation: 70, cycle: current)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(starts(), 2)
+        }
+    }
+
+    func testResetAndReplacementRevokePendingLifecycleActivation() {
+        withAudio { audio, starts, _ in
+            audio.legacyAudioSessionSetActiveForTesting = { !$0 }
+            audio.beginLegacySession(generation: 70)
+            audio.suspendLegacySessionForLifecycle(generation: 70)
+            audio.resumeLegacySessionAfterFreshFence(generation: 70)
+            let old = audio.legacyOwnershipForTesting.cycle
+            audio.reset()
+            audio.beginLegacySession(generation: 71)
+            audio.resumeLegacySessionAfterFreshFence(generation: 70, cycle: old)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(starts(), 0)
+            XCTAssertNil(audio.legacyOwnershipForTesting.suspended)
+            XCTAssertNil(audio.legacyOwnershipForTesting.fenceCycle)
+            XCTAssertNil(audio.legacyOwnershipForTesting.inactiveCycle)
+            XCTAssertEqual(audio.legacyOwnershipForTesting.owner, "none")
+        }
+    }
+
+    func testTwentyAlternatingCyclesOwnExactlyOneDeactivateActivateAndResume() {
+        withAudio { audio, starts, scheduled in
+            var requests: [Bool] = []
+            audio.legacyAudioSessionSetActiveForTesting = { active in requests.append(active); return true }
+            audio.pcmScheduleForTesting = nil
+            var completed = 0
+            audio.pcmScheduleForTesting = { _, completion in completed += 1; completion() }
+            audio.beginLegacySession(generation: 70)
+            for cycle in 0..<20 {
+                audio.engineRunningForTesting = { false }
+                audio.suspendLegacySessionForLifecycle(generation: 70)
+                audio.audioQueueForTesting.sync { }
+                if cycle % 2 == 0 { defaultInterruption(audio) }
+                audio.resumeLegacySessionAfterFreshFence(generation: 70)
+                audio.resumeLegacySessionAfterFreshFence(generation: 70)
+                audio.audioQueueForTesting.sync { }
+                audio.engineRunningForTesting = { true }
+                audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 70)
+                audio.audioQueueForTesting.sync { }
+                audio.audioQueueForTesting.sync { }
+                XCTAssertEqual(starts(), cycle + 1)
+                XCTAssertEqual(completed, cycle + 1)
+                XCTAssertEqual(requests.count, (cycle + 1) * 2)
+                XCTAssertEqual(Array(requests.suffix(2)), [false, true])
+                XCTAssertNil(audio.legacyOwnershipForTesting.suspended)
+                XCTAssertNil(audio.legacyOwnershipForTesting.fenceCycle)
+                XCTAssertEqual(audio.legacyOwnershipForTesting.owner, "none")
+                XCTAssertEqual(audio.playbackStateForTesting.queued, 0)
+            }
+            XCTAssertEqual(scheduled(), 0)
+            var diagnostics: [String] = []
+            audio.publishDiagnostics(generation: 70, profile: "usb", opus: false, receiveRejects: "", sink: { diagnostics.append($0) })
+            audio.audioQueueForTesting.sync { }
+            XCTAssertTrue(diagnostics.contains { $0.contains("pcm_reject=0") })
         }
     }
 }
@@ -2304,6 +2448,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         defer {
             manager.stopForTesting()
             audio.reset(); audio.audioQueueForTesting.sync { }
+            audio.clearInterruptionOwnershipForTesting()
             audio.audioQueueForTesting.sync {
                 audio.engineStartForTesting = nil
                 audio.pcmScheduleForTesting = nil

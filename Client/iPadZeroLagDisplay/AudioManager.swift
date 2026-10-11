@@ -111,6 +111,20 @@ public final class AudioManager {
     private var activePlaybackGeneration: UInt64?
     private var interruptedPlaybackEpoch: UInt64?
     private var playbackInterrupted = false
+    private enum PlaybackInterruptionOwner: Equatable {
+        case none
+        case external
+        case legacyLifecycle(generation: UInt64, cycle: UInt64)
+    }
+    private var interruptionOwner: PlaybackInterruptionOwner = .none
+    private var legacyLifecycleCycle: UInt64 = 0
+    private var legacyLifecycleFreshFenceCycle: UInt64?
+    private var legacyAudioSessionInactiveGeneration: UInt64?
+    private var legacyAudioSessionInactiveCycle: UInt64?
+    private var audioSessionDeactivateAttempts: UInt64 = 0
+    private var audioSessionDeactivateFailures: UInt64 = 0
+    private var audioSessionActivateAttempts: UInt64 = 0
+    private var audioSessionActivateFailures: UInt64 = 0
     private var legacyLifecycleSuspendedGeneration: UInt64?
     private var legacyLifecycleFreshFenceSatisfiedGeneration: UInt64?
     private var pendingLegacyLifecycleDiagnostics: [String] = []
@@ -131,6 +145,20 @@ public final class AudioManager {
 
     #if targetEnvironment(simulator)
     var interruptionResumeForTesting: (() -> Void)?
+    var legacyAudioSessionSetActiveForTesting: ((Bool) -> Bool)?
+    var legacyOwnershipForTesting: (owner: String, cycle: UInt64, suspended: UInt64?, fenceCycle: UInt64?, inactiveCycle: UInt64?) {
+        audioQueue.sync {
+            (interruptionOwnerName, legacyLifecycleCycle, legacyLifecycleSuspendedGeneration,
+             legacyLifecycleFreshFenceCycle, legacyAudioSessionInactiveCycle)
+        }
+    }
+    func clearInterruptionOwnershipForTesting() {
+        audioQueue.sync {
+            interruptionOwner = .none
+            interruptedPlaybackEpoch = nil
+            playbackInterrupted = false
+        }
+    }
     var engineStartForTesting: (() -> Void)?
     var engineRunningForTesting: (() -> Bool)?
     var clockForTesting: (() -> TimeInterval)?
@@ -371,8 +399,9 @@ public final class AudioManager {
                self.realtimeGeneration == nil, !self.playbackInterrupted { return }
             self.playbackEpoch &+= 1
             self.activePlaybackGeneration = generation
-            self.interruptedPlaybackEpoch = nil
-            self.playbackInterrupted = false
+            self.revokeLegacyLifecycleAuthority()
+            self.playbackInterrupted = self.interruptionOwner == .external
+            self.interruptedPlaybackEpoch = self.playbackInterrupted ? (self.interruptedPlaybackEpoch ?? self.playbackEpoch) : nil
             self.legacyLifecycleSuspendedGeneration = nil
             self.legacyLifecycleFreshFenceSatisfiedGeneration = nil
             self.legacyLifecycleDropCount = 0
@@ -403,7 +432,11 @@ public final class AudioManager {
                   self.realtimeGeneration == nil,
                   self.legacyLifecycleSuspendedGeneration != generation else { return }
             self.legacyLifecycleSuspendedGeneration = generation
+            self.legacyLifecycleCycle &+= 1
             self.legacyLifecycleFreshFenceSatisfiedGeneration = nil
+            self.legacyLifecycleFreshFenceCycle = nil
+            self.legacyAudioSessionInactiveGeneration = generation
+            self.legacyAudioSessionInactiveCycle = self.legacyLifecycleCycle
             self.playbackEpoch &+= 1
             if self.playbackInterrupted { self.interruptedPlaybackEpoch = self.playbackEpoch }
             self.playerNode.stop()
@@ -413,16 +446,18 @@ public final class AudioManager {
             self.engine.pause()
             self.engineStarted = false
             self.recordLegacyLifecycleTransition(generation: generation, action: "suspend")
+            _ = self.setLegacyAudioSessionActive(false, generation: generation, cycle: self.legacyLifecycleCycle)
         }
     }
 
-    func resumeLegacySessionAfterFreshFence(generation: UInt64) {
+    func resumeLegacySessionAfterFreshFence(generation: UInt64, cycle: UInt64? = nil) {
         audioQueue.async { [weak self] in
             guard let self, self.activePlaybackGeneration == generation,
                   self.realtimeGeneration == nil,
-                  self.legacyLifecycleSuspendedGeneration == generation else { return }
-            guard self.legacyLifecycleFreshFenceSatisfiedGeneration != generation else { return }
+                  self.legacyLifecycleSuspendedGeneration == generation,
+                  cycle == nil || cycle == self.legacyLifecycleCycle else { return }
             self.legacyLifecycleFreshFenceSatisfiedGeneration = generation
+            self.legacyLifecycleFreshFenceCycle = self.legacyLifecycleCycle
             self.recordLegacyLifecycleTransition(generation: generation, action: "fresh_fence_satisfied")
             if self.playbackInterrupted {
                 self.recordLegacyLifecycleTransition(generation: generation, action: "resume_deferred", detail: "reason=interruption_active")
@@ -436,7 +471,18 @@ public final class AudioManager {
         guard activePlaybackGeneration == generation, realtimeGeneration == nil,
               legacyLifecycleSuspendedGeneration == generation,
               legacyLifecycleFreshFenceSatisfiedGeneration == generation,
-              !playbackInterrupted else { return false }
+              legacyLifecycleFreshFenceCycle == legacyLifecycleCycle,
+              legacyAudioSessionInactiveGeneration == generation,
+              legacyAudioSessionInactiveCycle == legacyLifecycleCycle,
+              interruptionOwner != .external else { return false }
+        let cycle = legacyLifecycleCycle
+        guard setLegacyAudioSessionActive(true, generation: generation, cycle: cycle) else { return false }
+        if interruptionOwner == .legacyLifecycle(generation: generation, cycle: cycle) {
+            interruptionOwner = .none
+            recordLegacyLifecycleTransition(generation: generation, action: "lifecycle_interruption_retired")
+        }
+        playbackInterrupted = false
+        interruptedPlaybackEpoch = nil
         playbackEpoch &+= 1
         playerNode.stop()
         playerNode.reset()
@@ -444,10 +490,70 @@ public final class AudioManager {
         lastPcmProgressAt = nil
         legacyLifecycleSuspendedGeneration = nil
         legacyLifecycleFreshFenceSatisfiedGeneration = nil
-        configureAudioSession()
+        legacyLifecycleFreshFenceCycle = nil
+        legacyAudioSessionInactiveGeneration = nil
+        legacyAudioSessionInactiveCycle = nil
         startEngineIfNeeded()
         recordLegacyLifecycleTransition(generation: generation, action: "resume_complete", detail: "reason=\(reason)")
         return true
+    }
+
+    private func revokeLegacyLifecycleAuthority() {
+        if case .legacyLifecycle = interruptionOwner { interruptionOwner = .none }
+        legacyLifecycleSuspendedGeneration = nil
+        legacyLifecycleFreshFenceSatisfiedGeneration = nil
+        legacyLifecycleFreshFenceCycle = nil
+        legacyAudioSessionInactiveGeneration = nil
+        legacyAudioSessionInactiveCycle = nil
+    }
+
+    private var interruptionOwnerName: String {
+        switch interruptionOwner {
+        case .none: return "none"
+        case .external: return "external"
+        case .legacyLifecycle: return "legacy_lifecycle"
+        }
+    }
+
+    private var legacyOwnershipDiagnosticFields: String {
+        let ownerGeneration: String
+        let ownerCycle: String
+        if case let .legacyLifecycle(generation, cycle) = interruptionOwner {
+            ownerGeneration = String(generation)
+            ownerCycle = String(cycle)
+        } else {
+            ownerGeneration = "none"
+            ownerCycle = "none"
+        }
+        return "interruption_owner=\(interruptionOwnerName) interruption_owner_generation=\(ownerGeneration) interruption_owner_cycle=\(ownerCycle) legacy_lifecycle_cycle=\(legacyLifecycleCycle) legacy_audio_session_inactive=\(legacyAudioSessionInactiveGeneration == nil ? 0 : 1) audio_session_deactivate_attempt=\(audioSessionDeactivateAttempts) audio_session_deactivate_fail=\(audioSessionDeactivateFailures) audio_session_activate_attempt=\(audioSessionActivateAttempts) audio_session_activate_fail=\(audioSessionActivateFailures)"
+    }
+
+    private func setLegacyAudioSessionActive(_ active: Bool, generation: UInt64, cycle: UInt64) -> Bool {
+        guard activePlaybackGeneration == generation, realtimeGeneration == nil,
+              legacyLifecycleSuspendedGeneration == generation, legacyLifecycleCycle == cycle else { return false }
+        if active { audioSessionActivateAttempts &+= 1 }
+        else { audioSessionDeactivateAttempts &+= 1 }
+        let succeeded: Bool
+        #if targetEnvironment(simulator)
+        succeeded = legacyAudioSessionSetActiveForTesting?(active) ?? true
+        #else
+        do {
+            let session = AVAudioSession.sharedInstance()
+            if active { try session.setCategory(.playback, mode: .default, options: [.mixWithOthers]) }
+            try session.setActive(active)
+            succeeded = true
+        } catch {
+            succeeded = false
+            print("[AudioManager] Legacy audio session activation=\(active) failed: \(error)")
+        }
+        #endif
+        if !succeeded {
+            if active { audioSessionActivateFailures &+= 1 }
+            else { audioSessionDeactivateFailures &+= 1 }
+        }
+        recordLegacyLifecycleTransition(generation: generation,
+            action: "audio_session_\(active ? "activate" : "deactivate")_\(succeeded ? "success" : "failed")")
+        return succeeded
     }
 
     private func recordLegacyLifecycleTransition(generation: UInt64, action: String, detail: String = "") {
@@ -470,7 +576,7 @@ public final class AudioManager {
 
     private func retainAudioLifecycleDiagnostic(_ line: String) {
         audioDiagnosticEventSequence &+= 1
-        let timed = "\(line) audio_event_seq=\(audioDiagnosticEventSequence) uptime_ms=\(Int64(ProcessInfo.processInfo.systemUptime * 1000)) \(Self.audioSessionDiagnosticFields)"
+        let timed = "\(line) audio_event_seq=\(audioDiagnosticEventSequence) uptime_ms=\(Int64(ProcessInfo.processInfo.systemUptime * 1000)) \(Self.audioSessionDiagnosticFields) \(legacyOwnershipDiagnosticFields)"
         print(timed)
         pendingLegacyLifecycleDiagnostics.append(timed)
         if pendingLegacyLifecycleDiagnostics.count > 16 { pendingLegacyLifecycleDiagnostics.removeFirst() }
@@ -624,7 +730,8 @@ public final class AudioManager {
             self.playbackEpoch &+= 1
             self.activePlaybackGeneration = nil
             self.interruptedPlaybackEpoch = nil
-            self.playbackInterrupted = false
+            self.revokeLegacyLifecycleAuthority()
+            self.playbackInterrupted = self.interruptionOwner == .external
             self.legacyLifecycleSuspendedGeneration = nil
             self.legacyLifecycleFreshFenceSatisfiedGeneration = nil
             self.legacyLifecycleDropCount = 0
@@ -742,8 +849,22 @@ public final class AudioManager {
             audioQueue.async { [weak self] in
                 self?.recordInterruptionDiagnostic(metadata, receivedAt: receivedAt, phase: "received")
                 defer { self?.recordInterruptionDiagnostic(metadata, receivedAt: receivedAt, phase: "applied") }
-                guard let self, self.activePlaybackGeneration != nil,
-                      !self.playbackInterrupted else { return }
+                guard let self else { return }
+                if self.interruptionOwner != .external {
+                    if let generation = self.activePlaybackGeneration,
+                       self.realtimeGeneration == nil,
+                       self.legacyLifecycleSuspendedGeneration == generation {
+                        self.interruptionOwner = .legacyLifecycle(generation: generation, cycle: self.legacyLifecycleCycle)
+                        self.recordLegacyLifecycleTransition(generation: generation, action: "lifecycle_interruption_associated")
+                    } else {
+                        self.interruptionOwner = .external
+                    }
+                }
+                guard self.activePlaybackGeneration != nil else {
+                    self.playbackInterrupted = true
+                    return
+                }
+                guard !self.playbackInterrupted else { return }
                 // Retire queued output callbacks without retiring the negotiated session.
                 self.playbackEpoch &+= 1
                 self.interruptedPlaybackEpoch = self.playbackEpoch
@@ -766,19 +887,38 @@ public final class AudioManager {
             audioQueue.async { [weak self] in
                 self?.recordInterruptionDiagnostic(metadata, receivedAt: receivedAt, phase: "received")
                 defer { self?.recordInterruptionDiagnostic(metadata, receivedAt: receivedAt, phase: "applied") }
-                guard let self, self.activePlaybackGeneration != nil,
-                      let epoch = self.interruptedPlaybackEpoch,
-                      epoch == self.playbackEpoch, self.playbackInterrupted else { return }
-                self.interruptedPlaybackEpoch = nil
+                guard let self else { return }
+                if self.interruptionOwner == .external {
+                    self.interruptionOwner = .none
+                    guard self.activePlaybackGeneration != nil else {
+                        self.playbackInterrupted = false
+                        self.interruptedPlaybackEpoch = nil
+                        return
+                    }
+                } else if case let .legacyLifecycle(generation, cycle) = self.interruptionOwner {
+                    guard self.activePlaybackGeneration == generation,
+                          self.legacyLifecycleSuspendedGeneration == generation,
+                          self.legacyLifecycleCycle == cycle else { return }
+                    self.interruptionOwner = .none
+                }
+                guard self.activePlaybackGeneration != nil, self.playbackInterrupted else { return }
                 if self.realtimeGeneration == nil,
                    let generation = self.activePlaybackGeneration,
                    self.legacyLifecycleSuspendedGeneration == generation {
                     self.playbackInterrupted = false
+                    self.interruptedPlaybackEpoch = nil
                     if !self.completeLegacyLifecycleResumeIfReady(generation: generation, reason: "interruption_end") {
                         self.recordLegacyLifecycleTransition(generation: generation, action: "interruption_ended_waiting_fence", detail: "should_resume=\(options.contains(.shouldResume) ? 1 : 0)")
                     }
                     return
                 }
+                guard let epoch = self.interruptedPlaybackEpoch,
+                      epoch == self.playbackEpoch else {
+                    self.playbackInterrupted = false
+                    self.interruptedPlaybackEpoch = nil
+                    return
+                }
+                self.interruptedPlaybackEpoch = nil
                 guard options.contains(.shouldResume) else { return }
                 self.playbackInterrupted = false
                 self.publishRecoveryOwner()
