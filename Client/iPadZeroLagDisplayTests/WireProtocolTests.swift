@@ -2876,11 +2876,16 @@ final class USBListenerLifetimeTests: XCTestCase {
 
     func testNewBackgroundAfterFailedActivationRevokesPreviousCycleFence() throws {
         try withLegacyUsbPcm { audio, peer, generation, probe in
-            audio.legacyAudioSessionSetActiveForTesting = { !$0 }
+            var allowActivation = false
+            audio.legacyAudioSessionSetActiveForTesting = { !$0 || allowActivation }
             defer { audio.audioQueueForTesting.sync { audio.legacyAudioSessionSetActiveForTesting = nil } }
             manager.applicationDidEnterBackground()
             manager.networkQueueForTesting.sync { }
             let oldCycle = audio.legacyOwnershipForTesting.cycle
+            audio.interruptionNotificationForTesting(userInfo: [
+                AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue,
+                AVAudioSessionInterruptionReasonKey: UInt(0)
+            ])
             awaitLegacyPing(probe) { manager.applicationDidBecomeActive() }
             let oldPing = try XCTUnwrap(probe.pings.last)
             manager.receiveUsbWireForTesting(type: .pong, payload: oldPing, generation: generation, connection: peer)
@@ -2898,6 +2903,13 @@ final class USBListenerLifetimeTests: XCTestCase {
             manager.networkQueueForTesting.sync { }
             XCTAssertEqual(audio.legacyOwnershipForTesting.cycle, newCycle,
                            "Duplicate background must not manufacture another cycle")
+            allowActivation = true
+            awaitLegacyPing(probe) { manager.applicationDidBecomeActive() }
+            let newPing = try XCTUnwrap(probe.pings.last)
+            manager.receiveUsbWireForTesting(type: .pong, payload: newPing, generation: generation, connection: peer)
+            audio.audioQueueForTesting.sync { }
+            XCTAssertNil(audio.legacyOwnershipForTesting.suspended)
+            XCTAssertEqual(audio.legacyOwnershipForTesting.owner, "none")
         }
     }
 

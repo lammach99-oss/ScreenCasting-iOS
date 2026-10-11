@@ -433,6 +433,9 @@ public final class AudioManager {
                   self.legacyLifecycleSuspendedGeneration != generation || newBackgroundCycle else { return }
             self.legacyLifecycleSuspendedGeneration = generation
             self.legacyLifecycleCycle &+= 1
+            if case .legacyLifecycle = self.interruptionOwner {
+                self.interruptionOwner = .legacyLifecycle(generation: generation, cycle: self.legacyLifecycleCycle)
+            }
             self.legacyLifecycleFreshFenceSatisfiedGeneration = nil
             self.legacyLifecycleFreshFenceCycle = nil
             self.legacyAudioSessionInactiveGeneration = generation
