@@ -3832,6 +3832,20 @@ final class USBListenerLifetimeTests: XCTestCase {
             let oldHandler = try XCTUnwrap(incumbent.stateUpdateHandler)
             let candidate = try connect()
             let pending = try XCTUnwrap(manager.usbCandidateArbitrationForTesting)
+            let ready = expectation(description: "promoted candidate ready")
+            manager.networkQueueForTesting.sync {
+                manager.usbCandidateInstalledForTesting = { installed in
+                    XCTAssertTrue(installed === candidate)
+                    let callback = installed.stateUpdateHandler
+                    installed.stateUpdateHandler = { state in
+                        callback?(state)
+                        if case .ready = state {
+                            installed.stateUpdateHandler = callback
+                            ready.fulfill()
+                        }
+                    }
+                }
+            }
             if cycle.isMultiple(of: 2) {
                 try deliver(.failed(.posix(.ECONNRESET)), to: incumbent)
             } else {
@@ -3843,16 +3857,8 @@ final class USBListenerLifetimeTests: XCTestCase {
             manager.networkQueueForTesting.sync { oldHandler(.cancelled) }
             XCTAssertTrue(manager.usbSessionSnapshot().connection === candidate)
             incumbent = candidate
-            let ready = expectation(description: "promoted candidate ready")
-            manager.networkQueueForTesting.async {
-                if case .ready = candidate.state { ready.fulfill(); return }
-                let callback = candidate.stateUpdateHandler
-                candidate.stateUpdateHandler = { state in
-                    callback?(state)
-                    if case .ready = state { candidate.stateUpdateHandler = callback; ready.fulfill() }
-                }
-            }
             wait(for: [ready], timeout: 5)
+            manager.networkQueueForTesting.sync { manager.usbCandidateInstalledForTesting = nil }
         }
     }
 

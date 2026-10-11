@@ -1895,6 +1895,7 @@ public class NetworkManager: ObservableObject {
     private static let usbCandidateArbitrationTimeout: TimeInterval = 0.75
     #if targetEnvironment(simulator)
     var manualUsbCandidateDeadlineForTesting = false
+    var usbCandidateInstalledForTesting: ((NWConnection) -> Void)?
     #endif
     private let networkQueueKey = DispatchSpecificKey<Bool>()
     private let networkQueue = DispatchQueue(label: "com.iPadCasting.network", qos: .userInteractive)
@@ -3174,6 +3175,9 @@ public class NetworkManager: ObservableObject {
         recordUsbLifecycleDiagnostic("[USB_SESSION_ACCEPT] generation=\(connectionGeneration) connectionId=\(ObjectIdentifier(candidate))")
         setupStateHandler(for: candidate)
         setState(.connecting)
+        #if targetEnvironment(simulator)
+        usbCandidateInstalledForTesting?(candidate)
+        #endif
         candidate.start(queue: networkQueue)
     }
 
