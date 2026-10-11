@@ -4,6 +4,84 @@ import UIKit
 import AVFoundation
 @testable import iPadCasting
 
+final class LegacyPcmRenderedCreditTests: XCTestCase {
+    private func withResumedAudio(_ body: (AudioManager) -> Void) {
+        let audio = AudioManager.makeForTesting()
+        audio.engineRunningForTesting = { true }
+        audio.engineStartForTesting = { }
+        audio.legacyAudioSessionSetActiveForTesting = { _ in true }
+        audio.beginLegacySession(generation: 70)
+        audio.suspendLegacySessionForLifecycle(generation: 70)
+        audio.resumeLegacySessionAfterFreshFence(generation: 70)
+        audio.audioQueueForTesting.sync { }
+        defer {
+            audio.reset()
+            audio.audioQueueForTesting.sync { }
+        }
+        body(audio)
+    }
+
+    private func diagnostics(_ audio: AudioManager) -> String {
+        var lines: [String] = []
+        audio.publishDiagnostics(generation: 70, profile: "usb", opus: false,
+                                 receiveRejects: "", sink: { lines.append($0) })
+        audio.audioQueueForTesting.sync { }
+        return lines.joined(separator: "\n")
+    }
+
+    func testAlreadyRenderedCreditPrecedesQueuedResumeBurstAdmission() {
+        withResumedAudio { audio in
+            var signaled = 0
+            audio.pcmScheduleForTesting = { frames, completion in
+                XCTAssertEqual(frames, 480)
+                signaled += 1
+                completion()
+            }
+            // Queue the entire ingress burst before allowing any admission to run.
+            // Each scheduled buffer signals rendered completion immediately.
+            audio.audioQueueForTesting.sync {
+                for _ in 0..<25 {
+                    audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 70)
+                }
+            }
+            audio.audioQueueForTesting.sync { }
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(signaled, 25, "Already-rendered buffers must not cause false overflow")
+            XCTAssertEqual(audio.playbackStateForTesting.queued, 0)
+            XCTAssertEqual(audio.playbackStateForTesting.completions, 25)
+            let report = diagnostics(audio)
+            XCTAssertTrue(report.contains("pcm_reject=0 "), report)
+            XCTAssertTrue(report.contains("pcm_scheduled=25 "), report)
+        }
+    }
+
+    func testWithheldRenderedCompletionsPreserveTrueOverflowAtTwentyOneChunks() {
+        withResumedAudio { audio in
+            var completions: [() -> Void] = []
+            audio.pcmScheduleForTesting = { frames, completion in
+                XCTAssertEqual(frames, 480)
+                completions.append(completion)
+            }
+            audio.audioQueueForTesting.sync {
+                for _ in 0..<21 {
+                    audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 70)
+                }
+            }
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(completions.count, 20)
+            XCTAssertEqual(audio.playbackStateForTesting.queued, 9600)
+            XCTAssertEqual(audio.playbackStateForTesting.completions, 0)
+            let report = diagnostics(audio)
+            XCTAssertTrue(report.contains("pcm_reject=1 "), report)
+            XCTAssertTrue(report.contains("pcm_scheduled=20 "), report)
+            for completion in completions { completion() }
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(audio.playbackStateForTesting.queued, 0)
+            XCTAssertEqual(audio.playbackStateForTesting.completions, 20)
+        }
+    }
+}
+
 final class LegacyAudioSessionOwnershipTests: XCTestCase {
     private func withAudio(_ body: (AudioManager, () -> Int, () -> Int) -> Void) {
         let audio = AudioManager.makeForTesting()
