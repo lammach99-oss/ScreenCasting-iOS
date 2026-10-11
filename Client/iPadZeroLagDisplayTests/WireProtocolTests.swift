@@ -6207,7 +6207,7 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         var diagnostics: [String] = []
         container.touchView.diagnosticSink = { diagnostics.append($0) }
         container.keyboardButton.sendActions(for: .touchUpInside)
-        container.softwareTextView.setMarkedText(#ßuÁ‚ùÁyp", selectedRange: NSRange(location: 3, length: 0))
+        container.softwareTextView.setMarkedText("pending", selectedRange: NSRange(location:7,length:0))
 
         responderAcquired = false
         NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
@@ -6219,7 +6219,7 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         XCTAssertEqual(container.keyboardMode, .softwareOpen)
         XCTAssertFalse(container.keyboardButton.isHidden)
         XCTAssertNotNil(container.softwareTextView.markedTextRange)
-        XCTAssertEqual(container.softwareTextView.text, #∫w^~)ﬁup")
+        XCTAssertEqual(container.softwareTextView.text, "ƒë·∫πp")
         XCTAssertFalse(container.touchView.softwareResponderOwnsInput)
         XCTAssertTrue(container.touchView.passiveKeyboardCaptureEnabled)
     }
