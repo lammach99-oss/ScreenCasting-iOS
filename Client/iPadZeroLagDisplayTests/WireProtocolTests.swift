@@ -105,6 +105,83 @@ final class LegacyPcmRenderedCreditTests: XCTestCase {
             XCTAssertEqual(audio.playbackStateForTesting.completions, 20)
         }
     }
+
+    func testTenFreshFenceResumeBurstsApplyAlreadyRenderedCredit() {
+        withResumedAudio { audio in
+            var signaled = 0
+            audio.pcmScheduleForTesting = { _, completion in signaled += 1; completion() }
+            for cycle in 0..<10 {
+                audio.suspendLegacySessionForLifecycle(generation: 70)
+                audio.resumeLegacySessionAfterFreshFence(generation: 70)
+                audio.audioQueueForTesting.sync {
+                    for _ in 0..<25 {
+                        audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 70)
+                    }
+                }
+                audio.audioQueueForTesting.sync { }
+                audio.audioQueueForTesting.sync { }
+                XCTAssertEqual(signaled, (cycle + 1) * 25)
+                XCTAssertEqual(audio.playbackStateForTesting.queued, 0)
+                XCTAssertTrue(diagnostics(audio).contains("pcm_reject=0 "))
+            }
+        }
+    }
+
+    func testStaleEpochCreditCannotReleasePostResumeQueue() {
+        withResumedAudio { audio in
+            var completions: [() -> Void] = []
+            audio.pcmScheduleForTesting = { _, completion in completions.append(completion) }
+            audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 70)
+            audio.audioQueueForTesting.sync { }
+            let old = completions[0]
+            audio.suspendLegacySessionForLifecycle(generation: 70)
+            audio.resumeLegacySessionAfterFreshFence(generation: 70)
+            audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 70)
+            audio.audioQueueForTesting.sync { }
+            old()
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(audio.playbackStateForTesting.queued, 480)
+            XCTAssertEqual(audio.playbackStateForTesting.completions, 0)
+            completions[1]()
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(audio.playbackStateForTesting.queued, 0)
+        }
+    }
+
+    func testStaleGenerationCreditCannotReleaseReplacementQueue() {
+        withResumedAudio { audio in
+            var completions: [() -> Void] = []
+            audio.pcmScheduleForTesting = { _, completion in completions.append(completion) }
+            audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 70)
+            audio.audioQueueForTesting.sync { }
+            audio.reset()
+            audio.beginLegacySession(generation: 71)
+            audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 71)
+            audio.audioQueueForTesting.sync { }
+            completions[0]()
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(audio.playbackStateForTesting.generation, 71)
+            XCTAssertEqual(audio.playbackStateForTesting.queued, 480)
+            XCTAssertEqual(audio.playbackStateForTesting.completions, 0)
+            completions[1]()
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(audio.playbackStateForTesting.queued, 0)
+        }
+    }
+
+    func testCompletionWithoutFutureIngressDrainsExactlyOnce() {
+        withResumedAudio { audio in
+            var completion: (() -> Void)?
+            audio.pcmScheduleForTesting = { _, callback in completion = callback }
+            audio.playPCMData(Data(repeating: 0, count: 480 * 4), generation: 70)
+            audio.audioQueueForTesting.sync { }
+            completion?()
+            completion?()
+            audio.audioQueueForTesting.sync { }
+            XCTAssertEqual(audio.playbackStateForTesting.queued, 0)
+            XCTAssertEqual(audio.playbackStateForTesting.completions, 1)
+        }
+    }
 }
 
 final class LegacyAudioSessionOwnershipTests: XCTestCase {

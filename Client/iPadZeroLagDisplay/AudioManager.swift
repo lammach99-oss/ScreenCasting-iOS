@@ -103,6 +103,22 @@ public final class AudioManager {
     private var engineStarted = false
     private var queuedFrames = 0
     private let maxQueuedFrames = 9_600
+    private let legacyRenderedCreditLock = NSLock()
+    private var legacyRenderedCreditOwner: (generation: UInt64, epoch: UInt64)?
+    private var legacyRenderedCreditFrames = 0
+    private var legacyRenderedCreditCompletions: UInt64 = 0
+    private var legacyRenderedCreditDrainScheduled = false
+    private final class RenderedCompletion {
+        private let lock = NSLock()
+        private var completed = false
+        func claim() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !completed else { return false }
+            completed = true
+            return true
+        }
+    }
     private var opusDecoder: RealtimeOpusDecoder?
     private var jitterBuffer = AudioJitterBuffer(profile: .wifi)
     private var realtimeGeneration: UInt64?
@@ -660,6 +676,9 @@ public final class AudioManager {
                 return
             }
 
+            if self.realtimeGeneration == nil {
+                self.drainLegacyRenderedCredit()
+            }
             guard self.queuedFrames + frameCount <= self.maxQueuedFrames else {
                 self.playoutDiagnostics.record(.pcmRejected)
                 self.playoutDiagnostics.lastPcmRejection = (
@@ -696,7 +715,15 @@ public final class AudioManager {
             if self.queuedFrames == 0 { self.lastPcmProgressAt = self.playoutNow }
             self.queuedFrames += frameCount
             let epoch = self.playbackEpoch
+            let ownerGeneration = self.activePlaybackGeneration!
+            let legacy = self.realtimeGeneration == nil
+            let renderedCompletion = RenderedCompletion()
             let completion: () -> Void = { [weak self] in
+                if legacy {
+                    guard renderedCompletion.claim() else { return }
+                    self?.publishLegacyRenderedCredit(generation: ownerGeneration, epoch: epoch, frames: frameCount)
+                    return
+                }
                 self?.audioQueue.async {
                     guard let self, self.playbackEpoch == epoch else { return }
                     self.queuedFrames = max(0, self.queuedFrames - frameCount)
@@ -724,6 +751,46 @@ public final class AudioManager {
                 self.playoutDiagnostics.record(.playerStart)
             }
         }
+    }
+
+    // Render callbacks publish credit only. All queue accounting stays on audioQueue.
+    private func publishLegacyRenderedCredit(generation: UInt64, epoch: UInt64, frames: Int) {
+        legacyRenderedCreditLock.lock()
+        guard let owner = legacyRenderedCreditOwner,
+              owner.generation == generation, owner.epoch == epoch else {
+            legacyRenderedCreditLock.unlock()
+            return
+        }
+        legacyRenderedCreditFrames += frames
+        legacyRenderedCreditCompletions &+= 1
+        let scheduleDrain = !legacyRenderedCreditDrainScheduled
+        legacyRenderedCreditDrainScheduled = true
+        legacyRenderedCreditLock.unlock()
+        if scheduleDrain {
+            audioQueue.async { [weak self] in self?.drainLegacyRenderedCredit(scheduled: true) }
+        }
+    }
+
+    private func drainLegacyRenderedCredit(scheduled: Bool = false) {
+        legacyRenderedCreditLock.lock()
+        if scheduled { legacyRenderedCreditDrainScheduled = false }
+        let owner = legacyRenderedCreditOwner
+        let frames = legacyRenderedCreditFrames
+        let completions = legacyRenderedCreditCompletions
+        legacyRenderedCreditFrames = 0
+        legacyRenderedCreditCompletions = 0
+        if realtimeGeneration == nil, let generation = activePlaybackGeneration {
+            legacyRenderedCreditOwner = (generation, playbackEpoch)
+        } else {
+            legacyRenderedCreditOwner = nil
+        }
+        legacyRenderedCreditLock.unlock()
+        guard realtimeGeneration == nil, let owner,
+              activePlaybackGeneration == owner.generation,
+              playbackEpoch == owner.epoch, completions > 0 else { return }
+        queuedFrames = max(0, queuedFrames - frames)
+        pcmCompletionCount &+= completions
+        lastPcmProgressAt = playoutNow
     }
 
     public func reset() {
