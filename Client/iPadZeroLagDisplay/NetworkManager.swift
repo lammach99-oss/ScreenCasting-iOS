@@ -2396,7 +2396,8 @@ public class NetworkManager: ObservableObject {
                         self.cancelLegacyUsbPcmFreshFence()
                         self.usbLegacyPcmFreshFenceGeneration = self.connectionGeneration
                         AudioManager.shared.suspendLegacySessionForLifecycle(
-                            generation: self.connectionGeneration)
+                            generation: self.connectionGeneration,
+                            newBackgroundCycle: self.pendingUsbForegroundDecoderRearmGeneration != self.connectionGeneration)
                     }
                     self.pendingUsbForegroundDecoderRearmGeneration =
                         self.connectionGeneration

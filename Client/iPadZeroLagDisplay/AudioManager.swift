@@ -426,11 +426,11 @@ public final class AudioManager {
         }
     }
 
-    func suspendLegacySessionForLifecycle(generation: UInt64) {
+    func suspendLegacySessionForLifecycle(generation: UInt64, newBackgroundCycle: Bool = false) {
         audioQueue.async { [weak self] in
             guard let self, self.activePlaybackGeneration == generation,
                   self.realtimeGeneration == nil,
-                  self.legacyLifecycleSuspendedGeneration != generation else { return }
+                  self.legacyLifecycleSuspendedGeneration != generation || newBackgroundCycle else { return }
             self.legacyLifecycleSuspendedGeneration = generation
             self.legacyLifecycleCycle &+= 1
             self.legacyLifecycleFreshFenceSatisfiedGeneration = nil
