@@ -496,6 +496,148 @@ final class SingleLaneUsbProductionTests: XCTestCase {
 final class ExternalPointerInputTests: XCTestCase {
     private let point = CGPoint(x: 0.25, y: 0.75)
 
+    @MainActor private final class ScrollPan: UIPanGestureRecognizer {
+        var phase: UIGestureRecognizer.State = .possible
+        var position = CGPoint.zero
+        override var state: UIGestureRecognizer.State {
+            get { phase }
+            set { phase = newValue }
+        }
+        override func translation(in view: UIView?) -> CGPoint { position }
+    }
+
+    @MainActor private final class ScrollFixture {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        let view = PencilUIKitView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        let pan = ScrollPan()
+        var commands: [PointerInputCommand] = []
+        var logs: [String] = []
+        init() {
+            window.addSubview(view)
+            view.contentViewport = VideoContentViewport(rect: CGRect(x: 0, y: 0, width: 1, height: 1))
+            view.configureExternalPointer(active: true, generation: 7)
+            view.handleExternalPointer(id: 1, phase: 2, point: CGPoint(x: 200, y: 150), generation: 7)
+            view.onPointerInput = { [weak self] in self?.commands.append($0) }
+            view.diagnosticSink = { [weak self] in self?.logs.append($0) }
+        }
+        func event(_ phase: UIGestureRecognizer.State, delta: CGPoint = .zero) {
+            pan.phase = phase
+            if phase == .began { pan.position = .zero }
+            pan.position.x += delta.x; pan.position.y += delta.y
+            _ = view.perform(NSSelectorFromString("handleExternalPointerScroll:"), with: pan)
+        }
+        func units(_ action: PointerInputAction) -> Int {
+            commands.filter { $0.action == action }.reduce(0) { $0 + Int($1.value) }
+        }
+        func close() { view.removeFromSuperview() }
+    }
+
+    @MainActor func testHorizontalIntentSuppressesPhysicalVerticalJitterFixture() {
+        let f = ScrollFixture(); defer { f.close() }; f.event(.began)
+        for (x, y) in [(49.0, -15.0), (29, -9), (79, -23), (49, -13), (53, -15)] {
+            f.event(.changed, delta: CGPoint(x: x / 5, y: y / 5))
+        }
+        f.event(.ended)
+        XCTAssertEqual(f.units(.horizontalWheel), -259)
+        XCTAssertEqual(f.units(.verticalWheel), 0)
+    }
+
+    @MainActor func testVerticalIntentSuppressesPhysicalHorizontalJitterFixture() {
+        let f = ScrollFixture(); defer { f.close() }; f.event(.began)
+        for (x, y) in [(-7.0, -75.0), (-6, -53), (-6, -55), (-3, -30), (-3, -35)] {
+            f.event(.changed, delta: CGPoint(x: x / 5, y: y / 5))
+        }
+        f.event(.ended)
+        XCTAssertEqual(f.units(.verticalWheel), -248)
+        XCTAssertEqual(f.units(.horizontalWheel), 0)
+    }
+
+    @MainActor func testTinyOppositeTailAfterReleaseDoesNotCreateReverseScroll() {
+        let f = ScrollFixture(); defer { f.close() }; f.event(.began)
+        for units in [9.0, 7, 6, 5, 1] { f.event(.changed, delta: CGPoint(x: -units / 5, y: 0)) }
+        f.event(.ended)
+        let count = f.commands.count
+        f.event(.began)
+        for units in [-1.0, -2, -2] { f.event(.changed, delta: CGPoint(x: -units / 5, y: 0)) }
+        f.event(.ended)
+        XCTAssertEqual(f.commands.count, count)
+        XCTAssertEqual(f.units(.horizontalWheel), 28)
+    }
+
+    @MainActor func testTinyOppositeTailWithinGestureDoesNotReverseDirection() {
+        let f = ScrollFixture(); defer { f.close() }; f.event(.began)
+        for units in [80.0, 50, 20, 5, -1, -2, -2] { f.event(.changed, delta: CGPoint(x: -units / 5, y: 0)) }
+        f.event(.ended)
+        XCTAssertEqual(f.units(.horizontalWheel), 155)
+        XCTAssertTrue(f.commands.allSatisfy { $0.value > 0 })
+    }
+
+    @MainActor func testMeaningfulDirectionReversalIsAccepted() {
+        let f = ScrollFixture(); defer { f.close() }; f.event(.began)
+        f.event(.changed, delta: CGPoint(x: 24, y: 0))
+        f.event(.changed, delta: CGPoint(x: -1, y: 0))
+        XCTAssertEqual(f.commands.count, 1)
+        f.event(.changed, delta: CGPoint(x: -1, y: 0))
+        f.event(.changed, delta: CGPoint(x: -10, y: 0)); f.event(.ended)
+        XCTAssertEqual(f.units(.horizontalWheel), -60)
+        XCTAssertTrue(f.commands.contains { $0.value > 0 })
+    }
+
+    @MainActor func testIntentionalDiagonalGesturePreservesBothAxes() {
+        let f = ScrollFixture(); defer { f.close() }; f.event(.began)
+        f.event(.changed, delta: CGPoint(x: 6, y: 5)); f.event(.ended)
+        XCTAssertEqual(f.commands.map(\.action), [.horizontalWheel, .verticalWheel])
+        XCTAssertEqual(f.commands.map(\.value), [-30, 25])
+    }
+
+    @MainActor func testSlowHighResolutionScrollSurvivesIntentActivation() {
+        let f = ScrollFixture(); defer { f.close() }; f.event(.began)
+        for _ in 0..<3 { f.event(.changed, delta: CGPoint(x: 0, y: 0.5)) }
+        XCTAssertTrue(f.commands.isEmpty)
+        for _ in 0..<5 { f.event(.changed, delta: CGPoint(x: 0, y: 0.5)) }; f.event(.ended)
+        XCTAssertEqual(f.units(.verticalWheel), 20)
+        XCTAssertTrue(f.commands.allSatisfy { $0.value > 0 && $0.value < 120 })
+    }
+
+    @MainActor func testScrollGestureEndClearsIntentAndTailState() {
+        let f = ScrollFixture(); defer { f.close() }; f.event(.began)
+        f.event(.changed, delta: CGPoint(x: 6, y: 0.5))
+        f.event(.changed, delta: CGPoint(x: -1, y: 0)); f.event(.ended)
+        f.commands.removeAll(); f.event(.began)
+        f.event(.changed, delta: CGPoint(x: 0.1, y: -4)); f.event(.ended)
+        XCTAssertEqual(f.commands.map(\.action), [.verticalWheel])
+        XCTAssertEqual(f.units(.verticalWheel), -20)
+    }
+
+    @MainActor func testGenerationReplacementClearsExternalScrollIntentState() {
+        let f = ScrollFixture(); defer { f.close() }; f.event(.began)
+        f.event(.changed, delta: CGPoint(x: 1.5, y: 0))
+        f.view.configureExternalPointer(active: true, generation: 8)
+        f.view.handleExternalPointer(id: 1, phase: 2, point: CGPoint(x: 200, y: 150), generation: 8)
+        f.commands.removeAll(); f.event(.changed, delta: CGPoint(x: 10, y: 0))
+        XCTAssertTrue(f.commands.isEmpty)
+        f.event(.began); f.event(.changed, delta: CGPoint(x: 0, y: 3)); f.event(.ended)
+        XCTAssertEqual(f.commands.map(\.action), [.verticalWheel])
+        XCTAssertEqual(f.units(.verticalWheel), 15)
+    }
+
+    @MainActor func testExternalScrollDiagnosticsAreBoundedUnder120HzInput() {
+        let f = ScrollFixture(); defer { f.close() }; f.event(.began)
+        for _ in 0..<600 { f.event(.changed, delta: CGPoint(x: 1, y: 0.01)) }; f.event(.ended)
+        XCTAssertLessThanOrEqual(f.logs.count, 2)
+        XCTAssertEqual(f.logs.filter { $0.contains("[EXTERNAL_SCROLL]") }.count, 1)
+    }
+
+    @MainActor func testExternalScrollEndDiagnosticSummarizesSuppression() {
+        let f = ScrollFixture(); defer { f.close() }; f.event(.began)
+        f.event(.changed, delta: CGPoint(x: 6, y: 1))
+        f.event(.changed, delta: CGPoint(x: -1, y: 0.1)); f.event(.ended)
+        let summary = f.logs.first { $0.contains("[EXTERNAL_SCROLL]") } ?? ""
+        for field in ["intent=horizontal", "raw_dx=", "raw_dy=", "emitted_horizontal_units=",
+                      "emitted_vertical_units=", "suppressed_cross_axis_points=", "suppressed_reverse_points=",
+                      "changed_callbacks=2", "emitted_commands=1"] { XCTAssertTrue(summary.contains(field), field) }
+    }
+
     func testAbsoluteHoverAndLetterboxRejection() {
         var state = ExternalPointerInputState()
         XCTAssertTrue(state.configure(active: true, generation: 7).isEmpty)
