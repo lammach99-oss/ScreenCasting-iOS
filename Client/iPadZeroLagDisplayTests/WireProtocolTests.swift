@@ -712,7 +712,7 @@ final class ExternalPointerInputTests: XCTestCase {
         _ = state.configure(active: true, generation: 7)
         _ = state.hover(point: point, generation: 7)
         XCTAssertTrue(state.scroll(delta: CGPoint(x: 0.125, y: 0), generation: 7).isEmpty)
-        let vertical = state.scroll(delta: CGPoint(x: 0, y: 0.25), generation: 7)
+        let vertical = state.scroll(delta: CGPoint(x: 0, y: 0.375), generation: 7)
         XCTAssertEqual(vertical.map(\.action), [.verticalWheel])
         XCTAssertEqual(vertical.map(\.value), [1])
         let diagonal = state.scroll(delta: CGPoint(x: 0.125, y: 0.125), generation: 7)
