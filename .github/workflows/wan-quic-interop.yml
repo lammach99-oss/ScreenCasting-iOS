@@ -1,6 +1,11 @@
 name: Isolated WAN QUIC peer validation
 on:
   workflow_dispatch:
+  push:
+    branches: [codex/keyboard-v1-validation]
+    paths:
+      - 'tools/WanQuicInterop/AppleQuicPeer/**'
+      - '.github/workflows/wan-quic-interop.yml'
 jobs:
   apple-peer:
     runs-on: macos-15
