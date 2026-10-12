@@ -51,6 +51,14 @@ final class EvidenceRecorderTests: XCTestCase {
         let logs = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
         XCTAssertEqual(logs.count, 2)
     }
+    func testExportIsImmutableAfterMoreEvents() throws {
+        let recorder = EvidenceRecorder(directory: try directory(), maximumBytes: 4096)
+        _ = try recorder.beginRun(generation: 7); try append(recorder)
+        let export = try recorder.export(to: try directory())
+        let original = try Data(contentsOf: export)
+        try append(recorder, sequence: 1)
+        XCTAssertEqual(try Data(contentsOf: export), original)
+    }
     func testConcurrentWritesRemainWholeJSONLines() throws {
         let recorder = EvidenceRecorder(directory: try directory(), maximumBytes: 65536)
         let url = try recorder.beginRun(generation: 7)
