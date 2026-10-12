@@ -647,24 +647,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/11587506267" > "$C1_EVIDENCE_ROOT/entry/dependency-artifact.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/11758497205" > "$C1_EVIDENCE_ROOT/entry/dependency-artifact.json"
           python3 - <<'PY'
           import json, os, pathlib
           x=json.loads((pathlib.Path(os.environ['C1_EVIDENCE_ROOT'])/'entry/dependency-artifact.json').read_text())
-          assert x['id']==11587506267 and not x['expired']
-          assert x['workflow_run']['id']==37862873695
-          assert x['workflow_run']['head_sha']=='509c54fbb0f5d48bdf59cab71dea90667cbc9e30'
-          assert x['digest']=='sha256:bdcf18ac31b0698e46651087164aaa739ed91c8004d293d8981f612df7583164'
+          assert x['id']==11758497205 and not x['expired']
+          assert x['workflow_run']['id']==38272065310
+          assert x['workflow_run']['head_sha']=='5888a66060b3b272ba84b54e38e6eb9ee27e2be3'
+          assert x['digest']=='sha256:b9378493af7dc1e88a255aabb9fb8bc10a402bf92834139327e389a6a425b054'
           PY
-          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/11587506267/zip" > "$RUNNER_TEMP/c1-native-deps.zip"
-          printf '%s  %s\n' bdcf18ac31b0698e46651087164aaa739ed91c8004d293d8981f612df7583164 "$RUNNER_TEMP/c1-native-deps.zip" | shasum -a 256 -c -
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/11758497205/zip" > "$RUNNER_TEMP/c1-native-deps.zip"
+          printf '%s  %s\n' b9378493af7dc1e88a255aabb9fb8bc10a402bf92834139327e389a6a425b054 "$RUNNER_TEMP/c1-native-deps.zip" | shasum -a 256 -c -
           mkdir -p "$RUNNER_TEMP/c1-native-deps"
           unzip -q "$RUNNER_TEMP/c1-native-deps.zip" -d "$RUNNER_TEMP/c1-native-deps"
           manifest=$(find "$RUNNER_TEMP/c1-native-deps" -name native-deps.manifest.txt -type f)
           test "$(printf '%s\n' "$manifest" | wc -l | tr -d ' ')" = 1
           cp "$manifest" "$C1_EVIDENCE_ROOT/entry/native-deps.manifest.txt"
           grep -qx 'Native Output Tree SHA-256: 6030659b9b2824340d07692e6b9a4fad68070bb8538bf9e2c36f587763cb11c5' "$manifest"
-          export EXPECTED_PUBLIC_SHA=509c54fbb0f5d48bdf59cab71dea90667cbc9e30
+          export EXPECTED_PUBLIC_SHA=5888a66060b3b272ba84b54e38e6eb9ee27e2be3
           export EXPECTED_CACHE_KEY=$(sed -n 's/^Cache Key: //p' "$manifest")
           export EXPECTED_MANIFEST_SHA256=$(shasum -a 256 "$manifest" | awk '{print $1}')
           bash Client/scripts/verify_native_dependency_artifact.sh "$RUNNER_TEMP/c1-native-deps" "$GITHUB_WORKSPACE/Client/ThirdPartyBuild" 2>&1 | tee "$C1_EVIDENCE_ROOT/entry/dependency-verification.log"
