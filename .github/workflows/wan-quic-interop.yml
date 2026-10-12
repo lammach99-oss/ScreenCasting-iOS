@@ -23,10 +23,24 @@ jobs:
           brew install xcodegen
           xcodegen --version | tee xcodegen-version.log
           xcodegen generate --spec tools/WanQuicInterop/AppleQuicPeer/project.yml
+      - name: Create exact native test simulator
+        run: |
+          set -euo pipefail
+          xcrun simctl list runtimes -j > simulator-runtimes.json
+          xcrun simctl list devicetypes -j > simulator-types.json
+          python3 - <<'PY'
+          import json,subprocess,os
+          runtimes=json.load(open('simulator-runtimes.json'))['runtimes']
+          runtime=next(r for r in runtimes if r['version']=='18.5' and r['isAvailable'] and 'iOS' in r['name'])
+          types=json.load(open('simulator-types.json'))['devicetypes']
+          device=next(d for d in types if d['name']=='iPhone 16')
+          udid=subprocess.check_output(['xcrun','simctl','create','WanQuicInteropCI',device['identifier'],runtime['identifier']],text=True).strip()
+          with open(os.environ['GITHUB_ENV'],'a') as f:f.write('WAN_SIMULATOR_UDID='+udid+'\n')
+          PY
       - name: Build and native XCTest
         run: |
           set -o pipefail
-          xcodebuild -project tools/WanQuicInterop/AppleQuicPeer/WanQuicInterop.xcodeproj -scheme WanQuicInterop -destination 'platform=iOS Simulator,name=iPhone 16,OS=18.5' -resultBundlePath WanQuicInterop.xcresult CODE_SIGNING_ALLOWED=NO test 2>&1 | tee wan-quic-xcodebuild.log
+          xcodebuild -project tools/WanQuicInterop/AppleQuicPeer/WanQuicInterop.xcodeproj -scheme WanQuicInterop -destination "platform=iOS Simulator,id=$WAN_SIMULATOR_UDID" -resultBundlePath WanQuicInterop.xcresult CODE_SIGNING_ALLOWED=NO test 2>&1 | tee wan-quic-xcodebuild.log
       - name: Build isolated unsigned device IPA
         if: github.event_name == 'workflow_dispatch' && inputs.package_ipa
         run: |
@@ -68,3 +82,5 @@ jobs:
             WanQuicInterop.xcresult
             wan-quic-xcodebuild.log
             xcodegen-version.log
+            simulator-runtimes.json
+            simulator-types.json
