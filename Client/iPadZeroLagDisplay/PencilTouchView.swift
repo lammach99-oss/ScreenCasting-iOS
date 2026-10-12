@@ -632,23 +632,31 @@ struct ExternalPointerInputState {
     mutating func scroll(delta: CGPoint, generation: UInt64) -> [PointerInputCommand] {
         guard owns(generation), pointerInside, let point = lastValidPoint,
               delta.x.isFinite, delta.y.isFinite else { return [] }
-        horizontalRemainder += delta.x
-        verticalRemainder += delta.y
         var result: [PointerInputCommand] = []
-        // Bound a single event while retaining unconsumed movement for the next event.
-        for (horizontal, remainder) in [(true, horizontalRemainder), (false, verticalRemainder)] {
-            let steps = Int(max(-8, min(8, (remainder / 24).rounded(.towardZero))))
-            if steps != 0 {
-                for _ in 0..<abs(steps) {
-                    let value: Int16 = steps > 0 ? 120 : -120
-                    result.append(command(horizontal ? .horizontalWheel : .verticalWheel, point,
-                                          value: horizontal ? -value : value))
-                }
-            }
-            if horizontal { horizontalRemainder -= CGFloat(steps) * 24 }
-            else { verticalRemainder -= CGFloat(steps) * 24 }
+        let horizontal = Self.wheelValue(points: delta.x, remainder: &horizontalRemainder)
+        let vertical = Self.wheelValue(points: delta.y, remainder: &verticalRemainder)
+        if horizontal != 0 {
+            result.append(command(.horizontalWheel, point, value: -horizontal))
+        }
+        if vertical != 0 {
+            result.append(command(.verticalWheel, point, value: vertical))
         }
         return result
+    }
+
+    private static func wheelValue(points: CGFloat, remainder: inout CGFloat) -> Int16 {
+        // Preserve 24 points == 120 units and fractional movement between updates.
+        let accumulated = remainder + points
+        let exactUnits = accumulated * 5
+        let limit = CGFloat(Int16.max)
+        // Saturate extreme input before integer conversion; never retain an overflow burst.
+        if exactUnits >= limit || exactUnits <= -limit {
+            remainder = 0
+            return exactUnits > 0 ? Int16.max : -Int16.max
+        }
+        let wholeUnits = exactUnits.rounded(.towardZero)
+        remainder = accumulated - wholeUnits / 5
+        return Int16(wholeUnits)
     }
 
     mutating func retire() -> [PointerInputCommand] {
