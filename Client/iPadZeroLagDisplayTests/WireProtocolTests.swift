@@ -516,7 +516,8 @@ final class ExternalPointerInputTests: XCTestCase {
             window.addSubview(view)
             view.contentViewport = VideoContentViewport(rect: CGRect(x: 0, y: 0, width: 1, height: 1))
             view.configureExternalPointer(active: true, generation: 7)
-            view.handleExternalPointer(id: 1, phase: 2, point: CGPoint(x: 200, y: 150), generation: 7)
+            view.handleExternalPointer(id: 1, phase: 1, point: CGPoint(x: 200, y: 150), primary: true, generation: 7)
+            view.handleExternalPointer(id: 1, phase: 4, point: CGPoint(x: 200, y: 150), generation: 7)
             view.onPointerInput = { [weak self] in self?.commands.append($0) }
             view.diagnosticSink = { [weak self] in self?.logs.append($0) }
         }
@@ -613,7 +614,8 @@ final class ExternalPointerInputTests: XCTestCase {
         let f = ScrollFixture(); defer { f.close() }; f.event(.began)
         f.event(.changed, delta: CGPoint(x: 1.5, y: 0))
         f.view.configureExternalPointer(active: true, generation: 8)
-        f.view.handleExternalPointer(id: 1, phase: 2, point: CGPoint(x: 200, y: 150), generation: 8)
+        f.view.handleExternalPointer(id: 1, phase: 1, point: CGPoint(x: 200, y: 150), primary: true, generation: 8)
+        f.view.handleExternalPointer(id: 1, phase: 4, point: CGPoint(x: 200, y: 150), generation: 8)
         f.commands.removeAll(); f.event(.changed, delta: CGPoint(x: 10, y: 0))
         XCTAssertTrue(f.commands.isEmpty)
         f.event(.began); f.event(.changed, delta: CGPoint(x: 0, y: 3)); f.event(.ended)
