@@ -587,6 +587,13 @@ struct ExternalPointerInputState {
     private var verticalRemainder: CGFloat = 0
     private var horizontalRemainder: CGFloat = 0
 
+    var canScroll: Bool { enabled && pointerInside && lastValidPoint != nil }
+
+    mutating func resetScrollRemainders() {
+        verticalRemainder = 0
+        horizontalRemainder = 0
+    }
+
     mutating func configure(active: Bool, generation: UInt64) -> [PointerInputCommand] {
         let release = self.generation != generation || !active ? retire() : []
         self.generation = generation
@@ -688,6 +695,111 @@ struct ExternalPointerInputState {
         PointerInputCommand(action: action,
             x: UInt16(clamping: Int((point.x * 65_535).rounded())),
             y: UInt16(clamping: Int((point.y * 65_535).rounded())), value: value)
+    }
+}
+
+enum ExternalScrollIntent: String {
+    case undecided, horizontal, vertical, diagonal
+}
+
+struct ExternalScrollGestureState {
+    static let activationPoints: CGFloat = 2
+    static let dominanceRatio: CGFloat = 2
+    static let reversalPoints: CGFloat = 2
+
+    private struct Direction {
+        var sign: CGFloat = 0
+        var candidate: CGFloat = 0
+        var discarded: CGFloat = 0
+        var reversals = 0
+        var suppressed: CGFloat { discarded + abs(candidate) }
+
+        mutating func accept(_ points: CGFloat) -> CGFloat {
+            guard points != 0 else { return 0 }
+            let nextSign: CGFloat = points > 0 ? 1 : -1
+            if sign == 0 { sign = nextSign }
+            if sign == nextSign {
+                discarded += abs(candidate)
+                candidate = 0
+                return points
+            }
+            candidate += points
+            guard abs(candidate) >= ExternalScrollGestureState.reversalPoints else { return 0 }
+            // Confirm by distance, then release the complete accepted reversal.
+            let accepted = candidate
+            candidate = 0
+            sign = nextSign
+            reversals += 1
+            return accepted
+        }
+    }
+
+    private(set) var generation: UInt64?
+    private(set) var intent = ExternalScrollIntent.undecided
+    private var accumulated = CGPoint.zero
+    private var horizontal = Direction()
+    private var vertical = Direction()
+    private var raw = CGPoint.zero
+    private var suppressedCrossAxis: CGFloat = 0
+    private var callbacks = 0
+    private var emittedCommands = 0
+    private var emittedHorizontalUnits = 0
+    private var emittedVerticalUnits = 0
+    private var beganAt: TimeInterval = 0
+
+    mutating func begin(generation: UInt64, now: TimeInterval) {
+        self = Self()
+        self.generation = generation
+        beganAt = now
+    }
+
+    mutating func filter(_ delta: CGPoint, generation: UInt64) -> CGPoint {
+        guard self.generation == generation, delta.x.isFinite, delta.y.isFinite else { return .zero }
+        callbacks += 1
+        raw.x += delta.x
+        raw.y += delta.y
+        var accepted = delta
+        if intent == .undecided {
+            accumulated.x += delta.x
+            accumulated.y += delta.y
+            let ax = abs(accumulated.x), ay = abs(accumulated.y)
+            if ax >= Self.activationPoints && ax >= ay * Self.dominanceRatio {
+                intent = .horizontal
+            } else if ay >= Self.activationPoints && ay >= ax * Self.dominanceRatio {
+                intent = .vertical
+            } else if ax >= Self.activationPoints && ay >= Self.activationPoints {
+                intent = .diagonal
+            } else {
+                return .zero
+            }
+            accepted = accumulated
+            accumulated = .zero
+        }
+        switch intent {
+        case .horizontal:
+            suppressedCrossAxis += abs(accepted.y)
+            return CGPoint(x: horizontal.accept(accepted.x), y: 0)
+        case .vertical:
+            suppressedCrossAxis += abs(accepted.x)
+            return CGPoint(x: 0, y: vertical.accept(accepted.y))
+        case .diagonal:
+            return CGPoint(x: horizontal.accept(accepted.x), y: vertical.accept(accepted.y))
+        case .undecided:
+            return .zero
+        }
+    }
+
+    mutating func record(_ command: PointerInputCommand) {
+        emittedCommands += 1
+        if command.action == .horizontalWheel { emittedHorizontalUnits += Int(command.value) }
+        if command.action == .verticalWheel { emittedVerticalUnits += Int(command.value) }
+    }
+
+    mutating func end(phase: String, now: TimeInterval) -> String? {
+        guard let generation else { return nil }
+        let summary = "[EXTERNAL_SCROLL] phase=\(phase) generation=\(generation) intent=\(intent.rawValue) raw_dx=\(raw.x) raw_dy=\(raw.y) emitted_horizontal_units=\(emittedHorizontalUnits) emitted_vertical_units=\(emittedVerticalUnits) suppressed_cross_axis_points=\(suppressedCrossAxis) suppressed_reverse_points=\(horizontal.suppressed + vertical.suppressed) accepted_reversals=\(horizontal.reversals + vertical.reversals) changed_callbacks=\(callbacks) emitted_commands=\(emittedCommands) duration_ms=\(Int(max(0, now - beganAt) * 1000))"
+        self = Self()
+        return summary
     }
 }
 
@@ -835,6 +947,7 @@ public class PencilUIKitView: UIView {
     private var externalPointer = ExternalPointerInputState()
     private var externalPointerIDs = LifetimeIdentityMap<ObjectIdentifier>()
     private var externalScrollTranslation = CGPoint.zero
+    private var externalScroll = ExternalScrollGestureState()
     private var lastExternalMoveDiagnosticAt: TimeInterval = -.infinity
 
     override public init(frame: CGRect) {
@@ -976,6 +1089,7 @@ public class PencilUIKitView: UIView {
     }
 
     func retireExternalPointer() {
+        endExternalScroll(phase: "retired")
         let active = externalPointer.enabled
         let generation = externalPointer.generation
         for command in externalPointer.retire() { emitExternal(command, reason: "retire_left_up") }
@@ -1011,21 +1125,41 @@ public class PencilUIKitView: UIView {
         let translation = recognizer.translation(in: self)
         switch recognizer.state {
         case .began:
+            endExternalScroll(phase: "replaced")
             externalScrollTranslation = translation
+            guard externalPointer.canScroll else { return }
+            externalScroll.begin(generation: generation, now: ProcessInfo.processInfo.systemUptime)
         case .changed:
+            guard externalScroll.generation == generation else { return }
+            guard externalPointer.canScroll else { endExternalScroll(phase: "outside"); return }
             let delta = CGPoint(x: translation.x - externalScrollTranslation.x,
                                 y: translation.y - externalScrollTranslation.y)
             externalScrollTranslation = translation
-            for command in externalPointer.scroll(delta: delta, generation: generation) { emitExternal(command) }
+            let accepted = externalScroll.filter(delta, generation: generation)
+            for command in externalPointer.scroll(delta: accepted, generation: generation) {
+                guard externalScroll.generation == generation else { break }
+                externalScroll.record(command)
+                emitExternal(command)
+            }
         case .ended, .cancelled, .failed:
-            externalScrollTranslation = .zero
+            endExternalScroll(phase: String(describing: recognizer.state))
         default: break
         }
+    }
+
+    private func endExternalScroll(phase: String) {
+        if let summary = externalScroll.end(phase: phase, now: ProcessInfo.processInfo.systemUptime) {
+            diagnosticSink?(summary)
+        }
+        externalScrollTranslation = .zero
+        externalPointer.resetScrollRemainders()
     }
 
     private func emitExternal(_ command: PointerInputCommand?, reason: String? = nil) {
         guard let command else { return }
         onPointerInput?(command)
+        // Continuous wheels are accounted for by one gesture-end summary.
+        if command.action == .horizontalWheel || command.action == .verticalWheel || command.action == .zoomWheel { return }
         let now = ProcessInfo.processInfo.systemUptime
         if command.action != .move || now - lastExternalMoveDiagnosticAt >= 0.25 {
             if command.action == .move { lastExternalMoveDiagnosticAt = now }
