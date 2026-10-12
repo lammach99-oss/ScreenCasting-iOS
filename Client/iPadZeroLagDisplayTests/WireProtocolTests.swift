@@ -539,11 +539,12 @@ final class ExternalPointerInputTests: XCTestCase {
         _ = state.configure(active: true, generation: 7)
         XCTAssertTrue(state.scroll(delta: CGPoint(x: 24, y: 24), generation: 7).isEmpty)
         _ = state.hover(point: point, generation: 7)
-        XCTAssertTrue(state.scroll(delta: CGPoint(x: 12, y: 12), generation: 7).isEmpty)
         let wheels = state.scroll(delta: CGPoint(x: 12, y: 12), generation: 7)
-        XCTAssertEqual(Set(wheels.map { $0.action.rawValue }), Set([PointerInputAction.verticalWheel.rawValue, PointerInputAction.horizontalWheel.rawValue]))
-        XCTAssertTrue(wheels.allSatisfy { abs(Int($0.value)) == 120 && $0.x == 16_384 && $0.y == 49_151 })
+        XCTAssertEqual(wheels.map(\.action), [.horizontalWheel, .verticalWheel])
+        XCTAssertEqual(wheels.map(\.value), [-60, 60])
+        XCTAssertTrue(wheels.allSatisfy { $0.x == 16_384 && $0.y == 49_151 })
         XCTAssertTrue(state.scroll(delta: CGPoint(x: 24, y: 24), generation: 6).isEmpty)
+        XCTAssertTrue(state.scroll(delta: .zero, generation: 7).isEmpty)
     }
 
     @MainActor func testRecognizersCannotConsumeDirectFingerInput() {
@@ -619,28 +620,24 @@ final class ExternalPointerInputTests: XCTestCase {
         XCTAssertEqual(contacts.map(\.phase), [.down, .cancel])
     }
 
-    func testVerticalAndHorizontalAccumulateIndependentlyAt24Points() {
+    func testVerticalAndHorizontalPreserve24PointCalibration() {
         var state = ExternalPointerInputState()
         _ = state.configure(active: true, generation: 7)
         _ = state.hover(point: point, generation: 7)
-        XCTAssertTrue(state.scroll(delta: CGPoint(x: 12, y: 12), generation: 7).isEmpty)
-        let vertical = state.scroll(delta: CGPoint(x: 0, y: 12), generation: 7)
-        XCTAssertEqual(vertical.map(\.action), [.verticalWheel])
-        XCTAssertEqual(vertical.first?.value, 120)
-        let horizontal = state.scroll(delta: CGPoint(x: 12, y: 0), generation: 7)
-        XCTAssertEqual(horizontal.map(\.action), [.horizontalWheel])
-        XCTAssertEqual(horizontal.first?.value, -120)
+        XCTAssertEqual(state.scroll(delta: CGPoint(x: 24, y: 24), generation: 7).map(\.value), [-120, 120])
+        XCTAssertEqual(state.scroll(delta: CGPoint(x: -24, y: -24), generation: 7).map(\.value), [120, -120])
     }
 
-    func testWheelTargetsMostRecentValidPointerAndRetainsOverflow() {
+    func testWheelTargetsMostRecentValidPointerWithOneCommandPerAxis() {
         var state = ExternalPointerInputState()
         _ = state.configure(active: true, generation: 7)
         _ = state.hover(point: point, generation: 7)
         _ = state.hover(point: CGPoint(x: 0.75, y: 0.25), generation: 7)
-        let first = state.scroll(delta: CGPoint(x: 0, y: 24 * 10), generation: 7)
-        XCTAssertEqual(first.count, 8)
-        XCTAssertTrue(first.allSatisfy { $0.x == 49_151 && $0.y == 16_384 })
-        XCTAssertEqual(state.scroll(delta: .zero, generation: 7).count, 2)
+        let wheels = state.scroll(delta: CGPoint(x: 240, y: 240), generation: 7)
+        XCTAssertEqual(wheels.map(\.action), [.horizontalWheel, .verticalWheel])
+        XCTAssertEqual(wheels.map(\.value), [-1200, 1200])
+        XCTAssertTrue(wheels.allSatisfy { $0.x == 49_151 && $0.y == 16_384 })
+        XCTAssertTrue(state.scroll(delta: .zero, generation: 7).isEmpty)
     }
 
     @MainActor func testWindowRetirementReleasesLivePrimaryExactlyOnce() {
@@ -685,6 +682,91 @@ final class ExternalPointerInputTests: XCTestCase {
         XCTAssertTrue(source.contains("touchView.configureDirectTouch(active: remoteKeyboardActive"))
         XCTAssertFalse(source.contains("touchpadModeEnabled"))
     }
+
+    func testSubNotchVerticalAndHorizontalDeltasAreForwarded() {
+        var state = ExternalPointerInputState()
+        _ = state.configure(active: true, generation: 7)
+        _ = state.hover(point: point, generation: 7)
+        let vertical = state.scroll(delta: CGPoint(x: 0, y: 12), generation: 7)
+        XCTAssertEqual(vertical.map(\.action), [.verticalWheel])
+        XCTAssertEqual(vertical.map(\.value), [60])
+        let horizontal = state.scroll(delta: CGPoint(x: 12, y: 0), generation: 7)
+        XCTAssertEqual(horizontal.map(\.action), [.horizontalWheel])
+        XCTAssertEqual(horizontal.map(\.value), [-60])
+    }
+
+    func testFractionalWheelUnitsAccumulateAndDrainExactlyOnce() {
+        var state = ExternalPointerInputState()
+        _ = state.configure(active: true, generation: 7)
+        _ = state.hover(point: point, generation: 7)
+        XCTAssertTrue(state.scroll(delta: CGPoint(x: 0, y: 0.125), generation: 7).isEmpty)
+        XCTAssertEqual(state.scroll(delta: CGPoint(x: 0, y: 0.125), generation: 7).map(\.value), [1])
+        XCTAssertTrue(state.scroll(delta: .zero, generation: 7).isEmpty)
+        XCTAssertEqual(state.scroll(delta: CGPoint(x: 0, y: 0.25), generation: 7).map(\.value), [1])
+        XCTAssertEqual(state.scroll(delta: CGPoint(x: 0, y: 0.125), generation: 7).map(\.value), [1])
+        XCTAssertTrue(state.scroll(delta: .zero, generation: 7).isEmpty)
+    }
+
+    func testFractionalRemaindersStayIndependentAcrossDiagonalUpdates() {
+        var state = ExternalPointerInputState()
+        _ = state.configure(active: true, generation: 7)
+        _ = state.hover(point: point, generation: 7)
+        XCTAssertTrue(state.scroll(delta: CGPoint(x: 0.125, y: 0), generation: 7).isEmpty)
+        let vertical = state.scroll(delta: CGPoint(x: 0, y: 0.25), generation: 7)
+        XCTAssertEqual(vertical.map(\.action), [.verticalWheel])
+        XCTAssertEqual(vertical.map(\.value), [1])
+        let diagonal = state.scroll(delta: CGPoint(x: 0.125, y: 0.125), generation: 7)
+        XCTAssertEqual(diagonal.map(\.action), [.horizontalWheel, .verticalWheel])
+        XCTAssertEqual(diagonal.map(\.value), [-1, 1])
+    }
+
+    func testRetirementClearsFractionalRemaindersForReplacementOwner() {
+        var state = ExternalPointerInputState()
+        _ = state.configure(active: true, generation: 7)
+        _ = state.hover(point: point, generation: 7)
+        XCTAssertTrue(state.scroll(delta: CGPoint(x: 0.125, y: 0.125), generation: 7).isEmpty)
+        XCTAssertTrue(state.retire().isEmpty)
+        _ = state.configure(active: true, generation: 8)
+        _ = state.hover(point: point, generation: 8)
+        XCTAssertTrue(state.scroll(delta: CGPoint(x: 0.125, y: 0.125), generation: 8).isEmpty)
+        XCTAssertEqual(state.scroll(delta: CGPoint(x: 0.125, y: 0.125), generation: 8).map(\.value), [-1, 1])
+    }
+
+    func testGenerationAndOutsideFencesDoNotAccumulateScroll() {
+        var state = ExternalPointerInputState()
+        _ = state.configure(active: true, generation: 7)
+        _ = state.hover(point: point, generation: 7)
+        XCTAssertTrue(state.scroll(delta: CGPoint(x: 12, y: 12), generation: 6).isEmpty)
+        XCTAssertNil(state.hover(point: nil, generation: 7))
+        XCTAssertTrue(state.scroll(delta: CGPoint(x: 12, y: 12), generation: 7).isEmpty)
+        _ = state.hover(point: point, generation: 7)
+        XCTAssertTrue(state.scroll(delta: .zero, generation: 7).isEmpty)
+        XCTAssertEqual(state.scroll(delta: CGPoint(x: 12, y: 12), generation: 7).map(\.value), [-60, 60])
+    }
+
+    func testExtremeFiniteScrollIsBoundedAndDoesNotLeaveAnOverflowBurst() {
+        var state = ExternalPointerInputState()
+        _ = state.configure(active: true, generation: 7)
+        _ = state.hover(point: point, generation: 7)
+        let positive = state.scroll(delta: CGPoint(x: CGFloat.greatestFiniteMagnitude, y: CGFloat.greatestFiniteMagnitude), generation: 7)
+        XCTAssertEqual(positive.map(\.action), [.horizontalWheel, .verticalWheel])
+        XCTAssertEqual(positive.map(\.value), [-Int16.max, Int16.max])
+        XCTAssertTrue(state.scroll(delta: .zero, generation: 7).isEmpty)
+        let negative = state.scroll(delta: CGPoint(x: -CGFloat.greatestFiniteMagnitude, y: -CGFloat.greatestFiniteMagnitude), generation: 7)
+        XCTAssertEqual(negative.map(\.value), [Int16.max, -Int16.max])
+        XCTAssertTrue(state.scroll(delta: .zero, generation: 7).isEmpty)
+    }
+
+    func testNonfiniteScrollCannotPoisonFractionalRemainders() {
+        var state = ExternalPointerInputState()
+        _ = state.configure(active: true, generation: 7)
+        _ = state.hover(point: point, generation: 7)
+        XCTAssertTrue(state.scroll(delta: CGPoint(x: 0.125, y: 0.125), generation: 7).isEmpty)
+        XCTAssertTrue(state.scroll(delta: CGPoint(x: CGFloat.nan, y: 12), generation: 7).isEmpty)
+        XCTAssertTrue(state.scroll(delta: CGPoint(x: 12, y: CGFloat.infinity), generation: 7).isEmpty)
+        XCTAssertEqual(state.scroll(delta: CGPoint(x: 0.125, y: 0.125), generation: 7).map(\.value), [-1, 1])
+    }
+
 }
 
 final class UsbSplitCommitGateTests: XCTestCase {
