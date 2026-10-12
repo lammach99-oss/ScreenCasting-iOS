@@ -25,7 +25,7 @@ final class InteropSession {
                 guard let self, let o, self.isCurrent(o) else { return }
                 switch state {
                 case .ready:
-                    guard let metadata = group.metadata(definition: NWProtocolQUIC.definition) as? NWProtocolQUIC.Metadata,
+                    guard let metadata = o.group?.metadata(definition: NWProtocolQUIC.definition) as? NWProtocolQUIC.Metadata,
                           metadata.negotiatedALPN == TestProtocol.alpn else { self.fail(o, "alpn_mismatch"); return }
                     EventLog.write("group_ready_exact_alpn", generation: generation, owner: o.id)
                     self.openLanes(o)
