@@ -1,0 +1,27 @@
+name: Isolated WAN QUIC peer validation
+on:
+  workflow_dispatch:
+jobs:
+  apple-peer:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode 16.4
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+      - name: Generate isolated project
+        run: |
+          brew install xcodegen
+          xcodegen --version | tee xcodegen-version.log
+          xcodegen generate --spec tools/WanQuicInterop/AppleQuicPeer/project.yml
+      - name: Build and native XCTest
+        run: |
+          set -o pipefail
+          xcodebuild -project tools/WanQuicInterop/AppleQuicPeer/WanQuicInterop.xcodeproj -scheme WanQuicInterop -destination 'platform=iOS Simulator,name=iPhone 16,OS=18.5' -resultBundlePath WanQuicInterop.xcresult CODE_SIGNING_ALLOWED=NO test 2>&1 | tee wan-quic-xcodebuild.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wan-quic-native-evidence
+          path: |
+            WanQuicInterop.xcresult
+            wan-quic-xcodebuild.log
+            xcodegen-version.log
