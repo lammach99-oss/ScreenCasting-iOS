@@ -1,6 +1,11 @@
 name: Isolated WAN QUIC peer validation
 on:
   workflow_dispatch:
+    inputs:
+      package_ipa:
+        description: Build the isolated unsigned device IPA after XCTest GREEN
+        type: boolean
+        default: false
   push:
     branches: [codex/keyboard-v1-validation]
     paths:
@@ -22,6 +27,39 @@ jobs:
         run: |
           set -o pipefail
           xcodebuild -project tools/WanQuicInterop/AppleQuicPeer/WanQuicInterop.xcodeproj -scheme WanQuicInterop -destination 'platform=iOS Simulator,name=iPhone 16,OS=18.5' -resultBundlePath WanQuicInterop.xcresult CODE_SIGNING_ALLOWED=NO test 2>&1 | tee wan-quic-xcodebuild.log
+      - name: Build isolated unsigned device IPA
+        if: github.event_name == 'workflow_dispatch' && inputs.package_ipa
+        run: |
+          set -euo pipefail
+          mkdir -p package
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib
+          root=pathlib.Path('tools/WanQuicInterop/AppleQuicPeer')
+          files=[p for p in root.rglob('*') if p.is_file() and (p.suffix=='.swift' or p.name=='project.yml')]
+          data={'publicSha':os.environ['GITHUB_SHA'],'files':{str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(files)}}
+          pathlib.Path('package/qualified-source-manifest.json').write_text(json.dumps(data,indent=2))
+          PY
+          xcodebuild -project tools/WanQuicInterop/AppleQuicPeer/WanQuicInterop.xcodeproj -scheme WanQuicInterop -configuration Release -destination 'generic/platform=iOS' -derivedDataPath DeviceBuild CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build 2>&1 | tee package/device-build.log
+          mkdir -p package/Payload
+          ditto DeviceBuild/Build/Products/Release-iphoneos/WanQuicInterop.app package/Payload/WanQuicInterop.app
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' package/Payload/WanQuicInterop.app/Info.plist > package/bundle-id.txt
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' package/Payload/WanQuicInterop.app/Info.plist > package/deployment-target.txt
+          test "$(cat package/bundle-id.txt)" = 'com.screencasting.tools.wanquicinterop'
+          test "$(cat package/deployment-target.txt)" = '17.0'
+          test -f package/Payload/WanQuicInterop.app/WanQuicInterop
+          (cd package && /usr/bin/zip -qry WanQuicInterop-unsigned.ipa Payload)
+          shasum -a 256 package/WanQuicInterop-unsigned.ipa > package/IPA.sha256
+      - uses: actions/upload-artifact@v4
+        if: success() && github.event_name == 'workflow_dispatch' && inputs.package_ipa
+        with:
+          name: wan-quic-isolated-unsigned-ipa
+          path: |
+            package/WanQuicInterop-unsigned.ipa
+            package/qualified-source-manifest.json
+            package/device-build.log
+            package/bundle-id.txt
+            package/deployment-target.txt
+            package/IPA.sha256
       - uses: actions/upload-artifact@v4
         if: always()
         with:
