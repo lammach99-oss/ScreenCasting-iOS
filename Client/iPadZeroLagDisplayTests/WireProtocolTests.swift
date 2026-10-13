@@ -494,6 +494,123 @@ final class SingleLaneUsbProductionTests: XCTestCase {
 }
 
 final class ExternalPointerInputTests: XCTestCase {
+    @MainActor private final class ExternalPinch: UIPinchGestureRecognizer {
+        var phase: UIGestureRecognizer.State = .possible
+        var simulatedTouches = 0
+        override var state: UIGestureRecognizer.State {
+            get { phase }
+            set { phase = newValue }
+        }
+        override var numberOfTouches: Int { simulatedTouches }
+    }
+    @MainActor private func pinch(_ fixture: ScrollFixture, _ recognizer: ExternalPinch,
+                                  _ phase: UIGestureRecognizer.State, _ scale: CGFloat) {
+        recognizer.phase = phase; recognizer.scale = scale
+        let selector = NSSelectorFromString("handleExternalPointerPinch:")
+        XCTAssertTrue(fixture.view.responds(to: selector), "External semantic pinch handler is missing")
+        if fixture.view.responds(to: selector) { _ = fixture.view.perform(selector, with: recognizer) }
+    }
+    @MainActor func testExternalPointerInstallsExactlyOnePinchRecognizer() {
+        let view = PencilUIKitView(frame: .zero)
+        let pinch = (view.gestureRecognizers ?? []).compactMap { $0 as? UIPinchGestureRecognizer }
+        XCTAssertEqual(pinch.count, 1)
+        XCTAssertEqual(pinch.first?.allowedTouchTypes, [])
+        XCTAssertFalse(pinch.first?.cancelsTouchesInView ?? true)
+    }
+    @MainActor func testExternalPinchOutEmitsExactlyOneZoomInStep() {
+        let f = ScrollFixture(); defer { f.close() }; let p = ExternalPinch()
+        pinch(f,p,.began,1); for scale in [1.03,1.06,1.20] { pinch(f,p,.changed,scale) }
+        pinch(f,p,.ended,1.20)
+        XCTAssertEqual(f.commands.map(\.action), [.zoomWheel]); XCTAssertEqual(f.units(.zoomWheel),120)
+    }
+    @MainActor func testExternalPinchInEmitsExactlyOneZoomOutStep() {
+        let f = ScrollFixture(); defer { f.close() }; let p = ExternalPinch()
+        pinch(f,p,.began,1); for scale in [0.98,0.94,0.80] { pinch(f,p,.changed,scale) }
+        pinch(f,p,.ended,0.80)
+        XCTAssertEqual(f.commands.map(\.action), [.zoomWheel]); XCTAssertEqual(f.units(.zoomWheel),-120)
+    }
+    @MainActor func testExternalPinchNoiseBelowThresholdDoesNotZoom() {
+        let f = ScrollFixture(); defer { f.close() }; let p = ExternalPinch()
+        pinch(f,p,.began,1); for scale in [1.01,0.99,1.03,0.98] { pinch(f,p,.changed,scale) }
+        pinch(f,p,.ended,0.98); XCTAssertTrue(f.commands.isEmpty)
+    }
+    @MainActor func testExternalPinchLatchSuppressesRepeatedZoomSteps() {
+        let f = ScrollFixture(); defer { f.close() }; let p = ExternalPinch()
+        pinch(f,p,.began,1); for scale in [1.06,1.30,2.00] { pinch(f,p,.changed,scale) }
+        pinch(f,p,.ended,2); XCTAssertEqual(f.commands.count,1); XCTAssertEqual(f.units(.zoomWheel),120)
+        XCTAssertEqual(f.logs.filter { $0.contains("[EXTERNAL_PINCH]") }.count,1)
+    }
+    @MainActor func testExternalPinchCannotReverseAfterLatchWithinSameGesture() {
+        let f = ScrollFixture(); defer { f.close() }; let p = ExternalPinch()
+        pinch(f,p,.began,1); pinch(f,p,.changed,1.06); pinch(f,p,.changed,0.70)
+        pinch(f,p,.ended,0.70); XCTAssertEqual(f.commands.map(\.value),[120])
+    }
+    @MainActor func testExternalPinchLatchResetsAfterGestureCompletion() {
+        let f = ScrollFixture(); defer { f.close() }; let p = ExternalPinch()
+        for terminal in [UIGestureRecognizer.State.ended,.cancelled,.failed] {
+            pinch(f,p,.began,1); pinch(f,p,.changed,1.06); pinch(f,p,terminal,1.06)
+            pinch(f,p,.began,1); pinch(f,p,.changed,0.94); pinch(f,p,.ended,0.94)
+        }
+        XCTAssertEqual(f.commands.map(\.value),[120,-120,120,-120,120,-120])
+    }
+    @MainActor func testExternalPinchUsesRelativeBaselineAndRejectsMalformedScale() {
+        let f = ScrollFixture(); defer { f.close() }; let p = ExternalPinch()
+        pinch(f,p,.began,2); pinch(f,p,.changed,2.06); XCTAssertTrue(f.commands.isEmpty)
+        pinch(f,p,.changed,2.12); pinch(f,p,.ended,2.12); XCTAssertEqual(f.units(.zoomWheel),120)
+        f.commands.removeAll()
+        for invalid in [CGFloat.nan, .infinity, 0, -1] {
+            pinch(f,p,.began,invalid); pinch(f,p,.changed,1.50); pinch(f,p,.ended,1.50)
+            pinch(f,p,.began,1); pinch(f,p,.changed,invalid); pinch(f,p,.changed,1.50); pinch(f,p,.ended,1.50)
+        }
+        XCTAssertTrue(f.commands.isEmpty)
+    }
+    @MainActor func testExternalPinchZoomUsesLatestValidPointerTarget() {
+        let f = ScrollFixture(); defer { f.close() }; let p = ExternalPinch()
+        pinch(f,p,.began,1)
+        f.view.handleExternalPointer(id:2,phase:1,point:CGPoint(x:100,y:225),secondary:true,generation:7)
+        f.commands.removeAll(); pinch(f,p,.changed,1.06); pinch(f,p,.ended,1.06)
+        XCTAssertEqual(f.commands.first?.x,16384); XCTAssertEqual(f.commands.first?.y,49151)
+    }
+    @MainActor func testExternalPinchOutsideContentDoesNotEmitZoom() {
+        let f = ScrollFixture(); defer { f.close() }; let p = ExternalPinch()
+        pinch(f,p,.began,1)
+        f.view.handleExternalPointer(id:2,phase:1,point:CGPoint(x:-1,y:150),primary:true,generation:7)
+        pinch(f,p,.changed,1.06); pinch(f,p,.ended,1.06); XCTAssertTrue(f.commands.isEmpty)
+    }
+    @MainActor func testExternalPinchGenerationReplacementFencesStaleCallback() {
+        let f = ScrollFixture(); defer { f.close() }; let p = ExternalPinch()
+        pinch(f,p,.began,1); f.view.configureExternalPointer(active:true,generation:8)
+        f.view.handleExternalPointer(id:2,phase:1,point:CGPoint(x:100,y:225),secondary:true,generation:8)
+        f.commands.removeAll(); pinch(f,p,.changed,1.06); pinch(f,p,.ended,1.06)
+        XCTAssertTrue(f.commands.isEmpty)
+    }
+    @MainActor func testExternalPinchDoesNotLeakWheelScrollAndScrollRecoversAfterEnd() {
+        let f = ScrollFixture(); defer { f.close() }; let p = ExternalPinch()
+        f.event(.began); pinch(f,p,.began,1)
+        f.event(.changed,delta:CGPoint(x:10,y:10)); f.event(.began)
+        f.event(.changed,delta:CGPoint(x:10,y:10)); pinch(f,p,.changed,1.06)
+        pinch(f,p,.ended,1.06); f.event(.changed,delta:CGPoint(x:10,y:10))
+        XCTAssertEqual(f.commands.map(\.action),[.zoomWheel])
+        f.event(.began); f.event(.changed,delta:CGPoint(x:0,y:3)); f.event(.ended)
+        XCTAssertEqual(f.units(.verticalWheel),15); XCTAssertEqual(f.units(.horizontalWheel),0)
+    }
+    @MainActor func testExternalPinchRecognizerDoesNotClaimDirectTouchPinch() {
+        let f = ScrollFixture(); defer { f.close() }; let p = ExternalPinch(); p.simulatedTouches=2
+        pinch(f,p,.began,1); pinch(f,p,.changed,1.2); pinch(f,p,.ended,1.2)
+        XCTAssertTrue(f.commands.isEmpty)
+        let installed=(f.view.gestureRecognizers ?? []).compactMap { $0 as? UIPinchGestureRecognizer }
+        XCTAssertEqual(installed.first?.allowedTouchTypes,[])
+    }
+    @MainActor func testExternalPinchRetiresOnInactiveWindowAndViewport() {
+        for boundary in 0..<3 {
+            let f=ScrollFixture(); defer { f.close() }; let p=ExternalPinch()
+            pinch(f,p,.began,1)
+            if boundary==0 { f.view.configureExternalPointer(active:false,generation:7) }
+            else if boundary==1 { f.view.removeFromSuperview() }
+            else { f.view.contentViewport=VideoContentViewport(rect:CGRect(x:0.1,y:0.1,width:0.8,height:0.8)) }
+            pinch(f,p,.changed,1.2); pinch(f,p,.ended,1.2); XCTAssertTrue(f.commands.isEmpty)
+        }
+    }
     private let point = CGPoint(x: 0.25, y: 0.75)
 
     @MainActor private final class ScrollPan: UIPanGestureRecognizer {
