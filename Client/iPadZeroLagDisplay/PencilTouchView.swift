@@ -651,6 +651,12 @@ struct ExternalPointerInputState {
         return result
     }
 
+    func zoom(value: Int16, generation: UInt64) -> PointerInputCommand? {
+        guard owns(generation), pointerInside, let point = lastValidPoint,
+              value == 120 || value == -120 else { return nil }
+        return command(.zoomWheel, point, value: value)
+    }
+
     private static func wheelValue(points: CGFloat, remainder: inout CGFloat) -> Int16 {
         // Preserve 24 points == 120 units and fractional movement between updates.
         let accumulated = remainder + points
@@ -803,6 +809,37 @@ struct ExternalScrollGestureState {
     }
 }
 
+struct ExternalPinchGestureState {
+    static let activationRatio: CGFloat = 0.05
+    private(set) var generation: UInt64?
+    private(set) var latched = false
+    private var baselineScale: CGFloat = 1
+    var active: Bool { generation != nil }
+
+    mutating func begin(generation: UInt64, scale: CGFloat) {
+        self = Self()
+        guard scale.isFinite, scale > 0 else { return }
+        self.generation = generation
+        baselineScale = scale
+    }
+
+    mutating func update(scale: CGFloat, generation: UInt64) -> Int16? {
+        guard self.generation == generation else { return nil }
+        guard scale.isFinite, scale > 0 else { retire(); return nil }
+        let relative = scale / baselineScale
+        guard relative.isFinite else { retire(); return nil }
+        guard !latched else { return nil }
+        let value: Int16
+        if relative >= 1 + Self.activationRatio { value = 120 }
+        else if relative <= 1 - Self.activationRatio { value = -120 }
+        else { return nil }
+        latched = true
+        return value
+    }
+
+    mutating func retire() { self = Self() }
+}
+
 public class PencilUIKitView: UIView {
 
     public var onKeyboardInput: ((KeyboardInputCommand) -> Void)?
@@ -948,6 +985,7 @@ public class PencilUIKitView: UIView {
     private var externalPointerIDs = LifetimeIdentityMap<ObjectIdentifier>()
     private var externalScrollTranslation = CGPoint.zero
     private var externalScroll = ExternalScrollGestureState()
+    private var externalPinch = ExternalPinchGestureState()
     private var lastExternalMoveDiagnosticAt: TimeInterval = -.infinity
 
     override public init(frame: CGRect) {
@@ -1089,6 +1127,7 @@ public class PencilUIKitView: UIView {
     }
 
     func retireExternalPointer() {
+        externalPinch.retire()
         endExternalScroll(phase: "retired")
         let active = externalPointer.enabled
         let generation = externalPointer.generation
@@ -1107,6 +1146,11 @@ public class PencilUIKitView: UIView {
         scroll.allowedTouchTypes = []
         scroll.cancelsTouchesInView = false
         addGestureRecognizer(scroll)
+        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handleExternalPointerPinch(_:)))
+        // The existing indirect-input opt-in supplies touch-free trackpad transform events.
+        pinch.allowedTouchTypes = []
+        pinch.cancelsTouchesInView = false
+        addGestureRecognizer(pinch)
     }
 
     @objc private func handleExternalPointerHover(_ recognizer: UIHoverGestureRecognizer) {
@@ -1121,6 +1165,7 @@ public class PencilUIKitView: UIView {
     }
 
     @objc private func handleExternalPointerScroll(_ recognizer: UIPanGestureRecognizer) {
+        guard !externalPinch.active else { return }
         guard window != nil, let generation = externalPointer.generation else { return }
         let translation = recognizer.translation(in: self)
         switch recognizer.state {
@@ -1143,6 +1188,29 @@ public class PencilUIKitView: UIView {
             }
         case .ended, .cancelled, .failed:
             endExternalScroll(phase: String(describing: recognizer.state))
+        default: break
+        }
+    }
+
+    @objc private func handleExternalPointerPinch(_ recognizer: UIPinchGestureRecognizer) {
+        guard window != nil, recognizer.numberOfTouches == 0,
+              let generation = externalPointer.generation else { return }
+        switch recognizer.state {
+        case .began:
+            externalPinch.retire()
+            guard externalPointer.canScroll else { return }
+            endExternalScroll(phase: "pinch")
+            externalPinch.begin(generation: generation, scale: recognizer.scale)
+        case .changed:
+            guard externalPinch.generation == generation else { return }
+            guard externalPointer.canScroll else { externalPinch.retire(); return }
+            if let value = externalPinch.update(scale: recognizer.scale, generation: generation),
+               let command = externalPointer.zoom(value: value, generation: generation) {
+                emitExternal(command)
+                diagnosticSink?("[EXTERNAL_PINCH] result=\(value > 0 ? "zoom_in" : "zoom_out") zoom_value=\(value) generation=\(generation) x=\(command.x) y=\(command.y)")
+            }
+        case .ended, .cancelled, .failed:
+            externalPinch.retire()
         default: break
         }
     }
