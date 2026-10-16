@@ -2,6 +2,40 @@ import XCTest
 @testable import WanQuicInterop
 
 final class EvidenceRecorderTests: XCTestCase {
+    func testLaneFailureEvidenceRequiresRoleIdentityAndNativeError() throws {
+        EventLog.beginRun(generation: 70)
+        let owner = UUID()
+        EventLog.write("lane_failed", generation: 70, owner: owner)
+        let export = try EventLog.export()
+        let lines = try String(contentsOf: export, encoding: .utf8).split(separator: "\n")
+        let events = try lines.map {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any])
+        }
+        let detail = try XCTUnwrap(events.first { $0["event"] as? String == "lane_failed" })
+        XCTAssertNotNil(detail["laneRole"] as? String)
+        XCTAssertNotNil(detail["laneID"] as? String)
+        XCTAssertNotNil(detail["nativeErrorDomain"] as? String)
+        XCTAssertNotNil(detail["nativeErrorCode"] as? Int)
+    }
+    func testRetirementEvidenceIdentifiesFirstOwnerAndDoesNotDuplicate() throws {
+        EventLog.beginRun(generation: 71)
+        let owner = QuicConnectionOwner(generation: 71)
+        owner.retire()
+        owner.retire()
+        let export = try EventLog.export()
+        let lines = try String(contentsOf: export, encoding: .utf8).split(separator: "\n")
+        let events = try lines.map {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any])
+        }
+        let retirements = events.filter { $0["event"] as? String == "owner_retired_detail" }
+        XCTAssertEqual(retirements.count, 1)
+        let first = try XCTUnwrap(retirements.first)
+        XCTAssertEqual(first["owner"] as? String, owner.id.uuidString)
+        XCTAssertEqual(first["generation"] as? Int, 71)
+        XCTAssertNotNil(first["retirementReason"] as? String)
+        XCTAssertNotNil(first["initiator"] as? String)
+        XCTAssertFalse(owner.accepts(71))
+    }
     private func directory() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
