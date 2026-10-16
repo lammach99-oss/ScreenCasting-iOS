@@ -66,7 +66,7 @@ final class InteropSession {
             let laneID = isDatagram ? o.datagramLaneID : o.controlLaneID
             o.trace("lane_created_detail", details: LaneEvidence.fields(role: role, laneID: laneID, state: "extracted"))
             lane.stateUpdateHandler = { [weak self, weak o, weak lane] state in
-                guard let self, let o, self.isCurrent(o) else { return }
+                guard let self, let o else { return }
                 o.trace("lane_state_detail", details: LaneEvidence.fields(role: role, laneID: laneID, state: String(describing: state).prefix(512).description))
                 if let metadata = lane?.metadata(definition: NWProtocolQUIC.definition) as? NWProtocolQUIC.Metadata {
                     o.trace("lane_quic_metadata_detail", details: ["laneRole": role, "laneID": laneID.uuidString, "streamID": metadata.streamIdentifier])
@@ -74,6 +74,7 @@ final class InteropSession {
                 if case .waiting(let error) = state {
                     o.trace("lane_waiting_detail", details: LaneEvidence.fields(role: role, laneID: laneID, state: "waiting", error: error))
                 }
+                guard self.isCurrent(o) else { return }
                 switch state {
                 case .ready:
                     EventLog.write(isDatagram ? "datagram_same_group" : "control_same_group", generation: o.generation, owner: o.id)
@@ -91,11 +92,13 @@ final class InteropSession {
     private func send(_ o: QuicConnectionOwner, lane: NWConnection, data: Data, sequence: UInt32) {
         guard isCurrent(o), o.pendingSends < 128 else { return }
         o.pendingSends += 1
+        let diagnosticRole = lane === o.control ? "control" : "datagram"
+        let diagnosticLaneID = lane === o.control ? o.controlLaneID : o.datagramLaneID
         lane.send(content: data, completion: .contentProcessed { [weak self, weak o] error in
             guard let self, let o else { return }
             o.pendingSends -= 1 // own bookkeeping even after retirement
             guard self.isCurrent(o) else { return }
-            var completion = LaneEvidence.fields(role: lane === o.control ? "control" : "datagram", laneID: lane === o.control ? o.controlLaneID : o.datagramLaneID, state: "send_completion", error: error)
+            var completion = LaneEvidence.fields(role: diagnosticRole, laneID: diagnosticLaneID, state: "send_completion", error: error)
             completion["bytes"] = data.count
             completion["sequence"] = sequence
             o.trace("lane_send_completion_detail", details: completion)
