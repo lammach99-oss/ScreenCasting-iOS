@@ -3,6 +3,13 @@ import Network
 @testable import WanQuicInterop
 
 final class EvidenceRecorderTests: XCTestCase {
+    func testCausalLaneEvidenceIncludesExtractContract() {
+        let fields = LaneEvidence.fields(role: "control", laneID: UUID(), state: "extract")
+        XCTAssertEqual(fields["extractEndpoint"] as? String, "nil")
+        XCTAssertEqual(fields["direction"] as? String, "bidirectional")
+        XCTAssertEqual(fields["isDatagram"] as? Bool, false)
+        XCTAssertNotNil(fields["optionsALPN"] as? String)
+    }
     func testLaneFailureEvidenceRequiresRoleIdentityAndNativeError() throws {
         EventLog.beginRun(generation: 70)
         let owner = UUID()
