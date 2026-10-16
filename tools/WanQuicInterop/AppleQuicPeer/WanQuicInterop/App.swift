@@ -7,6 +7,7 @@ struct WanQuicInteropApp: App {
     @State private var port = "4433"
     @State private var generation = "1"
     @State private var alpn = TestProtocol.alpn
+    @State private var experimentMode = ControlLaneExperimentMode.baselineConcurrent
     @State private var ca: Data?
     @State private var importing = false
     @State private var evidence = EvidenceSnapshot()
@@ -21,12 +22,17 @@ struct WanQuicInteropApp: App {
                 TextField("Port", text: $port)
                 TextField("Run generation (same as Windows)", text: $generation)
                 TextField("ALPN (change only for negative test)", text: $alpn)
+                Picker("Control lane experiment", selection: $experimentMode) {
+                    ForEach(ControlLaneExperimentMode.allCases, id: \.self) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
                 Button("Import dedicated CA DER") { importing = true }
                 Button("Connect") {
                     if let ca, let p = UInt16(port), let g = UInt64(generation), !host.isEmpty {
-                        EventLog.beginRun(generation: g)
+                        EventLog.beginRun(generation: g, experimentMode: experimentMode)
                         exportURL = nil
-                        session.start(host: host, port: p, generation: g, ca: ca, alpn: alpn)
+                        session.start(host: host, port: p, generation: g, ca: ca, alpn: alpn, experimentMode: experimentMode)
                     }
                 }.disabled(ca == nil)
                 Button("Retire connection") {

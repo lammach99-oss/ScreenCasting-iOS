@@ -146,10 +146,13 @@ final class EvidenceRecorder {
 enum EventLog {
     private static let recorder = EvidenceRecorder(directory:
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0])
-    static func beginRun(generation: UInt64) {
+    static func beginRun(generation: UInt64, experimentMode: ControlLaneExperimentMode = .baselineConcurrent) {
         do { _ = try recorder.beginRun(generation: generation) }
         catch { recorder.setError(error) }
-        write("run_started", generation: generation, owner: UUID())
+        let owner = UUID()
+        write("run_started", generation: generation, owner: owner, details: ["experimentMode": experimentMode.rawValue])
+        write("experiment_config_detail", generation: generation, owner: owner,
+            details: ControlLaneExperiment(mode: experimentMode).fields)
     }
     static func clear() { do { try recorder.clear() } catch { recorder.setError(error) } }
     static func snapshot() -> EvidenceSnapshot { recorder.snapshot() }

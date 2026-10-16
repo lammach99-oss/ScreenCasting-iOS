@@ -3,6 +3,42 @@ import Network
 @testable import WanQuicInterop
 
 final class EvidenceRecorderTests: XCTestCase {
+    func testExperimentMatrixPreservesOneVariableAndOnceOnlyStartup() {
+        var baseline = ControlLaneExperiment(mode: .baselineConcurrent)
+        XCTAssertEqual(baseline.groupReady(), [.concurrentLanes])
+        XCTAssertEqual(baseline.groupReady(), [])
+        XCTAssertEqual(baseline.controlState(.ready), [])
+        var only = ControlLaneExperiment(mode: .controlOnly)
+        XCTAssertEqual(only.groupReady(), [.controlOnly])
+        XCTAssertEqual(only.controlState(.ready), [])
+        var serialized = ControlLaneExperiment(mode: .serializedControlThenDatagram)
+        XCTAssertEqual(serialized.controlState(.ready), []) // no group authority yet
+        XCTAssertEqual(serialized.groupReady(), [.controlOnly])
+        for state in [NWConnection.State.setup, .preparing, .waiting(.posix(.ENETDOWN)), .failed(.posix(.ENETDOWN)), .cancelled] {
+            XCTAssertEqual(serialized.controlState(state), [])
+        }
+        XCTAssertEqual(serialized.controlState(.ready), [.datagramOnly])
+        XCTAssertEqual(serialized.controlState(.ready), [])
+        var deferred = ControlLaneExperiment(mode: .deferredControlOneQueueTurn)
+        XCTAssertEqual(deferred.groupReady(), [.deferControl])
+        XCTAssertEqual(deferred.groupReady(), [])
+        XCTAssertEqual(deferred.controlState(.ready), [])
+    }
+    func testAllExperimentConfigurationsAreExplicitAndControlConstructionIsUnchanged() {
+        XCTAssertEqual(ControlLaneExperimentMode.allCases.count, 4) // no speculative A4
+        for mode in ControlLaneExperimentMode.allCases {
+            let fields = ControlLaneExperiment(mode: mode).fields
+            XCTAssertEqual(fields["experimentMode"] as? String, mode.rawValue)
+            XCTAssertEqual(fields["controlConstructionAPI"] as? String, "extract(connectionTo:using:)")
+            XCTAssertEqual(fields["controlDirection"] as? String, "bidirectional")
+            XCTAssertEqual(fields["datagramEnabled"] as? Bool,
+                mode == .baselineConcurrent || mode == .serializedControlThenDatagram)
+            XCTAssertEqual(fields["controlStartPolicy"] as? String,
+                mode == .deferredControlOneQueueTurn ? "one_serial_queue_turn" : "synchronous_group_ready")
+        }
+        XCTAssertEqual(ControlLaneExperiment(mode: .serializedControlThenDatagram).fields["datagramStartPolicy"] as? String, "after_control_ready")
+        XCTAssertEqual(ControlLaneExperiment(mode: .controlOnly).fields["datagramStartPolicy"] as? String, "suppressed")
+    }
     func testDefaultExperimentEvidenceIdentifiesUnchangedConcurrentBaseline() throws {
         EventLog.beginRun(generation: 73)
         let export = try EventLog.export()
@@ -57,7 +93,7 @@ final class EvidenceRecorderTests: XCTestCase {
         owner.retire(reason: "lane_failed", initiator: "test")
         let export = try EventLog.export()
         let lines = try String(contentsOf: export, encoding: .utf8).split(separator: "\n")
-        XCTAssertEqual(lines.count, 34)
+        XCTAssertEqual(lines.count, 35) // run + experiment config + bounded trace + retirement
     }
     func testRetirementEvidenceIdentifiesFirstOwnerAndDoesNotDuplicate() throws {
         EventLog.beginRun(generation: 71)

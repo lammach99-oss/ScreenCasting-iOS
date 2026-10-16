@@ -2,6 +2,49 @@ import Foundation
 import Network
 import Security
 
+enum ControlLaneExperimentMode: String, CaseIterable {
+    case baselineConcurrent = "A0_baseline"
+    case controlOnly = "A1_control_only"
+    case serializedControlThenDatagram = "A2_serialized"
+    case deferredControlOneQueueTurn = "A3_deferred_control"
+}
+
+struct ControlLaneExperiment {
+    enum Action: Equatable { case concurrentLanes, controlOnly, datagramOnly, deferControl }
+    let mode: ControlLaneExperimentMode
+    private(set) var groupReadyOrdinal = 0
+    private(set) var controlReadyOrdinal = 0
+    private var started = false
+    private var datagramRequested = false
+    init(mode: ControlLaneExperimentMode = .baselineConcurrent) { self.mode = mode }
+    mutating func groupReady() -> [Action] {
+        groupReadyOrdinal += 1
+        guard !started else { return [] }
+        started = true
+        switch mode {
+        case .baselineConcurrent: return [.concurrentLanes]
+        case .controlOnly, .serializedControlThenDatagram: return [.controlOnly]
+        case .deferredControlOneQueueTurn: return [.deferControl]
+        }
+    }
+    mutating func controlState(_ state: NWConnection.State) -> [Action] {
+        guard started, case .ready = state else { return [] }
+        controlReadyOrdinal += 1
+        guard mode == .serializedControlThenDatagram, !datagramRequested else { return [] }
+        datagramRequested = true
+        return [.datagramOnly]
+    }
+    var fields: [String: Any] {
+        ["experimentMode": mode.rawValue,
+         "datagramEnabled": mode == .baselineConcurrent || mode == .serializedControlThenDatagram,
+         "datagramStartPolicy": mode == .baselineConcurrent ? "concurrent_baseline" :
+            (mode == .serializedControlThenDatagram ? "after_control_ready" : "suppressed"),
+         "controlStartPolicy": mode == .deferredControlOneQueueTurn ? "one_serial_queue_turn" : "synchronous_group_ready",
+         "controlConstructionAPI": "extract(connectionTo:using:)", "controlDirection": "bidirectional",
+         "groupReadyOrdinal": groupReadyOrdinal, "controlReadyOrdinal": controlReadyOrdinal]
+    }
+}
+
 // All mutable owner state is confined to InteropSession.queue. A retired owner
 // stays separate from its replacement; delayed completions capture that owner.
 final class QuicConnectionOwner {
@@ -21,8 +64,10 @@ final class QuicConnectionOwner {
     var nextReply: UInt32 = 0
     var pendingSends = 0
     var probed = false
-    init(generation: UInt64) {
+    var experiment: ControlLaneExperiment
+    init(generation: UInt64, experimentMode: ControlLaneExperimentMode = .baselineConcurrent) {
         self.generation = generation
+        experiment = ControlLaneExperiment(mode: experimentMode)
         framer = ControlStreamFramer(generation: generation)
     }
     func accepts(_ g: UInt64) -> Bool { live && g == generation }
@@ -33,6 +78,7 @@ final class QuicConnectionOwner {
         fields["groupID"] = id.uuidString
         fields["endpoint"] = diagnosticEndpoint
         fields["alpn"] = diagnosticALPN
+        fields["experimentMode"] = experiment.mode.rawValue
         EventLog.write(event, generation: generation, owner: id, details: fields)
     }
     func retire(reason: String = "explicit_retire", initiator: String = "caller") {
