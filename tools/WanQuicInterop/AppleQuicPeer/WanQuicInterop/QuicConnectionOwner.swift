@@ -40,6 +40,7 @@ final class QuicConnectionOwner {
         EventLog.write("owner_retired_detail", generation: generation, owner: id,
             details: ["retirementReason": reason, "initiator": initiator, "groupID": id.uuidString])
         live = false // before cancelling callbacks
+        trace("cancel_callsite_detail", details: ["controlLaneID": controlLaneID.uuidString, "datagramLaneID": datagramLaneID.uuidString, "callsite": "QuicConnectionOwner.retire", "reason": reason])
         control?.cancel()
         datagrams?.cancel()
         group?.cancel()

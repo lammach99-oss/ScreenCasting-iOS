@@ -2,6 +2,14 @@ import Foundation
 import Network
 
 enum LaneEvidence {
+    static func extractFields(role: String, laneID: UUID, options: NWProtocolQUIC.Options) -> [String: Any] {
+        var fields = fields(role: role, laneID: laneID, state: "extract")
+        fields["extractEndpoint"] = "nil"
+        fields["direction"] = String(describing: options.direction)
+        fields["isDatagram"] = options.isDatagram
+        fields["optionsALPN"] = TestProtocol.alpn
+        return fields
+    }
     static func fields(role: String, laneID: UUID, state: String, error: NWError? = nil) -> [String: Any] {
         var fields: [String: Any] = ["laneRole": role, "laneID": laneID.uuidString, "networkState": state]
         if let error {

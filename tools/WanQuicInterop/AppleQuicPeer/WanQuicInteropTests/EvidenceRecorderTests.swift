@@ -4,7 +4,9 @@ import Network
 
 final class EvidenceRecorderTests: XCTestCase {
     func testCausalLaneEvidenceIncludesExtractContract() {
-        let fields = LaneEvidence.fields(role: "control", laneID: UUID(), state: "extract")
+        let options = NWProtocolQUIC.Options(alpn: [TestProtocol.alpn])
+        options.direction = .bidirectional
+        let fields = LaneEvidence.extractFields(role: "control", laneID: UUID(), options: options)
         XCTAssertEqual(fields["extractEndpoint"] as? String, "nil")
         XCTAssertEqual(fields["direction"] as? String, "bidirectional")
         XCTAssertEqual(fields["isDatagram"] as? Bool, false)

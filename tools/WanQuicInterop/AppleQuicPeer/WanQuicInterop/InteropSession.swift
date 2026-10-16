@@ -54,6 +54,8 @@ final class InteropSession {
         controlOptions.direction = .bidirectional
         let datagramOptions = NWProtocolQUIC.Options(alpn: [TestProtocol.alpn])
         datagramOptions.isDatagram = true
+        o.trace("extract_arguments_detail", details: LaneEvidence.extractFields(role: "control", laneID: o.controlLaneID, options: controlOptions))
+        o.trace("extract_arguments_detail", details: LaneEvidence.extractFields(role: "datagram", laneID: o.datagramLaneID, options: datagramOptions))
         guard let control = group.extract(connectionTo: nil, using: controlOptions),
               let datagrams = group.extract(connectionTo: nil, using: datagramOptions) else { fail(o, "extract_failed"); return }
         // Both lanes are extracted from this one multiplex group. Never create
@@ -63,9 +65,15 @@ final class InteropSession {
             let role = isDatagram ? "datagram" : "control"
             let laneID = isDatagram ? o.datagramLaneID : o.controlLaneID
             o.trace("lane_created_detail", details: LaneEvidence.fields(role: role, laneID: laneID, state: "extracted"))
-            lane.stateUpdateHandler = { [weak self, weak o] state in
+            lane.stateUpdateHandler = { [weak self, weak o, weak lane] state in
                 guard let self, let o, self.isCurrent(o) else { return }
                 o.trace("lane_state_detail", details: LaneEvidence.fields(role: role, laneID: laneID, state: String(describing: state).prefix(512).description))
+                if let metadata = lane?.metadata(definition: NWProtocolQUIC.definition) as? NWProtocolQUIC.Metadata {
+                    o.trace("lane_quic_metadata_detail", details: ["laneRole": role, "laneID": laneID.uuidString, "streamID": metadata.streamIdentifier])
+                }
+                if case .waiting(let error) = state {
+                    o.trace("lane_waiting_detail", details: LaneEvidence.fields(role: role, laneID: laneID, state: "waiting", error: error))
+                }
                 switch state {
                 case .ready:
                     EventLog.write(isDatagram ? "datagram_same_group" : "control_same_group", generation: o.generation, owner: o.id)
@@ -87,6 +95,10 @@ final class InteropSession {
             guard let self, let o else { return }
             o.pendingSends -= 1 // own bookkeeping even after retirement
             guard self.isCurrent(o) else { return }
+            var completion = LaneEvidence.fields(role: lane === o.control ? "control" : "datagram", laneID: lane === o.control ? o.controlLaneID : o.datagramLaneID, state: "send_completion", error: error)
+            completion["bytes"] = data.count
+            completion["sequence"] = sequence
+            o.trace("lane_send_completion_detail", details: completion)
             EventLog.write(error == nil ? "send_processed" : "send_rejected",
                 generation: o.generation, owner: o.id, sequence: sequence, value: data.count)
         })
@@ -107,6 +119,9 @@ final class InteropSession {
     private func receiveControl(_ o: QuicConnectionOwner) {
         o.control?.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self, weak o] data, _, complete, error in
             guard let self, let o, self.isCurrent(o) else { return }
+            var detail = LaneEvidence.fields(role: "control", laneID: o.controlLaneID, state: "receive_completion", error: error)
+            detail["bytes"] = data?.count ?? 0; detail["isComplete"] = complete
+            o.trace("lane_receive_completion_detail", details: detail)
             do {
                 if let data { for r in try o.framer.feed(data) {
                     guard r.opcode == 2, r.sequence == o.nextReply else { throw TestProtocol.Failure.invalid }
@@ -122,6 +137,9 @@ final class InteropSession {
     private func receiveDatagram(_ o: QuicConnectionOwner) {
         o.datagrams?.receiveMessage { [weak self, weak o] data, _, _, error in
             guard let self, let o, self.isCurrent(o) else { return }
+            var detail = LaneEvidence.fields(role: "datagram", laneID: o.datagramLaneID, state: "receive_completion", error: error)
+            detail["bytes"] = data?.count ?? 0
+            o.trace("lane_receive_completion_detail", details: detail)
             do {
                 if let data {
                     let r = try TestProtocol.decodeDatagram(data, generation: o.generation, channel: 1)
