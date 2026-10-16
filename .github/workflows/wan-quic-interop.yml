@@ -23,6 +23,18 @@ jobs:
           brew install xcodegen
           xcodegen --version | tee xcodegen-version.log
           xcodegen generate --spec tools/WanQuicInterop/AppleQuicPeer/project.yml
+      - name: Retain pinned Network framework declarations
+        run: |
+          set -euo pipefail
+          mkdir -p sdk-contract
+          xcodebuild -version > sdk-contract/xcode-version.txt
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          echo "$SDK" > sdk-contract/sdk-path.txt
+          FRAMEWORK="$SDK/System/Library/Frameworks/Network.framework"
+          cp "$FRAMEWORK/Headers/connection_group.h" sdk-contract/
+          cp "$FRAMEWORK/Headers/quic_options.h" sdk-contract/
+          find "$FRAMEWORK/Modules" -name '*.swiftinterface' -exec cp {} sdk-contract/ \;
+          shasum -a 256 sdk-contract/* > sdk-contract.sha256
       - name: Create exact native test simulator
         run: |
           set -euo pipefail
@@ -84,3 +96,5 @@ jobs:
             xcodegen-version.log
             simulator-runtimes.json
             simulator-types.json
+            sdk-contract/**
+            sdk-contract.sha256
