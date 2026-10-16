@@ -6,9 +6,9 @@ enum LaneEvidence {
         var fields: [String: Any] = ["laneRole": role, "laneID": laneID.uuidString, "networkState": state]
         if let error {
             switch error {
-            case .posix(let code): fields["nativeErrorDomain"] = "POSIX"; fields["nativeErrorCode"] = code.rawValue
-            case .dns(let code): fields["nativeErrorDomain"] = "DNS"; fields["nativeErrorCode"] = code
-            case .tls(let code): fields["nativeErrorDomain"] = "TLS"; fields["nativeErrorCode"] = code
+            case .posix(let code): fields["nativeErrorDomain"] = "POSIX"; fields["nativeErrorCode"] = Int(code.rawValue)
+            case .dns(let code): fields["nativeErrorDomain"] = "DNS"; fields["nativeErrorCode"] = Int(code)
+            case .tls(let code): fields["nativeErrorDomain"] = "TLS"; fields["nativeErrorCode"] = Int(code)
             @unknown default: fields["nativeErrorDomain"] = "unknown"; fields["nativeErrorCode"] = (error as NSError).code
             }
             fields["nativeErrorDescription"] = String(describing: error).prefix(512).description
