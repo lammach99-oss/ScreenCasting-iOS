@@ -3,6 +3,21 @@ import Network
 @testable import WanQuicInterop
 
 final class EvidenceRecorderTests: XCTestCase {
+    func testDefaultExperimentEvidenceIdentifiesUnchangedConcurrentBaseline() throws {
+        EventLog.beginRun(generation: 73)
+        let export = try EventLog.export()
+        let events = try String(contentsOf: export, encoding: .utf8).split(separator: "\n").map {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any])
+        }
+        let config = try XCTUnwrap(events.first { $0["event"] as? String == "experiment_config_detail" })
+        XCTAssertEqual(config["experimentMode"] as? String, "A0_baseline")
+        XCTAssertEqual(config["datagramEnabled"] as? Bool, true)
+        XCTAssertEqual(config["controlStartPolicy"] as? String, "synchronous_group_ready")
+        XCTAssertEqual(config["datagramStartPolicy"] as? String, "concurrent_baseline")
+        XCTAssertEqual(config["controlConstructionAPI"] as? String, "extract(connectionTo:using:)")
+        XCTAssertEqual(config["groupReadyOrdinal"] as? Int, 0)
+        XCTAssertEqual(config["controlReadyOrdinal"] as? Int, 0)
+    }
     func testCausalLaneEvidenceIncludesExtractContract() {
         let options = NWProtocolQUIC.Options(alpn: [TestProtocol.alpn])
         options.direction = .bidirectional
