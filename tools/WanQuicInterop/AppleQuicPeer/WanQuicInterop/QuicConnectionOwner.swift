@@ -7,6 +7,11 @@ import Security
 final class QuicConnectionOwner {
     let id = UUID()
     let generation: UInt64
+    let controlLaneID = UUID()
+    let datagramLaneID = UUID()
+    private var diagnosticCount = 0
+    var diagnosticEndpoint = ""
+    var diagnosticALPN = ""
     var live = true
     var group: NWConnectionGroup?
     var control: NWConnection?
@@ -21,8 +26,19 @@ final class QuicConnectionOwner {
         framer = ControlStreamFramer(generation: generation)
     }
     func accepts(_ g: UInt64) -> Bool { live && g == generation }
-    func retire() {
+    func trace(_ event: String, details: [String: Any]) {
+        guard diagnosticCount < 32 else { return }
+        diagnosticCount += 1
+        var fields = details
+        fields["groupID"] = id.uuidString
+        fields["endpoint"] = diagnosticEndpoint
+        fields["alpn"] = diagnosticALPN
+        EventLog.write(event, generation: generation, owner: id, details: fields)
+    }
+    func retire(reason: String = "explicit_retire", initiator: String = "caller") {
         guard live else { return }
+        EventLog.write("owner_retired_detail", generation: generation, owner: id,
+            details: ["retirementReason": reason, "initiator": initiator, "groupID": id.uuidString])
         live = false // before cancelling callbacks
         control?.cancel()
         datagrams?.cancel()

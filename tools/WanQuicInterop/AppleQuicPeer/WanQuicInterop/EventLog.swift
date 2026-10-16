@@ -1,4 +1,28 @@
 import Foundation
+import Network
+
+enum LaneEvidence {
+    static func fields(role: String, laneID: UUID, state: String, error: NWError? = nil) -> [String: Any] {
+        var fields: [String: Any] = ["laneRole": role, "laneID": laneID.uuidString, "networkState": state]
+        if let error {
+            switch error {
+            case .posix(let code): fields["nativeErrorDomain"] = "POSIX"; fields["nativeErrorCode"] = code.rawValue
+            case .dns(let code): fields["nativeErrorDomain"] = "DNS"; fields["nativeErrorCode"] = code
+            case .tls(let code): fields["nativeErrorDomain"] = "TLS"; fields["nativeErrorCode"] = code
+            @unknown default: fields["nativeErrorDomain"] = "unknown"; fields["nativeErrorCode"] = (error as NSError).code
+            }
+            fields["nativeErrorDescription"] = String(describing: error).prefix(512).description
+            let bridged = error as NSError
+            fields["bridgedDomain"] = bridged.domain
+            fields["bridgedCode"] = bridged.code
+            if let underlying = bridged.userInfo[NSUnderlyingErrorKey] as? NSError {
+                fields["underlyingDomain"] = underlying.domain
+                fields["underlyingCode"] = underlying.code
+            }
+        }
+        return fields
+    }
+}
 
 struct EvidenceSnapshot {
     var runID = "None"
@@ -128,10 +152,11 @@ enum EventLog {
         return try recorder.export(to: directory)
     }
     // Existing event semantics/fields remain unchanged; only synthetic metadata.
-    static func write(_ event: String, generation: UInt64, owner: UUID, sequence: UInt32 = 0, value: Int = 0) {
-        let fields: [String: Any] = ["event": event, "generation": generation,
+    static func write(_ event: String, generation: UInt64, owner: UUID, sequence: UInt32 = 0, value: Int = 0, details: [String: Any] = [:]) {
+        var fields: [String: Any] = details
+        fields.merge(["event": event, "generation": generation,
             "owner": owner.uuidString, "sequence": sequence, "value": value,
-            "monotonicSeconds": ProcessInfo.processInfo.systemUptime]
+            "monotonicSeconds": ProcessInfo.processInfo.systemUptime]) { _, base in base }
         if let data = try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]),
            let line = String(data: data, encoding: .utf8) {
             print(line)

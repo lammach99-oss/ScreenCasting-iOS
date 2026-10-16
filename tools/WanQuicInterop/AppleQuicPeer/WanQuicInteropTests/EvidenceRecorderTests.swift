@@ -1,11 +1,14 @@
 import XCTest
+import Network
 @testable import WanQuicInterop
 
 final class EvidenceRecorderTests: XCTestCase {
     func testLaneFailureEvidenceRequiresRoleIdentityAndNativeError() throws {
         EventLog.beginRun(generation: 70)
         let owner = UUID()
-        EventLog.write("lane_failed", generation: 70, owner: owner)
+        let lane = UUID()
+        EventLog.write("lane_failed", generation: 70, owner: owner, details:
+            LaneEvidence.fields(role: "datagram", laneID: lane, state: "failed", error: .posix(.ECONNREFUSED)))
         let export = try EventLog.export()
         let lines = try String(contentsOf: export, encoding: .utf8).split(separator: "\n")
         let events = try lines.map {
@@ -16,6 +19,21 @@ final class EvidenceRecorderTests: XCTestCase {
         XCTAssertNotNil(detail["laneID"] as? String)
         XCTAssertNotNil(detail["nativeErrorDomain"] as? String)
         XCTAssertNotNil(detail["nativeErrorCode"] as? Int)
+        XCTAssertEqual(detail["laneRole"] as? String, "datagram")
+        XCTAssertEqual(detail["laneID"] as? String, lane.uuidString)
+        XCTAssertEqual(detail["nativeErrorDomain"] as? String, "POSIX")
+        XCTAssertEqual(detail["nativeErrorCode"] as? Int, Int(POSIXErrorCode.ECONNREFUSED.rawValue))
+    }
+    func testNativeTLSAndDNSCodesAndDiagnosticBound() throws {
+        XCTAssertEqual(LaneEvidence.fields(role: "control", laneID: UUID(), state: "failed", error: .tls(-9807))["nativeErrorCode"] as? Int, -9807)
+        XCTAssertEqual(LaneEvidence.fields(role: "datagram", laneID: UUID(), state: "failed", error: .dns(-65537))["nativeErrorDomain"] as? String, "DNS")
+        EventLog.beginRun(generation: 72)
+        let owner = QuicConnectionOwner(generation: 72)
+        for _ in 0..<100 { owner.trace("lane_state_detail", details: [:]) }
+        owner.retire(reason: "lane_failed", initiator: "test")
+        let export = try EventLog.export()
+        let lines = try String(contentsOf: export, encoding: .utf8).split(separator: "\n")
+        XCTAssertEqual(lines.count, 34)
     }
     func testRetirementEvidenceIdentifiesFirstOwnerAndDoesNotDuplicate() throws {
         EventLog.beginRun(generation: 71)

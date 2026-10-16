@@ -7,10 +7,13 @@ final class InteropSession {
     private var current: QuicConnectionOwner?
     func start(host: String, port: UInt16, generation: UInt64, ca: Data, alpn: String = TestProtocol.alpn) {
         queue.async { [self] in
-            current?.retire()
+            current?.retire(reason: "replacement_start", initiator: "start")
             guard generation > 0, let certificate = SecCertificateCreateWithData(nil, ca as CFData) else { return }
             let o = QuicConnectionOwner(generation: generation)
+            o.diagnosticEndpoint = "\(host):\(port)"
+            o.diagnosticALPN = alpn
             current = o
+            o.trace("session_owner_detail", details: ["evidenceRunID": EventLog.snapshot().runID])
             let parameters = QuicConnectionOwner.parameters(host: host, ca: certificate, alpn: alpn)
             let descriptor = NWMultiplexGroup(to: .hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!))
             let group = NWConnectionGroup(with: descriptor, using: parameters)
@@ -23,24 +26,27 @@ final class InteropSession {
             }
             group.stateUpdateHandler = { [weak self, weak o] state in
                 guard let self, let o, self.isCurrent(o) else { return }
+                o.trace("group_state_detail", details: ["networkState": String(describing: state).prefix(512).description])
                 switch state {
                 case .ready:
                     guard let metadata = o.group?.metadata(definition: NWProtocolQUIC.definition) as? NWProtocolQUIC.Metadata,
                           metadata.negotiatedALPN == TestProtocol.alpn else { self.fail(o, "alpn_mismatch"); return }
                     EventLog.write("group_ready_exact_alpn", generation: generation, owner: o.id)
                     self.openLanes(o)
-                case .failed: self.fail(o, "group_failed")
+                case .failed(let error):
+                    o.trace("group_failed_detail", details: LaneEvidence.fields(role: "group", laneID: o.id, state: "failed", error: error))
+                    self.fail(o, "group_failed")
                 default: break
                 }
             }
             group.start(queue: queue)
         }
     }
-    func stop() { queue.async { [self] in current?.retire(); current = nil } }
+    func stop() { queue.async { [self] in current?.retire(reason: "operator_stop", initiator: "stop"); current = nil } }
     private func isCurrent(_ o: QuicConnectionOwner) -> Bool { current === o && o.accepts(o.generation) }
-    private func fail(_ o: QuicConnectionOwner, _ event: String) {
-        EventLog.write(event, generation: o.generation, owner: o.id)
-        o.retire()
+    private func fail(_ o: QuicConnectionOwner, _ event: String, details: [String: Any] = [:]) {
+        EventLog.write(event, generation: o.generation, owner: o.id, details: details)
+        o.retire(reason: event, initiator: "InteropSession.fail")
     }
     private func openLanes(_ o: QuicConnectionOwner) {
         guard isCurrent(o), o.control == nil, o.datagrams == nil, let group = o.group else { return }
@@ -54,17 +60,23 @@ final class InteropSession {
         // a standalone NWConnection as a fallback.
         o.control = control; o.datagrams = datagrams
         for (lane, isDatagram) in [(control, false), (datagrams, true)] {
+            let role = isDatagram ? "datagram" : "control"
+            let laneID = isDatagram ? o.datagramLaneID : o.controlLaneID
+            o.trace("lane_created_detail", details: LaneEvidence.fields(role: role, laneID: laneID, state: "extracted"))
             lane.stateUpdateHandler = { [weak self, weak o] state in
                 guard let self, let o, self.isCurrent(o) else { return }
+                o.trace("lane_state_detail", details: LaneEvidence.fields(role: role, laneID: laneID, state: String(describing: state).prefix(512).description))
                 switch state {
                 case .ready:
                     EventLog.write(isDatagram ? "datagram_same_group" : "control_same_group", generation: o.generation, owner: o.id)
                     if isDatagram { self.receiveDatagram(o) } else { self.receiveControl(o) }
                     self.probeWhenReady(o)
-                case .failed: self.fail(o, "lane_failed")
+                case .failed(let error): self.fail(o, "lane_failed", details:
+                    LaneEvidence.fields(role: role, laneID: laneID, state: "failed", error: error))
                 default: break
                 }
             }
+            o.trace("lane_start_detail", details: LaneEvidence.fields(role: role, laneID: laneID, state: "start"))
             lane.start(queue: queue)
         }
     }
