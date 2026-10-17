@@ -1,0 +1,39 @@
+name: P1 Client qualification
+on:
+  workflow_dispatch:
+    inputs:
+      selectors:
+        type: string
+        default: iPadCastingTests/RendererConstantOwnershipTests
+permissions:
+  contents: read
+  actions: read
+jobs:
+  native:
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+      - name: Acquire exact qualified G02 dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/producer
+          gh api repos/lammach99-oss/ScreenCasting-iOS/actions/artifacts/12091540222 > evidence/producer/artifact.json
+          gh api repos/lammach99-oss/ScreenCasting-iOS/actions/runs/39005711789 > evidence/producer/run.json
+          gh api repos/lammach99-oss/ScreenCasting-iOS/actions/artifacts/12091540222/zip > evidence/producer/artifact.zip
+          python3 Client/scripts/p1_native_qualification.py prepare
+      - name: Build and qualify immutable Client snapshot
+        env:
+          P1_SELECTORS: ${{ inputs.selectors }}
+        run: python3 Client/scripts/p1_native_qualification.py test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: P1-Client-native-${{ github.run_id }}
+          path: evidence
+          retention-days: 14

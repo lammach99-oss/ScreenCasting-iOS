@@ -1,6 +1,60 @@
 import XCTest
 import Network
+import Metal
 @testable import iPadCasting
+
+final class RendererConstantOwnershipTests: XCTestCase {
+    func testTransientConstantsKeepTwoEncodedDrawsIndependent() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        let library = try device.makeLibrary(source: """
+            #include <metal_stdlib>
+            using namespace metal;
+            struct Out { float4 position [[position]]; float2 scale; };
+            vertex Out v(uint i [[vertex_id]], constant float2& s [[buffer(0)]]) {
+                float2 p[3] = {float2(-1,-1),float2(3,-1),float2(-1,3)};
+                return {float4(p[i],0,1),s};
+            }
+            fragment float4 f(Out x [[stage_in]]) { return float4(x.scale,0,1); }
+            """, options: nil)
+        let descriptor = MTLRenderPipelineDescriptor()
+        descriptor.vertexFunction = library.makeFunction(name: "v")
+        descriptor.fragmentFunction = library.makeFunction(name: "f")
+        descriptor.colorAttachments[0].pixelFormat = .rgba32Float
+        let pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
+        let command = try XCTUnwrap(queue.makeCommandBuffer())
+        var targets: [MTLTexture] = []
+        for expected in [SIMD2<Float>(0.25, 0.5), SIMD2<Float>(0.75, 1)] {
+            let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba32Float, width: 1, height: 1, mipmapped: false)
+            textureDescriptor.storageMode = .shared
+            textureDescriptor.usage = .renderTarget
+            let texture = try XCTUnwrap(device.makeTexture(descriptor: textureDescriptor))
+            targets.append(texture)
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture = texture
+            pass.colorAttachments[0].loadAction = .clear
+            pass.colorAttachments[0].storeAction = .store
+            let encoder = try XCTUnwrap(command.makeRenderCommandEncoder(descriptor: pass))
+            encoder.setRenderPipelineState(pipeline)
+            var scale = expected
+            encoder.setVertexBytes(&scale, length: MemoryLayout<SIMD2<Float>>.size, index: 0)
+            scale = .zero // caller storage is deliberately reused before GPU submission
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            encoder.endEncoding()
+        }
+        command.commit()
+        command.waitUntilCompleted()
+        XCTAssertEqual(command.status, .completed)
+        for (texture, expected) in zip(targets, [SIMD2<Float>(0.25, 0.5), SIMD2<Float>(0.75, 1)]) {
+            var pixel = SIMD4<Float>.zero
+            texture.getBytes(&pixel, bytesPerRow: MemoryLayout<SIMD4<Float>>.size,
+                from: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0)
+            XCTAssertEqual(pixel.x, expected.x)
+            XCTAssertEqual(pixel.y, expected.y)
+        }
+    }
+}
 
 final class Display120HzSourceTests: XCTestCase {
     func testCapabilitiesDecodeCanonical120HzNativeModes() throws {
