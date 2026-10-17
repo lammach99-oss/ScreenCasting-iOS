@@ -3,6 +3,53 @@ import Network
 import Metal
 @testable import iPadCasting
 
+final class UsbBindCompletionOwnershipTests: XCTestCase {
+    func testRetiredSendCompletionCannotAdoptOrReplaceNewLane() throws {
+        let queue = DispatchQueue(label: "UsbBindCompletionOwnershipTests")
+        let session = try XCTUnwrap(SessionID(bytes: Data(repeating: 7, count: 16)))
+        var completions: [(NWError?) -> Void] = []
+        var adopted: [NWConnection] = []
+        let server = UsbLaneServer(networkQueue: queue, parametersProvider: { .tcp },
+            onBound: { _, _, connection in adopted.append(connection) }, onFailure: { _ in XCTFail() })
+        let old = NWConnection(host: "127.0.0.1", port: 1, using: .tcp)
+        let replacement = NWConnection(host: "127.0.0.1", port: 2, using: .tcp)
+        queue.sync {
+            server.bindingResultSenderForTesting = { _, completion in completions.append(completion) }
+            server.prepareBoundForTesting(old, sessionID: session, connectionGeneration: 1, lane: .video, generation: 1)
+            server.prepareBoundForTesting(replacement, sessionID: session, connectionGeneration: 2, lane: .video, generation: 1)
+            completions[1](nil)
+        }
+        queue.sync { }
+        queue.sync { completions[0](nil); completions[1](nil) }
+        queue.sync { }
+        queue.sync {
+            XCTAssertEqual(adopted.count, 1)
+            XCTAssertTrue(adopted.first === replacement)
+        }
+        server.abort()
+        queue.sync { }
+    }
+
+    func testFinalizeAndErrorCompletionNeverAdopt() throws {
+        let queue = DispatchQueue(label: "UsbBindCompletionOwnershipTests.finalize")
+        let session = try XCTUnwrap(SessionID(bytes: Data(repeating: 8, count: 16)))
+        var completion: ((NWError?) -> Void)?
+        let server = UsbLaneServer(networkQueue: queue, parametersProvider: { .tcp },
+            onBound: { _, _, _ in XCTFail("retired lane adopted") }, onFailure: { _ in XCTFail() })
+        queue.sync {
+            server.bindingResultSenderForTesting = { _, callback in completion = callback }
+            server.prepareBoundForTesting(NWConnection(host: "127.0.0.1", port: 1, using: .tcp),
+                sessionID: session, connectionGeneration: 1, lane: .audio, generation: 1)
+        }
+        server.finalize()
+        queue.sync { }
+        completion?(nil)
+        queue.sync { }
+        completion?(.posix(.ECONNRESET))
+        queue.sync { }
+    }
+}
+
 final class RendererConstantOwnershipTests: XCTestCase {
     func testTransientConstantsKeepTwoEncodedDrawsIndependent() throws {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
