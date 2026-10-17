@@ -2048,17 +2048,7 @@ public class NetworkManager: ObservableObject {
                 connection.cancel()
                 return
             }
-            guard self.usbLaneServer.owns(token, connection: connection),
-                  token.connectionGeneration == self.connectionGeneration,
-                  self.pendingTransportOffer?.sessionID == token.sessionID,
-                  self.pendingTransportOffer?.mode == RealtimeTransportMode.usbSplitTLS else {
-                connection.cancel()
-                return
-            }
-            let lane = token.lane
-            self.usbLaneConnections[lane]?.cancel()
-            self.usbLaneConnections[lane] = connection
-            self.startUsbLaneReceiveLoop(connection, lane: lane, generation: token.connectionGeneration)
+            self.adoptUsbLane(token, connection: connection)
         },
         onFailure: { [weak self] error in
             self?.handleStreamError(
@@ -3831,6 +3821,21 @@ public class NetworkManager: ObservableObject {
             mode: RealtimeTransportMode.usbSplitTLS,
             audioEnabled: clientSettingsState.effective.audioEnabled)
         recordDiagnosticLine("[USB_AUDIO_RUNTIME] generation=\(generation) available=0 reason=\(reason)")
+    }
+
+    private func adoptUsbLane(_ token: UsbLaneBindToken, connection: NWConnection) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard usbLaneServer.owns(token, connection: connection),
+              token.connectionGeneration == connectionGeneration,
+              pendingTransportOffer?.sessionID == token.sessionID,
+              pendingTransportOffer?.mode == RealtimeTransportMode.usbSplitTLS else {
+            connection.cancel()
+            return
+        }
+        let lane = token.lane
+        usbLaneConnections[lane]?.cancel()
+        usbLaneConnections[lane] = connection
+        startUsbLaneReceiveLoop(connection, lane: lane, generation: token.connectionGeneration)
     }
 
     private func startUsbLaneReceiveLoop(
