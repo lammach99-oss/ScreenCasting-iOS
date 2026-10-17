@@ -2043,14 +2043,22 @@ public class NetworkManager: ObservableObject {
             guard let self else { throw USBListenerError.identityUnavailable }
             return try self.buildUSBListenerParameters()
         },
-        onBound: { [weak self] lane, _, connection in
+        onBound: { [weak self] token, _, connection in
             guard let self else {
                 connection.cancel()
                 return
             }
+            guard self.usbLaneServer.owns(token, connection: connection),
+                  token.connectionGeneration == self.connectionGeneration,
+                  self.pendingTransportOffer?.sessionID == token.sessionID,
+                  self.pendingTransportOffer?.mode == RealtimeTransportMode.usbSplitTLS else {
+                connection.cancel()
+                return
+            }
+            let lane = token.lane
             self.usbLaneConnections[lane]?.cancel()
             self.usbLaneConnections[lane] = connection
-            self.startUsbLaneReceiveLoop(connection, lane: lane)
+            self.startUsbLaneReceiveLoop(connection, lane: lane, generation: token.connectionGeneration)
         },
         onFailure: { [weak self] error in
             self?.handleStreamError(
@@ -3827,10 +3835,9 @@ public class NetworkManager: ObservableObject {
 
     private func startUsbLaneReceiveLoop(
         _ connection: NWConnection,
-        lane: UsbLaneKind)
+        lane: UsbLaneKind, generation: UInt64)
     {
         dispatchPrecondition(condition: .onQueue(networkQueue))
-        let generation = connectionGeneration
         let parser = WireStreamParser(generation: generation)
         var terminated = false
 
@@ -4684,7 +4691,8 @@ public class NetworkManager: ObservableObject {
                     usbSplitCommitGate.begin(sessionID: offer.sessionID)
                     usbLaneServer.start(
                         sessionID: offer.sessionID,
-                        secret: offer.usbBindingSecret)
+                        secret: offer.usbBindingSecret,
+                        connectionGeneration: generation)
                 }
             } else {
                 offer.zeroSecrets()

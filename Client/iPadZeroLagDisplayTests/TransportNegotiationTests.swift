@@ -4,6 +4,52 @@ import Metal
 @testable import iPadCasting
 
 final class UsbBindCompletionOwnershipTests: XCTestCase {
+    func testEveryBindIdentityComponentIsRequired() throws {
+        let queue = DispatchQueue(label: "UsbBindCompletionOwnershipTests.identity")
+        let session = try XCTUnwrap(SessionID(bytes: Data(repeating: 9, count: 16)))
+        let other = try XCTUnwrap(SessionID(bytes: Data(repeating: 10, count: 16)))
+        let connection = NWConnection(host: "127.0.0.1", port: 1, using: .tcp)
+        var token: UsbLaneBindToken?
+        let server = UsbLaneServer(networkQueue: queue, parametersProvider: { .tcp },
+            onBound: { value, _, _ in token = value }, onFailure: { _ in XCTFail() })
+        queue.sync {
+            server.bindingResultSenderForTesting = { _, done in done(nil) }
+            server.prepareBoundForTesting(connection, sessionID: session,
+                connectionGeneration: 7, lane: .video, generation: 3)
+        }
+        queue.sync { }
+        let current = try XCTUnwrap(token)
+        queue.sync {
+            XCTAssertTrue(server.owns(current, connection: connection))
+            for invalid in [
+                UsbLaneBindToken(serverEpoch: UUID(), sessionID: session, connectionGeneration: 7, lane: .video, bindGeneration: 3, connectionID: current.connectionID),
+                UsbLaneBindToken(serverEpoch: current.serverEpoch, sessionID: other, connectionGeneration: 7, lane: .video, bindGeneration: 3, connectionID: current.connectionID),
+                UsbLaneBindToken(serverEpoch: current.serverEpoch, sessionID: session, connectionGeneration: 6, lane: .video, bindGeneration: 3, connectionID: current.connectionID),
+                UsbLaneBindToken(serverEpoch: current.serverEpoch, sessionID: session, connectionGeneration: 7, lane: .audio, bindGeneration: 3, connectionID: current.connectionID),
+                UsbLaneBindToken(serverEpoch: current.serverEpoch, sessionID: session, connectionGeneration: 7, lane: .video, bindGeneration: 2, connectionID: current.connectionID)
+            ] { XCTAssertFalse(server.owns(invalid, connection: connection)) }
+            XCTAssertFalse(server.owns(current, connection:
+                NWConnection(host: "127.0.0.1", port: 2, using: .tcp)))
+        }
+        server.abort()
+        queue.sync { }
+    }
+
+    func testCurrentSendErrorDoesNotAdopt() throws {
+        let queue = DispatchQueue(label: "UsbBindCompletionOwnershipTests.error")
+        let session = try XCTUnwrap(SessionID(bytes: Data(repeating: 11, count: 16)))
+        let server = UsbLaneServer(networkQueue: queue, parametersProvider: { .tcp },
+            onBound: { _, _, _ in XCTFail("failed send adopted") }, onFailure: { _ in XCTFail() })
+        queue.sync {
+            server.bindingResultSenderForTesting = { _, done in done(.posix(.ECONNRESET)) }
+            server.prepareBoundForTesting(NWConnection(host: "127.0.0.1", port: 1, using: .tcp),
+                sessionID: session, connectionGeneration: 1, lane: .video, generation: 1)
+        }
+        queue.sync { }
+        server.abort()
+        queue.sync { }
+    }
+
     func testRetiredSendCompletionCannotAdoptOrReplaceNewLane() throws {
         let queue = DispatchQueue(label: "UsbBindCompletionOwnershipTests")
         let session = try XCTUnwrap(SessionID(bytes: Data(repeating: 7, count: 16)))

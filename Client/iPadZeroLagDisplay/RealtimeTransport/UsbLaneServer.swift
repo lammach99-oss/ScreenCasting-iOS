@@ -59,9 +59,18 @@ struct UsbLaneBinding {
     }
 }
 
+struct UsbLaneBindToken {
+    let serverEpoch: UUID
+    let sessionID: SessionID
+    let connectionGeneration: UInt64
+    let lane: UsbLaneKind
+    let bindGeneration: UInt64
+    let connectionID: ObjectIdentifier
+}
+
 final class UsbLaneServer {
     typealias ParametersProvider = () throws -> NWParameters
-    typealias BoundHandler = (UsbLaneKind, UInt64, NWConnection) -> Void
+    typealias BoundHandler = (UsbLaneBindToken, UInt64, NWConnection) -> Void
     typealias FailureHandler = (Error) -> Void
 
     private let networkQueue: DispatchQueue
@@ -74,9 +83,24 @@ final class UsbLaneServer {
     private var sessionID: SessionID?
     private var secret = Data()
     private var stopped = true
+    private var serverEpoch = UUID()
+    private var connectionGeneration: UInt64 = 0
+    private var delivered: [UsbLaneKind: ObjectIdentifier] = [:]
 
     #if targetEnvironment(simulator)
     var bindingReceiverForTesting: ((NWConnection, @escaping (Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void) -> Void)?
+    var bindingResultSenderForTesting: ((NWConnection, @escaping (NWError?) -> Void) -> Void)?
+
+    func prepareBoundForTesting(_ connection: NWConnection, sessionID: SessionID,
+        connectionGeneration: UInt64, lane: UsbLaneKind, generation: UInt64) {
+        abortOnQueue()
+        self.sessionID = sessionID
+        self.connectionGeneration = connectionGeneration
+        stopped = false
+        connections[lane] = connection
+        highestGeneration[lane] = generation
+        completeBinding(connection, lane: lane, generation: generation)
+    }
 
     func receiveBindingForTesting(_ connection: NWConnection, lane: UsbLaneKind) {
         networkQueue.async { [weak self] in
@@ -97,12 +121,13 @@ final class UsbLaneServer {
         self.onFailure = onFailure
     }
 
-    func start(sessionID: SessionID, secret: Data) {
+    func start(sessionID: SessionID, secret: Data, connectionGeneration: UInt64) {
         networkQueue.async { [weak self] in
             guard let self else { return }
             self.abortOnQueue()
             guard secret.count == 32 else { return }
             self.sessionID = sessionID
+            self.connectionGeneration = connectionGeneration
             self.secret = Data(secret)
             self.stopped = false
             do {
@@ -141,12 +166,17 @@ final class UsbLaneServer {
         let listener = try NWListener(
             using: parametersProvider(),
             on: lane.port)
+        let epoch = serverEpoch
         listeners[lane] = listener
         listener.newConnectionHandler = { [weak self] connection in
-            self?.accept(connection, expectedLane: lane)
+            guard let self, self.serverEpoch == epoch, !self.stopped else {
+                connection.cancel()
+                return
+            }
+            self.accept(connection, expectedLane: lane)
         }
         listener.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
+            guard let self, self.serverEpoch == epoch else { return }
             if case .failed(let error) = state,
                !self.stopped,
                lane != .audio {
@@ -164,8 +194,10 @@ final class UsbLaneServer {
             connection.cancel()
             return
         }
+        let epoch = serverEpoch
         connection.stateUpdateHandler = { [weak self, weak connection] state in
             guard let self, let connection else { return }
+            guard self.serverEpoch == epoch, !self.stopped else { connection.cancel(); return }
             switch state {
             case .ready:
                 self.receiveBinding(
@@ -189,8 +221,10 @@ final class UsbLaneServer {
         accumulated: Data)
     {
         let totalSize = 16 + UsbLaneBinding.encodedSize
+        let epoch = serverEpoch
         let completion: (Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void = { [weak self] content, _, isComplete, error in
             guard let self else { return }
+            guard self.serverEpoch == epoch else { connection.cancel(); return }
             var bytes = accumulated
             if let content { bytes.append(content) }
             if let error {
@@ -257,14 +291,37 @@ final class UsbLaneServer {
 
         highestGeneration[expectedLane] = binding.generation
         connections[expectedLane] = connection
+        completeBinding(connection, lane: expectedLane, generation: binding.generation)
+    }
+
+    func owns(_ token: UsbLaneBindToken, connection: NWConnection) -> Bool {
+        !stopped && serverEpoch == token.serverEpoch && sessionID == token.sessionID &&
+            connectionGeneration == token.connectionGeneration &&
+            token.connectionID == ObjectIdentifier(connection) &&
+            connections[token.lane] === connection &&
+            highestGeneration[token.lane] == token.bindGeneration
+    }
+
+    private func completeBinding(_ connection: NWConnection, lane: UsbLaneKind, generation: UInt64) {
+        guard let sessionID else { connection.cancel(); return }
+        let token = UsbLaneBindToken(serverEpoch: serverEpoch, sessionID: sessionID,
+            connectionGeneration: connectionGeneration, lane: lane, bindGeneration: generation,
+            connectionID: ObjectIdentifier(connection))
         sendResult(
             connection,
-            lane: expectedLane,
-            generation: binding.generation,
+            lane: lane,
+            generation: generation,
             status: 0,
             thenCancel: false)
         { [weak self] in
-            self?.onBound(expectedLane, binding.generation, connection)
+            guard let self else { connection.cancel(); return }
+            guard self.owns(token, connection: connection) else {
+                if !self.connections.values.contains(where: { $0 === connection }) { connection.cancel() }
+                return
+            }
+            guard self.delivered[lane] != token.connectionID else { return }
+            self.delivered[lane] = token.connectionID
+            self.onBound(token, generation, connection)
         }
     }
 
@@ -293,18 +350,36 @@ final class UsbLaneServer {
         message[5] = 14
         message.storeLittleEndian(UInt32(payload.count), at: 8)
         message.append(payload)
-        connection.send(
-            content: message,
-            completion: .contentProcessed { error in
+        let epoch = serverEpoch
+        var processedOnce = false // accessed only on networkQueue
+        let processed: (NWError?) -> Void = { [weak self] error in
+            guard let self else { connection.cancel(); return }
+            self.networkQueue.async {
+                guard !processedOnce else { return }
+                processedOnce = true
+                guard self.serverEpoch == epoch else {
+                    if !self.connections.values.contains(where: { $0 === connection }) { connection.cancel() }
+                    return
+                }
                 if thenCancel || error != nil {
                     connection.cancel()
                 } else {
                     completion?()
                 }
-            })
+            }
+        }
+        #if targetEnvironment(simulator)
+        if let bindingResultSenderForTesting {
+            bindingResultSenderForTesting(connection, processed)
+            return
+        }
+        #endif
+        connection.send(content: message, completion: .contentProcessed(processed))
     }
 
     private func finalizeOnQueue() {
+        serverEpoch = UUID()
+        delivered.removeAll()
         stopped = true
         listeners.values.forEach { $0.cancel() }
         listeners.removeAll()
