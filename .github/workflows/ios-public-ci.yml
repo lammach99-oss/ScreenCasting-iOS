@@ -7,6 +7,11 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      g02_consumer_provenance_only:
+        description: Inspect immutable G02 producer provenance only; no builds/tests/IPA
+        required: false
+        default: false
+        type: boolean
       g02_dependencies_only:
         description: Qualify pinned native dependencies only; no Client tests or IPA
         required: false
@@ -81,7 +86,7 @@ env:
 
 jobs:
   prepare-native-deps:
-    if: ${{ !inputs.g02_dependencies_only && (!inputs.c1_native_stability) }}
+    if: ${{ !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (!inputs.c1_native_stability)) }}
     name: Prepare verified native dependencies
     runs-on: macos-15-intel
     timeout-minutes: 45
@@ -233,7 +238,7 @@ jobs:
           retention-days: 3
 
   build-and-test:
-    if: ${{ !inputs.g02_dependencies_only && (!inputs.c1_native_stability) }}
+    if: ${{ !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (!inputs.c1_native_stability)) }}
     name: Build and XCTest
     needs: prepare-native-deps
     runs-on: macos-15-intel
@@ -330,7 +335,7 @@ jobs:
   build-unsigned-ipad-app:
     name: Build unsigned iPad app
     needs: [prepare-native-deps, build-and-test]
-    if: ${{ !inputs.g02_dependencies_only && ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.build_unsigned_ipa == true)) && needs.prepare-native-deps.result == 'success' && needs.build-and-test.result == 'success') }}
+    if: ${{ !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.build_unsigned_ipa == true)) && needs.prepare-native-deps.result == 'success' && needs.build-and-test.result == 'success')) }}
     runs-on: macos-15-intel
     timeout-minutes: 45
     outputs:
@@ -450,7 +455,7 @@ jobs:
   package-unsigned-ipa:
     name: Package unsigned iPad IPA
     needs: build-unsigned-ipad-app
-    if: ${{ !inputs.g02_dependencies_only && (needs.build-unsigned-ipad-app.result == 'success') }}
+    if: ${{ !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (needs.build-unsigned-ipad-app.result == 'success')) }}
     runs-on: macos-15-intel
     timeout-minutes: 15
     outputs:
@@ -559,7 +564,7 @@ jobs:
   revalidate-uploaded-ipa:
     name: Revalidate uploaded unsigned IPA
     needs: package-unsigned-ipa
-    if: ${{ !inputs.g02_dependencies_only && (needs.package-unsigned-ipa.result == 'success') }}
+    if: ${{ !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (needs.package-unsigned-ipa.result == 'success')) }}
     runs-on: macos-15-intel
     timeout-minutes: 15
     permissions:
@@ -605,7 +610,7 @@ jobs:
           echo 'DOWNLOADED_ARTIFACT_REVALIDATION=PASS'
 
   c1-native-stability:
-    if: ${{ !inputs.g02_dependencies_only && (github.event_name == 'workflow_dispatch' && inputs.c1_native_stability && !inputs.c1_extract_reports) }}
+    if: ${{ !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (github.event_name == 'workflow_dispatch' && inputs.c1_native_stability && !inputs.c1_extract_reports)) }}
     permissions:
       contents: read
       actions: read
@@ -728,7 +733,7 @@ jobs:
           retention-days: 14
 
   c1-extract-reports:
-    if: ${{ !inputs.g02_dependencies_only && (github.event_name == 'workflow_dispatch' && inputs.c1_native_stability && inputs.c1_extract_reports) }}
+    if: ${{ !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (github.event_name == 'workflow_dispatch' && inputs.c1_native_stability && inputs.c1_extract_reports)) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -805,7 +810,7 @@ jobs:
           retention-days: 14
 
   g02-native-dependencies-only:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.g02_dependencies_only }}
+    if: ${{ !inputs.g02_consumer_provenance_only && (github.event_name == 'workflow_dispatch' && inputs.g02_dependencies_only) }}
     runs-on: macos-15-intel
     timeout-minutes: 90
     env:
@@ -875,5 +880,51 @@ jobs:
         with:
           name: G02-native-dependencies-${{ github.run_id }}
           path: evidence/
+          if-no-files-found: error
+          retention-days: 30
+
+  g02-consumer-provenance-only:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.g02_consumer_provenance_only && !inputs.g02_dependencies_only && !inputs.c1_native_stability }}
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Pin diagnostic consumer toolchain
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+      - name: Test isolated diagnostic contract only
+        run: python3 -B Client/scripts/test_g02_native_consumer_attestation.py
+      - name: Acquire exact producer metadata and envelope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: lammach99-oss/ScreenCasting-iOS
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/g02-consumer-diagnostic"
+          test ! -e "$out"
+          mkdir "$out"
+          gh api --method GET repos/lammach99-oss/ScreenCasting-iOS/actions/artifacts/12091540222 > "$out/artifact.json"
+          gh api --method GET repos/lammach99-oss/ScreenCasting-iOS/actions/runs/39005711789 > "$out/run.json"
+          gh api --method GET repos/lammach99-oss/ScreenCasting-iOS/actions/artifacts/12091540222/zip > "$out/artifact.zip"
+      - name: Verify diagnostic evidence without staging or building
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/g02-consumer-diagnostic"
+          python3 -B Client/scripts/verify_g02_native_consumer_attestation.py \
+            --artifact-zip "$out/artifact.zip" --artifact-metadata "$out/artifact.json" \
+            --run-metadata "$out/run.json" --consumer-sha "$GITHUB_SHA" \
+            --consumer-root "$GITHUB_WORKSPACE" --output "$out/consumer-diagnostic.json"
+      - name: Retain diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: G02-consumer-diagnostic-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/g02-consumer-diagnostic/*.json
           if-no-files-found: error
           retention-days: 30
