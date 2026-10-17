@@ -7,6 +7,11 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      p1_client_qualification:
+        description: P1 native tests using retained qualified dependencies; no dependency build or IPA
+        required: false
+        default: false
+        type: boolean
       g02_consumer_provenance_only:
         description: Inspect immutable G02 producer provenance only; no builds/tests/IPA
         required: false
@@ -86,7 +91,7 @@ env:
 
 jobs:
   prepare-native-deps:
-    if: ${{ !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (!inputs.c1_native_stability)) }}
+    if: ${{ !inputs.p1_client_qualification && !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (!inputs.c1_native_stability)) }}
     name: Prepare verified native dependencies
     runs-on: macos-15-intel
     timeout-minutes: 45
@@ -238,7 +243,7 @@ jobs:
           retention-days: 3
 
   build-and-test:
-    if: ${{ !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (!inputs.c1_native_stability)) }}
+    if: ${{ !inputs.p1_client_qualification && !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (!inputs.c1_native_stability)) }}
     name: Build and XCTest
     needs: prepare-native-deps
     runs-on: macos-15-intel
@@ -335,7 +340,7 @@ jobs:
   build-unsigned-ipad-app:
     name: Build unsigned iPad app
     needs: [prepare-native-deps, build-and-test]
-    if: ${{ !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.build_unsigned_ipa == true)) && needs.prepare-native-deps.result == 'success' && needs.build-and-test.result == 'success')) }}
+    if: ${{ !inputs.p1_client_qualification && !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.build_unsigned_ipa == true)) && needs.prepare-native-deps.result == 'success' && needs.build-and-test.result == 'success')) }}
     runs-on: macos-15-intel
     timeout-minutes: 45
     outputs:
@@ -455,7 +460,7 @@ jobs:
   package-unsigned-ipa:
     name: Package unsigned iPad IPA
     needs: build-unsigned-ipad-app
-    if: ${{ !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (needs.build-unsigned-ipad-app.result == 'success')) }}
+    if: ${{ !inputs.p1_client_qualification && !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (needs.build-unsigned-ipad-app.result == 'success')) }}
     runs-on: macos-15-intel
     timeout-minutes: 15
     outputs:
@@ -564,7 +569,7 @@ jobs:
   revalidate-uploaded-ipa:
     name: Revalidate uploaded unsigned IPA
     needs: package-unsigned-ipa
-    if: ${{ !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (needs.package-unsigned-ipa.result == 'success')) }}
+    if: ${{ !inputs.p1_client_qualification && !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (needs.package-unsigned-ipa.result == 'success')) }}
     runs-on: macos-15-intel
     timeout-minutes: 15
     permissions:
@@ -610,7 +615,7 @@ jobs:
           echo 'DOWNLOADED_ARTIFACT_REVALIDATION=PASS'
 
   c1-native-stability:
-    if: ${{ !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (github.event_name == 'workflow_dispatch' && inputs.c1_native_stability && !inputs.c1_extract_reports)) }}
+    if: ${{ !inputs.p1_client_qualification && !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (github.event_name == 'workflow_dispatch' && inputs.c1_native_stability && !inputs.c1_extract_reports)) }}
     permissions:
       contents: read
       actions: read
@@ -733,7 +738,7 @@ jobs:
           retention-days: 14
 
   c1-extract-reports:
-    if: ${{ !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (github.event_name == 'workflow_dispatch' && inputs.c1_native_stability && inputs.c1_extract_reports)) }}
+    if: ${{ !inputs.p1_client_qualification && !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (github.event_name == 'workflow_dispatch' && inputs.c1_native_stability && inputs.c1_extract_reports)) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -810,7 +815,7 @@ jobs:
           retention-days: 14
 
   g02-native-dependencies-only:
-    if: ${{ !inputs.g02_consumer_provenance_only && (github.event_name == 'workflow_dispatch' && inputs.g02_dependencies_only) }}
+    if: ${{ !inputs.p1_client_qualification && !inputs.g02_consumer_provenance_only && (github.event_name == 'workflow_dispatch' && inputs.g02_dependencies_only) }}
     runs-on: macos-15-intel
     timeout-minutes: 90
     env:
@@ -884,7 +889,7 @@ jobs:
           retention-days: 30
 
   g02-consumer-provenance-only:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.g02_consumer_provenance_only && !inputs.g02_dependencies_only && !inputs.c1_native_stability }}
+    if: ${{ !inputs.p1_client_qualification && github.event_name == 'workflow_dispatch' && inputs.g02_consumer_provenance_only && !inputs.g02_dependencies_only && !inputs.c1_native_stability }}
     runs-on: macos-15-intel
     timeout-minutes: 15
     permissions:
@@ -928,3 +933,36 @@ jobs:
             ${{ runner.temp }}/g02-consumer-diagnostic/*.json
           if-no-files-found: error
           retention-days: 30
+
+  p1-client-qualification:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.p1_client_qualification }}
+    permissions:
+      contents: read
+      actions: read
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+      - name: Acquire exact qualified G02 dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/producer
+          gh api repos/lammach99-oss/ScreenCasting-iOS/actions/artifacts/12091540222 > evidence/producer/artifact.json
+          gh api repos/lammach99-oss/ScreenCasting-iOS/actions/runs/39005711789 > evidence/producer/run.json
+          gh api repos/lammach99-oss/ScreenCasting-iOS/actions/artifacts/12091540222/zip > evidence/producer/artifact.zip
+          python3 Client/scripts/p1_native_qualification.py prepare
+      - name: Build and qualify immutable Client snapshot
+        env:
+          P1_SELECTORS: ${{ inputs.xctest_filter }}
+        run: python3 Client/scripts/p1_native_qualification.py test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: P1-Client-native-${{ github.run_id }}
+          path: evidence
+          retention-days: 14
