@@ -7909,10 +7909,13 @@ final class VisualProductionSourceClosureTests: XCTestCase {
         let renderer = try source("Renderer.swift")
         let draw = try XCTUnwrap(renderer.range(of: "public func draw(in view: MTKView)"))
         let body = String(renderer[draw.lowerBound...])
-        let aspect = try XCTUnwrap(body.range(of: "let aspectRatioBuffer = aspectRatioBuffer"))
         let encoder = try XCTUnwrap(body.range(of: "makeRenderCommandEncoder"))
-        XCTAssertLessThan(aspect.lowerBound, encoder.lowerBound)
-        XCTAssertFalse(body.contains("aspectRatioBuffer?.contents()"))
+        let constants = try XCTUnwrap(body.range(of:
+            "encoder.setVertexBytes(&scale, length: MemoryLayout<SIMD2<Float>>.size, index: 0)"))
+        let drawCall = try XCTUnwrap(body.range(of: "encoder.drawPrimitives"))
+        XCTAssertLessThan(encoder.lowerBound, constants.lowerBound)
+        XCTAssertLessThan(constants.lowerBound, drawCall.lowerBound)
+        XCTAssertFalse(renderer.contains("aspectRatioBuffer"))
         XCTAssertTrue(renderer.contains("geometryPublishGate.authorize"))
         XCTAssertTrue(renderer.contains("freshness.isCurrent(token.identity)"))
     }
