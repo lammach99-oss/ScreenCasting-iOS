@@ -9,8 +9,9 @@ CLIENT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CACHE_ROOT="${SCREENCASTING_DEP_CACHE:-${TMPDIR:-/tmp}/screencasting-ios-deps}"
 OUTPUT="$CLIENT_ROOT/ThirdPartyBuild"
 OPENSSL_URL="https://github.com/openssl/openssl.git"
-OPENSSL_REV="openssl-3.3.2"
-OPENSSL_TAG_OBJECT="98b3bf1433f8f4a29e64ca8b9bd42c58d3d1b98a"
+OPENSSL_REV="openssl-3.5.7"
+OPENSSL_TAG_OBJECT="6ca677c395a4ae4472a12c5857c122ec33b36f66"
+OPENSSL_COMMIT="8cf17aaeb4599f8af87fefd810b5b5fee90fe69e"
 OPENSSL_IPAD_DEVICE_TARGET="ios64-xcrun"
 OPENSSL_IPAD_SIMULATOR_TARGET="iossimulator-x86_64-xcrun"
 LIBSRTP_URL="https://github.com/cisco/libsrtp.git"
@@ -112,6 +113,9 @@ package_xcframework() {
 }
 
 clone_at "$OPENSSL_URL" openssl "$OPENSSL_REV" "$OPENSSL_TAG_OBJECT"
+[[ "$(git -C "$CACHE_ROOT/src/openssl" rev-parse HEAD)" == "$OPENSSL_COMMIT" ]] || {
+  echo 'OpenSSL peeled commit verification failed' >&2; exit 1;
+}
 clone_at "$LIBSRTP_URL" libsrtp "$LIBSRTP_REV"
 clone_at "$OPUS_URL" opus "$OPUS_REV"
 
