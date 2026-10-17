@@ -7,6 +7,11 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      g02_dependencies_only:
+        description: Qualify pinned native dependencies only; no Client tests or IPA
+        required: false
+        default: false
+        type: boolean
       c1_final_qualification:
         description: Two full suites only on immutable corrected C1 source
         required: false
@@ -76,7 +81,7 @@ env:
 
 jobs:
   prepare-native-deps:
-    if: ${{ !inputs.c1_native_stability }}
+    if: ${{ !inputs.g02_dependencies_only && (!inputs.c1_native_stability) }}
     name: Prepare verified native dependencies
     runs-on: macos-15-intel
     timeout-minutes: 45
@@ -228,7 +233,7 @@ jobs:
           retention-days: 3
 
   build-and-test:
-    if: ${{ !inputs.c1_native_stability }}
+    if: ${{ !inputs.g02_dependencies_only && (!inputs.c1_native_stability) }}
     name: Build and XCTest
     needs: prepare-native-deps
     runs-on: macos-15-intel
@@ -325,7 +330,7 @@ jobs:
   build-unsigned-ipad-app:
     name: Build unsigned iPad app
     needs: [prepare-native-deps, build-and-test]
-    if: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.build_unsigned_ipa == true)) && needs.prepare-native-deps.result == 'success' && needs.build-and-test.result == 'success' }}
+    if: ${{ !inputs.g02_dependencies_only && ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.build_unsigned_ipa == true)) && needs.prepare-native-deps.result == 'success' && needs.build-and-test.result == 'success') }}
     runs-on: macos-15-intel
     timeout-minutes: 45
     outputs:
@@ -445,7 +450,7 @@ jobs:
   package-unsigned-ipa:
     name: Package unsigned iPad IPA
     needs: build-unsigned-ipad-app
-    if: ${{ needs.build-unsigned-ipad-app.result == 'success' }}
+    if: ${{ !inputs.g02_dependencies_only && (needs.build-unsigned-ipad-app.result == 'success') }}
     runs-on: macos-15-intel
     timeout-minutes: 15
     outputs:
@@ -554,7 +559,7 @@ jobs:
   revalidate-uploaded-ipa:
     name: Revalidate uploaded unsigned IPA
     needs: package-unsigned-ipa
-    if: ${{ needs.package-unsigned-ipa.result == 'success' }}
+    if: ${{ !inputs.g02_dependencies_only && (needs.package-unsigned-ipa.result == 'success') }}
     runs-on: macos-15-intel
     timeout-minutes: 15
     permissions:
@@ -600,7 +605,7 @@ jobs:
           echo 'DOWNLOADED_ARTIFACT_REVALIDATION=PASS'
 
   c1-native-stability:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.c1_native_stability && !inputs.c1_extract_reports }}
+    if: ${{ !inputs.g02_dependencies_only && (github.event_name == 'workflow_dispatch' && inputs.c1_native_stability && !inputs.c1_extract_reports) }}
     permissions:
       contents: read
       actions: read
@@ -723,7 +728,7 @@ jobs:
           retention-days: 14
 
   c1-extract-reports:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.c1_native_stability && inputs.c1_extract_reports }}
+    if: ${{ !inputs.g02_dependencies_only && (github.event_name == 'workflow_dispatch' && inputs.c1_native_stability && inputs.c1_extract_reports) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -798,3 +803,77 @@ jobs:
           path: /tmp/c1-reports
           if-no-files-found: error
           retention-days: 14
+
+  g02-native-dependencies-only:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.g02_dependencies_only }}
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    env:
+      SCREENCASTING_DEP_CACHE: ${{ github.workspace }}/Client/ThirdPartyBuild
+      IPHONEOS_DEPLOYMENT_TARGET: '17.0'
+      PUBLIC_SHA: ${{ github.sha }}
+      CACHE_SCHEMA: g02-v1
+      OPENSSL_PIN: openssl-3.5.7-8cf17aaeb4599f8af87fefd810b5b5fee90fe69e
+      LIBSRTP_PIN: 24b3bf8f19b6f5ab4cd2bcceb4f4064efca86fd5
+      OPUS_PIN: ddbe48383984d56acd9e1ab6a090c54ca6b735a6
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+      - name: Pin Xcode and retain toolchain identity
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          { xcodebuild -version; xcode-select -p; xcrun --sdk iphoneos --show-sdk-version; xcrun --sdk iphonesimulator --show-sdk-version; xcrun clang --version; cmake --version; uname -a; } | tee evidence/toolchain.txt
+          test "$(xcrun --sdk iphonesimulator --show-sdk-version)" = '18.5'
+          echo "XCODE_FINGERPRINT=$(shasum -a 256 evidence/toolchain.txt | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "CACHE_KEY=g02-${GITHUB_SHA}-openssl-3.5.7" >> "$GITHUB_ENV"
+      - name: Pin contract RED then GREEN
+        run: |
+          set -euo pipefail
+          git show d47f6d976660ffe3944363d50d296d55d763c3a6:Client/scripts/build_ios_dependencies.sh > evidence/builder-before.sh
+          set +e
+          python3 Client/scripts/test_g02_dependency_pin.py evidence/builder-before.sh > evidence/pin-RED.log 2>&1
+          red=$?
+          set -e
+          test "$red" = 1
+          grep -F 'FAILED (failures=1)' evidence/pin-RED.log
+          python3 Client/scripts/test_g02_dependency_pin.py 2>&1 | tee evidence/pin-GREEN.log
+      - name: Build exact pinned native inputs without cache reuse
+        run: |
+          set -euo pipefail
+          test ! -e Client/ThirdPartyBuild
+          bash Client/scripts/build_ios_dependencies.sh 2>&1 | tee evidence/native-build.log
+      - name: Retain source identities and file hashes
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,subprocess
+          root=pathlib.Path('Client/ThirdPartyBuild')
+          pins={'openssl':'8cf17aaeb4599f8af87fefd810b5b5fee90fe69e','libsrtp':'24b3bf8f19b6f5ab4cd2bcceb4f4064efca86fd5','opus':'ddbe48383984d56acd9e1ab6a090c54ca6b735a6'}
+          for name,expected in pins.items():
+              actual=subprocess.check_output(['git','-C',str(root/'src'/name),'rev-parse','HEAD'],text=True).strip()
+              assert actual==expected,(name,actual,expected)
+          scripts=['build_ios_dependencies.sh','test_g02_dependency_pin.py','verify_ios_dependency_artifacts.sh','compute_native_dependency_manifest.sh','native_dependency_helpers.sh']
+          inputs={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in [pathlib.Path('Client/scripts')/s for s in scripts]+[pathlib.Path('.github/workflows/g02-native-dependencies.yml')]}
+          files={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for base in ['build','xcframeworks'] for p in sorted((root/base).rglob('*')) if p.is_file()}
+          data={'publicSha':os.environ['GITHUB_SHA'],'canonicalAuthority':'573b3d7dfd2818c37ac39d10fe03f1c8e3988bbf','pins':pins,'buildInputSha256':inputs,'nativeFileSha256':files,'applicationBuild':'NOT_RUN','ipa':'NOT_CREATED'}
+          pathlib.Path('evidence/provenance.json').write_text(json.dumps(data,indent=2))
+          PY
+      - name: Strict native verification and export artifact
+        run: |
+          set -euo pipefail
+          bash Client/scripts/verify_ios_dependency_artifacts.sh Client/ThirdPartyBuild/xcframeworks Client/ThirdPartyBuild/build 2>&1 | tee evidence/native-verify.log
+          rm -rf "$SCREENCASTING_DEP_CACHE/src"
+          bash Client/scripts/compute_native_dependency_manifest.sh Client/ThirdPartyBuild evidence/native-deps.manifest.txt
+          tar -czf evidence/G02-native-deps-openssl-3.5.7.tar.gz Client/ThirdPartyBuild/build Client/ThirdPartyBuild/xcframeworks
+          shasum -a 256 evidence/G02-native-deps-openssl-3.5.7.tar.gz > evidence/G02-native-deps-openssl-3.5.7.tar.gz.sha256
+      - name: Retain qualification evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: G02-native-dependencies-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30
