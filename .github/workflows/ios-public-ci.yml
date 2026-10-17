@@ -819,7 +819,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 3
+          fetch-depth: 4
       - name: Pin Xcode and retain toolchain identity
         run: |
           set -euo pipefail
@@ -864,9 +864,9 @@ jobs:
       - name: Strict native verification and export artifact
         run: |
           set -euo pipefail
-          bash Client/scripts/verify_ios_dependency_artifacts.sh Client/ThirdPartyBuild/xcframeworks Client/ThirdPartyBuild/build 2>&1 | tee evidence/native-verify.log
+          bash Client/scripts/verify_ios_dependency_artifacts.sh "$SCREENCASTING_DEP_CACHE/xcframeworks" "$SCREENCASTING_DEP_CACHE/build" 2>&1 | tee evidence/native-verify.log
           rm -rf "$SCREENCASTING_DEP_CACHE/src"
-          bash Client/scripts/compute_native_dependency_manifest.sh Client/ThirdPartyBuild evidence/native-deps.manifest.txt
+          bash Client/scripts/compute_native_dependency_manifest.sh "$SCREENCASTING_DEP_CACHE" evidence/native-deps.manifest.txt
           tar -czf evidence/G02-native-deps-openssl-3.5.7.tar.gz Client/ThirdPartyBuild/build Client/ThirdPartyBuild/xcframeworks
           shasum -a 256 evidence/G02-native-deps-openssl-3.5.7.tar.gz > evidence/G02-native-deps-openssl-3.5.7.tar.gz.sha256
       - name: Retain qualification evidence even on failure
