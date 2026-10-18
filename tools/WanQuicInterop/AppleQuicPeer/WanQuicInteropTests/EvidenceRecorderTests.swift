@@ -3,6 +3,19 @@ import Network
 @testable import WanQuicInterop
 
 final class EvidenceRecorderTests: XCTestCase {
+    func testAlternateConstructionExperimentIsControlOnlyAndExplicit() throws {
+        let mode = try XCTUnwrap(ControlLaneExperimentMode(rawValue: "A4_alternate_stream_construction"))
+        var experiment = ControlLaneExperiment(mode: mode)
+        XCTAssertEqual(experiment.groupReady(), [.controlOnly])
+        XCTAssertEqual(experiment.groupReady(), [])
+        XCTAssertEqual(experiment.controlState(.ready), [])
+        let fields = experiment.fields
+        XCTAssertEqual(fields["controlConstructionAPI"] as? String, "NWConnection.init(from:to:using:)")
+        XCTAssertEqual(fields["datagramEnabled"] as? Bool, false)
+        XCTAssertEqual(fields["datagramStartPolicy"] as? String, "suppressed")
+        XCTAssertEqual(fields["controlStartPolicy"] as? String, "synchronous_group_ready")
+        XCTAssertEqual(fields["controlDirection"] as? String, "bidirectional")
+    }
     func testByteReserveRetainsCriticalEventAndExportReportsLoss() throws {
         let recorder = EvidenceRecorder(directory: try directory(), maximumBytes: 8192)
         let identity = EvidenceIdentity(runID: UUID(), ownerID: UUID(), generation: 1)
