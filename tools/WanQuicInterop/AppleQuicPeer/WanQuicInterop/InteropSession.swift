@@ -52,7 +52,7 @@ final class InteropSession {
     } }
     private func isCurrent(_ o: QuicConnectionOwner) -> Bool { current === o && o.accepts(o.generation) }
     private func fail(_ o: QuicConnectionOwner, _ event: String, details: [String: Any] = [:]) {
-        EventLog.write(event, identity: o.evidenceIdentity, details: details)
+        EventLog.write(event, identity: o.evidenceIdentity, details: details, critical: true)
         o.retire(reason: event, initiator: "InteropSession.fail")
     }
     private func perform(_ actions: [ControlLaneExperiment.Action], owner o: QuicConnectionOwner) {
