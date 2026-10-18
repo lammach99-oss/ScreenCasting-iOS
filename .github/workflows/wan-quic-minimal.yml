@@ -1,0 +1,105 @@
+name: Minimal WAN QUIC reproducer qualification
+on:
+  workflow_dispatch:
+    inputs:
+      package_ipa:
+        description: Package exactly one unsigned minimal IPA after qualification
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  minimal:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select pinned toolchain
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          mkdir -p evidence
+          xcodebuild -version | tee evidence/xcode-version.txt
+          test "$(xcrun --sdk iphoneos --show-sdk-version)" = '18.5'
+          xcrun --sdk iphoneos --show-sdk-path > evidence/device-sdk-path.txt
+          brew install xcodegen
+          xcodegen --version > evidence/xcodegen-version.txt
+      - name: Generate isolated projects and source provenance
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,subprocess
+          roots=['tools/WanQuicInterop/AppleMinimalQuicRepro','tools/WanQuicInterop/AppleQuicPeer']
+          files={}
+          for root in roots:
+              for p in sorted(pathlib.Path(root).rglob('*')):
+                  if p.is_file() and (p.suffix=='.swift' or p.name=='project.yml'):
+                      raw=p.read_bytes()
+                      committed=subprocess.check_output(['git','show',f'HEAD:{p.as_posix()}'])
+                      assert raw==committed, str(p)
+                      files[p.as_posix()]={'sha256':hashlib.sha256(raw).hexdigest(),'blob':subprocess.check_output(['git','rev-parse',f'HEAD:{p.as_posix()}'],text=True).strip()}
+          pathlib.Path('evidence/qualified-source-manifest.json').write_text(json.dumps({'publicSHA':os.environ['GITHUB_SHA'],'files':files},indent=2))
+          PY
+          xcodegen generate --spec tools/WanQuicInterop/AppleMinimalQuicRepro/project.yml
+          xcodegen generate --spec tools/WanQuicInterop/AppleQuicPeer/project.yml
+      - name: Create fresh pinned simulator
+        run: |
+          set -euo pipefail
+          xcrun simctl list runtimes -j > evidence/runtimes.json
+          python3 - <<'PY'
+          import json,os,subprocess
+          runtime=next(r['identifier'] for r in json.load(open('evidence/runtimes.json'))['runtimes'] if r['version']=='18.5' and r['isAvailable'] and 'iOS' in r['name'])
+          udid=subprocess.check_output(['xcrun','simctl','create','MinimalQUICCI','com.apple.CoreSimulator.SimDeviceType.iPhone-16',runtime],text=True).strip()
+          with open(os.environ['GITHUB_ENV'],'a') as f:f.write('REPRO_SIM='+udid+'\n')
+          PY
+      - name: Focused native tests
+        run: |
+          set -euo pipefail
+          xcodebuild -project tools/WanQuicInterop/AppleMinimalQuicRepro/MinimalQuicRepro.xcodeproj -scheme MinimalQuicRepro -destination "platform=iOS Simulator,id=$REPRO_SIM" -resultBundlePath evidence/Focused.xcresult -only-testing:MinimalQuicReproTests/MinimalProtocolTests CODE_SIGNING_ALLOWED=NO REPRO_SOURCE_SHA="$GITHUB_SHA" test 2>&1 | tee evidence/focused.log
+      - name: Full minimal native suite
+        run: |
+          set -euo pipefail
+          xcodebuild -project tools/WanQuicInterop/AppleMinimalQuicRepro/MinimalQuicRepro.xcodeproj -scheme MinimalQuicRepro -destination "platform=iOS Simulator,id=$REPRO_SIM" -resultBundlePath evidence/Minimal.xcresult CODE_SIGNING_ALLOWED=NO REPRO_SOURCE_SHA="$GITHUB_SHA" test 2>&1 | tee evidence/minimal.log
+      - name: Existing isolated harness regression
+        run: |
+          set -euo pipefail
+          xcodebuild -project tools/WanQuicInterop/AppleQuicPeer/WanQuicInterop.xcodeproj -scheme WanQuicInterop -destination "platform=iOS Simulator,id=$REPRO_SIM" -resultBundlePath evidence/Interop.xcresult CODE_SIGNING_ALLOWED=NO test 2>&1 | tee evidence/interop.log
+      - name: Require authoritative inventories
+        run: |
+          set -euo pipefail
+          for suite in Focused Minimal Interop; do
+            xcrun xcresulttool get test-results summary --path "evidence/$suite.xcresult" --format json > "evidence/$suite-summary.json"
+            xcrun xcresulttool get test-results tests --path "evidence/$suite.xcresult" --format json > "evidence/$suite-tests.json"
+          done
+          python3 - <<'PY'
+          import json,pathlib
+          for name,expected in [('Focused',10),('Minimal',14),('Interop',24)]:
+              s=json.loads(pathlib.Path(f'evidence/{name}-summary.json').read_text())
+              assert s['passedTests']==expected and s['failedTests']==0 and s['skippedTests']==0, (name,s)
+          PY
+      - name: Device arm64 compile
+        run: |
+          set -euo pipefail
+          xcodebuild -project tools/WanQuicInterop/AppleMinimalQuicRepro/MinimalQuicRepro.xcodeproj -scheme MinimalQuicRepro -configuration Release -destination 'generic/platform=iOS' -derivedDataPath DeviceBuild ARCHS=arm64 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO REPRO_SOURCE_SHA="$GITHUB_SHA" build 2>&1 | tee evidence/device-build.log
+          APP=DeviceBuild/Build/Products/Release-iphoneos/MinimalQuicRepro.app
+          lipo -archs "$APP/MinimalQuicRepro" | tee evidence/architectures.txt
+          test "$(cat evidence/architectures.txt)" = arm64
+          if codesign -d "$APP" 2> evidence/codesign.txt; then echo 'Unexpected signed build'; exit 1; fi
+      - name: Package one unsigned IPA
+        if: inputs.package_ipa
+        run: |
+          set -euo pipefail
+          mkdir -p package/Payload
+          ditto DeviceBuild/Build/Products/Release-iphoneos/MinimalQuicRepro.app package/Payload/MinimalQuicRepro.app
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' package/Payload/MinimalQuicRepro.app/Info.plist)" = com.screencasting.tools.quicminimalrepro
+          (cd package && zip -qry WanQuicMinimalRepro-unsigned.ipa Payload)
+          shasum -a 256 package/WanQuicMinimalRepro-unsigned.ipa > evidence/IPA.sha256
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: minimal-quic-native-evidence
+          path: evidence
+      - uses: actions/upload-artifact@v4
+        if: success() && inputs.package_ipa
+        with:
+          name: minimal-quic-unsigned-ipa
+          path: package/WanQuicMinimalRepro-unsigned.ipa
