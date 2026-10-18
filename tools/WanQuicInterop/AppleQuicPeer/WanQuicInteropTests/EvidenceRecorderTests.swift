@@ -3,6 +3,20 @@ import Network
 @testable import WanQuicInterop
 
 final class EvidenceRecorderTests: XCTestCase {
+    func testRetiredRunCannotContaminateReplacementWithSameGeneration() throws {
+        EventLog.beginRun(generation: 1)
+        let retiredOwner = QuicConnectionOwner(generation: 1)
+        retiredOwner.trace("session_owner_detail", details: [:])
+        retiredOwner.retire()
+        EventLog.beginRun(generation: 1)
+        let before = EventLog.snapshot()
+        let bytes = try Data(contentsOf: XCTUnwrap(before.fileURL))
+        EventLog.write("control_reply", generation: 1, owner: retiredOwner.id)
+        retiredOwner.trace("lane_failed", details: [:])
+        XCTAssertEqual(EventLog.snapshot().controlReplies, 0)
+        XCTAssertEqual(EventLog.snapshot().lastEvent, before.lastEvent)
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(before.fileURL)), bytes)
+    }
     func testExperimentMatrixPreservesOneVariableAndOnceOnlyStartup() {
         var baseline = ControlLaneExperiment(mode: .baselineConcurrent)
         XCTAssertEqual(baseline.groupReady(), [.concurrentLanes])
