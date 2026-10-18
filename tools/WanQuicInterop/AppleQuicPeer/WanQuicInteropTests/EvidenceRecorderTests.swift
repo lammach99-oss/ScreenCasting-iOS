@@ -3,6 +3,31 @@ import Network
 @testable import WanQuicInterop
 
 final class EvidenceRecorderTests: XCTestCase {
+    func testByteReserveRetainsCriticalEventAndExportReportsLoss() throws {
+        let recorder = EvidenceRecorder(directory: try directory(), maximumBytes: 8192)
+        let identity = EvidenceIdentity(runID: UUID(), ownerID: UUID(), generation: 1)
+        _ = try recorder.beginRun(generation: 1, identity: identity)
+        for _ in 0..<100 {
+            _ = recorder.append(json: Data(repeating: 0x20, count: 200), event: "optional", identity: identity, value: 0)
+        }
+        XCTAssertTrue(recorder.append(json: Data("{\"event\":\"lane_failed\"}".utf8), event: "lane_failed", identity: identity, value: 0, critical: true))
+        let export = try recorder.export(to: directory())
+        let data = try Data(contentsOf: export)
+        XCTAssertLessThanOrEqual(data.count, 8192)
+        XCTAssertTrue(String(decoding: data, as: UTF8.self).contains("UNKNOWN_CAPTURE_INCOMPLETE"))
+        XCTAssertGreaterThan(recorder.snapshot().droppedDiagnostics, 0)
+    }
+    func testCleanExportAllowsAbsenceClassificationAndCriticalFloodIsBounded() throws {
+        let identity = EventLog.beginRun(generation: 1)
+        XCTAssertTrue(try String(contentsOf: EventLog.export(), encoding: .utf8).contains("ABSENT_WITH_COMPLETE_CAPTURE"))
+        let owner = QuicConnectionOwner(generation: 1, evidenceIdentity: identity)
+        for _ in 0..<300 { owner.trace("lane_failed_detail", details: [:]) }
+        owner.retire()
+        let events = try String(contentsOf: EventLog.export(), encoding: .utf8).split(separator: "\n")
+        XCTAssertLessThan(events.count, 140)
+        XCTAssertTrue(events.contains { $0.contains("owner_retired_detail") })
+        XCTAssertTrue(events.contains { $0.contains("UNKNOWN_CAPTURE_INCOMPLETE") })
+    }
     func testCriticalFailureSurvivesOptionalDiagnosticExhaustion() throws {
         let identity = EventLog.beginRun(generation: 1)
         let owner = QuicConnectionOwner(generation: 1, evidenceIdentity: identity)
@@ -135,7 +160,7 @@ final class EvidenceRecorderTests: XCTestCase {
         owner.retire(reason: "lane_failed", initiator: "test")
         let export = try EventLog.export()
         let lines = try String(contentsOf: export, encoding: .utf8).split(separator: "\n")
-        XCTAssertEqual(lines.count, 35) // run + experiment config + bounded trace + retirement
+        XCTAssertEqual(lines.count, 37) // run/config + 32 optional + retirement/cancel + export summary
     }
     func testRetirementEvidenceIdentifiesFirstOwnerAndDoesNotDuplicate() throws {
         let identity = EventLog.beginRun(generation: 71)

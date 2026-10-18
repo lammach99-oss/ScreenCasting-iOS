@@ -54,6 +54,7 @@ final class QuicConnectionOwner {
     let controlLaneID = UUID()
     let datagramLaneID = UUID()
     private var diagnosticCount = 0
+    private var criticalDiagnosticCount = 0
     var diagnosticEndpoint = ""
     var diagnosticALPN = ""
     var live = true
@@ -75,19 +76,28 @@ final class QuicConnectionOwner {
     }
     func accepts(_ g: UInt64) -> Bool { live && g == generation }
     func trace(_ event: String, details: [String: Any]) {
-        guard diagnosticCount < 32 else { return }
-        diagnosticCount += 1
+        let state = details["networkState"] as? String ?? ""
+        let critical = event.contains("failed") || event.contains("retired") || event.contains("cancel") ||
+            event.contains("extract") || event.contains("created") || event.contains("waiting") ||
+            state.contains("failed") || state.contains("cancelled") || state.contains("waiting")
+        if critical {
+            guard criticalDiagnosticCount < 128 else { EventLog.dropped(identity: evidenceIdentity); return }
+            criticalDiagnosticCount += 1
+        } else {
+            guard diagnosticCount < 32 else { EventLog.dropped(identity: evidenceIdentity); return }
+            diagnosticCount += 1
+        }
         var fields = details
         fields["groupID"] = id.uuidString
         fields["endpoint"] = diagnosticEndpoint
         fields["alpn"] = diagnosticALPN
         fields["experimentMode"] = experiment.mode.rawValue
-        EventLog.write(event, identity: evidenceIdentity, details: fields)
+        EventLog.write(event, identity: evidenceIdentity, details: fields, critical: critical)
     }
     func retire(reason: String = "explicit_retire", initiator: String = "caller") {
         guard live else { return }
         EventLog.write("owner_retired_detail", identity: evidenceIdentity,
-            details: ["retirementReason": reason, "initiator": initiator, "groupID": id.uuidString])
+            details: ["retirementReason": reason, "initiator": initiator, "groupID": id.uuidString], critical: true)
         live = false // before cancelling callbacks
         trace("cancel_callsite_detail", details: ["controlLaneID": controlLaneID.uuidString, "datagramLaneID": datagramLaneID.uuidString, "callsite": "QuicConnectionOwner.retire", "reason": reason])
         control?.cancel()

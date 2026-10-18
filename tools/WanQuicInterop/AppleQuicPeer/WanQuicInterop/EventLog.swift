@@ -48,6 +48,7 @@ struct EvidenceSnapshot {
     var hostDatagrams = 0
     var sendErrors = 0
     var truncated = false
+    var droppedDiagnostics = 0
     var storageError: String?
     var fileURL: URL?
 }
@@ -61,6 +62,7 @@ final class EvidenceRecorder {
     private var bytes = 0
     private var state = EvidenceSnapshot()
     private var identity: EvidenceIdentity?
+    private var criticalBytes = 0
     init(directory: URL, maximumBytes: Int = 4 * 1024 * 1024, retainedRuns: Int = 8) {
         self.directory = directory
         self.maximumBytes = max(0, maximumBytes)
@@ -79,7 +81,7 @@ final class EvidenceRecorder {
             throw CocoaError(.fileWriteUnknown)
         }
         handle = try FileHandle(forWritingTo: url)
-        bytes = 0; state = EvidenceSnapshot()
+        bytes = 0; criticalBytes = 0; state = EvidenceSnapshot()
         state.runID = id; state.generation = generation; state.fileURL = url
         self.identity = identity
         let logs = try FileManager.default.contentsOfDirectory(at: directory,
@@ -96,7 +98,7 @@ final class EvidenceRecorder {
         return url
     }
     @discardableResult
-    func append(json: Data, event: String, identity: EvidenceIdentity, value: Int) -> Bool {
+    func append(json: Data, event: String, identity: EvidenceIdentity, value: Int, critical: Bool = false) -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard self.identity == identity else { return false }
         state.lastEvent = event
@@ -117,19 +119,29 @@ final class EvidenceRecorder {
         }
         guard let handle else { state.storageError = "No active evidence file"; return false }
         var line = json; line.append(0x0a)
-        guard line.count <= maximumBytes - bytes else { state.truncated = true; return false }
+        let reserve = min(16384, maximumBytes / 4)
+        let limit = critical ? maximumBytes - min(1024, reserve) : maximumBytes - reserve
+        guard line.count <= limit - bytes else {
+            state.truncated = true; state.droppedDiagnostics += 1; return false
+        }
         do {
             try handle.write(contentsOf: line)
             try handle.synchronize() // evidence is durable without an attached debugger
             bytes += line.count
+            if critical { criticalBytes += line.count }
             return true
         } catch { state.storageError = error.localizedDescription; return false }
+    }
+    func dropped(identity: EvidenceIdentity) {
+        lock.lock(); defer { lock.unlock() }
+        guard self.identity == identity else { return }
+        state.droppedDiagnostics += 1
     }
     func clear() throws {
         lock.lock(); defer { lock.unlock() }
         guard let handle else { return }
         try handle.truncate(atOffset: 0); try handle.seek(toOffset: 0); try handle.synchronize()
-        bytes = 0
+        bytes = 0; criticalBytes = 0
         let id = state.runID, generation = state.generation, url = state.fileURL
         state = EvidenceSnapshot(); state.runID = id; state.generation = generation; state.fileURL = url
     }
@@ -149,6 +161,19 @@ final class EvidenceRecorder {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let destination = directory.appendingPathComponent("WanQuicInterop-export-\(UUID().uuidString).jsonl")
         try FileManager.default.copyItem(at: source, to: destination)
+        let complete = state.droppedDiagnostics == 0 && !state.truncated && state.storageError == nil
+        var summary = try JSONSerialization.data(withJSONObject: [
+            "event": "capture_summary_detail", "runID": state.runID,
+            "owner": identity?.ownerID.uuidString ?? "None", "generation": state.generation,
+            "droppedDiagnostics": state.droppedDiagnostics, "criticalBytes": criticalBytes,
+            "captureComplete": complete,
+            "absenceClassification": complete ? "ABSENT_WITH_COMPLETE_CAPTURE" : "UNKNOWN_CAPTURE_INCOMPLETE"
+        ], options: [.sortedKeys])
+        summary.append(0x0a)
+        guard summary.count <= maximumBytes - bytes else { throw CocoaError(.fileWriteOutOfSpace) }
+        let output = try FileHandle(forWritingTo: destination)
+        defer { try? output.close() }
+        try output.seekToEnd(); try output.write(contentsOf: summary); try output.synchronize()
         return destination
     }
 }
@@ -168,6 +193,7 @@ enum EventLog {
     }
     static func clear() { do { try recorder.clear() } catch { recorder.setError(error) } }
     static func snapshot() -> EvidenceSnapshot { recorder.snapshot() }
+    static func dropped(identity: EvidenceIdentity) { recorder.dropped(identity: identity) }
     static func export() throws -> URL {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("WanQuicInteropExports")
         // Exports are temporary. Remove old copies only on an explicit new export.
@@ -175,14 +201,14 @@ enum EventLog {
         return try recorder.export(to: directory)
     }
     // Existing event semantics/fields remain unchanged; only synthetic metadata.
-    static func write(_ event: String, identity: EvidenceIdentity, sequence: UInt32 = 0, value: Int = 0, details: [String: Any] = [:]) {
+    static func write(_ event: String, identity: EvidenceIdentity, sequence: UInt32 = 0, value: Int = 0, details: [String: Any] = [:], critical: Bool = false) {
         var fields: [String: Any] = details
         fields.merge(["event": event, "generation": identity.generation, "runID": identity.runID.uuidString,
             "owner": identity.ownerID.uuidString, "sequence": sequence, "value": value,
             "monotonicSeconds": ProcessInfo.processInfo.systemUptime]) { _, base in base }
         if let data = try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]),
            let line = String(data: data, encoding: .utf8) {
-            if recorder.append(json: data, event: event, identity: identity, value: value) { print(line) }
+            if recorder.append(json: data, event: event, identity: identity, value: value, critical: critical) { print(line) }
         }
     }
 }
