@@ -3,6 +3,19 @@ import Network
 @testable import WanQuicInterop
 
 final class EvidenceRecorderTests: XCTestCase {
+    func testCriticalFailureSurvivesOptionalDiagnosticExhaustion() throws {
+        let identity = EventLog.beginRun(generation: 1)
+        let owner = QuicConnectionOwner(generation: 1, evidenceIdentity: identity)
+        for _ in 0..<100 { owner.trace("lane_state_detail", details: [:]) }
+        owner.trace("lane_failed_detail", details: LaneEvidence.fields(
+            role: "control", laneID: owner.controlLaneID, state: "failed", error: .posix(.ENETDOWN)))
+        owner.retire(reason: "lane_failed", initiator: "test")
+        let events = try String(contentsOf: EventLog.export(), encoding: .utf8)
+        XCTAssertTrue(events.contains("lane_failed_detail"))
+        XCTAssertTrue(events.contains("capture_summary_detail"))
+        XCTAssertTrue(events.contains("UNKNOWN_CAPTURE_INCOMPLETE"))
+        XCTAssertTrue(events.contains("droppedDiagnostics"))
+    }
     func testRetiredRunCannotContaminateReplacementWithSameGeneration() throws {
         let oldIdentity = EventLog.beginRun(generation: 1)
         let retiredOwner = QuicConnectionOwner(generation: 1, evidenceIdentity: oldIdentity)
