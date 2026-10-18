@@ -18,6 +18,28 @@ if sys.argv[1]=='prepare':
  assert subprocess.check_output(['xcrun','--sdk','iphonesimulator','--show-sdk-version'],text=True).strip()=='18.5'
  files={str(p):sha(p.read_bytes()) for p in (root/'Client').rglob('*') if p.is_file() and 'ThirdPartyBuild' not in p.parts}
  (out/'source-manifest.json').write_text(json.dumps({'publicSha':os.environ['GITHUB_SHA'],'files':files},indent=2))
+elif sys.argv[1]=='package':
+ import plistlib,shutil
+ assert os.environ['GITHUB_SHA']
+ package=out/'production-package';package.mkdir()
+ base=['xcodebuild','-project','Client/iPadZeroLagDisplay/iPadCasting.xcodeproj','-scheme','iPadCasting',
+  '-configuration','Release','-destination','generic/platform=iOS','-derivedDataPath',str(out/'device'),
+  'ARCHS=arm64','ONLY_ACTIVE_ARCH=NO','CODE_SIGNING_ALLOWED=NO','CODE_SIGNING_REQUIRED=NO','build']
+ run(base,'device-build.log')
+ app=out/'device/Build/Products/Release-iphoneos/iPadCasting.app'
+ assert app.is_dir()
+ info=plistlib.loads((app/'Info.plist').read_bytes())
+ assert 'iPhoneOS' in info['CFBundleSupportedPlatforms']
+ assert not (app/'_CodeSignature').exists() and not (app/'embedded.mobileprovision').exists()
+ payload=package/'Payload';payload.mkdir();shutil.copytree(app,payload/app.name)
+ ipa=package/'ScreenCasting-iPad-unsigned.ipa'
+ with zipfile.ZipFile(ipa,'w',zipfile.ZIP_DEFLATED) as z:
+  for p in sorted(payload.rglob('*')):
+   if p.is_file():z.write(p,p.relative_to(package))
+ with zipfile.ZipFile(ipa) as z:assert z.testzip() is None
+ shutil.copyfile(out/'source-manifest.json',package/'source-manifest.json')
+ shutil.copyfile(out/'dependency-verification.json',package/'dependency-verification.json')
+ (package/'IPA.sha256').write_text(sha(ipa.read_bytes())+'  '+ipa.name+'\n')
 else:
  devices=json.loads(subprocess.check_output(['xcrun','simctl','list','devices','available','-j']))['devices']
  choices=[d for runtime,ds in devices.items() if runtime.endswith('iOS-18-5') for d in ds if 'iPad' in d['name']]

@@ -7,6 +7,11 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      p1_production_ipa:
+        description: Package qualified production app with retained G02 dependencies; no dependency rebuild
+        required: false
+        default: false
+        type: boolean
       p1_client_qualification:
         description: P1 native tests using retained qualified dependencies; no dependency build or IPA
         required: false
@@ -959,7 +964,18 @@ jobs:
       - name: Build and qualify immutable Client snapshot
         env:
           P1_SELECTORS: ${{ inputs.xctest_filter }}
-        run: python3 Client/scripts/p1_native_qualification.py test
+        run: |
+          if [ "${{ inputs.p1_production_ipa }}" = true ]; then
+            python3 Client/scripts/p1_native_qualification.py package
+          else
+            python3 Client/scripts/p1_native_qualification.py test
+          fi
+      - uses: actions/upload-artifact@v4
+        if: success() && inputs.p1_production_ipa
+        with:
+          name: ScreenCasting-production-unsigned-${{ github.run_id }}
+          path: evidence/production-package
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         if: always()
         with:
