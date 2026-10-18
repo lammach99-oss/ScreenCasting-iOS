@@ -7,6 +7,7 @@ enum ControlLaneExperimentMode: String, CaseIterable {
     case controlOnly = "A1_control_only"
     case serializedControlThenDatagram = "A2_serialized"
     case deferredControlOneQueueTurn = "A3_deferred_control"
+    case alternateStreamConstruction = "A4_alternate_stream_construction"
 }
 
 struct ControlLaneExperiment {
@@ -23,7 +24,7 @@ struct ControlLaneExperiment {
         started = true
         switch mode {
         case .baselineConcurrent: return [.concurrentLanes]
-        case .controlOnly, .serializedControlThenDatagram: return [.controlOnly]
+        case .controlOnly, .serializedControlThenDatagram, .alternateStreamConstruction: return [.controlOnly]
         case .deferredControlOneQueueTurn: return [.deferControl]
         }
     }
@@ -40,7 +41,8 @@ struct ControlLaneExperiment {
          "datagramStartPolicy": mode == .baselineConcurrent ? "concurrent_baseline" :
             (mode == .serializedControlThenDatagram ? "after_control_ready" : "suppressed"),
          "controlStartPolicy": mode == .deferredControlOneQueueTurn ? "one_serial_queue_turn" : "synchronous_group_ready",
-         "controlConstructionAPI": "extract(connectionTo:using:)", "controlDirection": "bidirectional",
+         "controlConstructionAPI": mode == .alternateStreamConstruction ?
+            "NWConnection.init(from:to:using:)" : "extract(connectionTo:using:)", "controlDirection": "bidirectional",
          "groupReadyOrdinal": groupReadyOrdinal, "controlReadyOrdinal": controlReadyOrdinal]
     }
 }

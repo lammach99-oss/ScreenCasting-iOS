@@ -81,7 +81,13 @@ final class InteropSession {
         let role = isDatagram ? "datagram" : "control"
         let laneID = isDatagram ? o.datagramLaneID : o.controlLaneID
         o.trace("extract_arguments_detail", details: LaneEvidence.extractFields(role: role, laneID: laneID, options: options))
-        guard let lane = group.extract(connectionTo: nil, using: options) else { fail(o, "extract_failed"); return }
+        let lane: NWConnection?
+        if !isDatagram && o.experiment.mode == .alternateStreamConstruction {
+            lane = NWConnection(from: group, to: nil, using: options)
+        } else {
+            lane = group.extract(connectionTo: nil, using: options)
+        }
+        guard let lane else { fail(o, "extract_failed"); return }
         if isDatagram { o.datagrams = lane } else { o.control = lane }
         startLane(lane, isDatagram: isDatagram, owner: o)
     }

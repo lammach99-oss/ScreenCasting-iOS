@@ -106,11 +106,12 @@ final class EvidenceRecorderTests: XCTestCase {
         XCTAssertEqual(deferred.controlState(.ready), [])
     }
     func testAllExperimentConfigurationsAreExplicitAndControlConstructionIsUnchanged() {
-        XCTAssertEqual(ControlLaneExperimentMode.allCases.count, 4) // no speculative A4
+        XCTAssertEqual(ControlLaneExperimentMode.allCases.count, 5)
         for mode in ControlLaneExperimentMode.allCases {
             let fields = ControlLaneExperiment(mode: mode).fields
             XCTAssertEqual(fields["experimentMode"] as? String, mode.rawValue)
-            XCTAssertEqual(fields["controlConstructionAPI"] as? String, "extract(connectionTo:using:)")
+            XCTAssertEqual(fields["controlConstructionAPI"] as? String,
+                mode == .alternateStreamConstruction ? "NWConnection.init(from:to:using:)" : "extract(connectionTo:using:)")
             XCTAssertEqual(fields["controlDirection"] as? String, "bidirectional")
             XCTAssertEqual(fields["datagramEnabled"] as? Bool,
                 mode == .baselineConcurrent || mode == .serializedControlThenDatagram)
