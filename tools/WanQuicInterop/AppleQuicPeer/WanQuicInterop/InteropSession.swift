@@ -6,15 +6,15 @@ final class InteropSession {
     let queue = DispatchQueue(label: "wan.interop.owner")
     private var current: QuicConnectionOwner?
     func start(host: String, port: UInt16, generation: UInt64, ca: Data, alpn: String = TestProtocol.alpn,
-               experimentMode: ControlLaneExperimentMode = .baselineConcurrent) {
+               experimentMode: ControlLaneExperimentMode = .baselineConcurrent, evidenceIdentity: EvidenceIdentity) {
         queue.async { [self] in
             current?.retire(reason: "replacement_start", initiator: "start")
             guard generation > 0, let certificate = SecCertificateCreateWithData(nil, ca as CFData) else { return }
-            let o = QuicConnectionOwner(generation: generation, experimentMode: experimentMode)
+            let o = QuicConnectionOwner(generation: generation, evidenceIdentity: evidenceIdentity, experimentMode: experimentMode)
             o.diagnosticEndpoint = "\(host):\(port)"
             o.diagnosticALPN = alpn
             current = o
-            o.trace("session_owner_detail", details: ["evidenceRunID": EventLog.snapshot().runID])
+            o.trace("session_owner_detail", details: ["evidenceRunID": o.evidenceIdentity.runID.uuidString])
             let parameters = QuicConnectionOwner.parameters(host: host, ca: certificate, alpn: alpn)
             let descriptor = NWMultiplexGroup(to: .hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!))
             let group = NWConnectionGroup(with: descriptor, using: parameters)
@@ -32,7 +32,7 @@ final class InteropSession {
                 case .ready:
                     guard let metadata = o.group?.metadata(definition: NWProtocolQUIC.definition) as? NWProtocolQUIC.Metadata,
                           metadata.negotiatedALPN == TestProtocol.alpn else { self.fail(o, "alpn_mismatch"); return }
-                    EventLog.write("group_ready_exact_alpn", generation: generation, owner: o.id)
+                    EventLog.write("group_ready_exact_alpn", identity: o.evidenceIdentity)
                     self.perform(o.experiment.groupReady(), owner: o)
                 case .failed(let error):
                     o.trace("group_failed_detail", details: LaneEvidence.fields(role: "group", laneID: o.id, state: "failed", error: error))
@@ -43,10 +43,16 @@ final class InteropSession {
             group.start(queue: queue)
         }
     }
-    func stop() { queue.async { [self] in current?.retire(reason: "operator_stop", initiator: "stop"); current = nil } }
+    func stop() { queue.async { [self] in
+        if let o = current {
+            o.retire(reason: "operator_stop", initiator: "stop")
+            EventLog.write("run_retired", identity: o.evidenceIdentity)
+        }
+        current = nil
+    } }
     private func isCurrent(_ o: QuicConnectionOwner) -> Bool { current === o && o.accepts(o.generation) }
     private func fail(_ o: QuicConnectionOwner, _ event: String, details: [String: Any] = [:]) {
-        EventLog.write(event, generation: o.generation, owner: o.id, details: details)
+        EventLog.write(event, identity: o.evidenceIdentity, details: details)
         o.retire(reason: event, initiator: "InteropSession.fail")
     }
     private func perform(_ actions: [ControlLaneExperiment.Action], owner o: QuicConnectionOwner) {
@@ -112,7 +118,7 @@ final class InteropSession {
                 guard self.isCurrent(o) else { return }
                 switch state {
                 case .ready:
-                    EventLog.write(isDatagram ? "datagram_same_group" : "control_same_group", generation: o.generation, owner: o.id)
+                    EventLog.write(isDatagram ? "datagram_same_group" : "control_same_group", identity: o.evidenceIdentity)
                     if isDatagram { self.receiveDatagram(o) } else { self.receiveControl(o) }
                     if !isDatagram { self.perform(o.experiment.controlState(state), owner: o) }
                     self.probeWhenReady(o)
@@ -138,7 +144,7 @@ final class InteropSession {
             completion["sequence"] = sequence
             o.trace("lane_send_completion_detail", details: completion)
             EventLog.write(error == nil ? "send_processed" : "send_rejected",
-                generation: o.generation, owner: o.id, sequence: sequence, value: data.count)
+                identity: o.evidenceIdentity, sequence: sequence, value: data.count)
         })
     }
     private func probeWhenReady(_ o: QuicConnectionOwner) {
@@ -167,7 +173,7 @@ final class InteropSession {
                 if let data { for r in try o.framer.feed(data) {
                     guard r.opcode == 2, r.sequence == o.nextReply else { throw TestProtocol.Failure.invalid }
                     o.nextReply += 1
-                    EventLog.write("control_reply", generation: o.generation, owner: o.id, sequence: r.sequence)
+                    EventLog.write("control_reply", identity: o.evidenceIdentity, sequence: r.sequence)
                 }}
                 if complete { try o.framer.finish() }
                 if error != nil { self.fail(o, "control_receive_failed") }
@@ -184,8 +190,7 @@ final class InteropSession {
             do {
                 if let data {
                     let r = try TestProtocol.decodeDatagram(data, generation: o.generation, channel: 1)
-                    EventLog.write("host_datagram_received", generation: o.generation,
-                        owner: o.id, sequence: r.sequence, value: data.count)
+                    EventLog.write("host_datagram_received", identity: o.evidenceIdentity, sequence: r.sequence, value: data.count)
                     if r.sequence >= 10000, let lane = o.datagrams {
                         self.send(o, lane: lane, data: try TestProtocol.datagram(r, channel: 2), sequence: r.sequence)
                     }

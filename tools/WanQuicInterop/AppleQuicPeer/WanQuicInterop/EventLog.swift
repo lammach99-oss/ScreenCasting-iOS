@@ -32,6 +32,12 @@ enum LaneEvidence {
     }
 }
 
+struct EvidenceIdentity: Equatable {
+    let runID: UUID
+    let ownerID: UUID
+    let generation: UInt64
+}
+
 struct EvidenceSnapshot {
     var runID = "None"
     var generation: UInt64 = 0
@@ -54,6 +60,7 @@ final class EvidenceRecorder {
     private var handle: FileHandle?
     private var bytes = 0
     private var state = EvidenceSnapshot()
+    private var identity: EvidenceIdentity?
     init(directory: URL, maximumBytes: Int = 4 * 1024 * 1024, retainedRuns: Int = 8) {
         self.directory = directory
         self.maximumBytes = max(0, maximumBytes)
@@ -61,11 +68,12 @@ final class EvidenceRecorder {
     }
     deinit { try? handle?.close() }
     @discardableResult
-    func beginRun(generation: UInt64) throws -> URL {
+    func beginRun(generation: UInt64, identity: EvidenceIdentity) throws -> URL {
         lock.lock(); defer { lock.unlock() }
+        self.identity = nil
         try handle?.close(); handle = nil
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let id = UUID().uuidString
+        let id = identity.runID.uuidString
         let url = directory.appendingPathComponent("WanQuicInterop-\(id).jsonl")
         guard FileManager.default.createFile(atPath: url.path, contents: Data()) else {
             throw CocoaError(.fileWriteUnknown)
@@ -73,6 +81,7 @@ final class EvidenceRecorder {
         handle = try FileHandle(forWritingTo: url)
         bytes = 0; state = EvidenceSnapshot()
         state.runID = id; state.generation = generation; state.fileURL = url
+        self.identity = identity
         let logs = try FileManager.default.contentsOfDirectory(at: directory,
             includingPropertiesForKeys: [.creationDateKey]).filter {
                 $0.lastPathComponent.hasPrefix("WanQuicInterop-") && $0.pathExtension == "jsonl"
@@ -87,8 +96,9 @@ final class EvidenceRecorder {
         return url
     }
     @discardableResult
-    func append(json: Data, event: String, generation: UInt64, value: Int) -> Bool {
+    func append(json: Data, event: String, identity: EvidenceIdentity, value: Int) -> Bool {
         lock.lock(); defer { lock.unlock() }
+        guard self.identity == identity else { return false }
         state.lastEvent = event
         switch event {
         case "group_ready_exact_alpn": state.connectionState = "Connected"
@@ -146,13 +156,15 @@ final class EvidenceRecorder {
 enum EventLog {
     private static let recorder = EvidenceRecorder(directory:
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0])
-    static func beginRun(generation: UInt64, experimentMode: ControlLaneExperimentMode = .baselineConcurrent) {
-        do { _ = try recorder.beginRun(generation: generation) }
+    @discardableResult
+    static func beginRun(generation: UInt64, experimentMode: ControlLaneExperimentMode = .baselineConcurrent) -> EvidenceIdentity {
+        let identity = EvidenceIdentity(runID: UUID(), ownerID: UUID(), generation: generation)
+        do { _ = try recorder.beginRun(generation: generation, identity: identity) }
         catch { recorder.setError(error) }
-        let owner = UUID()
-        write("run_started", generation: generation, owner: owner, details: ["experimentMode": experimentMode.rawValue])
-        write("experiment_config_detail", generation: generation, owner: owner,
+        write("run_started", identity: identity, details: ["experimentMode": experimentMode.rawValue])
+        write("experiment_config_detail", identity: identity,
             details: ControlLaneExperiment(mode: experimentMode).fields)
+        return identity
     }
     static func clear() { do { try recorder.clear() } catch { recorder.setError(error) } }
     static func snapshot() -> EvidenceSnapshot { recorder.snapshot() }
@@ -163,15 +175,14 @@ enum EventLog {
         return try recorder.export(to: directory)
     }
     // Existing event semantics/fields remain unchanged; only synthetic metadata.
-    static func write(_ event: String, generation: UInt64, owner: UUID, sequence: UInt32 = 0, value: Int = 0, details: [String: Any] = [:]) {
+    static func write(_ event: String, identity: EvidenceIdentity, sequence: UInt32 = 0, value: Int = 0, details: [String: Any] = [:]) {
         var fields: [String: Any] = details
-        fields.merge(["event": event, "generation": generation,
-            "owner": owner.uuidString, "sequence": sequence, "value": value,
+        fields.merge(["event": event, "generation": identity.generation, "runID": identity.runID.uuidString,
+            "owner": identity.ownerID.uuidString, "sequence": sequence, "value": value,
             "monotonicSeconds": ProcessInfo.processInfo.systemUptime]) { _, base in base }
         if let data = try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]),
            let line = String(data: data, encoding: .utf8) {
-            print(line)
-            _ = recorder.append(json: data, event: event, generation: generation, value: value)
+            if recorder.append(json: data, event: event, identity: identity, value: value) { print(line) }
         }
     }
 }

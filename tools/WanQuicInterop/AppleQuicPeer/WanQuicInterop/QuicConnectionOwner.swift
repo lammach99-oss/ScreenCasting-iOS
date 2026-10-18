@@ -48,7 +48,8 @@ struct ControlLaneExperiment {
 // All mutable owner state is confined to InteropSession.queue. A retired owner
 // stays separate from its replacement; delayed completions capture that owner.
 final class QuicConnectionOwner {
-    let id = UUID()
+    let evidenceIdentity: EvidenceIdentity
+    var id: UUID { evidenceIdentity.ownerID }
     let generation: UInt64
     let controlLaneID = UUID()
     let datagramLaneID = UUID()
@@ -65,7 +66,9 @@ final class QuicConnectionOwner {
     var pendingSends = 0
     var probed = false
     var experiment: ControlLaneExperiment
-    init(generation: UInt64, experimentMode: ControlLaneExperimentMode = .baselineConcurrent) {
+    init(generation: UInt64, evidenceIdentity: EvidenceIdentity, experimentMode: ControlLaneExperimentMode = .baselineConcurrent) {
+        precondition(evidenceIdentity.generation == generation)
+        self.evidenceIdentity = evidenceIdentity
         self.generation = generation
         experiment = ControlLaneExperiment(mode: experimentMode)
         framer = ControlStreamFramer(generation: generation)
@@ -79,11 +82,11 @@ final class QuicConnectionOwner {
         fields["endpoint"] = diagnosticEndpoint
         fields["alpn"] = diagnosticALPN
         fields["experimentMode"] = experiment.mode.rawValue
-        EventLog.write(event, generation: generation, owner: id, details: fields)
+        EventLog.write(event, identity: evidenceIdentity, details: fields)
     }
     func retire(reason: String = "explicit_retire", initiator: String = "caller") {
         guard live else { return }
-        EventLog.write("owner_retired_detail", generation: generation, owner: id,
+        EventLog.write("owner_retired_detail", identity: evidenceIdentity,
             details: ["retirementReason": reason, "initiator": initiator, "groupID": id.uuidString])
         live = false // before cancelling callbacks
         trace("cancel_callsite_detail", details: ["controlLaneID": controlLaneID.uuidString, "datagramLaneID": datagramLaneID.uuidString, "callsite": "QuicConnectionOwner.retire", "reason": reason])

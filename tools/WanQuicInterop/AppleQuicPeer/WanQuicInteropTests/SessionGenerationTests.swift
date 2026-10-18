@@ -2,8 +2,8 @@ import XCTest
 @testable import WanQuicInterop
 final class SessionGenerationTests: XCTestCase {
     func testRetirementAndLateCompletionCannotMutateReplacement() {
-        let old = QuicConnectionOwner(generation: 7)
-        let next = QuicConnectionOwner(generation: 8)
+        let old = QuicConnectionOwner(generation: 7, evidenceIdentity: EvidenceIdentity(runID: UUID(), ownerID: UUID(), generation: 7))
+        let next = QuicConnectionOwner(generation: 8, evidenceIdentity: EvidenceIdentity(runID: UUID(), ownerID: UUID(), generation: 8))
         XCTAssertTrue(old.accepts(7)); XCTAssertFalse(old.accepts(8))
         old.retire(); old.retire()
         var delivered = 0

@@ -30,14 +30,13 @@ struct WanQuicInteropApp: App {
                 Button("Import dedicated CA DER") { importing = true }
                 Button("Connect") {
                     if let ca, let p = UInt16(port), let g = UInt64(generation), !host.isEmpty {
-                        EventLog.beginRun(generation: g, experimentMode: experimentMode)
+                        let identity = EventLog.beginRun(generation: g, experimentMode: experimentMode)
                         exportURL = nil
-                        session.start(host: host, port: p, generation: g, ca: ca, alpn: alpn, experimentMode: experimentMode)
+                        session.start(host: host, port: p, generation: g, ca: ca, alpn: alpn, experimentMode: experimentMode, evidenceIdentity: identity)
                     }
                 }.disabled(ca == nil)
                 Button("Retire connection") {
                     session.stop()
-                    EventLog.write("run_retired", generation: evidence.generation, owner: UUID())
                 }
                 Section("Runtime evidence") {
                     Text("Current run: \(evidence.runID)")
