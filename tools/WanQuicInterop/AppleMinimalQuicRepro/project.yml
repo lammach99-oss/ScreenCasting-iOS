@@ -11,15 +11,18 @@ targets:
     type: application
     platform: iOS
     sources: [MinimalQuicRepro]
+    info:
+      path: Generated/MinimalInfo.plist
+      properties:
+        NSLocalNetworkUsageDescription: Minimal isolated QUIC diagnostic
+        UILaunchScreen: {}
+        ReproSourceSHA: "$(REPRO_SOURCE_SHA)"
+        ReproXcode: "16.4 (16F6)"
+        ReproSDK: "iphoneos18.5"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.screencasting.tools.quicminimalrepro
-        GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_NSLocalNetworkUsageDescription: Minimal isolated QUIC diagnostic
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_ReproSourceSHA: "$(REPRO_SOURCE_SHA)"
-        INFOPLIST_KEY_ReproXcode: "$(XCODE_VERSION_ACTUAL)"
-        INFOPLIST_KEY_ReproSDK: "$(SDK_VERSION)"
+        GENERATE_INFOPLIST_FILE: NO
         MARKETING_VERSION: "1.0"
         CURRENT_PROJECT_VERSION: "1"
         TARGETED_DEVICE_FAMILY: "1,2"
