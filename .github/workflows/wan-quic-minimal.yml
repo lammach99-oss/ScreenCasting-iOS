@@ -1,5 +1,10 @@
 name: Minimal WAN QUIC reproducer qualification
 on:
+  push:
+    branches: [codex/keyboard-v1-validation]
+    paths:
+      - 'tools/WanQuicInterop/AppleMinimalQuicRepro/**'
+      - '.github/workflows/wan-quic-minimal.yml'
   workflow_dispatch:
     inputs:
       package_ipa:
