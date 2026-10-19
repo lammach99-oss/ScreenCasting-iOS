@@ -4217,6 +4217,12 @@ public class NetworkManager: ObservableObject {
             movement: movement,
             bulk: bulk,
             completion: { [weak self] error in
+                // Queued bulk cancellation is terminal for its transfer owner,
+                // not a transport send failure. Preserve the authenticated session.
+                if bulk, case .posix(.ECANCELED)? = error {
+                    completion(error)
+                    return
+                }
                 if let error {
                     self?.handleControlSendError(
                         error, generation: sendGeneration,
@@ -5696,6 +5702,14 @@ public class NetworkManager: ObservableObject {
         }
     }
     var transferPendingForTesting: Int { networkQueue.sync { transferReceivePending } }
+    func beginTransferWriterForTesting() {
+        networkQueue.sync { controlChannelWriter.begin(generation: connectionGeneration) }
+    }
+    func enqueueTransferWireForTesting(bulk: Bool, completion: @escaping (NWError?) -> Void) {
+        networkQueue.async {
+            self.sendWireMessage(type: bulk ? .transferEnd : .ping, payload: Data(count: bulk ? 25 : 16), sequence: 0, bulk: bulk, completion: completion)
+        }
+    }
 
     var realtimeAudioPlaybackForTesting: ((Bool) -> Void)?
     var controlSendForAudioTesting: ((Data, @escaping (NWError?) -> Void) -> Void)?

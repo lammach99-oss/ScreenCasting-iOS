@@ -242,6 +242,63 @@ final class DataTransferTests: XCTestCase {
     }
 
     #if targetEnvironment(simulator)
+    func testBulkCancellationDoesNotRetireAuthenticatedSession() async {
+        let network = NetworkManager(), session = network.simulateCommittedWifiSessionForTesting()
+        defer { network.stopForTesting() }
+        var sends: [UInt8] = [], callbacks: [(NWError?) -> Void] = []
+        var active = 0, queued = 0, control = 0
+        let done = expectation(description: "urgent control completes")
+        network.controlSendForAudioTesting = { data, completion in sends.append(data[5]); callbacks.append(completion) }
+        network.beginTransferWriterForTesting()
+        network.enqueueTransferWireForTesting(bulk: true) { error in active += 1; XCTAssertNil(error) }
+        network.enqueueTransferWireForTesting(bulk: true) { error in queued += 1; XCTAssertNotNil(error) }
+        network.enqueueTransferWireForTesting(bulk: false) { error in control += 1; XCTAssertNil(error); done.fulfill() }
+        network.networkQueueForTesting.sync {}
+        network.cancelTransfer(); network.networkQueueForTesting.sync {}
+        XCTAssertEqual(queued, 1); XCTAssertEqual(active, 0); XCTAssertEqual(control, 0)
+        XCTAssertEqual(network.wifiLifecycleSnapshotForTesting().authenticatedGeneration, session.generation)
+        network.networkQueueForTesting.sync { callbacks.removeFirst()(nil) }
+        network.networkQueueForTesting.sync {}
+        XCTAssertEqual(sends, [WireMessageType.transferEnd.rawValue, WireMessageType.ping.rawValue])
+        network.networkQueueForTesting.sync { if !callbacks.isEmpty { callbacks.removeFirst()(nil) } }
+        await fulfillment(of: [done], timeout: 3)
+        XCTAssertEqual(active, 1); XCTAssertEqual(queued, 1); XCTAssertEqual(control, 1)
+        XCTAssertEqual(network.wifiSessionSnapshotForTesting().generation, session.generation)
+    }
+
+    func testRealManagerSaturationFailsTransferClosedAndRearmsOnce() async throws {
+        let network = NetworkManager(), session = network.simulateCommittedWifiSessionForTesting()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let manager = DataTransferManager(generation: session.generation, directory: root) { _, completion in completion(true) }
+        let blocked = expectation(description: "first accepted offer held"), rearmed = expectation(description: "accepted work releases receive"), failed = expectation(description: "overflow fails transfer closed")
+        let release = DispatchSemaphore(value: 0)
+        manager.changed = { snapshot in
+            if snapshot.phase == .awaitingDecision { blocked.fulfill(); release.wait() }
+            if snapshot.phase == .failed { failed.fulfill() }
+        }
+        var reads: [(Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void] = [], arms = 0
+        network.transferReceiveForTesting = { _, callback in
+            arms += 1; reads.append(callback); XCTAssertEqual(reads.count, 1)
+            if arms == 2 { rearmed.fulfill() }
+        }
+        defer { network.stopForTesting(); manager.retire(); try? FileManager.default.removeItem(at: root) }
+        network.startTransferReceiveForTesting(manager: manager)
+        var bytes = Data()
+        for _ in 0..<3 {
+            let offer = TransferPacket(kind: .offer, generation: 7, id: UUID(), files: [TransferFile(name: "x", length: 0)])
+            bytes.append(transferTestFrame(.transferOffer, try TransferProtocol.encode(offer)))
+        }
+        network.networkQueueForTesting.sync { reads.removeFirst()(bytes, nil, false, nil) }
+        await fulfillment(of: [blocked], timeout: 3)
+        XCTAssertEqual(network.transferPendingForTesting, 2); XCTAssertTrue(reads.isEmpty); XCTAssertEqual(arms, 1)
+        release.signal()
+        await fulfillment(of: [rearmed, failed], timeout: 3)
+        network.networkQueueForTesting.sync {}
+        XCTAssertEqual(network.transferPendingForTesting, 0); XCTAssertEqual(arms, 2); XCTAssertEqual(reads.count, 1)
+        XCTAssertEqual(network.wifiLifecycleSnapshotForTesting().authenticatedGeneration, session.generation)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("x").path))
+    }
+
     private func transferTestFrame(_ type: WireMessageType, _ payload: Data) -> Data {
         var frame = Data("SCST".utf8); frame.append(contentsOf: [1, type.rawValue, 0, 0])
         var size = UInt32(payload.count).littleEndian, sequence = UInt32(1).littleEndian
