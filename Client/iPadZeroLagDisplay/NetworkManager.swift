@@ -4448,9 +4448,9 @@ public class NetworkManager: ObservableObject {
             guard wireAuthenticatedGeneration == generation, committedTransportGeneration == generation,
                   let kind = TransferKind(rawValue: header.type.rawValue) else { return }
             do {
-                if kind == .cancel { controlChannelWriter.cancelBulk() }
                 let packet = try TransferProtocol.decode(kind,payload)
                 if let manager = dataTransfers {
+                    if kind == .cancel && manager.owns(packet) { controlChannelWriter.cancelBulk() }
                     transferReceivePending += 1
                     if !manager.post(packet, completion: { [weak self] in
                         guard let self else {return}

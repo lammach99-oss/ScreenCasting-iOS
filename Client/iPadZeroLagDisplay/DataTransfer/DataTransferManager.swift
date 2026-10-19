@@ -29,6 +29,8 @@ final class DataTransferManager {
     private let queue = DispatchQueue(label: "ScreenCasting.DataTransfer.IO", qos: .utility)
     private let admission = NSLock()
     private var pending = 0
+    private var wireOwner: (UUID,UInt64)?
+    func owns(_ packet: TransferPacket) -> Bool {admission.lock();defer{admission.unlock()};return wireOwner?.0 == packet.id && wireOwner?.1 == packet.generation}
     private let generation: UInt64, directory: URL, sender: Sender
     private var owner: Owner?, retired = false
     private var snapshot = Snapshot()
@@ -64,7 +66,7 @@ final class DataTransferManager {
                 }
                 _ = try TransferProtocol.validate(files)
                 let active=Owner(id: UUID(),generation: self.generation,outgoing: true,files: files)
-                active.sources=urls;active.scoped=scoped;self.owner=active;active.waiting = .response
+                active.sources=urls;active.scoped=scoped;self.owner=active;self.admission.lock();self.wireOwner=(active.id,active.generation);self.admission.unlock();active.waiting = .response
                 self.publish(.offering);self.send(active,.offer) { _ in }
             } catch {for url in scoped {url.stopAccessingSecurityScopedResource()};self.publish(.failed)}
         }
@@ -105,7 +107,7 @@ final class DataTransferManager {
         guard now-active.lastProgress>=0.1 else{return};active.lastProgress=now
         snapshot.bytes=bytes;snapshot.phase=active.outgoing ? .sending : .receiving;changed?(snapshot)
     }
-    private func finish(_ phase: Phase) {publish(phase);if let active=owner {retiredIDs.append(active.id);if retiredIDs.count>256 {retiredIDs.removeFirst()}};owner?.close();owner=nil}
+    private func finish(_ phase: Phase) {admission.lock();wireOwner=nil;admission.unlock();publish(phase);if let active=owner {retiredIDs.append(active.id);if retiredIDs.count>256 {retiredIDs.removeFirst()}};owner?.close();owner=nil}
     private func fail(phase: Phase = .failed) {
         guard let active=owner else {return}
         var cancel=packet(active,.cancel);cancel.reason = .cancelled;sender(cancel){_ in};finish(phase)
@@ -126,7 +128,7 @@ final class DataTransferManager {
             guard !retiredIDs.contains(p.id), peerGeneration == nil || peerGeneration == p.generation else {return}
             peerGeneration = p.generation
             guard owner == nil else {var busy=TransferPacket(kind:.response,generation:p.generation,id:p.id);busy.reason = .busy;sender(busy){_ in};return}
-            _ = try TransferProtocol.validate(p.files);owner=Owner(id:p.id,generation:p.generation,outgoing:false,files:p.files);snapshot.received=[];publish(.awaitingDecision);return
+            _ = try TransferProtocol.validate(p.files);owner=Owner(id:p.id,generation:p.generation,outgoing:false,files:p.files);admission.lock();wireOwner=(p.id,p.generation);admission.unlock();snapshot.received=[];publish(.awaitingDecision);return
         }
         guard let active=owner, active.id==p.id, active.generation==p.generation else {return}
         if p.kind == .cancel {finish(.cancelled);return}
