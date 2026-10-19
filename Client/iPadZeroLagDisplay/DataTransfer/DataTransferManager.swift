@@ -35,7 +35,13 @@ final class DataTransferManager {
     private var retiredIDs: [UUID] = []
     private var peerGeneration: UInt64?
     var changed: ((Snapshot) -> Void)?
-    init(generation: UInt64, directory: URL, sender: @escaping Sender) { self.generation=generation;self.directory=directory;self.sender=sender }
+    init(generation: UInt64, directory: URL, sender: @escaping Sender) {
+        self.generation=generation;self.directory=directory;self.sender=sender
+        queue.async {
+            let files=(try? FileManager.default.contentsOfDirectory(at:directory,includingPropertiesForKeys:nil)) ?? []
+            for file in files where file.lastPathComponent.hasPrefix(".scdt-") && file.pathExtension == "part" {try? FileManager.default.removeItem(at:file)}
+        }
+    }
     @discardableResult func post(_ packet: TransferPacket) -> Bool {
         admission.lock();guard pending < 2 else {admission.unlock();cancel(failed: true);return false};pending += 1;admission.unlock()
         queue.async { [weak self] in
@@ -71,6 +77,9 @@ final class DataTransferManager {
                     try FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true)
                     let values=try self.directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
                     let total=try TransferProtocol.validate(active.files)
+                    let retained=(try? FileManager.default.contentsOfDirectory(at:self.directory,includingPropertiesForKeys:[.fileSizeKey])) ?? []
+                    let retainedBytes=retained.reduce(UInt64(0)){sum,url in sum+UInt64(max(0,(try? url.resourceValues(forKeys:[.fileSizeKey]).fileSize) ?? 0))}
+                    guard retained.count+active.files.count<=256,retainedBytes<=8*1024*1024*1024,total<=8*1024*1024*1024-retainedBytes else {throw CocoaError(.fileWriteOutOfSpace)}
                     if let free=values.volumeAvailableCapacityForImportantUsage, free < 0 || UInt64(free)<total+64*1024*1024 {throw CocoaError(.fileWriteOutOfSpace)}
                     active.store=try TransferStore(directory:self.directory,metadata:active.files[0],id:active.id)
                     active.accepted=true;self.publish(.receiving)

@@ -4169,7 +4169,7 @@ public class NetworkManager: ObservableObject {
 
     func sendTransferFiles(_ urls: [URL]) { networkQueue.async { [weak self] in self?.dataTransfers?.sendFiles(urls) } }
     func decideTransfer(_ accepted: Bool) { networkQueue.async { [weak self] in self?.dataTransfers?.decide(accepted) } }
-    func cancelTransfer() { networkQueue.async { [weak self] in self?.dataTransfers?.cancel() } }
+    func cancelTransfer() { networkQueue.async { [weak self] in self?.controlChannelWriter.cancelBulk(); self?.dataTransfers?.cancel() } }
     private func beginDataTransfer(generation: UInt64) {
         guard generation == connectionGeneration, dataTransfers == nil else { return }
         let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("ScreenCasting Transfers")
@@ -4446,7 +4446,7 @@ public class NetworkManager: ObservableObject {
         case .transferOffer, .transferResponse, .transferChunk, .transferFileEnd, .transferFileAck, .transferCancel, .transferEnd, .transferAck:
             guard wireAuthenticatedGeneration == generation, committedTransportGeneration == generation,
                   let kind = TransferKind(rawValue: header.type.rawValue) else { return }
-            do { _ = dataTransfers?.post(try TransferProtocol.decode(kind, payload)) }
+            do { if kind == .cancel { controlChannelWriter.cancelBulk() }; _ = dataTransfers?.post(try TransferProtocol.decode(kind, payload)) }
             catch { dataTransfers?.cancel(failed: true) }
             return
         case .pairingSuccess:

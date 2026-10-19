@@ -75,6 +75,17 @@ final class DataTransferTests: XCTestCase {
         XCTAssertThrowsError(try store.publish(length:1,digest:Data(count:32)))
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath:directory.path).isEmpty)
     }
+    func testCancelDropsQueuedBulkButPreservesControl() async {
+        let queue=DispatchQueue(label:"transfer-cancel-test"),done=expectation(description:"cancel boundary")
+        var bytes:[UInt8]=[];var callbacks:[(NWError?)->Void]=[]
+        let writer=ControlChannelWriter(queue:queue){data,_,callback in bytes.append(data[0]);callbacks.append(callback)}
+        queue.async {
+            writer.begin(generation:3);XCTAssertTrue(writer.enqueueBulk(Data([1])){_ in});XCTAssertTrue(writer.enqueueBulk(Data([2])){_ in});XCTAssertTrue(writer.enqueue(Data([9])))
+            writer.cancelBulk();callbacks.removeFirst()(nil)
+            queue.asyncAfter(deadline:.now()+0.02){XCTAssertEqual(bytes,[1,9]);callbacks.removeFirst()(nil);done.fulfill()}
+        }
+        await fulfillment(of:[done],timeout:2)
+    }
     func testBulkYieldsToControl() async throws {
         let queue=DispatchQueue(label:"transfer-writer-test")
         let finished=expectation(description:"priority order")

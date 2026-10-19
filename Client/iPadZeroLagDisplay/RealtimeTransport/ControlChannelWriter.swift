@@ -144,6 +144,12 @@ final class ControlChannelWriter {
         }
     }
 
+    /// Retires queued transfer frames without disturbing reliable input or the active write.
+    func cancelBulk() {
+        dispatchPrecondition(condition: .onQueue(queue))
+        pending.removeAll { $0.priority == .bulk }
+    }
+
     /// Keeps an in-flight send serialized, but drops all stale queued work.
     func cancel() {
         dispatchPrecondition(condition: .onQueue(queue))
