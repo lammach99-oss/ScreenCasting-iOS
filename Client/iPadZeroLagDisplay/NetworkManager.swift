@@ -1880,6 +1880,7 @@ public class NetworkManager: ObservableObject {
     private var activeDirectTouchCommand: DirectTouchContactCommand?
     @Published private(set) var transferSnapshot = DataTransferManager.Snapshot()
     private var dataTransfers: DataTransferManager?
+    private var transferReceivePending = 0
     private let connectionGenerationClock = ConnectionGenerationClock()
     private var connectionGeneration: UInt64 {
         connectionGenerationClock.current
@@ -2988,7 +2989,7 @@ public class NetworkManager: ObservableObject {
         resetDisplaySession()
         clearPendingTransportOffer()
         wireParser.reset(generation: stoppedGeneration)
-        dataTransfers?.retire(); dataTransfers = nil
+        dataTransfers?.retire(); dataTransfers = nil; transferReceivePending = 0
         controlChannelWriter.cancel()
         if wasUSB { controlChannelWriter.abandonConnection() }
         stopTelemetryTimer()
@@ -4325,7 +4326,7 @@ public class NetworkManager: ObservableObject {
                 self.handleStreamError("Server closed the stream.")
                 return
             }
-            self.receiveWireChunk(generation: generation)
+            if self.transferReceivePending == 0 { self.receiveWireChunk(generation: generation) }
         }
     }
 
@@ -4446,7 +4447,21 @@ public class NetworkManager: ObservableObject {
         case .transferOffer, .transferResponse, .transferChunk, .transferFileEnd, .transferFileAck, .transferCancel, .transferEnd, .transferAck:
             guard wireAuthenticatedGeneration == generation, committedTransportGeneration == generation,
                   let kind = TransferKind(rawValue: header.type.rawValue) else { return }
-            do { if kind == .cancel { controlChannelWriter.cancelBulk() }; _ = dataTransfers?.post(try TransferProtocol.decode(kind, payload)) }
+            do {
+                if kind == .cancel { controlChannelWriter.cancelBulk() }
+                let packet = try TransferProtocol.decode(kind,payload)
+                if let manager = dataTransfers {
+                    transferReceivePending += 1
+                    if !manager.post(packet, completion: { [weak self] in
+                        guard let self else {return}
+                        self.networkQueue.async {
+                            guard generation == self.connectionGeneration, self.dataTransfers === manager else {return}
+                            self.transferReceivePending = max(0,self.transferReceivePending-1)
+                            if self.transferReceivePending == 0 { self.receiveWireChunk(generation:generation) }
+                        }
+                    }) { transferReceivePending -= 1 }
+                }
+            }
             catch { dataTransfers?.cancel(failed: true) }
             return
         case .pairingSuccess:
@@ -5579,7 +5594,7 @@ public class NetworkManager: ObservableObject {
         resetDisplaySession()
         clearPendingTransportOffer()
         wireParser.reset(generation: failedGeneration)
-        dataTransfers?.retire(); dataTransfers = nil
+        dataTransfers?.retire(); dataTransfers = nil; transferReceivePending = 0
         controlChannelWriter.cancel()
         decoder.invalidate(waitForCompletion: !usbListenerExplicitlyStarted)
         AudioManager.shared.reset()

@@ -42,11 +42,11 @@ final class DataTransferManager {
             for file in files where file.lastPathComponent.hasPrefix(".scdt-") && file.pathExtension == "part" {try? FileManager.default.removeItem(at:file)}
         }
     }
-    @discardableResult func post(_ packet: TransferPacket) -> Bool {
+    @discardableResult func post(_ packet: TransferPacket, completion: @escaping () -> Void = {}) -> Bool {
         admission.lock();guard pending < 2 else {admission.unlock();cancel(failed: true);return false};pending += 1;admission.unlock()
         queue.async { [weak self] in
             guard let self else {return}
-            defer {self.admission.lock();self.pending -= 1;self.admission.unlock()}
+            defer {self.admission.lock();self.pending -= 1;self.admission.unlock();completion()}
             do {try self.receive(packet)} catch {self.fail()}
         }
         return true
