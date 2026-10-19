@@ -58,6 +58,9 @@
 		D70111111111111111111103 /* DataTransferManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = D70211111111111111111103 /* DataTransferManager.swift */; };
 		D70111111111111111111104 /* DataTransferTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D70211111111111111111104 /* DataTransferTests.swift */; };
 		D70111111111111111111105 /* TransferPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = D70211111111111111111105 /* TransferPanel.swift */; };
+		D70111111111111111111106 = {isa = PBXBuildFile; fileRef = D70211111111111111111106; };
+		D70111111111111111111107 = {isa = PBXBuildFile; fileRef = D70211111111111111111107; };
+		D70111111111111111111108 = {isa = PBXBuildFile; fileRef = D70211111111111111111108; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -125,6 +128,9 @@
 		D70211111111111111111103 /* DataTransferManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DataTransfer/DataTransferManager.swift; sourceTree = "<group>"; };
 		D70211111111111111111104 /* DataTransferTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DataTransferTests.swift; sourceTree = "<group>"; };
 		D70211111111111111111105 /* TransferPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DataTransfer/TransferPanel.swift; sourceTree = "<group>"; };
+		D70211111111111111111106 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DataTransfer/TransferCenterSheet.swift; sourceTree = "<group>"; };
+		D70211111111111111111107 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DataTransfer/TransferPresentation.swift; sourceTree = "<group>"; };
+		D70211111111111111111108 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransferCenterPresentationTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -160,6 +166,8 @@
 				200611111111111111111116 /* H264VideoConfiguration.swift */,
 				200711111111111111111107 /* NetworkManager.swift */,
 				D70211111111111111111105 /* TransferPanel.swift */,
+				D70211111111111111111106,
+				D70211111111111111111107,
 				D70211111111111111111103 /* DataTransferManager.swift */,
 				D70211111111111111111102 /* TransferStore.swift */,
 				D70211111111111111111101 /* TransferProtocol.swift */,
@@ -201,6 +209,7 @@
 			children = (
 				201711111111111111111117 /* WireProtocolTests.swift */,
 				D70211111111111111111104 /* DataTransferTests.swift */,
+				D70211111111111111111108,
 				201811111111111111111118 /* AccessUnitMailboxTests.swift */,
 				201911111111111111111119 /* TransportTelemetryTests.swift */,
 				202111111111111111111123 /* DecoderParameterSetTests.swift */,
@@ -324,6 +333,8 @@
 				300111111111111111111116 /* H264VideoConfiguration.swift in Sources */,
 				300111111111111111111107 /* NetworkManager.swift in Sources */,
 				D70111111111111111111105 /* TransferPanel.swift in Sources */,
+				D70111111111111111111106,
+				D70111111111111111111107,
 				D70111111111111111111103 /* DataTransferManager.swift in Sources */,
 				D70111111111111111111102 /* TransferStore.swift in Sources */,
 				D70111111111111111111101 /* TransferProtocol.swift in Sources */,
@@ -358,6 +369,7 @@
 			files = (
 				300111111111111111111110 /* WireProtocolTests.swift in Sources */,
 				D70111111111111111111104 /* DataTransferTests.swift in Sources */,
+				D70111111111111111111108,
 				300111111111111111111111 /* AccessUnitMailboxTests.swift in Sources */,
 				300111111111111111111112 /* TransportTelemetryTests.swift in Sources */,
 				300111111111111111111118 /* DecoderParameterSetTests.swift in Sources */,

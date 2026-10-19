@@ -4183,6 +4183,10 @@ public class NetworkManager: ObservableObject {
                 self.sendWireMessage(type: kind, payload: payload, sequence: 0, bulk: true) { completion($0 == nil) }
             }
         }
+        let transferTransport = activeTransportKind == .usb ? "USBC" : "WiFi"
+        manager.diagnostic = { [weak self] line in
+            self?.recordDiagnosticLine(line + " transport=\(transferTransport)")
+        }
         manager.changed = { [weak self] snapshot in
             DispatchQueue.main.async { guard let self, self.connectionGenerationClock.current == generation else { return }; self.transferSnapshot = snapshot }
         }

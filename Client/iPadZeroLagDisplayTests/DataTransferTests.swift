@@ -5,6 +5,47 @@ import Foundation
 @testable import iPadCasting
 
 final class DataTransferTests: XCTestCase {
+    func testF03AdmissionFailureRetainsStageAndSanitizedNativeError() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try Data([1]).write(to:root)
+        defer {try? FileManager.default.removeItem(at:root)}
+        let offered=expectation(description:"offer"),failed=expectation(description:"native storage failure")
+        let manager=DataTransferManager(generation:4,directory:root){_,done in done(true)}
+        manager.changed={ value in
+            if value.phase == .awaitingDecision {offered.fulfill()}
+            if value.phase == .failed {
+                XCTAssertFalse(value.outgoing);XCTAssertEqual(value.stage,"admission")
+                XCTAssertNotNil(value.failure);XCTAssertFalse(String(describing:value.failure).contains(root.path))
+                failed.fulfill()
+            }
+        }
+        XCTAssertTrue(manager.post(TransferPacket(kind:.offer,generation:2,id:UUID(),files:[TransferFile(name:"private.pdf",length:1)])))
+        await fulfillment(of:[offered],timeout:3);manager.decide(true)
+        await fulfillment(of:[failed],timeout:3);manager.retire()
+    }
+    func testF03InvalidOffsetHasBoundedRedactedTraceAndNoPublishedFile() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer {try? FileManager.default.removeItem(at:root)}
+        let offered=expectation(description:"offer"),accepted=expectation(description:"accepted"),failed=expectation(description:"invalid offset")
+        let id=UUID()
+        let manager=DataTransferManager(generation:4,directory:root){_,done in done(true)}
+        var lines:[String]=[]
+        manager.diagnostic={lines.append($0)}
+        manager.changed={ value in
+            if value.phase == .awaitingDecision {offered.fulfill()}
+            if value.phase == .receiving {accepted.fulfill()}
+            if value.phase == .failed {
+                XCTAssertEqual(value.failure?.reason,"INVALID_TRANSFER");XCTAssertEqual(value.stage,"write")
+                XCTAssertTrue(value.received.isEmpty)
+                XCTAssertFalse(lines.joined().contains("private.pdf"));XCTAssertFalse(lines.joined().contains(root.path))
+                XCTAssertLessThan(lines.count,20);failed.fulfill()
+            }
+        }
+        XCTAssertTrue(manager.post(TransferPacket(kind:.offer,generation:2,id:id,files:[TransferFile(name:"private.pdf",length:1)])))
+        await fulfillment(of:[offered],timeout:3);manager.decide(true);await fulfillment(of:[accepted],timeout:3)
+        var chunk=TransferPacket(kind:.chunk,generation:2,id:id);chunk.offset=1;chunk.bytes=Data([9])
+        XCTAssertTrue(manager.post(chunk));await fulfillment(of:[failed],timeout:3);manager.retire()
+    }
     func testF03SnapshotRetainsSanitizedFailureAndDirection() {
         let fields = Set(Mirror(reflecting: DataTransferManager.Snapshot()).children.compactMap(\.label))
         XCTAssertTrue(fields.contains("failure"), "Receive errors must not disappear behind Failed")
