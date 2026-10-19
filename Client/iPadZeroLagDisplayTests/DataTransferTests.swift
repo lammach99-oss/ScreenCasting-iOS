@@ -1,3 +1,4 @@
+import CryptoKit
 import Network
 import XCTest
 import Foundation
@@ -85,6 +86,62 @@ final class DataTransferTests: XCTestCase {
             queue.asyncAfter(deadline:.now()+0.02){XCTAssertEqual(bytes,[1,9]);callbacks.removeFirst()(nil);done.fulfill()}
         }
         await fulfillment(of:[done],timeout:2)
+    }
+    func testStoreBoundarySizesCollisionAndInvalidOffsets() throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer{try? FileManager.default.removeItem(at:root)}
+        for size in [0,1,15360,16384,16385,65536,65537,2*1024*1024] {
+            let directory=root.appendingPathComponent(String(size)),bytes=Data(repeating:0x41,count:size)
+            let store=try TransferStore(directory:directory,metadata:TransferFile(name:"đẹp.bin",length:UInt64(size)),id:UUID())
+            var offset=0,chunk:UInt64=0
+            while offset<size {let count=min(16384,size-offset);try store.append(chunk:chunk,offset:UInt64(offset),bytes:bytes.subdata(in:offset..<offset+count));offset+=count;chunk+=1}
+            let final=try store.publish(length:UInt64(size),digest:Data(SHA256.hash(data:bytes)))
+            XCTAssertEqual(try Data(contentsOf:final),bytes)
+            let collision=try TransferStore(directory:directory,metadata:TransferFile(name:"đẹp.bin",length:0),id:UUID())
+            XCTAssertNotEqual(try collision.publish(length:0,digest:Data(SHA256.hash(data:Data()))),final)
+        }
+        let store=try TransferStore(directory:root,metadata:TransferFile(name:"invalid",length:3),id:UUID())
+        XCTAssertThrowsError(try store.append(chunk:1,offset:0,bytes:Data([1])))
+        XCTAssertThrowsError(try store.append(chunk:0,offset:1,bytes:Data([1])))
+        try store.append(chunk:0,offset:0,bytes:Data([1]))
+        XCTAssertThrowsError(try store.append(chunk:0,offset:0,bytes:Data([1])))
+        XCTAssertThrowsError(try store.publish(length:3,digest:Data(count:32)))
+    }
+    func testManagersSequentialBatchAndExplicitApproval() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
+        defer{try? FileManager.default.removeItem(at:root)}
+        let source=root.appendingPathComponent("source.bin"),empty=root.appendingPathComponent("empty.bin")
+        try Data(repeating:7,count:32769).write(to:source);try Data().write(to:empty)
+        let completed=expectation(description:"batch ack"),approval=expectation(description:"explicit approval")
+        var left:DataTransferManager!,right:DataTransferManager!
+        left=DataTransferManager(generation:1,directory:root.appendingPathComponent("left")){packet,completion in
+            if !right.post(packet,completion:{completion(true)}) {completion(false)}
+        }
+        right=DataTransferManager(generation:2,directory:root.appendingPathComponent("right")){packet,completion in
+            if !left.post(packet,completion:{completion(true)}) {completion(false)}
+        }
+        right.changed={snapshot in if snapshot.phase == .awaitingDecision {approval.fulfill()}}
+        left.changed={snapshot in if snapshot.phase == .completed {completed.fulfill()}}
+        left.sendFiles([source,empty]);await fulfillment(of:[approval],timeout:3)
+        XCTAssertFalse(FileManager.default.fileExists(atPath:root.appendingPathComponent("right/source.bin").path))
+        right.decide(true);await fulfillment(of:[completed],timeout:5)
+        XCTAssertEqual(try Data(contentsOf:root.appendingPathComponent("right/source.bin")),Data(repeating:7,count:32769))
+        XCTAssertEqual(try Data(contentsOf:root.appendingPathComponent("right/empty.bin")),Data())
+        left.retire();right.retire()
+    }
+    func testWrongCancelIdentityCannotOwnReplacement() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer{try? FileManager.default.removeItem(at:root)}
+        let offered=expectation(description:"offer"),rejected=expectation(description:"reject")
+        let manager=DataTransferManager(generation:9,directory:root){_,completion in completion(true)}
+        manager.changed={snapshot in if snapshot.phase == .awaitingDecision {offered.fulfill()};if snapshot.phase == .rejected {rejected.fulfill()}}
+        let id=UUID(),offer=TransferPacket(kind:.offer,generation:7,id:id,files:[TransferFile(name:"x",length:1)])
+        XCTAssertTrue(manager.post(offer));await fulfillment(of:[offered],timeout:2)
+        XCTAssertTrue(manager.owns(TransferPacket(kind:.cancel,generation:7,id:id)))
+        XCTAssertFalse(manager.owns(TransferPacket(kind:.cancel,generation:7,id:UUID())))
+        XCTAssertFalse(manager.owns(TransferPacket(kind:.cancel,generation:8,id:id)))
+        manager.decide(false);await fulfillment(of:[rejected],timeout:2);manager.retire()
     }
     func testBulkYieldsToControl() async throws {
         let queue=DispatchQueue(label:"transfer-writer-test")
