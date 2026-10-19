@@ -6,6 +6,7 @@ final class DataTransferManager {
     struct Snapshot {
         var outgoing = false
         var stage = "idle"
+        var transport = "Connected to PC"
         var failure: FailureDetail?
         var retainedBytes: UInt64 = 0
         var retainedCount = 0
@@ -51,6 +52,7 @@ final class DataTransferManager {
     private var wireOwner: (UUID,UInt64)?
     func owns(_ packet: TransferPacket) -> Bool {admission.lock();defer{admission.unlock()};return wireOwner?.0 == packet.id && wireOwner?.1 == packet.generation}
     private let generation: UInt64, directory: URL, sender: Sender
+    private let transport: String
     private var owner: Owner?, retired = false
     private var snapshot = Snapshot()
     private var retiredIDs: [UUID] = []
@@ -61,8 +63,8 @@ final class DataTransferManager {
     private var droppedDiagnostics = 0
     private var diagnosticStage = "idle"
     private var verifiedFiles: [URL] = []
-    init(generation: UInt64, directory: URL, sender: @escaping Sender) {
-        self.generation=generation;self.directory=directory;self.sender=sender
+    init(generation: UInt64, directory: URL, transport: String = "Connected to PC", sender: @escaping Sender) {
+        self.generation=generation;self.directory=directory;self.sender=sender;self.transport=transport
         queue.async {
             let files=(try? FileManager.default.contentsOfDirectory(at:directory,includingPropertiesForKeys:nil)) ?? []
             for file in files where file.lastPathComponent.hasPrefix(".scdt-") && file.pathExtension == "part" {try? FileManager.default.removeItem(at:file)}
@@ -129,6 +131,7 @@ final class DataTransferManager {
     private func current(_ active: Owner) -> Bool {!retired && owner === active}
     private func publish(_ phase: Phase) {
         snapshot.phase=phase
+        snapshot.transport=transport
         snapshot.stage = diagnosticStage
         if let active=owner {snapshot.outgoing=active.outgoing;snapshot.count=active.files.count;snapshot.index=active.index;snapshot.published=active.published;snapshot.bytes=active.bytes;snapshot.total=active.files.reduce(0){$0+$1.length};snapshot.name=active.index<active.files.count ? active.files[active.index].name : snapshot.name}
         snapshot.received = verifiedFiles

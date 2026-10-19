@@ -4174,7 +4174,7 @@ public class NetworkManager: ObservableObject {
     private func beginDataTransfer(generation: UInt64) {
         guard generation == connectionGeneration, dataTransfers == nil else { return }
         let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("ScreenCasting Transfers")
-        let manager = DataTransferManager(generation: generation, directory: root) { [weak self] packet, completion in
+        let manager = DataTransferManager(generation: generation, directory: root, transport: activeTransportKind == .usb ? "USB-C" : "Wi-Fi") { [weak self] packet, completion in
             guard let self else { completion(false); return }
             self.networkQueue.async {
                 guard generation == self.connectionGeneration, self.wireAuthenticatedGeneration == generation,

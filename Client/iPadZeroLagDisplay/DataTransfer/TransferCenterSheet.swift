@@ -16,7 +16,7 @@ struct TransferCenterSheet: View {
             ScrollViewReader { reader in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 24) {
-                        Label(networkManager.isConnected ? "Connected to PC" : "PC disconnected", systemImage: networkManager.isConnected ? "checkmark.circle.fill" : "wifi.slash")
+                        Label(networkManager.isConnected ? "Connected to PC · \(state.transport)" : "PC disconnected", systemImage: networkManager.isConnected ? "checkmark.circle.fill" : "wifi.slash")
                             .foregroundStyle(networkManager.isConnected ? Color.green : Color.gray)
                         ViewThatFits(in: .horizontal) {
                             HStack { sendButton; receivedButton { reader.scrollTo("received", anchor: .top) } }
@@ -108,6 +108,8 @@ struct TransferCenterSheet: View {
             ForEach(state.received, id: \.self) { url in
                 VStack(alignment: .leading, spacing: 6) {
                     Text(url.lastPathComponent).fixedSize(horizontal: false, vertical: true)
+                    Text(TransferPresentation.size(UInt64(max(0,(try? url.resourceValues(forKeys:[.fileSizeKey]).fileSize) ?? 0))))
+                        .font(.subheadline).foregroundStyle(.secondary)
                     Button { exportFile=ExportFile(url:url) } label: { Label("Save to Files", systemImage: "square.and.arrow.up").frame(minHeight: 44) }
                         .accessibilityLabel("Save \(url.lastPathComponent) to Files")
                     Divider()

@@ -17,7 +17,7 @@ final class TransferCenterPresentationTests: XCTestCase {
         XCTAssertFalse(TransferPresentation.size(UInt64.max).isEmpty)
     }
     func testTerminalStatesAreNotCancellable() {
-        for phase: DataTransferManager.Phase in [.completed,.failed,.cancelled,.rejected,.retired,.idle] {
+        for phase in [DataTransferManager.Phase.completed,.failed,.cancelled,.rejected,.retired,.idle] {
             XCTAssertFalse(TransferPresentation.active(phase))
         }
         XCTAssertTrue(TransferPresentation.active(.awaitingDecision))
