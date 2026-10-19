@@ -36,6 +36,7 @@ final class DataTransferManager {
         var sources: [URL] = [], scoped: [URL] = []
         var accepted = false, index = 0, published = 0
         var bytes: UInt64 = 0, offset: UInt64 = 0, chunk: UInt64 = 0
+        var receivedChunks: UInt64 = 0
         var handle: FileHandle?, store: TransferStore?
         var hash = SHA256()
         var initialDate: Date?
@@ -187,6 +188,7 @@ final class DataTransferManager {
             diagnosticStage = "write"
             guard p.fileIndex==active.index,let store=active.store else {throw TransferProtocol.Failure.invalid}
             try store.append(chunk:p.chunkIndex,offset:p.offset,bytes:p.bytes)
+            active.receivedChunks += 1
             if p.chunkIndex == 0 {event("first_chunk", updateStage:false)}
             progress(active,bytes:active.bytes+store.written)
         case .fileEnd:
@@ -232,11 +234,14 @@ final class DataTransferManager {
         guard diagnosticCount < 128 || terminal else {droppedDiagnostics += 1;return}
         diagnosticCount += 1
         let active=owner
-        diagnostic?("component=DataTransfer direction=\(snapshot.outgoing ? "IPAD_TO_PC" : "PC_TO_IPAD") local_generation=\(generation) peer_generation=\(active?.generation ?? 0) transfer_id=\(active?.id.uuidString ?? "none") stage=\(stage) file_index=\(active?.index ?? 0) file_count=\(active?.files.count ?? 0) bytes=\(snapshot.bytes) expected=\(snapshot.total) reason=\(snapshot.failure?.reason ?? "none") error_domain=\(snapshot.failure?.domain ?? "none") error_code=\(snapshot.failure?.code ?? 0) dropped=\(droppedDiagnostics)")
+        let offset = active?.outgoing == true ? (active?.offset ?? 0) : (active?.store?.written ?? 0)
+        let expected = active?.files.reduce(UInt64(0)) {$0+$1.length} ?? snapshot.total
+        diagnostic?("component=DataTransfer direction=\(snapshot.outgoing ? "IPAD_TO_PC" : "PC_TO_IPAD") local_generation=\(generation) peer_generation=\(active?.generation ?? 0) transfer_id=\(active?.id.uuidString ?? "none") stage=\(stage) file_index=\(active?.index ?? 0) file_count=\(active?.files.count ?? 0) bytes=\((active?.bytes ?? 0)+offset) expected=\(expected) file_offset=\(offset) chunk_count=\(active?.outgoing == true ? (active?.chunk ?? 0) : (active?.receivedChunks ?? 0)) reason=\(snapshot.failure?.reason ?? "none") error_domain=\(snapshot.failure?.domain ?? "none") error_code=\(snapshot.failure?.code ?? 0) dropped=\(droppedDiagnostics)")
     }
     private func refreshRetainedFiles() {
-        let files=(try? FileManager.default.contentsOfDirectory(at:directory,includingPropertiesForKeys:[.isRegularFileKey,.fileSizeKey],options:.skipsHiddenFiles)) ?? []
+        let files=(try? FileManager.default.contentsOfDirectory(at:directory,includingPropertiesForKeys:[.isRegularFileKey,.fileSizeKey])) ?? []
         verifiedFiles=files.filter {
+            guard !($0.lastPathComponent.hasPrefix(".scdt-") && $0.pathExtension == "part") else {return false}
             guard let values=try? $0.resourceValues(forKeys:[.isRegularFileKey,.isSymbolicLinkKey]) else {return false}
             return values.isRegularFile == true && values.isSymbolicLink != true
         }.sorted {$0.lastPathComponent < $1.lastPathComponent}
