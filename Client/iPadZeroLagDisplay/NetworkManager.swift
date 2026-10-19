@@ -5719,7 +5719,7 @@ public class NetworkManager: ObservableObject {
             usbLaneConnections[lane]?.cancel()
             usbLaneConnections[lane] = connection
             connection.start(queue: networkQueue)
-            startUsbLaneReceiveLoop(connection, lane: lane)
+            startUsbLaneReceiveLoop(connection, lane: lane, generation: connectionGeneration)
         }
     }
 

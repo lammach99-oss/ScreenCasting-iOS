@@ -19,6 +19,7 @@ final class DataTransferManager {
         var handle: FileHandle?, store: TransferStore?
         var hash = SHA256()
         var initialDate: Date?
+        var lastProgress: TimeInterval = 0
         var waiting: TransferKind?
         var received: [URL] = []
         init(id: UUID, generation: UInt64, outgoing: Bool, files: [TransferFile]) { self.id=id;self.generation=generation;self.outgoing=outgoing;self.files=files }
@@ -31,6 +32,8 @@ final class DataTransferManager {
     private let generation: UInt64, directory: URL, sender: Sender
     private var owner: Owner?, retired = false
     private var snapshot = Snapshot()
+    private var retiredIDs: [UUID] = []
+    private var peerGeneration: UInt64?
     var changed: ((Snapshot) -> Void)?
     init(generation: UInt64, directory: URL, sender: @escaping Sender) { self.generation=generation;self.directory=directory;self.sender=sender }
     @discardableResult func post(_ packet: TransferPacket) -> Bool {
@@ -88,7 +91,12 @@ final class DataTransferManager {
         if let active=owner {snapshot.count=active.files.count;snapshot.index=active.index;snapshot.published=active.published;snapshot.bytes=active.bytes;snapshot.total=active.files.reduce(0){$0+$1.length};snapshot.name=active.index<active.files.count ? active.files[active.index].name : "";snapshot.received=active.received}
         let value=snapshot;changed?(value)
     }
-    private func finish(_ phase: Phase) {publish(phase);owner?.close();owner=nil}
+    private func progress(_ active: Owner, bytes: UInt64) {
+        let now=ProcessInfo.processInfo.systemUptime
+        guard now-active.lastProgress>=0.1 else{return};active.lastProgress=now
+        snapshot.bytes=bytes;snapshot.phase=active.outgoing ? .sending : .receiving;changed?(snapshot)
+    }
+    private func finish(_ phase: Phase) {publish(phase);if let active=owner {retiredIDs.append(active.id);if retiredIDs.count>256 {retiredIDs.removeFirst()}};owner?.close();owner=nil}
     private func fail(phase: Phase = .failed) {
         guard let active=owner else {return}
         var cancel=packet(active,.cancel);cancel.reason = .cancelled;sender(cancel){_ in};finish(phase)
@@ -106,6 +114,8 @@ final class DataTransferManager {
     private func receive(_ p: TransferPacket) throws {
         guard !retired else {return}
         if p.kind == .offer {
+            guard !retiredIDs.contains(p.id), peerGeneration == nil || peerGeneration == p.generation else {return}
+            peerGeneration = p.generation
             guard owner == nil else {var busy=TransferPacket(kind:.response,generation:p.generation,id:p.id);busy.reason = .busy;sender(busy){_ in};return}
             _ = try TransferProtocol.validate(p.files);owner=Owner(id:p.id,generation:p.generation,outgoing:false,files:p.files);snapshot.received=[];publish(.awaitingDecision);return
         }
@@ -127,6 +137,7 @@ final class DataTransferManager {
         case .chunk:
             guard p.fileIndex==active.index,let store=active.store else {throw TransferProtocol.Failure.invalid}
             try store.append(chunk:p.chunkIndex,offset:p.offset,bytes:p.bytes)
+            progress(active,bytes:active.bytes+store.written)
         case .fileEnd:
             guard p.fileIndex==active.index,let store=active.store else {throw TransferProtocol.Failure.invalid}
             publish(.verifying);let final=try store.publish(length:p.offset,digest:p.bytes);active.store=nil;active.received.append(final);active.bytes+=p.offset;active.published+=1;active.index+=1
@@ -151,7 +162,7 @@ final class DataTransferManager {
             if active.offset<length {
                 guard let bytes=try active.handle?.read(upToCount:Int(min(UInt64(TransferProtocol.defaultChunkBytes),length-active.offset))),!bytes.isEmpty else {throw TransferProtocol.Failure.invalid}
                 active.hash.update(data:bytes);var p=packet(active,.chunk);p.fileIndex=UInt16(active.index);p.offset=active.offset;p.chunkIndex=active.chunk;p.bytes=bytes
-                write(active,p){ [weak self,weak active] _ in guard let self,let active else{return};active.offset+=UInt64(bytes.count);active.chunk+=1;self.pump(active) }
+                write(active,p){ [weak self,weak active] _ in guard let self,let active else{return};active.offset+=UInt64(bytes.count);active.chunk+=1;self.progress(active,bytes:active.bytes+active.offset);self.pump(active) }
             } else {
                 let values=try active.sources[active.index].resourceValues(forKeys:[.fileSizeKey,.contentModificationDateKey])
                 guard values.fileSize==Int(length),values.contentModificationDate==active.initialDate else {throw TransferProtocol.Failure.invalid}

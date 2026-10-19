@@ -3,7 +3,8 @@ root=pathlib.Path.cwd(); out=root/'evidence'
 def run(args,log):
  with (out/log).open('w') as f:
   p=subprocess.run(args,stdout=f,stderr=subprocess.STDOUT)
- if p.returncode: raise RuntimeError(str(args)+' exit='+str(p.returncode))
+ if p.returncode:
+  print((out/log).read_text(errors='replace')[-40000:]);raise RuntimeError(str(args)+' exit='+str(p.returncode))
 def sha(b):return hashlib.sha256(b).hexdigest()
 if sys.argv[1]=='prepare':
  spec=importlib.util.spec_from_file_location('attest',root/'Client/scripts/verify_g02_native_consumer_attestation.py')
