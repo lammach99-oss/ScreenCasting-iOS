@@ -5,6 +5,12 @@ import Foundation
 @testable import iPadCasting
 
 final class DataTransferTests: XCTestCase {
+    func testF03SnapshotRetainsSanitizedFailureAndDirection() {
+        let fields = Set(Mirror(reflecting: DataTransferManager.Snapshot()).children.compactMap(\.label))
+        XCTAssertTrue(fields.contains("failure"), "Receive errors must not disappear behind Failed")
+        XCTAssertTrue(fields.contains("outgoing"), "Terminal progress must retain transfer direction")
+        XCTAssertTrue(fields.contains("stage"), "Retain the actual failed stage")
+    }
     func testCanonicalEnvelopeAndAllTruncationPoints() throws {
         let id=UUID(uuidString:"00112233-4455-6677-8899-AABBCCDDEEFF")!
         let p=TransferPacket(kind:.end,generation:0x0807060504030201,id:id)
