@@ -161,4 +161,172 @@ final class DataTransferTests: XCTestCase {
         }
         await fulfillment(of:[finished],timeout:2)
     }
+
+    func testCancelBulkCompletesQueuedBulkFailureExactlyOnceWithoutAffectingControl() async {
+        let q = DispatchQueue(label: "F01.explicit-callbacks")
+        let done = expectation(description: "active and control drained")
+        var sent: [UInt8] = [], callbacks: [(NWError?) -> Void] = []
+        var a = 0, b = 0, c = 0
+        let writer = ControlChannelWriter(queue: q) { data, _, callback in
+            sent.append(data[0]); callbacks.append(callback)
+        }
+        q.async {
+            writer.begin(generation: 31)
+            XCTAssertTrue(writer.enqueueBulk(Data([1])) { error in a += 1; XCTAssertNil(error) })
+            XCTAssertTrue(writer.enqueueBulk(Data([2])) { error in b += 1; XCTAssertNotNil(error) })
+            XCTAssertTrue(writer.enqueue(Data([9])) { error in c += 1; XCTAssertNil(error) })
+            writer.cancelBulk(); writer.cancelBulk()
+            XCTAssertEqual(b, 1, "Queued B must receive exactly one terminal failure")
+            XCTAssertEqual(a, 0); XCTAssertEqual(c, 0); XCTAssertEqual(sent, [1])
+            callbacks.removeFirst()(nil)
+            q.async {
+                XCTAssertEqual(a, 1); XCTAssertEqual(b, 1); XCTAssertEqual(sent, [1, 9])
+                let control = callbacks.removeFirst(); control(nil); control(nil)
+                q.async {
+                    XCTAssertEqual(c, 1); XCTAssertEqual(b, 1)
+                    writer.cancelBulk(); writer.cancel()
+                    XCTAssertEqual(b, 1); done.fulfill()
+                }
+            }
+        }
+        await fulfillment(of: [done], timeout: 3)
+    }
+
+    func testCancelBulkPreservesActiveAndRejectsStaleGenerationCallback() async {
+        let q = DispatchQueue(label: "F01.generation")
+        let done = expectation(description: "replacement control")
+        var callbacks: [(NWError?) -> Void] = [], sent: [UInt8] = []
+        var active = 0, queued = 0, replacement = 0
+        let writer = ControlChannelWriter(queue: q) { data, _, callback in sent.append(data[0]); callbacks.append(callback) }
+        q.async {
+            writer.begin(generation: 1)
+            XCTAssertTrue(writer.enqueueBulk(Data([1])) { _ in active += 1 })
+            writer.cancelBulk(); XCTAssertEqual(active, 0)
+            XCTAssertTrue(writer.enqueueBulk(Data([2])) { error in queued += 1; XCTAssertNotNil(error) })
+            writer.cancelBulk(); writer.cancel(); writer.begin(generation: 2)
+            XCTAssertTrue(writer.enqueue(Data([9])) { _ in replacement += 1 })
+            let old = callbacks.removeFirst(); old(.posix(.ECANCELED)); old(nil)
+            q.async {
+                XCTAssertEqual(sent, [1, 9]); XCTAssertEqual(active, 0); XCTAssertEqual(queued, 1)
+                callbacks.removeFirst()(nil)
+                q.async { XCTAssertEqual(replacement, 1); XCTAssertEqual(queued, 1); done.fulfill() }
+            }
+        }
+        await fulfillment(of: [done], timeout: 3)
+    }
+
+    func testCancelBulkCallbackMayEnqueueReplacementWithoutLosingControl() async {
+        let q = DispatchQueue(label: "F01.reentrant"), done = expectation(description: "replacement drained")
+        var callbacks: [(NWError?) -> Void] = [], sent: [UInt8] = [], cancelled = 0
+        let writer = ControlChannelWriter(queue: q) { data, _, callback in sent.append(data[0]); callbacks.append(callback) }
+        q.async {
+            writer.begin(generation: 1)
+            XCTAssertTrue(writer.enqueueBulk(Data([1])) { _ in })
+            XCTAssertTrue(writer.enqueueBulk(Data([2])) { error in
+                cancelled += 1; XCTAssertNotNil(error)
+                XCTAssertTrue(writer.enqueueBulk(Data([3])) { _ in })
+            })
+            XCTAssertTrue(writer.enqueue(Data([9])))
+            writer.cancelBulk(); XCTAssertEqual(cancelled, 1)
+            callbacks.removeFirst()(nil)
+            q.async {
+                XCTAssertEqual(sent, [1, 9]); callbacks.removeFirst()(nil)
+                q.async {
+                    XCTAssertEqual(sent, [1, 9, 3])
+                    if !callbacks.isEmpty { callbacks.removeFirst()(nil) }
+                    q.async { done.fulfill() }
+                }
+            }
+        }
+        await fulfillment(of: [done], timeout: 3)
+    }
+
+    #if targetEnvironment(simulator)
+    private func transferTestFrame(_ type: WireMessageType, _ payload: Data) -> Data {
+        var frame = Data("SCST".utf8); frame.append(contentsOf: [1, type.rawValue, 0, 0])
+        var size = UInt32(payload.count).littleEndian, sequence = UInt32(1).littleEndian
+        withUnsafeBytes(of: &size) { frame.append(contentsOf: $0) }
+        withUnsafeBytes(of: &sequence) { frame.append(contentsOf: $0) }
+        frame.append(payload); return frame
+    }
+
+    func testRejectedTransferAdmissionRearmsAuthenticatedReceiveOrRetiresExplicitly() throws {
+        let network = NetworkManager(), session = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let manager = DataTransferManager(generation: session.generation, directory: root) { _, completion in completion(true) }
+        defer { network.stopForTesting(); manager.retire(); try? FileManager.default.removeItem(at: root) }
+        var reads: [(Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void] = []
+        var arms = 0, posts = 0, pongs = 0
+        network.transferReceiveForTesting = { _, callback in arms += 1; reads.append(callback); XCTAssertEqual(reads.count, 1) }
+        network.transferPostForTesting = { _, _ in posts += 1; return false }
+        network.controlSendForAudioTesting = { data, completion in
+            if data.count >= 16 && data[5] == WireMessageType.pong.rawValue { pongs += 1 }
+            completion(nil)
+        }
+        network.startTransferReceiveForTesting(manager: manager)
+        let packet = TransferPacket(kind: .end, generation: 7, id: UUID())
+        let transfer = transferTestFrame(.transferEnd, try TransferProtocol.encode(packet))
+        let ping = transferTestFrame(.ping, Data(count: 16))
+        // Repeated synchronous refusal must return to the outer receive boundary,
+        // with one outstanding read, without recursive parser entry or extra queues.
+        for _ in 0..<16 {
+            network.networkQueueForTesting.sync { reads.removeFirst()(transfer + ping, nil, false, nil) }
+            network.networkQueueForTesting.sync {}
+            XCTAssertEqual(network.transferPendingForTesting, 0)
+        }
+        XCTAssertEqual(posts, 16); XCTAssertEqual(arms, 17); XCTAssertEqual(reads.count, 1); XCTAssertEqual(pongs, 16)
+        // A captured old receive callback must not dispatch into a replacement owner.
+        let stale = reads.removeFirst()
+        _ = network.simulateCommittedWifiSessionForTesting()
+        network.networkQueueForTesting.sync { stale(transfer, nil, false, nil) }
+        XCTAssertEqual(posts, 16); XCTAssertEqual(arms, 17)
+    }
+
+    func testTransferAdmissionAcceptedThenRefusedWaitsForExactlyOneOwnerCompletion() throws {
+        let network = NetworkManager(), session = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let manager = DataTransferManager(generation: session.generation, directory: root) { _, completion in completion(true) }
+        defer { network.stopForTesting(); manager.retire(); try? FileManager.default.removeItem(at: root) }
+        var reads: [(Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void] = [], finishes: [() -> Void] = []
+        var posts = 0, arms = 0
+        network.transferReceiveForTesting = { _, callback in arms += 1; reads.append(callback); XCTAssertEqual(reads.count, 1) }
+        network.transferPostForTesting = { _, completion in
+            posts += 1
+            if posts == 1 { finishes.append(completion); return true }
+            return false
+        }
+        network.startTransferReceiveForTesting(manager: manager)
+        let frame = transferTestFrame(.transferEnd, try TransferProtocol.encode(TransferPacket(kind: .end, generation: 7, id: UUID())))
+        network.networkQueueForTesting.sync { reads.removeFirst()(frame + frame, nil, false, nil) }
+        XCTAssertEqual(posts, 2); XCTAssertEqual(arms, 1); XCTAssertTrue(reads.isEmpty); XCTAssertEqual(network.transferPendingForTesting, 1)
+        finishes.removeFirst()(); network.networkQueueForTesting.sync {}
+        XCTAssertEqual(arms, 2); XCTAssertEqual(reads.count, 1); XCTAssertEqual(network.transferPendingForTesting, 0)
+        // Hold an accepted completion, reconnect, then release it: no stale rearm.
+        posts = 0
+        network.networkQueueForTesting.sync { reads.removeFirst()(frame, nil, false, nil) }
+        XCTAssertEqual(network.transferPendingForTesting, 1)
+        _ = network.simulateCommittedWifiSessionForTesting()
+        finishes.removeFirst()(); network.networkQueueForTesting.sync {}
+        XCTAssertEqual(arms, 2); XCTAssertTrue(reads.isEmpty)
+    }
+
+    func testTransferAdmissionWithoutManagerOrAuthenticationHasNoSideEffects() throws {
+        let network = NetworkManager(), session = network.simulateCommittedWifiSessionForTesting()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let manager = DataTransferManager(generation: session.generation, directory: root) { _, _ in XCTFail("No transfer side effects allowed") }
+        defer { network.stopForTesting(); manager.retire(); try? FileManager.default.removeItem(at: root) }
+        var reads: [(Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void] = [], posts = 0
+        network.transferReceiveForTesting = { _, callback in reads.append(callback) }
+        network.transferPostForTesting = { _, _ in posts += 1; return false }
+        let frame = transferTestFrame(.transferEnd, try TransferProtocol.encode(TransferPacket(kind: .end, generation: 7, id: UUID())))
+        network.startTransferReceiveForTesting(manager: nil)
+        network.networkQueueForTesting.sync { reads.removeFirst()(frame, nil, false, nil) }
+        XCTAssertEqual(posts, 0); XCTAssertEqual(reads.count, 1)
+        reads.removeAll()
+        network.startTransferReceiveForTesting(manager: manager, authenticated: false)
+        network.networkQueueForTesting.sync { reads.removeFirst()(frame, nil, false, nil) }
+        XCTAssertEqual(posts, 0); XCTAssertEqual(network.transferPendingForTesting, 0)
+    }
+    #endif
+
 }

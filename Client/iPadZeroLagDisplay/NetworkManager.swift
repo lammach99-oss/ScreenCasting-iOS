@@ -4297,10 +4297,7 @@ public class NetworkManager: ObservableObject {
               let connection else { return }
 
         let maximumLength = wireParser.suggestedReceiveLength
-        connection.receive(
-            minimumIncompleteLength: 1,
-            maximumLength: maximumLength
-        ) { [weak self] data, _, isComplete, error in
+        let completion: (Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void = { [weak self] data, _, isComplete, error in
             guard let self,
                   generation == self.connectionGeneration,
                   self.connection === connection,
@@ -4328,6 +4325,13 @@ public class NetworkManager: ObservableObject {
             }
             if self.transferReceivePending == 0 { self.receiveWireChunk(generation: generation) }
         }
+        #if targetEnvironment(simulator)
+        if let transferReceiveForTesting {
+            transferReceiveForTesting(maximumLength, completion)
+            return
+        }
+        #endif
+        connection.receive(minimumIncompleteLength: 1, maximumLength: maximumLength, completion: completion)
     }
 
     private func handleWireReceiveError(
@@ -4452,7 +4456,13 @@ public class NetworkManager: ObservableObject {
                 if let manager = dataTransfers {
                     if kind == .cancel && manager.owns(packet) { controlChannelWriter.cancelBulk() }
                     transferReceivePending += 1
-                    if !manager.post(packet, completion: { [weak self] in
+                    let post: (TransferPacket, @escaping () -> Void) -> Bool
+                    #if targetEnvironment(simulator)
+                    post = transferPostForTesting ?? { manager.post($0, completion: $1) }
+                    #else
+                    post = { manager.post($0, completion: $1) }
+                    #endif
+                    if !post(packet, { [weak self] in
                         guard let self else {return}
                         self.networkQueue.async {
                             guard generation == self.connectionGeneration, self.dataTransfers === manager else {return}
@@ -5673,6 +5683,20 @@ public class NetworkManager: ObservableObject {
     }
 
     #if targetEnvironment(simulator)
+    // Deterministic admission/receive boundary only; absent from device builds.
+    var transferReceiveForTesting: ((Int, @escaping (Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void) -> Void)?
+    var transferPostForTesting: ((TransferPacket, @escaping () -> Void) -> Bool)?
+    func startTransferReceiveForTesting(manager: DataTransferManager?, authenticated: Bool = true) {
+        networkQueue.sync {
+            dataTransfers = manager
+            transferReceivePending = 0
+            wireParser.reset(generation: connectionGeneration)
+            wireAuthenticatedGeneration = authenticated ? connectionGeneration : nil
+            receiveWireChunk(generation: connectionGeneration)
+        }
+    }
+    var transferPendingForTesting: Int { networkQueue.sync { transferReceivePending } }
+
     var realtimeAudioPlaybackForTesting: ((Bool) -> Void)?
     var controlSendForAudioTesting: ((Data, @escaping (NWError?) -> Void) -> Void)?
 
