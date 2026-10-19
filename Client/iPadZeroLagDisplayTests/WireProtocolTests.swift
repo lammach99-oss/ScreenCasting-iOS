@@ -916,8 +916,8 @@ final class ExternalPointerInputTests: XCTestCase {
         XCTAssertEqual(commands.map(\.action), [.leftDown, .leftUp])
     }
 
-    func testNoRaw43RegistrationRemains() {
-        XCTAssertNil(WireMessageType(rawValue: 43))
+    func testRaw43UsesAuditedDataTransferOffer() {
+        XCTAssertEqual(WireMessageType(rawValue: 43), .transferOffer)
     }
 
     private func clientSource(_ file: String) throws -> String {

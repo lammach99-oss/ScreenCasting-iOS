@@ -49,6 +49,7 @@ public struct SettingsView: View {
 
                 ScrollView {
                     VStack(spacing: 20) {
+                        TransferPanel(networkManager: networkManager).padding().foregroundColor(.white)
                         settingsCard {
                             VStack(alignment: .leading, spacing: 14) {
                                 Label("Virtual Display", systemImage: "rectangle.on.rectangle")

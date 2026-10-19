@@ -87,6 +87,7 @@ enum WireMessageType: UInt8 {
     case textCommit = 40
     case directTouchContact = 41
     case cursorOwnership = 42
+    case transferOffer = 43, transferResponse, transferChunk, transferFileEnd, transferFileAck, transferCancel, transferEnd, transferAck
 }
 
 public enum DirectTouchPhase: UInt8 { case down = 0, update = 1, up = 2, cancel = 3 }
@@ -1642,6 +1643,10 @@ final class WireStreamParser {
             return
         }
 
+        if TransferKind(rawValue: type.rawValue) != nil && (payloadLength < 25 || payloadLength > TransferProtocol.maxPayloadBytes) {
+            state = .draining(header, remaining: payloadLength)
+            return
+        }
         payload = Data(count: payloadLength)
         payloadOffset = 0
         state = .payload(header)
@@ -1873,6 +1878,8 @@ public class NetworkManager: ObservableObject {
     private var usbListenerExplicitlyStarted = false
     private var usbScdpConnection: NWConnection?
     private var activeDirectTouchCommand: DirectTouchContactCommand?
+    @Published private(set) var transferSnapshot = DataTransferManager.Snapshot()
+    private var dataTransfers: DataTransferManager?
     private let connectionGenerationClock = ConnectionGenerationClock()
     private var connectionGeneration: UInt64 {
         connectionGenerationClock.current
@@ -2981,6 +2988,7 @@ public class NetworkManager: ObservableObject {
         resetDisplaySession()
         clearPendingTransportOffer()
         wireParser.reset(generation: stoppedGeneration)
+        dataTransfers?.retire(); dataTransfers = nil
         controlChannelWriter.cancel()
         if wasUSB { controlChannelWriter.abandonConnection() }
         stopTelemetryTimer()
@@ -4159,12 +4167,33 @@ public class NetworkManager: ObservableObject {
         }
     }
 
+    func sendTransferFiles(_ urls: [URL]) { networkQueue.async { [weak self] in self?.dataTransfers?.sendFiles(urls) } }
+    func decideTransfer(_ accepted: Bool) { networkQueue.async { [weak self] in self?.dataTransfers?.decide(accepted) } }
+    func cancelTransfer() { networkQueue.async { [weak self] in self?.dataTransfers?.cancel() } }
+    private func beginDataTransfer(generation: UInt64) {
+        guard generation == connectionGeneration, dataTransfers == nil else { return }
+        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("ScreenCasting Transfers")
+        let manager = DataTransferManager(generation: generation, directory: root) { [weak self] packet, completion in
+            guard let self else { completion(false); return }
+            self.networkQueue.async {
+                guard generation == self.connectionGeneration, self.wireAuthenticatedGeneration == generation,
+                      self.committedTransportGeneration == generation, let kind = WireMessageType(rawValue: packet.kind.rawValue),
+                      let payload = try? TransferProtocol.encode(packet) else { completion(false); return }
+                self.sendWireMessage(type: kind, payload: payload, sequence: 0, bulk: true) { completion($0 == nil) }
+            }
+        }
+        manager.changed = { [weak self] snapshot in
+            DispatchQueue.main.async { guard let self, self.connectionGenerationClock.current == generation else { return }; self.transferSnapshot = snapshot }
+        }
+        dataTransfers = manager
+    }
     private func sendWireMessage(
         type: WireMessageType,
         payload: Data,
         sequence: UInt32,
         flags: UInt16 = 0,
         movement: Bool = false,
+        bulk: Bool = false,
         completion: @escaping (NWError?) -> Void = { _ in }
     ) {
         guard payload.count <= WireProtocol.maxPayloadSize else { return }
@@ -4185,6 +4214,7 @@ public class NetworkManager: ObservableObject {
             message,
             telemetry: type == .videoFeedback,
             movement: movement,
+            bulk: bulk,
             completion: { [weak self] error in
                 if let error {
                     self?.handleControlSendError(
@@ -4222,12 +4252,15 @@ public class NetworkManager: ObservableObject {
         _ data: Data,
         telemetry: Bool = false,
         movement: Bool = false,
+        bulk: Bool = false,
         completion: @escaping (NWError?) -> Void = { _ in }
     ) {
         let generation = connectionGeneration
         networkQueue.async { [weak self] in
             guard let self, generation == self.connectionGeneration else { return }
-            if telemetry {
+            if bulk {
+                if !self.controlChannelWriter.enqueueBulk(data, completion: completion) { completion(.posix(.ENOBUFS)) }
+            } else if telemetry {
                 self.controlChannelWriter.enqueueTelemetry(data, completion: completion)
             } else if movement {
                 self.controlChannelWriter.enqueueMovement(data, completion: completion)
@@ -4410,6 +4443,12 @@ public class NetworkManager: ObservableObject {
         }
 
         switch header.type {
+        case .transferOffer, .transferResponse, .transferChunk, .transferFileEnd, .transferFileAck, .transferCancel, .transferEnd, .transferAck:
+            guard wireAuthenticatedGeneration == generation, committedTransportGeneration == generation,
+                  let kind = TransferKind(rawValue: header.type.rawValue) else { return }
+            do { _ = dataTransfers?.post(try TransferProtocol.decode(kind, payload)) }
+            catch { dataTransfers?.cancel(failed: true) }
+            return
         case .pairingSuccess:
             storePairingCredential(payload)
 
@@ -5212,6 +5251,7 @@ public class NetworkManager: ObservableObject {
               committedTransportGeneration != generation else { return }
         committedTransportGeneration = generation
         committedRealtimeMode = mode
+        beginDataTransfer(generation: generation)
         committedTransportAudioAvailable = audioEnabled
         wifiLegacyFallbackGeneration = nil
         wifiLegacyFallbackRequestGeneration = nil
@@ -5539,6 +5579,7 @@ public class NetworkManager: ObservableObject {
         resetDisplaySession()
         clearPendingTransportOffer()
         wireParser.reset(generation: failedGeneration)
+        dataTransfers?.retire(); dataTransfers = nil
         controlChannelWriter.cancel()
         decoder.invalidate(waitForCompletion: !usbListenerExplicitlyStarted)
         AudioManager.shared.reset()
@@ -5678,7 +5719,7 @@ public class NetworkManager: ObservableObject {
             usbLaneConnections[lane]?.cancel()
             usbLaneConnections[lane] = connection
             connection.start(queue: networkQueue)
-            startUsbLaneReceiveLoop(connection, lane: lane, generation: connectionGeneration)
+            startUsbLaneReceiveLoop(connection, lane: lane)
         }
     }
 
