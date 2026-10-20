@@ -289,6 +289,108 @@ final class DataTransferTests: XCTestCase {
     }
 
     #if targetEnvironment(simulator)
+    func testT01AuthenticatedCoalescedChunksWaitForWorkerWithoutOverflow() async throws {
+        let network = NetworkManager()
+        let session = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let id = UUID(), peerGeneration: UInt64 = 7
+        let offered = expectation(description: "offer admitted")
+        let accepted = expectation(description: "explicitly accepted")
+        let blocked = expectation(description: "first chunk holds real IO worker")
+        let terminal = expectation(description: "verified transfer terminal")
+        let release = DispatchSemaphore(value: 0)
+        let payload = Data(repeating: 0x5A, count: 6 * TransferProtocol.defaultChunkBytes)
+        var cancels = 0, fileAcks = 0, acks = 0, rejectedPosts = 0
+        var final: DataTransferManager.Snapshot?
+        let manager = DataTransferManager(generation: session.generation, directory: root) { packet, done in
+            if packet.kind == .cancel { cancels += 1 }
+            if packet.kind == .fileAck { fileAcks += 1 }
+            if packet.kind == .ack { acks += 1 }
+            done(true)
+        }
+        manager.changed = { snapshot in
+            if snapshot.phase == .awaitingDecision { offered.fulfill() }
+            if snapshot.phase == .receiving && snapshot.bytes == 0 { accepted.fulfill() }
+            if snapshot.phase == .failed || snapshot.phase == .completed {
+                final = snapshot; terminal.fulfill()
+            }
+        }
+        manager.diagnostic = { line in
+            if line.contains("stage=first_chunk ") { blocked.fulfill(); release.wait() }
+        }
+        var reads: [(Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void] = []
+        network.transferReceiveForTesting = { _, callback in reads.append(callback); XCTAssertEqual(reads.count, 1) }
+        network.transferPostForTesting = { packet, completion in
+            let admitted = manager.post(packet, completion: completion)
+            if !admitted { rejectedPosts += 1 }
+            return admitted
+        }
+        defer {
+            release.signal(); network.stopForTesting(); manager.retire()
+            try? FileManager.default.removeItem(at: root)
+        }
+        network.startTransferReceiveForTesting(manager: manager)
+        let offer = TransferPacket(kind: .offer, generation: peerGeneration, id: id,
+                                   files: [TransferFile(name: "coalesced.bin", length: UInt64(payload.count))])
+        network.networkQueueForTesting.sync {
+            reads.removeFirst()(transferTestFrame(.transferOffer, try! TransferProtocol.encode(offer)), nil, false, nil)
+        }
+        await fulfillment(of: [offered], timeout: 3)
+        manager.decide(true); await fulfillment(of: [accepted], timeout: 3)
+        network.networkQueueForTesting.sync {}
+        var burst = Data()
+        for index in 0..<3 {
+            var packet = TransferPacket(kind: .chunk, generation: peerGeneration, id: id)
+            packet.chunkIndex = UInt64(index); packet.offset = UInt64(index * TransferProtocol.defaultChunkBytes)
+            packet.bytes = payload.subdata(in: index * TransferProtocol.defaultChunkBytes..<(index + 1) * TransferProtocol.defaultChunkBytes)
+            burst.append(transferTestFrame(.transferChunk, try TransferProtocol.encode(packet)))
+        }
+        XCTAssertLessThanOrEqual(burst.count, 64 * 1024)
+        network.networkQueueForTesting.sync { reads.removeFirst()(burst, nil, false, nil) }
+        await fulfillment(of: [blocked], timeout: 3)
+        XCTAssertEqual(network.transferPendingForTesting, 2)
+        XCTAssertEqual(rejectedPosts, 0, "Valid third chunk must pause before the two-message admission guard")
+        XCTAssertTrue(reads.isEmpty)
+        release.signal()
+        // Completion is observable through a fresh receive; it must drain the saved suffix first.
+        let rearmed = expectation(description: "coalesced suffix drained")
+        network.networkQueueForTesting.async {
+            network.transferReceiveForTesting = { _, callback in
+                reads.append(callback); XCTAssertEqual(reads.count, 1); rearmed.fulfill()
+            }
+            if !reads.isEmpty { rearmed.fulfill() }
+        }
+        await fulfillment(of: [rearmed], timeout: 3)
+        if rejectedPosts != 0 {
+            await fulfillment(of: [terminal], timeout: 3)
+            XCTAssertEqual(final?.phase, .completed)
+            return
+        }
+        for index in 3..<6 {
+            let drained = expectation(description: "chunk drained")
+            var packet = TransferPacket(kind: .chunk, generation: peerGeneration, id: id)
+            packet.chunkIndex = UInt64(index); packet.offset = UInt64(index * TransferProtocol.defaultChunkBytes)
+            packet.bytes = payload.subdata(in: index * TransferProtocol.defaultChunkBytes..<(index + 1) * TransferProtocol.defaultChunkBytes)
+            network.networkQueueForTesting.sync {
+                network.transferReceiveForTesting = { _, callback in reads.append(callback); drained.fulfill() }
+                reads.removeFirst()(transferTestFrame(.transferChunk, try! TransferProtocol.encode(packet)), nil, false, nil)
+            }
+            await fulfillment(of: [drained], timeout: 3)
+        }
+        var end = TransferPacket(kind: .fileEnd, generation: peerGeneration, id: id)
+        end.offset = UInt64(payload.count); end.bytes = Data(SHA256.hash(data: payload))
+        let last = transferTestFrame(.transferFileEnd, try TransferProtocol.encode(end)) +
+            transferTestFrame(.transferEnd, try TransferProtocol.encode(TransferPacket(kind: .end, generation: peerGeneration, id: id)))
+        network.networkQueueForTesting.sync {
+            network.transferReceiveForTesting = { _, callback in reads.append(callback) }
+            reads.removeFirst()(last, nil, false, nil)
+        }
+        await fulfillment(of: [terminal], timeout: 3)
+        XCTAssertEqual(final?.phase, .completed); XCTAssertEqual(cancels, 0)
+        XCTAssertEqual(fileAcks, 1); XCTAssertEqual(acks, 1)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("coalesced.bin")), payload)
+    }
+
     func testBulkCancellationDoesNotRetireAuthenticatedSession() async {
         let network = NetworkManager(), session = network.simulateCommittedWifiSessionForTesting()
         defer { network.stopForTesting() }
