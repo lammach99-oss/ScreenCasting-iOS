@@ -74,7 +74,15 @@ final class DataTransferManager {
         }
     }
     @discardableResult func post(_ packet: TransferPacket, completion: @escaping () -> Void = {}) -> Bool {
-        admission.lock();guard pending < 2 else {admission.unlock();cancel(failed: true);return false};pending += 1;admission.unlock()
+        admission.lock();guard pending < 2 else {
+            admission.unlock()
+            queue.async { [weak self] in
+                guard let self else { return }
+                self.snapshot.failure = FailureDetail(reason: "ADMISSION_FULL", domain: "Transfer", code: 0)
+                self.event("admission_rejected"); self.fail()
+            }
+            return false
+        };pending += 1;admission.unlock()
         queue.async { [weak self] in
             guard let self else {return}
             defer {self.admission.lock();self.pending -= 1;self.admission.unlock();completion()}

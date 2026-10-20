@@ -1453,20 +1453,21 @@ final class WireStreamParser {
         maximumDrainChunkObserved = 0
     }
 
-    func consume(
+    @discardableResult func consume(
         _ data: Data,
         generation: UInt64,
         receivedAt: TimeInterval = ProcessInfo.processInfo.systemUptime,
+        shouldContinue: () -> Bool = { true },
         onEvent: (WireParserEvent) -> Void
-    ) {
-        guard generation == self.generation, !data.isEmpty else { return }
+    ) -> Int {
+        guard generation == self.generation, !data.isEmpty else { return 0 }
 
-        data.withUnsafeBytes { source in
-            guard let sourceBase = source.baseAddress else { return }
+        return data.withUnsafeBytes { source in
+            guard let sourceBase = source.baseAddress else { return 0 }
             var sourceOffset = 0
 
             while sourceOffset < source.count {
-                guard generation == self.generation else { break }
+                guard generation == self.generation, shouldContinue() else { break }
                 switch state {
                 case .header:
                     if headerOffset == 0 { messageFirstByteAt = receivedAt }
@@ -1528,6 +1529,7 @@ final class WireStreamParser {
                     sourceOffset = source.count
                 }
             }
+            return sourceOffset
         }
     }
 
@@ -1693,14 +1695,16 @@ final class WireParserQueueDomain {
         parser.reset(generation: generation)
     }
 
-    func consume(
+    @discardableResult func consume(
         _ data: Data,
         generation: UInt64,
         receivedAt: TimeInterval = ProcessInfo.processInfo.systemUptime,
+        shouldContinue: () -> Bool = { true },
         onEvent: (WireParserEvent) -> Void
-    ) {
+    ) -> Int {
         dispatchPrecondition(condition: .onQueue(queue))
-        parser.consume(data, generation: generation, receivedAt: receivedAt, onEvent: onEvent)
+        return parser.consume(data, generation: generation, receivedAt: receivedAt,
+                              shouldContinue: shouldContinue, onEvent: onEvent)
     }
 }
 
@@ -1881,6 +1885,15 @@ public class NetworkManager: ObservableObject {
     @Published private(set) var transferSnapshot = DataTransferManager.Snapshot()
     private var dataTransfers: DataTransferManager?
     private var transferReceivePending = 0
+    private struct TransferReceiveSuffix {
+        let data: Data
+        let receivedAt: TimeInterval
+        let generation: UInt64
+        let connection: NWConnection
+        let isComplete: Bool
+    }
+    private var transferReceiveSuffix: TransferReceiveSuffix?
+    private var wireReceiveOutstanding: (generation: UInt64, connection: ObjectIdentifier)?
     private let connectionGenerationClock = ConnectionGenerationClock()
     private var connectionGeneration: UInt64 {
         connectionGenerationClock.current
@@ -2979,6 +2992,8 @@ public class NetworkManager: ObservableObject {
         usbLaneConnections.values.forEach { $0.cancel() }
         usbLaneConnections.removeAll()
         wireReceiveActiveGeneration = nil
+        wireReceiveOutstanding = nil
+        transferReceiveSuffix = nil
         wireAuthenticatedGeneration = nil
         committedTransportGeneration = nil
         committedRealtimeMode = nil
@@ -4306,34 +4321,38 @@ public class NetworkManager: ObservableObject {
               wireReceiveActiveGeneration == generation,
               let connection else { return }
 
+        if let outstanding = wireReceiveOutstanding,
+           outstanding.generation == generation,
+           outstanding.connection == ObjectIdentifier(connection) { return }
+        if let suffix = transferReceiveSuffix {
+            guard suffix.generation == generation, suffix.connection === connection else {
+                transferReceiveSuffix = nil
+                return
+            }
+            guard transferReceivePending == 0 else { return }
+            transferReceiveSuffix = nil
+            consumeWireReceive(suffix.data, generation: generation, connection: connection,
+                               receivedAt: suffix.receivedAt, isComplete: suffix.isComplete)
+            return
+        }
+        guard transferReceivePending == 0 else { return }
+        wireReceiveOutstanding = (generation, ObjectIdentifier(connection))
+
         let maximumLength = wireParser.suggestedReceiveLength
         let completion: (Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void = { [weak self] data, _, isComplete, error in
             guard let self,
                   generation == self.connectionGeneration,
                   self.connection === connection,
                   self.wireReceiveActiveGeneration == generation else { return }
+            self.wireReceiveOutstanding = nil
             if let error {
                 self.handleWireReceiveError(
                     error, generation: generation, connection: connection)
                 return
             }
 
-            if let data, !data.isEmpty {
-                self.wireParser.consume(
-                    data,
-                    generation: generation,
-                    receivedAt: CACurrentMediaTime()) { event in
-                    self.handleWireParserEvent(event, generation: generation)
-                }
-            }
-
-            guard generation == self.connectionGeneration,
-                  self.wireReceiveActiveGeneration == generation else { return }
-            if isComplete {
-                self.handleStreamError("Server closed the stream.")
-                return
-            }
-            if self.transferReceivePending == 0 { self.receiveWireChunk(generation: generation) }
+            self.consumeWireReceive(data ?? Data(), generation: generation, connection: connection,
+                                    receivedAt: CACurrentMediaTime(), isComplete: isComplete)
         }
         #if targetEnvironment(simulator)
         if let transferReceiveForTesting {
@@ -4342,6 +4361,32 @@ public class NetworkManager: ObservableObject {
         }
         #endif
         connection.receive(minimumIncompleteLength: 1, maximumLength: maximumLength, completion: completion)
+    }
+
+    private func consumeWireReceive(_ data: Data, generation: UInt64, connection: NWConnection,
+                                    receivedAt: TimeInterval, isComplete: Bool) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard data.count <= WireProtocol.receiveChunkSize else {
+            handleStreamError("Receive buffer exceeded its bound.")
+            return
+        }
+        let consumed = wireParser.consume(data, generation: generation, receivedAt: receivedAt,
+            shouldContinue: { self.transferReceivePending < 2 }) { event in
+                self.handleWireParserEvent(event, generation: generation)
+            }
+        guard generation == connectionGeneration, self.connection === connection,
+              wireReceiveActiveGeneration == generation else { return }
+        if consumed < data.count {
+            // One bounded socket buffer owns the FIFO suffix; no new read may bypass it.
+            transferReceiveSuffix = TransferReceiveSuffix(data: Data(data.dropFirst(consumed)),
+                receivedAt: receivedAt, generation: generation, connection: connection, isComplete: isComplete)
+            return
+        }
+        if isComplete {
+            handleStreamError("Server closed the stream.")
+            return
+        }
+        if transferReceivePending == 0 { receiveWireChunk(generation: generation) }
     }
 
     private func handleWireReceiveError(
@@ -5603,6 +5648,8 @@ public class NetworkManager: ObservableObject {
         let failedGeneration = connectionGenerationClock.advance()
         resetDirectTouchSessionOnQueue()
         wireReceiveActiveGeneration = nil
+        wireReceiveOutstanding = nil
+        transferReceiveSuffix = nil
         wireAuthenticatedGeneration = nil
         committedTransportGeneration = nil
         committedRealtimeMode = nil
@@ -5700,6 +5747,8 @@ public class NetworkManager: ObservableObject {
         networkQueue.sync {
             dataTransfers = manager
             transferReceivePending = 0
+            transferReceiveSuffix = nil
+            wireReceiveOutstanding = nil
             wireParser.reset(generation: connectionGeneration)
             wireAuthenticatedGeneration = authenticated ? connectionGeneration : nil
             receiveWireChunk(generation: connectionGeneration)
