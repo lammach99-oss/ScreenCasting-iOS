@@ -433,19 +433,53 @@ final class DataTransferTests: XCTestCase {
         defer { network.stopForTesting(); manager.retire(); try? FileManager.default.removeItem(at: root) }
         network.startTransferReceiveForTesting(manager: manager)
         var bytes = Data()
-        for _ in 0..<3 {
+        for _ in 0..<2 {
             let offer = TransferPacket(kind: .offer, generation: 7, id: UUID(), files: [TransferFile(name: "x", length: 0)])
             bytes.append(transferTestFrame(.transferOffer, try TransferProtocol.encode(offer)))
         }
         network.networkQueueForTesting.sync { reads.removeFirst()(bytes, nil, false, nil) }
         await fulfillment(of: [blocked], timeout: 3)
         XCTAssertEqual(network.transferPendingForTesting, 2); XCTAssertTrue(reads.isEmpty); XCTAssertEqual(arms, 1)
+        // The parser now pauses before overflow. Exercise a true manager refusal
+        // independently, while its two real worker admissions remain held.
+        XCTAssertFalse(manager.post(TransferPacket(kind: .offer, generation: 7, id: UUID(),
+            files: [TransferFile(name: "overflow", length: 0)])))
         release.signal()
         await fulfillment(of: [rearmed, failed], timeout: 3)
         network.networkQueueForTesting.sync {}
         XCTAssertEqual(network.transferPendingForTesting, 0); XCTAssertEqual(arms, 2); XCTAssertEqual(reads.count, 1)
         XCTAssertEqual(network.wifiLifecycleSnapshotForTesting().authenticatedGeneration, session.generation)
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("x").path))
+    }
+
+    func testT01ParserPausedMixedBurstPreservesEveryByteAtEverySplit() throws {
+        let packet = TransferPacket(kind: .chunk, generation: 7, id: UUID(), bytes: Data(repeating: 3, count: 31))
+        let chunk = transferTestFrame(.transferChunk, try TransferProtocol.encode(packet))
+        let mixed = chunk + chunk + transferTestFrame(.ping, Data(count: 16)) +
+            transferTestFrame(.pointerInput, Data(count: 8)) + chunk + chunk + chunk
+        XCTAssertLessThanOrEqual(mixed.count, WireProtocol.receiveChunkSize)
+        for split in 0...mixed.count {
+            let parser = WireStreamParser(generation: 7)
+            var frames: [WireMessageType] = [], admitted = 0
+            for fragment in [Data(mixed.prefix(split)), Data(mixed.dropFirst(split))] {
+                var offset = 0
+                while offset < fragment.count {
+                    let count = parser.consume(Data(fragment.dropFirst(offset)), generation: 7,
+                        shouldContinue: { admitted < 2 }) { event in
+                            if case .message(let message) = event {
+                                frames.append(message.header.type)
+                                if message.header.type == .transferChunk { admitted += 1 }
+                            }
+                        }
+                    offset += count
+                    XCTAssertLessThanOrEqual(admitted, 2)
+                    if admitted == 2 { admitted = 0 }
+                    else { XCTAssertGreaterThan(count, 0) }
+                }
+            }
+            XCTAssertEqual(frames, [.transferChunk, .transferChunk, .ping, .pointerInput,
+                                     .transferChunk, .transferChunk, .transferChunk])
+        }
     }
 
     private func transferTestFrame(_ type: WireMessageType, _ payload: Data) -> Data {
