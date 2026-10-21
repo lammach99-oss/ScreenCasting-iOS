@@ -5,6 +5,238 @@ import Foundation
 @testable import iPadCasting
 
 final class DataTransferTests: XCTestCase {
+
+    // C2 v3.3 G1: packet-boundary integration tests; existing runtime API only.
+    private final class UX03Receiver {
+        let library: ReceivedFileLibrary
+        var manager: DataTransferManager!
+        private let lock = NSLock()
+        private var sent: [TransferPacket] = []
+        private var state = DataTransferManager.Snapshot()
+        var atSend: ((TransferPacket) -> Void)?
+        init(root: URL, library: ReceivedFileLibrary) {
+            self.library = library
+            manager = DataTransferManager(generation: 11, directory: root) { [weak self] packet, done in
+                guard let self else { done(false); return }
+                self.lock.lock(); self.sent.append(packet); self.lock.unlock()
+                self.atSend?(packet); done(true)
+            }
+            manager.changed = { [weak self] value in
+                guard let self else { return }
+                self.lock.lock(); self.state = value; self.lock.unlock()
+            }
+        }
+        var packets: [TransferPacket] { lock.lock(); defer { lock.unlock() }; return sent }
+        var snapshot: DataTransferManager.Snapshot { lock.lock(); defer { lock.unlock() }; return state }
+    }
+    private func ux03Post(_ packet: TransferPacket, to manager: DataTransferManager) async {
+        let processed = expectation(description: "exact packet processed")
+        XCTAssertTrue(manager.post(packet) { processed.fulfill() })
+        await fulfillment(of: [processed], timeout: 3)
+    }
+    private func ux03Barrier(_ manager: DataTransferManager) async {
+        // Foreign CANCEL is inert; its completion fences earlier IO work.
+        await ux03Post(TransferPacket(kind: .cancel, generation: 999, id: UUID()), to: manager)
+    }
+    private func ux03Offer(_ files: [TransferFile], id: UUID, receiver: UX03Receiver) async {
+        await ux03Post(TransferPacket(kind: .offer, generation: 7, id: id, files: files), to: receiver.manager)
+        receiver.manager.decide(true); await ux03Barrier(receiver.manager)
+    }
+    private func ux03File(_ bytes: Data, index: UInt16, id: UUID, receiver: UX03Receiver, digest: Data? = nil) async {
+        if !bytes.isEmpty {
+            var chunk = TransferPacket(kind: .chunk, generation: 7, id: id)
+            chunk.fileIndex = index; chunk.bytes = bytes
+            await ux03Post(chunk, to: receiver.manager)
+        }
+        var end = TransferPacket(kind: .fileEnd, generation: 7, id: id)
+        end.fileIndex = index; end.offset = UInt64(bytes.count); end.bytes = digest ?? Data(SHA256.hash(data: bytes))
+        await ux03Post(end, to: receiver.manager)
+    }
+
+    func testUX03FileAckOccursOnlyAfterReceiptIsDurablyReadable() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ReceivedFileLibrary(directory: root), name = "\u{0111}\u{1EB9}p.bin", id = UUID()
+        try Data([9]).write(to: root.appendingPathComponent(name))
+        let receiver = UX03Receiver(root: root, library: library)
+        receiver.atSend = { packet in
+            guard packet.kind == .fileAck && packet.reason == .ok else { return }
+            XCTAssertEqual(packet.id, id); XCTAssertEqual(packet.generation, 7)
+            do {
+                XCTAssertEqual(try ReceivedFileLibrary(directory: root).snapshot().eligibleCount, Int(packet.fileIndex) + 1,
+                               "FileAck requires durable receipt visibility at send time")
+                XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(ReceivedFileLibrary.metadataName).appendingPathComponent("receipts.json").path))
+            } catch { XCTFail("Receipt not readable before FileAck: \(error)") }
+        }
+        await ux03Offer([TransferFile(name: "empty.bin", length: 0), TransferFile(name: name, length: 2)], id: id, receiver: receiver)
+        await ux03File(Data(), index: 0, id: id, receiver: receiver)
+        await ux03File(Data([1, 2]), index: 1, id: id, receiver: receiver)
+        await ux03Post(TransferPacket(kind: .end, generation: 7, id: id), to: receiver.manager); await ux03Barrier(receiver.manager)
+        XCTAssertEqual(receiver.packets.filter { $0.kind == .fileAck && $0.reason == .ok }.map(\.fileIndex), [0, 1])
+        XCTAssertEqual(receiver.snapshot.phase, .completed)
+        let inventory = try library.snapshot()
+        XCTAssertEqual(inventory.retainedCount, 3); XCTAssertEqual(inventory.retainedBytes, 3)
+        XCTAssertEqual(inventory.eligibleCount, 2); XCTAssertEqual(inventory.eligibleBytes, 2)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("\u{0111}\u{1EB9}p (1).bin")), Data([1, 2]))
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(name)), Data([9]))
+        receiver.manager.retire(); await ux03Barrier(receiver.manager)
+    }
+
+    func testUX03ReceiptCommitFailureSendsNoSuccessfulFileAckAndKeepsLegacyCopy() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var hooks = ReceivedFileLibrary.Hooks(); hooks.beforeReceiptCommit = { throw CocoaError(.fileWriteOutOfSpace) }
+        let library = try ReceivedFileLibrary(directory: root, hooks: hooks), id = UUID()
+        let receiver = UX03Receiver(root: root, library: library)
+        await ux03Offer([TransferFile(name: "retained.bin", length: 2)], id: id, receiver: receiver)
+        await ux03File(Data([3, 4]), index: 0, id: id, receiver: receiver)
+        XCTAssertEqual(receiver.packets.filter { $0.kind == .fileAck && $0.reason == .ok }.count, 0)
+        XCTAssertEqual(receiver.snapshot.phase, .failed)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("retained.bin")), Data([3, 4]))
+        let inventory = try library.snapshot()
+        XCTAssertEqual(inventory.retainedCount, 1); XCTAssertEqual(inventory.retainedBytes, 2)
+        XCTAssertEqual(inventory.eligibleCount, 0); XCTAssertFalse(inventory.busy)
+        receiver.manager.retire(); await ux03Barrier(receiver.manager)
+    }
+
+    func testUX03QuotaIgnoresReceiptMetadataButCountsLegacyBytesAndFiles() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ReceivedFileLibrary(directory: root), id = UUID()
+        for index in 0..<255 { try Data([1]).write(to: root.appendingPathComponent("legacy-\(index)")) }
+        let nested = root.appendingPathComponent("nested")
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: false)
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("alias"), withDestinationURL: nested)
+        let receiver = UX03Receiver(root: root, library: library)
+        await ux03Offer([TransferFile(name: "last.bin", length: 1)], id: id, receiver: receiver)
+        XCTAssertEqual(receiver.snapshot.phase, .receiving, "Internal metadata, directories and symlinks are not file slots")
+        await ux03File(Data([2]), index: 0, id: id, receiver: receiver)
+        await ux03Post(TransferPacket(kind: .end, generation: 7, id: id), to: receiver.manager); await ux03Barrier(receiver.manager)
+        XCTAssertEqual(try library.snapshot().retainedCount, 256); XCTAssertEqual(try library.snapshot().retainedBytes, 256)
+        XCTAssertEqual(try library.snapshot().eligibleCount, 1)
+        await ux03Offer([TransferFile(name: "overflow.bin", length: 0)], id: UUID(), receiver: receiver)
+        XCTAssertEqual(receiver.snapshot.phase, .failed)
+        XCTAssertEqual(receiver.packets.filter { $0.kind == .response && $0.accepted }.count, 1)
+        receiver.manager.retire(); await ux03Barrier(receiver.manager)
+    }
+
+    func testUX03TransferLeaseBlocksClearAndForeignOwnerCannotRelease() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ReceivedFileLibrary(directory: root), id = UUID()
+        let receiver = UX03Receiver(root: root, library: library)
+        await ux03Post(TransferPacket(kind: .offer, generation: 7, id: id, files: [TransferFile(name: "x", length: 1)]), to: receiver.manager)
+        XCTAssertEqual(receiver.snapshot.phase, .awaitingDecision); XCTAssertTrue(try library.snapshot().busy)
+        XCTAssertThrowsError(try library.confirmClear(), "Pending consent must fence Clear")
+        let foreign = UUID(); XCTAssertFalse(library.beginTransfer(owner: foreign)); library.endTransfer(owner: foreign)
+        XCTAssertThrowsError(try library.confirmClear())
+        receiver.manager.decide(true); await ux03Barrier(receiver.manager); XCTAssertThrowsError(try library.confirmClear())
+        receiver.manager.cancel(); await ux03Barrier(receiver.manager)
+        XCTAssertFalse(try library.snapshot().busy); XCTAssertEqual(try library.confirmClear().count, 0)
+        receiver.manager.retire(); await ux03Barrier(receiver.manager)
+    }
+
+    func testUX03RetireDuringReceivingReleasesLeaseAfterStageClose() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ReceivedFileLibrary(directory: root), id = UUID()
+        let receiver = UX03Receiver(root: root, library: library)
+        await ux03Offer([TransferFile(name: "x", length: 2)], id: id, receiver: receiver)
+        var chunk = TransferPacket(kind: .chunk, generation: 7, id: id); chunk.bytes = Data([1])
+        await ux03Post(chunk, to: receiver.manager); XCTAssertTrue(try library.snapshot().busy)
+        receiver.manager.retire(); await ux03Barrier(receiver.manager)
+        XCTAssertFalse(try library.snapshot().busy); XCTAssertEqual(try library.confirmClear().count, 0)
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).contains { $0.pathExtension == "part" })
+        XCTAssertEqual(receiver.packets.filter { $0.kind == .fileAck }.count, 0)
+    }
+
+    func testUX03NewManagerCannotClearDuringPreviousManagerRetirement() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ReceivedFileLibrary(directory: root), id = UUID()
+        let first = UX03Receiver(root: root, library: library)
+        await ux03Offer([TransferFile(name: "first", length: 1)], id: id, receiver: first)
+        let stages = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).filter { $0.pathExtension == "part" }
+        XCTAssertEqual(stages.count, 1)
+        let second = UX03Receiver(root: root, library: library); await ux03Barrier(second.manager)
+        XCTAssertTrue(stages.allSatisfy { FileManager.default.fileExists(atPath: $0.path) }, "New initialization cannot unlink another owner's stage")
+        XCTAssertThrowsError(try library.confirmClear())
+        first.manager.retire(); await ux03Barrier(first.manager)
+        await ux03Post(TransferPacket(kind: .offer, generation: 8, id: UUID(), files: [TransferFile(name: "next", length: 0)]), to: second.manager)
+        XCTAssertEqual(second.snapshot.phase, .awaitingDecision)
+        first.manager.retire(); await ux03Barrier(first.manager)
+        XCTAssertThrowsError(try library.confirmClear(), "Stale retirement cannot release the successor")
+        second.manager.decide(false); await ux03Barrier(second.manager); await ux03Barrier(second.manager)
+        XCTAssertFalse(try library.snapshot().busy)
+        second.manager.retire(); await ux03Barrier(second.manager)
+    }
+
+    func testUX03TwoFileBatchPreservesEarlierReceiptsWhenLaterReceiptFails() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var commits = 0; var hooks = ReceivedFileLibrary.Hooks()
+        hooks.beforeReceiptCommit = { commits += 1; if commits == 2 { throw CocoaError(.fileWriteNoPermission) } }
+        let library = try ReceivedFileLibrary(directory: root, hooks: hooks), id = UUID()
+        let receiver = UX03Receiver(root: root, library: library)
+        await ux03Offer([TransferFile(name: "first", length: 1), TransferFile(name: "later", length: 2)], id: id, receiver: receiver)
+        await ux03File(Data([1]), index: 0, id: id, receiver: receiver)
+        await ux03File(Data([2, 3]), index: 1, id: id, receiver: receiver)
+        XCTAssertEqual(receiver.packets.filter { $0.kind == .fileAck && $0.reason == .ok }.map(\.fileIndex), [0])
+        XCTAssertEqual(receiver.snapshot.phase, .failed); XCTAssertEqual(receiver.snapshot.published, 1)
+        let inventory = try library.snapshot()
+        XCTAssertEqual(inventory.retainedCount, 2); XCTAssertEqual(inventory.retainedBytes, 3)
+        XCTAssertEqual(inventory.eligibleCount, 1); XCTAssertEqual(inventory.eligibleBytes, 1)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("later")), Data([2, 3]))
+        receiver.manager.retire(); await ux03Barrier(receiver.manager)
+    }
+
+    func testUX03OutgoingTransferDoesNotCreateInboundReceipt() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = root.appendingPathComponent("retained"), source = root.appendingPathComponent("source.bin")
+        let library = try ReceivedFileLibrary(directory: directory); try Data([4]).write(to: source)
+        let receiver = UX03Receiver(root: directory, library: library)
+        receiver.manager.sendFiles([source]); await ux03Barrier(receiver.manager)
+        XCTAssertEqual(receiver.snapshot.phase, .offering); XCTAssertTrue(try library.snapshot().busy)
+        XCTAssertThrowsError(try library.confirmClear())
+        let offer = try XCTUnwrap(receiver.packets.first { $0.kind == .offer })
+        var rejected = TransferPacket(kind: .response, generation: offer.generation, id: offer.id); rejected.reason = .userRejected
+        await ux03Post(rejected, to: receiver.manager)
+        XCTAssertFalse(try library.snapshot().busy); XCTAssertEqual(try library.snapshot().eligibleCount, 0)
+        XCTAssertEqual(try Data(contentsOf: source), Data([4]))
+        receiver.manager.retire(); await ux03Barrier(receiver.manager)
+    }
+
+    func testUX03DigestFailureAndCorruptJournalNeverProduceSuccessfulFileAck() async throws {
+        for corrupt in [false, true] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let library = try ReceivedFileLibrary(directory: root), id = UUID()
+            if corrupt { try Data("torn{".utf8).write(to: root.appendingPathComponent(ReceivedFileLibrary.metadataName).appendingPathComponent("receipts.json")) }
+            let receiver = UX03Receiver(root: root, library: library)
+            await ux03Offer([TransferFile(name: "x", length: 1)], id: id, receiver: receiver)
+            await ux03File(Data([1]), index: 0, id: id, receiver: receiver, digest: corrupt ? nil : Data(count: 32))
+            XCTAssertEqual(receiver.packets.filter { $0.kind == .fileAck && $0.reason == .ok }.count, 0)
+            XCTAssertEqual(receiver.snapshot.phase, .failed); XCTAssertEqual(try library.snapshot().eligibleCount, 0)
+            XCTAssertEqual(try library.snapshot().retainedCount, corrupt ? 1 : 0); XCTAssertFalse(try library.snapshot().busy)
+            receiver.manager.retire(); await ux03Barrier(receiver.manager)
+        }
+    }
+
+    func testUX03ActiveExportCannotLoseItsLeaseToIncomingOffer() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ReceivedFileLibrary(directory: root), source = root.appendingPathComponent("legacy.bin"), id = UUID()
+        try Data([1]).write(to: source)
+        let token = try library.beginExport(source), receiver = UX03Receiver(root: root, library: library)
+        await ux03Post(TransferPacket(kind: .offer, generation: 7, id: id, files: [TransferFile(name: "x", length: 1)]), to: receiver.manager)
+        XCTAssertFalse(receiver.manager.owns(TransferPacket(kind: .cancel, generation: 7, id: id)))
+        XCTAssertEqual(receiver.packets.filter { $0.kind == .response && $0.reason == .busy }.count, 1)
+        XCTAssertThrowsError(try library.confirmClear())
+        library.endExport(token); XCTAssertFalse(try library.snapshot().busy)
+        receiver.manager.retire(); await ux03Barrier(receiver.manager)
+    }
+
     func testUX03LegacyFilesRemainVisibleAndIneligibleAfterReopen() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
