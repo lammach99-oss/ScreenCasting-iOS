@@ -1884,8 +1884,36 @@ public class NetworkManager: ObservableObject {
     private var activeDirectTouchCommand: DirectTouchContactCommand?
     @Published private(set) var transferSnapshot = DataTransferManager.Snapshot()
     private var dataTransfers: DataTransferManager?
-    private let retainedTransferRoot = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("ScreenCasting Transfers")
+    private let retainedTransferRoot: URL
+    private let receivedFilesQueue = DispatchQueue(label: "ScreenCasting.ReceivedFiles.IO", qos: .utility)
+    private var receivedStorage: ReceivedFileLibrary? // receivedFilesQueue only.
+    private var pendingStorageClear: (id: UUID, token: ReceivedFileLibrary.Confirmation, fingerprint: Data, storageRevision: UInt64)?
+    private let receivedActionClock = ConnectionGenerationClock() // Separate lock-backed storage/UI epoch, not a transport clock.
+    private var receivedUIRevision: UInt64 = 0 // Main queue only.
+    private var pendingReceivedClearID: UUID? // networkQueue only.
+    private var receivedRefreshInFlight = false, receivedRefreshRequested = false
+    private var receivedTransferEvent = ""
+    struct ReceivedFilesViewState {
+        var files: [URL] = [], eligibleNames: Set<String> = [], fileBytes: [URL: UInt64] = [:]
+        var retainedCount = 0, eligibleCount = 0
+        var retainedBytes: UInt64 = 0, eligibleBytes: UInt64 = 0
+        var busy = false, loaded = false
+        var storageWarning: String?
+        var legacyCount: Int { max(0, retainedCount - eligibleCount) }
+        var legacyBytes: UInt64 { retainedBytes >= eligibleBytes ? retainedBytes - eligibleBytes : 0 }
+        init() {}
+        init(_ data: ReceivedFileLibrary.Inventory) {
+            files=data.files;eligibleNames=data.eligibleNames;fileBytes=data.fileBytes
+            retainedCount=data.retainedCount;eligibleCount=data.eligibleCount
+            retainedBytes=data.retainedBytes;eligibleBytes=data.eligibleBytes;busy=data.busy;loaded=true
+        }
+    }
+    struct ReceivedClearPrompt: Identifiable {
+        let id: UUID, count: Int, bytes: UInt64, legacyCount: Int, legacyBytes: UInt64
+    }
+    @Published private(set) var receivedFilesViewState = ReceivedFilesViewState()
+    @Published private(set) var receivedClearPrompt: ReceivedClearPrompt?
+    @Published private(set) var receivedClearMessage: String?
     private var retainedFileLibrary: ReceivedFileLibrary? // Strong across retired transport generations; networkQueue owned.
     private var transferReceivePending = 0
     private struct TransferReceiveSuffix {
@@ -2128,7 +2156,9 @@ public class NetworkManager: ObservableObject {
     var videoFeedbackCountForTesting: Int { testingVideoFeedbackCount }
     #endif
 
-    public init(userDefaults: UserDefaults = .standard) {
+    public init(userDefaults: UserDefaults = .standard, receivedFilesDirectory: URL? = nil) {
+        retainedTransferRoot = receivedFilesDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ScreenCasting Transfers")
         networkQueue.setSpecific(key: networkQueueKey, value: true)
         clientDebugLoggingEnabled = ClientDebugLoggingPreference.load(
             defaults: userDefaults)
@@ -2185,6 +2215,7 @@ public class NetworkManager: ObservableObject {
                 }
             }
         }
+        refreshReceivedFiles()
     }
 
     // MARK: - Public API
@@ -2220,6 +2251,7 @@ public class NetworkManager: ObservableObject {
         wifiLifecycleTransitionGeneration = nil
         wifiWaitingOwner = nil
         _ = connectionGenerationClock.advance()
+        advanceReceivedRevisionOnQueue()
         resetDirectTouchSessionOnQueue()
         #if targetEnvironment(simulator)
         testingSimulatedWifiSession = false
@@ -2981,6 +3013,7 @@ public class NetworkManager: ObservableObject {
         #endif
         RecentWifiResumeStore.clear()
         let stoppedGeneration = connectionGenerationClock.advance()
+        advanceReceivedRevisionOnQueue()
         resetDirectTouchSessionOnQueue()
         listenerGeneration &+= 1
         decoder.invalidate()
@@ -3191,6 +3224,7 @@ public class NetworkManager: ObservableObject {
     private func installUsbCandidate(_ candidate: NWConnection) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         _ = connectionGenerationClock.advance()
+        advanceReceivedRevisionOnQueue()
         resetDirectTouchSessionOnQueue()
         clientSettingsState.resetHostGeneration()
         settingsReconciliationGate.reset()
@@ -4186,6 +4220,166 @@ public class NetworkManager: ObservableObject {
         }
     }
 
+
+    private func receivedLibraryOnWorker() throws -> ReceivedFileLibrary {
+        dispatchPrecondition(condition: .onQueue(receivedFilesQueue))
+        if let receivedStorage { return receivedStorage }
+        let library = try ReceivedFileLibrary(directory: retainedTransferRoot)
+        receivedStorage = library
+        networkQueue.async { [weak self] in self?.retainedFileLibrary = library }
+        return library
+    }
+    private func publishReceivedUI(revision: UInt64, _ update: @escaping (NetworkManager) -> Void) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, revision >= self.receivedUIRevision else { return }
+            self.receivedUIRevision = revision; update(self)
+        }
+    }
+    private func advanceReceivedRevisionOnQueue() {
+        let revision = receivedActionClock.advance()
+        pendingReceivedClearID = nil
+        publishReceivedUI(revision: revision) { $0.receivedClearPrompt = nil }
+        refreshReceivedFilesOnQueue()
+    }
+    func refreshReceivedFiles() { networkQueue.async { [weak self] in self?.refreshReceivedFilesOnQueue() } }
+    private func refreshReceivedFilesOnQueue() {
+        if receivedRefreshInFlight { receivedRefreshRequested = true; return }
+        receivedRefreshInFlight = true
+        let revision = receivedActionClock.current
+        receivedFilesQueue.async { [weak self] in
+            guard let self else { return }
+            let result = Result { try self.receivedLibraryOnWorker().snapshot() }
+            self.networkQueue.async {
+                self.receivedRefreshInFlight = false
+                if revision == self.receivedActionClock.current {
+                    self.publishReceivedUI(revision: revision) { owner in
+                        switch result {
+                        case .success(let data): owner.receivedFilesViewState = ReceivedFilesViewState(data)
+                        case .failure:
+                            owner.receivedFilesViewState.loaded = false
+                            owner.receivedFilesViewState.storageWarning = "Stored files cannot be inspected safely. Try again."
+                        }
+                    }
+                } else { self.receivedRefreshRequested = true }
+                if self.receivedRefreshRequested { self.receivedRefreshRequested = false; self.refreshReceivedFilesOnQueue() }
+            }
+        }
+    }
+    private func receivedMessage(_ text: String, revision: UInt64) {
+        publishReceivedUI(revision: revision) { $0.receivedClearMessage = text }
+    }
+    func requestClearReceivedFiles() {
+        networkQueue.async { [weak self] in
+            guard let self, self.pendingReceivedClearID == nil else { return }
+            let id = UUID(), revision = self.receivedActionClock.current, session = self.connectionGeneration
+            self.pendingReceivedClearID = id
+            self.receivedFilesQueue.async {
+                do {
+                    let library = try self.receivedLibraryOnWorker(), inventory = try library.snapshot()
+                    guard !inventory.busy else { throw CocoaError(.fileLocking) }
+                    guard inventory.eligibleCount > 0 else {
+                        self.networkQueue.async {
+                            if self.pendingReceivedClearID == id { self.pendingReceivedClearID = nil }
+                            self.receivedMessage("No verified copies are available to delete. Older files remain.", revision: revision)
+                        }; return
+                    }
+                    let token = try library.confirmClear(), current = try library.snapshot()
+                    guard current.fingerprint == inventory.fingerprint, current.revision == inventory.revision,
+                          self.receivedActionClock.current == revision else { throw CocoaError(.fileReadUnknown) }
+                    self.pendingStorageClear = (id, token, inventory.fingerprint, inventory.revision)
+                    let prompt = ReceivedClearPrompt(id: id, count: token.count, bytes: token.bytes,
+                                                     legacyCount: inventory.retainedCount - inventory.eligibleCount,
+                                                     legacyBytes: inventory.retainedBytes - inventory.eligibleBytes)
+                    self.networkQueue.async {
+                        guard self.pendingReceivedClearID == id, self.receivedActionClock.current == revision,
+                              self.connectionGeneration == session else { return }
+                        self.publishReceivedUI(revision: revision) { $0.receivedClearMessage = nil; $0.receivedClearPrompt = prompt }
+                    }
+                } catch {
+                    self.networkQueue.async {
+                        if self.pendingReceivedClearID == id { self.pendingReceivedClearID = nil }
+                        self.receivedMessage("Cannot clear while a transfer or Save to Files is active, or storage is unavailable.", revision: revision)
+                    }
+                }
+            }
+        }
+    }
+    func cancelClearReceivedFiles(id: UUID) {
+        networkQueue.async { [weak self] in
+            guard let self, self.pendingReceivedClearID == id else { return }
+            self.pendingReceivedClearID = nil
+            self.publishReceivedUI(revision: self.receivedActionClock.current) { $0.receivedClearPrompt = nil }
+            self.receivedFilesQueue.async { if self.pendingStorageClear?.id == id { self.pendingStorageClear = nil } }
+        }
+    }
+    func confirmClearReceivedFiles(id: UUID) {
+        networkQueue.async { [weak self] in
+            guard let self, self.pendingReceivedClearID == id else { return }
+            self.pendingReceivedClearID = nil // Consume before dispatch: double taps cannot enqueue a second delete.
+            let revision = self.receivedActionClock.current, generation = self.connectionGeneration
+            self.publishReceivedUI(revision: revision) { $0.receivedClearPrompt = nil }
+            self.receivedFilesQueue.async {
+                var result: ReceivedFileLibrary.ClearResult?, inventory: ReceivedFileLibrary.Inventory?
+                var message = "Received files changed. Review and confirm again."
+                do {
+                    guard let pending = self.pendingStorageClear, pending.id == id else { throw CocoaError(.fileReadUnknown) }
+                    self.pendingStorageClear = nil
+                    let library = try self.receivedLibraryOnWorker(), current = try library.snapshot()
+                    guard self.receivedActionClock.current == revision,
+                          current.fingerprint == pending.fingerprint, current.revision == pending.storageRevision else { throw CocoaError(.fileReadUnknown) }
+                    guard !current.busy else { throw CocoaError(.fileLocking) }
+                    result = try library.clear(pending.token, expectedFingerprint: pending.fingerprint,
+                                               expectedRevision: pending.storageRevision, authorize: {
+                        self.receivedActionClock.current == revision && self.connectionGenerationClock.current == generation
+                    })
+                    inventory = try library.snapshot()
+                    message = TransferPresentation.clearResult(result!, legacyCount: inventory!.retainedCount - inventory!.eligibleCount)
+                } catch { /* A fresh snapshot below reports surviving bytes; no inferred reclamation. */ }
+                self.networkQueue.async {
+                    if self.receivedActionClock.current == revision {
+                        self.receivedMessage(message, revision: revision)
+                        if let data = inventory {
+                            self.publishReceivedUI(revision: revision) { owner in
+                                owner.receivedFilesViewState = ReceivedFilesViewState(data)
+                                if (result?.deletedCount ?? 0) > 0, !owner.transferSnapshot.outgoing,
+                                   owner.transferSnapshot.phase == .completed {
+                                    owner.transferSnapshot.count = 0 // Preserve failure/stage/direction diagnostics.
+                                    owner.transferSnapshot.received = data.files
+                                    owner.transferSnapshot.retainedCount = data.retainedCount
+                                    owner.transferSnapshot.retainedBytes = data.retainedBytes
+                                }
+                            }
+                        }
+                    }
+                    self.advanceReceivedRevisionOnQueue()
+                }
+            }
+        }
+    }
+    func requestReceivedFileExport(_ url: URL, completion: @escaping (UUID?) -> Void) {
+        networkQueue.async { [weak self] in
+            guard let self else { DispatchQueue.main.async { completion(nil) }; return }
+            self.advanceReceivedRevisionOnQueue()
+            self.receivedFilesQueue.async {
+                let token = try? self.receivedLibraryOnWorker().beginExport(url)
+                self.networkQueue.async {
+                    if token == nil { self.receivedMessage("Cannot export while a transfer is active or this file is unavailable.", revision: self.receivedActionClock.current) }
+                    self.advanceReceivedRevisionOnQueue()
+                    DispatchQueue.main.async { completion(token) }
+                }
+            }
+        }
+    }
+    func releaseReceivedFileExport(_ token: UUID) {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.receivedFilesQueue.async {
+                self.receivedStorage?.endExport(token) // App-storage lease survives network teardown; foreign token is inert.
+                self.networkQueue.async { self.advanceReceivedRevisionOnQueue() }
+            }
+        }
+    }
+
     func sendTransferFiles(_ urls: [URL]) { networkQueue.async { [weak self] in self?.dataTransfers?.sendFiles(urls) } }
     func decideTransfer(_ accepted: Bool) { networkQueue.async { [weak self] in self?.dataTransfers?.decide(accepted) } }
     func cancelTransfer() { networkQueue.async { [weak self] in self?.controlChannelWriter.cancelBulk(); self?.dataTransfers?.cancel() } }
@@ -4211,7 +4405,18 @@ public class NetworkManager: ObservableObject {
             self?.recordDiagnosticLine(line + " transport=\(transferTransport)")
         }
         manager.changed = { [weak self] snapshot in
-            DispatchQueue.main.async { guard let self, self.connectionGenerationClock.current == generation else { return }; self.transferSnapshot = snapshot }
+            guard let self else { return }
+            self.networkQueue.async {
+                let event = "\(generation)|\(snapshot.phase.rawValue)|\(snapshot.published)|\(snapshot.count)|\(snapshot.outgoing)"
+                if self.receivedTransferEvent != event {
+                    self.receivedTransferEvent = event; self.advanceReceivedRevisionOnQueue()
+                }
+                guard self.connectionGeneration == generation else { return }
+                DispatchQueue.main.async {
+                    guard self.connectionGenerationClock.current == generation else { return }
+                    self.transferSnapshot = snapshot
+                }
+            }
         }
         dataTransfers = manager
     }
@@ -5654,6 +5859,7 @@ public class NetworkManager: ObservableObject {
         connectionTimeoutWorkItem?.cancel()
         connectionTimeoutWorkItem = nil
         let failedGeneration = connectionGenerationClock.advance()
+        advanceReceivedRevisionOnQueue()
         resetDirectTouchSessionOnQueue()
         wireReceiveActiveGeneration = nil
         wireReceiveOutstanding = nil
@@ -5969,6 +6175,7 @@ public class NetworkManager: ObservableObject {
         networkQueue.sync {
             let peer = NWConnection(host: "127.0.0.1", port: 27015, using: .tcp)
             let generation = connectionGenerationClock.advance()
+            advanceReceivedRevisionOnQueue()
             resetDirectTouchSessionOnQueue()
             connection?.cancel()
             wifiBackgroundDisconnectWorkItem?.cancel()

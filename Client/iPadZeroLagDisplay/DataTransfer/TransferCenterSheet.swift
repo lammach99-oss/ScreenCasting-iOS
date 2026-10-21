@@ -7,7 +7,30 @@ struct TransferCenterSheet: View {
     @State private var importing = false
     @State private var exportFile: ExportFile?
     @State private var localError: String?
-    private struct ExportFile: Identifiable { let id = UUID(); let url: URL }
+    @State private var exportLease: UUID?
+    @State private var exportRequest: UUID?
+    @State private var exportSheetActive = false
+    @State private var visible = false
+    @State private var clearDialogPresented = false
+    @State private var clearApprovedID: UUID?
+    private struct ExportFile: Identifiable { let id: UUID; let url: URL }
+    private var retained: NetworkManager.ReceivedFilesViewState { networkManager.receivedFilesViewState }
+    private func finishExport() {
+        if let token = exportLease { networkManager.releaseReceivedFileExport(token) }
+        exportLease = nil; exportSheetActive = false; exportRequest = nil
+    }
+    private func startExport(_ url: URL) {
+        guard exportRequest == nil, exportLease == nil else { return }
+        let request = UUID(); exportRequest = request
+        networkManager.requestReceivedFileExport(url) { token in
+            guard visible, exportRequest == request else {
+                if let token { networkManager.releaseReceivedFileExport(token) }; return
+            }
+            exportRequest = nil
+            guard let token else { localError = "This file is unavailable while another operation is active."; return }
+            exportLease = token; exportFile = ExportFile(id: token, url: url)
+        }
+    }
     private let background = Color(red: 15/255, green: 23/255, blue: 42/255)
     private var state: DataTransferManager.Snapshot { networkManager.transferSnapshot }
 
@@ -49,7 +72,37 @@ struct TransferCenterSheet: View {
             case .failure: localError="Files could not be opened. Choose them again."
             }
         }
-        .sheet(item: $exportFile) { TransferExporter(url: $0.url) }
+        .onAppear { visible = true; networkManager.refreshReceivedFiles() }
+        .onDisappear {
+            visible = false; exportRequest = nil
+            if let prompt = networkManager.receivedClearPrompt { networkManager.cancelClearReceivedFiles(id: prompt.id) }
+            // A built picker owns its lease through UIKit completion/dismantle, even if this view disappears.
+            if !exportSheetActive { finishExport() }
+        }
+        .sheet(item: $exportFile, onDismiss: { finishExport() }) { item in
+            TransferExporter(url: item.url) {
+                networkManager.releaseReceivedFileExport(item.id)
+            }.onAppear { exportSheetActive = true }
+        }
+        .onChange(of: networkManager.receivedClearPrompt?.id) { _, newID in
+            clearApprovedID = nil; clearDialogPresented = newID != nil
+        }
+        .confirmationDialog("Delete verified copies stored in ScreenCasting?", isPresented: $clearDialogPresented, titleVisibility: .visible) {
+            if let prompt = networkManager.receivedClearPrompt {
+                Button("Delete \(prompt.count) Files", role: .destructive) {
+                    clearApprovedID = prompt.id; networkManager.confirmClearReceivedFiles(id: prompt.id)
+                }
+                Button("Cancel", role: .cancel) { networkManager.cancelClearReceivedFiles(id: prompt.id) }
+            }
+        } message: {
+            if let prompt = networkManager.receivedClearPrompt {
+                Text("Delete \(prompt.count) verified copies (\(TransferPresentation.size(prompt.bytes))) from ScreenCasting. Copies saved to Files stay untouched. \(prompt.legacyCount) older/unclassified files (\(TransferPresentation.size(prompt.legacyBytes))) will remain.")
+            }
+        }
+        .onChange(of: clearDialogPresented) { _, presented in
+            guard !presented, let prompt = networkManager.receivedClearPrompt, clearApprovedID != prompt.id else { return }
+            networkManager.cancelClearReceivedFiles(id: prompt.id)
+        }
     }
     private var sendButton: some View {
         Button { importing=true } label: { Label("Send to PC", systemImage: "arrow.up.doc").frame(minHeight: 44) }
@@ -57,7 +110,7 @@ struct TransferCenterSheet: View {
             .disabled(!networkManager.isConnected || TransferPresentation.active(state.phase))
     }
     private func receivedButton(_ action: @escaping () -> Void) -> some View {
-        Button(action: action) { Label("Received Files (\(state.received.count))", systemImage: "tray.and.arrow.down").frame(minHeight: 44) }
+        Button(action: action) { Label("Received Files (\(retained.retainedCount))", systemImage: "tray.and.arrow.down").frame(minHeight: 44) }
             .buttonStyle(.bordered)
     }
     private var incoming: some View {
@@ -102,20 +155,39 @@ struct TransferCenterSheet: View {
     private var received: some View {
         VStack(alignment: .leading, spacing: 14) {
             Label("Received Files", systemImage: "tray.full").font(.headline)
-            Text("\(state.retainedCount) of 256 files · \(TransferPresentation.size(state.retainedBytes)) of 8 GB retained")
-                .font(.subheadline).foregroundStyle(.secondary)
-            if state.received.isEmpty { Text("Verified files received from your PC will appear here.").foregroundStyle(.secondary) }
-            ForEach(state.received, id: \.self) { url in
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(url.lastPathComponent).fixedSize(horizontal: false, vertical: true)
-                    Text(TransferPresentation.size(UInt64(max(0,(try? url.resourceValues(forKeys:[.fileSizeKey]).fileSize) ?? 0))))
-                        .font(.subheadline).foregroundStyle(.secondary)
-                    Button { exportFile=ExportFile(url:url) } label: { Label("Save to Files", systemImage: "square.and.arrow.up").frame(minHeight: 44) }
-                        .accessibilityLabel("Save \(url.lastPathComponent) to Files")
-                    Divider()
+            if let message = networkManager.receivedClearMessage {
+                Text(message).foregroundStyle(.secondary).accessibilityLabel(message)
+            }
+            if !retained.loaded {
+                Text(retained.storageWarning ?? "Loading saved files…").foregroundStyle(.secondary)
+                Button("Refresh Received Files") { networkManager.refreshReceivedFiles() }.frame(minHeight: 44)
+            } else {
+                Text("\(retained.retainedCount) of 256 files · \(TransferPresentation.size(retained.retainedBytes)) of 8 GB retained")
+                Text("\(retained.eligibleCount) verified copies eligible for Clear · \(TransferPresentation.size(retained.eligibleBytes))")
+                if retained.legacyCount > 0 {
+                    Text("\(retained.legacyCount) older/unclassified files (\(TransferPresentation.size(retained.legacyBytes))) are kept and still use storage.").foregroundStyle(.secondary)
+                }
+                if retained.busy { Text("Cannot clear while a transfer or Save to Files is active.").foregroundStyle(.secondary) }
+                Button(role: .destructive) { networkManager.requestClearReceivedFiles() } label: {
+                    Label("Clear Received Files", systemImage: "trash").frame(minHeight: 44)
+                }.disabled(retained.eligibleCount == 0 || retained.busy)
+                    .accessibilityLabel("Clear verified received copies stored in ScreenCasting")
+                if retained.eligibleCount == 0 { Text("No verified copies are eligible. Older/unclassified files remain.").foregroundStyle(.secondary) }
+                ForEach(retained.files, id: \.self) { url in
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(url.lastPathComponent).fixedSize(horizontal: false, vertical: true)
+                        Text(TransferPresentation.size(retained.fileBytes[url] ?? 0)).font(.subheadline).foregroundStyle(.secondary)
+                        Text(retained.eligibleNames.contains(url.lastPathComponent) ? "Verified received copy" : "Older/unclassified - not clearable")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Button { startExport(url) } label: {
+                            Label("Save to Files", systemImage: "square.and.arrow.up").frame(minHeight: 44)
+                        }.disabled(retained.busy || exportRequest != nil || exportLease != nil)
+                            .accessibilityLabel("Save \(url.lastPathComponent) to Files")
+                        Divider()
+                    }
                 }
             }
-            Text("Files remain in app storage after export. Saving to Files creates a copy; nothing is deleted automatically.")
+            Text("Saving to Files creates a separate copy. Clear removes only verified copies stored in ScreenCasting; exported and older/unclassified files stay untouched.")
                 .font(.footnote).foregroundStyle(.secondary)
         }
     }

@@ -11,6 +11,10 @@ final class ReceivedFileLibrary {
         let eligibleBytes: UInt64
         let files: [URL]
         let busy: Bool
+        let eligibleNames: Set<String>
+        let fileBytes: [URL: UInt64]
+        let fingerprint: Data
+        let revision: UInt64
     }
     struct Confirmation {
         let count: Int
@@ -23,6 +27,7 @@ final class ReceivedFileLibrary {
         let deletedCount: Int
         let failedCount: Int
         let deletedBytes: UInt64
+        let journalCleanupDurable: Bool
     }
     struct Hooks {
         var beforeReceiptCommit: (() throws -> Void)?
@@ -51,6 +56,7 @@ final class ReceivedFileLibrary {
         let directory: URL, identity: Identity, fd: Int32, metadata: Int32
         let lock = NSLock()
         var transfer: UUID?
+        var revision: UInt64 = 0
         var exports: Set<UUID> = []
         var hooks: Hooks
         init(directory: URL, hooks: Hooks) throws {
@@ -195,23 +201,30 @@ final class ReceivedFileLibrary {
     private func eligible(_ journal: Journal) -> [Receipt] {
         journal.receipts.filter { (try? verified($0.name, receipt: $0)) != nil }
     }
-    func snapshot() throws -> Inventory { try locked {
+    func snapshot() throws -> Inventory { try locked { try snapshotOnLock() } }
+    private func snapshotOnLock() throws -> Inventory {
         try validateRoot()
         let receipts = (try? readJournal()).map(eligible) ?? []
         let children = try FileManager.default.contentsOfDirectory(at: state.directory, includingPropertiesForKeys: nil)
         var files: [URL] = [], bytes: UInt64 = 0
+        var fileBytes: [URL: UInt64] = [:], identities: [String] = []
         for url in children where validLeaf(url.lastPathComponent) {
             var value = stat()
             guard fstatat(state.fd, url.lastPathComponent, &value, AT_SYMLINK_NOFOLLOW) == 0,
                   value.st_mode & S_IFMT == S_IFREG, value.st_size >= 0 else { continue }
             let (sum, overflow) = bytes.addingReportingOverflow(UInt64(value.st_size))
             guard !overflow else { throw CocoaError(.fileReadUnknown) }; bytes = sum; files.append(url)
+            fileBytes[url] = UInt64(value.st_size)
+            identities.append("\(url.lastPathComponent.utf8.count):\(url.lastPathComponent)|\(value.st_dev)|\(value.st_ino)|\(value.st_size)|\(value.st_mtimespec.tv_sec)|\(value.st_mtimespec.tv_nsec)|\(value.st_birthtimespec.tv_sec)|\(value.st_birthtimespec.tv_nsec)")
         }
         return Inventory(retainedCount: files.count, retainedBytes: bytes, eligibleCount: receipts.count,
                          eligibleBytes: receipts.reduce(0) { $0 + $1.length },
                          files: files.sorted { $0.lastPathComponent < $1.lastPathComponent },
-                         busy: state.transfer != nil || !state.exports.isEmpty)
-    } }
+                         busy: state.transfer != nil || !state.exports.isEmpty,
+                         eligibleNames: Set(receipts.map(\.name)), fileBytes: fileBytes,
+                         fingerprint: Data(SHA256.hash(data: try JSONEncoder().encode([identities.sorted(), receipts.map { $0.id.uuidString }.sorted()]))),
+                         revision: state.revision)
+    }
     func recordPublished(_ url: URL, length: UInt64, digest: Data) throws { try locked {
         var journal = try readJournal(); let name = try leaf(url)
         guard digest.count == 32 else { throw CocoaError(.fileReadCorruptFile) }
@@ -223,19 +236,19 @@ final class ReceivedFileLibrary {
         // Missing files cannot accumulate unbounded stale receipts after a crash.
         journal.receipts = journal.receipts.filter { $0.name != name && (try? verified($0.name, receipt: $0)) != nil }
         guard journal.receipts.count < 256 else { throw CocoaError(.fileWriteOutOfSpace) }
-        journal.receipts.append(receipt); try commit(journal)
+        journal.receipts.append(receipt); try commit(journal); state.revision &+= 1
     } }
     func beginTransfer(owner: UUID) -> Bool { locked {
         guard state.transfer == nil, state.exports.isEmpty, (try? validateRoot()) != nil else { return false }
-        state.transfer = owner; return true
+        state.transfer = owner; state.revision &+= 1; return true
     } }
-    func endTransfer(owner: UUID) { locked { if state.transfer == owner { state.transfer = nil } } }
+    func endTransfer(owner: UUID) { locked { if state.transfer == owner { state.transfer = nil; state.revision &+= 1 } } }
     func beginExport(_ url: URL) throws -> UUID { try locked {
         try validateRoot(); guard state.transfer == nil else { throw CocoaError(.fileLocking) }
         let name = try leaf(url); _ = try verified(name)
-        let token = UUID(); state.exports.insert(token); return token
+        let token = UUID(); state.exports.insert(token); state.revision &+= 1; return token
     } }
-    func endExport(_ token: UUID) { locked { state.exports.remove(token) } }
+    func endExport(_ token: UUID) { locked { if state.exports.remove(token) != nil { state.revision &+= 1 } } }
     func confirmClear() throws -> Confirmation { try locked {
         guard state.transfer == nil, state.exports.isEmpty else { throw CocoaError(.fileLocking) }
         // Corrupt metadata never authorizes deletion, even when the inventory remains visible.
@@ -244,8 +257,15 @@ final class ReceivedFileLibrary {
         return Confirmation(count: receipts.count, bytes: receipts.reduce(0) { $0 + $1.length },
                             nonce: nonce, root: state.identity, receipts: receipts)
     } }
-    func clear(_ confirmation: Confirmation) throws -> ClearResult { try locked {
+    func clear(_ confirmation: Confirmation, expectedFingerprint: Data? = nil, expectedRevision: UInt64? = nil,
+               authorize: (() -> Bool)? = nil) throws -> ClearResult { try locked {
         guard state.transfer == nil, state.exports.isEmpty else { throw CocoaError(.fileLocking) }
+        if let expectedFingerprint, let expectedRevision {
+            let current = try snapshotOnLock()
+            guard current.fingerprint == expectedFingerprint, current.revision == expectedRevision else { throw CocoaError(.fileReadUnknown) }
+        }
+        // Same storage lock as lease/receipt changes; authorization callback only reads lock-backed clocks.
+        guard authorize?() != false else { throw CocoaError(.fileReadNoPermission) }
         var journal = try readJournal()
         guard confirmation.root == state.identity, journal.confirmation == confirmation.nonce else { throw CocoaError(.fileReadNoPermission) }
         journal.confirmation = nil; try commit(journal) // Consume durably BEFORE the first destructive operation.
@@ -264,7 +284,9 @@ final class ReceivedFileLibrary {
             } catch { failed += 1 }
         }
         // A failed metadata cleanup leaves only identity-bound stale records, never authority over a replacement.
-        try? commit(journal)
-        return ClearResult(deletedCount: deleted, failedCount: failed, deletedBytes: bytes)
+        var durable = true
+        do { try commit(journal) } catch { durable = false }
+        state.revision &+= 1
+        return ClearResult(deletedCount: deleted, failedCount: failed, deletedBytes: bytes, journalCleanupDurable: durable)
     } }
 }

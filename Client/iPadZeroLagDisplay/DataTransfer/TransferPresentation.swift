@@ -25,4 +25,12 @@ enum TransferPresentation {
     static func active(_ phase: DataTransferManager.Phase) -> Bool {
         [.offering,.awaitingDecision,.sending,.receiving,.verifying,.awaitingAck].contains(phase)
     }
+    static func clearResult(_ result: ReceivedFileLibrary.ClearResult, legacyCount: Int) -> String {
+        let deleted = "Deleted \(result.deletedCount) files (\(size(result.deletedBytes)))."
+        if !result.journalCleanupDurable {
+            return deleted + " File deletion counts reflect disk operations, but metadata maintenance is incomplete. Refresh required."
+        }
+        if result.failedCount > 0 { return deleted + " \(result.failedCount) files could not be removed. Review files and retry." }
+        return deleted + " \(legacyCount) older/unclassified files remain in ScreenCasting. Copies saved to Files stay untouched."
+    }
 }
