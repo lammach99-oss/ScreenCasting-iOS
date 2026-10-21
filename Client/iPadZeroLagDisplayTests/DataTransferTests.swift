@@ -6,6 +6,221 @@ import Foundation
 
 final class DataTransferTests: XCTestCase {
 
+
+    // C2 v3.3 G3: executable tests against the fail-closed OFF/default API.
+    private final class UX02Session {
+        let root: URL, library: ReceivedFileLibrary, network: NetworkManager
+        let generation: UInt64
+        var manager: DataTransferManager!
+        private let lock = NSLock()
+        private var sent: [TransferPacket] = []
+        init(usb: Bool = false, hooks: ReceivedFileLibrary.Hooks = .init()) throws {
+            root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            library = try ReceivedFileLibrary(directory: root, hooks: hooks)
+            network = NetworkManager(receivedFilesDirectory: root)
+            generation = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS).generation
+            manager = DataTransferManager(generation: generation, directory: root, receivedLibrary: library) { [weak self] p, done in
+                guard let self else { done(false); return }
+                self.lock.lock(); self.sent.append(p); self.lock.unlock(); done(true)
+            }
+            network.configureTransferAuthorizationForTesting(manager: manager, authenticated: true, committed: true, usb: usb)
+        }
+        var packets: [TransferPacket] { lock.lock(); defer { lock.unlock() }; return sent }
+        func responses(_ id: UUID) -> [TransferPacket] { packets.filter { $0.id == id && $0.kind == .response } }
+    }
+    private func ux02AssertEnabled(_ f: UX02Session, _ expected: Bool, file: StaticString = #filePath, line: UInt = #line) async {
+        let enabled = await MainActor.run { f.network.autoAcceptIncomingFiles }
+        XCTAssertEqual(enabled, expected, file: file, line: line)
+    }
+    private func ux02Toggle(_ f: UX02Session, _ enabled: Bool) async {
+        f.network.setAutoAcceptIncomingFiles(enabled)
+        f.network.networkQueueForTesting.sync { }
+        await MainActor.run { }
+        await ux03Barrier(f.manager)
+    }
+    private func ux02Finish(_ f: UX02Session) async {
+        f.network.stopForTesting(); f.manager.retire(); await ux03Barrier(f.manager)
+        try? FileManager.default.removeItem(at: f.root)
+    }
+    private func ux02Offer(_ f: UX02Session, id: UUID, name: String = "received.bin", length: UInt64 = 0) async {
+        await ux03Post(TransferPacket(kind: .offer, generation: 7, id: id,
+                       files: [TransferFile(name: name, length: length)]), to: f.manager)
+    }
+    private func ux02Complete(_ f: UX02Session, id: UUID, bytes: Data = Data(), digest: Data? = nil) async {
+        guard f.responses(id).contains(where: { $0.accepted }) else { return }
+        if !bytes.isEmpty {
+            var p = TransferPacket(kind: .chunk, generation: 7, id: id); p.bytes = bytes
+            await ux03Post(p, to: f.manager)
+        }
+        var end = TransferPacket(kind: .fileEnd, generation: 7, id: id)
+        end.offset = UInt64(bytes.count); end.bytes = digest ?? Data(SHA256.hash(data: bytes))
+        await ux03Post(end, to: f.manager)
+        await ux03Post(TransferPacket(kind: .end, generation: 7, id: id), to: f.manager)
+        await ux03Barrier(f.manager)
+    }
+
+    func testUX02AutoAcceptDefaultsOffAndRequiresManualConsent() async throws {
+        for usb in [false, true] {
+            let f = try UX02Session(usb: usb), id = UUID()
+            await ux03Barrier(f.manager)
+            await ux02AssertEnabled(f, false)
+            await ux02Offer(f, id: id)
+            XCTAssertTrue(f.responses(id).isEmpty, "No passive approval without an opt-in")
+            f.manager.decide(false); await ux03Barrier(f.manager); await ux03Barrier(f.manager)
+            XCTAssertEqual(f.responses(id).count, 1); XCTAssertFalse(f.responses(id).first?.accepted ?? true)
+            let next = UUID(); await ux02Offer(f, id: next)
+            f.manager.decide(true); await ux03Barrier(f.manager)
+            XCTAssertEqual(f.responses(next).filter(\.accepted).count, 1)
+            await ux02Complete(f, id: next); XCTAssertEqual(try f.library.snapshot().eligibleCount, 1)
+            await ux02Finish(f)
+        }
+    }
+    func testUX02AuthenticatedWifiAutoAcceptsTwoSequentialBatchesExactlyOnce() async throws {
+        let f = try UX02Session(); await ux02Toggle(f, true)
+        await ux02AssertEnabled(f, true)
+        for value in [UInt8(1), 2] {
+            let id = UUID(); await ux02Offer(f, id: id, name: "same.bin", length: 1)
+            XCTAssertEqual(f.responses(id).filter(\.accepted).count, 1, "ON must use real admission exactly once")
+            await ux02Complete(f, id: id, bytes: Data([value]))
+            XCTAssertEqual(f.packets.filter { $0.id == id && $0.kind == .fileAck && $0.reason == .ok }.count, 1)
+        }
+        XCTAssertEqual(try f.library.snapshot().eligibleCount, 2)
+        XCTAssertEqual(try f.library.snapshot().eligibleBytes, 2)
+        await ux02Finish(f)
+    }
+    func testUX02AuthenticatedUsbAutoAcceptsOnlyAfterCommit() async throws {
+        for auth in [false, true] {
+            for commit in [false, true] {
+                let f = try UX02Session(usb: true)
+                f.network.configureTransferAuthorizationForTesting(manager: f.manager, authenticated: auth, committed: commit, usb: true)
+                await ux02Toggle(f, true)
+                let enabled = await MainActor.run { f.network.autoAcceptIncomingFiles }
+                XCTAssertEqual(enabled, auth && commit)
+                let id = UUID(); await ux02Offer(f, id: id)
+                XCTAssertEqual(f.responses(id).filter(\.accepted).count, auth && commit ? 1 : 0)
+                await ux02Finish(f)
+            }
+        }
+    }
+    func testUX02TurningOnWithPendingOfferDoesNotAutoAcceptOldOffer() async throws {
+        let f = try UX02Session(), id = UUID(); await ux02Offer(f, id: id)
+        await ux02Toggle(f, true)
+        await ux02AssertEnabled(f, true)
+        XCTAssertTrue(f.responses(id).isEmpty)
+        f.manager.decide(true); f.manager.decide(true); await ux03Barrier(f.manager)
+        XCTAssertEqual(f.responses(id).filter(\.accepted).count, 1)
+        await ux02Complete(f, id: id); await ux02Finish(f)
+    }
+    func testUX02TurningOffBeforeQueuedOfferDecisionFencesAutoResponse() async throws {
+        let f = try UX02Session(); await ux02Toggle(f, true)
+        let entered = expectation(description: "offer owns IO boundary"), release = DispatchSemaphore(value: 0)
+        f.manager.changed = { s in
+            if s.phase == .awaitingDecision { entered.fulfill(); _ = release.wait(timeout: .now() + 5) }
+        }
+        let done = expectation(description: "offer finished"), id = UUID()
+        XCTAssertTrue(f.manager.post(TransferPacket(kind: .offer, generation: 7, id: id,
+                      files: [TransferFile(name: "queued.bin", length: 0)])) { done.fulfill() })
+        await fulfillment(of: [entered], timeout: 3)
+        f.network.setAutoAcceptIncomingFiles(false); f.network.networkQueueForTesting.sync { }
+        release.signal(); await fulfillment(of: [done], timeout: 3); await ux03Barrier(f.manager)
+        XCTAssertTrue(f.responses(id).isEmpty, "OFF invalidates a captured queued authorization")
+        await ux02Finish(f)
+    }
+    func testUX02DisconnectAndReconnectResetToOff() async throws {
+        let f = try UX02Session(); await ux02Toggle(f, true)
+        await ux02AssertEnabled(f, true)
+        f.network.stopForTesting(); f.network.networkQueueForTesting.sync { }; await MainActor.run { }
+        await ux02AssertEnabled(f, false)
+        _ = f.network.simulateCommittedWifiSessionForTesting(); await MainActor.run { }
+        await ux02AssertEnabled(f, false)
+        await ux02Finish(f)
+    }
+    func testUX02UsbWifiTransportHandoverResetsToOff() async throws {
+        let f = try UX02Session(); await ux02Toggle(f, true)
+        await ux02AssertEnabled(f, true)
+        f.network.configureTransferAuthorizationForTesting(manager: f.manager, authenticated: true, committed: true, usb: true)
+        await MainActor.run { }; await ux03Barrier(f.manager)
+        await ux02AssertEnabled(f, false)
+        let id = UUID(); await ux02Offer(f, id: id); XCTAssertTrue(f.responses(id).isEmpty)
+        await ux02Toggle(f, true); await ux02AssertEnabled(f, true)
+        XCTAssertTrue(f.responses(id).isEmpty, "Handover requires a fresh opt-in and old offers stay manual")
+        await ux02Finish(f)
+    }
+    func testUX02AppRelaunchHasNoPersistedAutoAcceptFlag() async throws {
+        let f = try UX02Session(); await ux02Toggle(f, true)
+        await ux02AssertEnabled(f, true)
+        // Reopening the presentation uses the same NetworkManager and must retain ON.
+        f.network.refreshReceivedFiles(); f.network.networkQueueForTesting.sync { }; await MainActor.run { }
+        await ux02AssertEnabled(f, true)
+        let fresh = NetworkManager(receivedFilesDirectory: f.root)
+        let freshEnabled = await MainActor.run { fresh.autoAcceptIncomingFiles }; XCTAssertFalse(freshEnabled)
+        fresh.stopForTesting(); await ux02Finish(f)
+    }
+    func testUX02StaleCancelAndWrongPeerGenerationCannotPurgeCurrentBatch() async throws {
+        let f = try UX02Session(); await ux02Toggle(f, true)
+        let id = UUID(); await ux02Offer(f, id: id)
+        XCTAssertEqual(f.responses(id).filter(\.accepted).count, 1)
+        await ux03Post(TransferPacket(kind: .cancel, generation: 999, id: id), to: f.manager)
+        await ux03Post(TransferPacket(kind: .cancel, generation: 7, id: UUID()), to: f.manager)
+        await ux02Complete(f, id: id)
+        XCTAssertEqual(try f.library.snapshot().eligibleCount, 1)
+        await ux02Finish(f)
+    }
+    func testUX02AutoAcceptInvalidMetadataAndNoQuotaCannotBypassAdmission() async throws {
+        let f = try UX02Session(); await ux02Toggle(f, true)
+        let invalid = UUID(); await ux02Offer(f, id: invalid, name: "../escape")
+        XCTAssertTrue(f.responses(invalid).isEmpty)
+        for n in 0..<256 { try Data().write(to: f.root.appendingPathComponent("legacy-\(n)")) }
+        let id = UUID(); await ux02Offer(f, id: id)
+        XCTAssertEqual(f.responses(id).filter(\.accepted).count, 0)
+        XCTAssertEqual(f.packets.filter { $0.kind == .cancel && $0.id == id }.count, 1,
+                       "ON must actually attempt existing quota admission and fail closed")
+        XCTAssertEqual(try f.library.snapshot().retainedCount, 256)
+        await ux02Finish(f)
+    }
+    func testUX02AutoAcceptDigestOrReceiptErrorCannotProduceSuccessAck() async throws {
+        for receiptFailure in [false, true] {
+            var hooks = ReceivedFileLibrary.Hooks()
+            if receiptFailure { hooks.beforeReceiptCommit = { throw CocoaError(.fileWriteOutOfSpace) } }
+            let f = try UX02Session(hooks: hooks); await ux02Toggle(f, true)
+            let id = UUID(); await ux02Offer(f, id: id, length: 1)
+            XCTAssertEqual(f.responses(id).filter(\.accepted).count, 1)
+            await ux02Complete(f, id: id, bytes: Data([1]), digest: receiptFailure ? nil : Data(repeating: 0, count: 32))
+            XCTAssertEqual(f.packets.filter { $0.kind == .fileAck && $0.reason == .ok }.count, 0)
+            XCTAssertEqual(try f.library.snapshot().eligibleCount, 0)
+            XCTAssertEqual(try f.library.snapshot().retainedCount, receiptFailure ? 1 : 0)
+            await ux02Finish(f)
+        }
+    }
+    func testUX02OutboundIpadtoPCIgnoresInboundAutoAcceptSetting() async throws {
+        let f = try UX02Session(); await ux02Toggle(f, true)
+        let url = f.root.appendingPathComponent("outgoing.bin"); try Data([9]).write(to: url)
+        f.manager.sendFiles([url]); await ux03Barrier(f.manager)
+        XCTAssertEqual(f.packets.filter { $0.kind == .offer }.count, 1)
+        XCTAssertEqual(f.packets.filter { $0.kind == .response }.count, 0)
+        XCTAssertEqual(try f.library.snapshot().eligibleCount, 0)
+        await ux02Finish(f)
+    }
+    func testUX02AuthenticationRevocationAndStaleEnableCannotCarryPolicy() async throws {
+        let f = try UX02Session(); await ux02Toggle(f, true)
+        await ux02AssertEnabled(f, true)
+        f.network.configureTransferAuthorizationForTesting(manager: f.manager, authenticated: false, committed: true)
+        await ux02Toggle(f, true)
+        await ux02AssertEnabled(f, false)
+        let id = UUID(); await ux02Offer(f, id: id); XCTAssertTrue(f.responses(id).isEmpty)
+        await ux02Finish(f)
+    }
+    func testUX02ConcurrentManualDecisionAndDuplicateOfferNeverDoubleAdmit() async throws {
+        let f = try UX02Session(); await ux02Toggle(f, true)
+        let id = UUID(); await ux02Offer(f, id: id)
+        f.manager.decide(true); f.manager.decide(false); await ux03Barrier(f.manager)
+        XCTAssertEqual(f.responses(id).count, 1)
+        let other = UUID(); await ux02Offer(f, id: other)
+        XCTAssertEqual(f.responses(other).count, 1); XCTAssertEqual(f.responses(other).first?.reason, .busy)
+        await ux02Complete(f, id: id); XCTAssertEqual(try f.library.snapshot().eligibleCount, 1)
+        await ux02Finish(f)
+    }
+
     func testUX03RetainedQuotaBoundariesWithoutLargeDiskFixtures() throws {
         let limit: UInt64 = 8 * 1024 * 1024 * 1024, reserve: Int64 = 64 * 1024 * 1024
         XCTAssertNoThrow(try DataTransferManager.validateRetainedQuota(count: 255, bytes: limit - 1,

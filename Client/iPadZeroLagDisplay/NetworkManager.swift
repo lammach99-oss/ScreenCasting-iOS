@@ -4380,6 +4380,14 @@ public class NetworkManager: ObservableObject {
         }
     }
 
+    // C2 v3.3 UX02 RED scaffold: fail-closed OFF; no policy is enabled yet.
+    @Published private(set) var autoAcceptIncomingFiles = false
+    @Published private(set) var canEnableAutoAccept = false
+    func setAutoAcceptIncomingFiles(_ requested: Bool) {
+        networkQueue.async { /* Explicit OFF/default path until executable RED. */ }
+    }
+    private func refreshAutoAcceptPolicyOnQueue() { }
+
     func sendTransferFiles(_ urls: [URL]) { networkQueue.async { [weak self] in self?.dataTransfers?.sendFiles(urls) } }
     func decideTransfer(_ accepted: Bool) { networkQueue.async { [weak self] in self?.dataTransfers?.decide(accepted) } }
     func cancelTransfer() { networkQueue.async { [weak self] in self?.controlChannelWriter.cancelBulk(); self?.dataTransfers?.cancel() } }
@@ -5966,6 +5974,17 @@ public class NetworkManager: ObservableObject {
             wireParser.reset(generation: connectionGeneration)
             wireAuthenticatedGeneration = authenticated ? connectionGeneration : nil
             receiveWireChunk(generation: connectionGeneration)
+        }
+    }
+    // Simulator-only authorization fixture. Uses the real session/manager boundary.
+    func configureTransferAuthorizationForTesting(manager: DataTransferManager?, authenticated: Bool,
+                                                   committed: Bool, usb: Bool = false) {
+        networkQueue.sync {
+            dataTransfers = manager
+            activeTransportKind = usb ? .usb : .wifi
+            wireAuthenticatedGeneration = authenticated ? connectionGeneration : nil
+            committedTransportGeneration = committed ? connectionGeneration : nil
+            refreshAutoAcceptPolicyOnQueue()
         }
     }
     var transferPendingForTesting: Int { networkQueue.sync { transferReceivePending } }
