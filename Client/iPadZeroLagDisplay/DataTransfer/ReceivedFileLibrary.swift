@@ -69,7 +69,7 @@ final class ReceivedFileLibrary {
                 close(fd); throw CocoaError(.fileReadUnknown)
             }
             identity = Identity(live)
-            if mkdirat(fd, ReceivedFileLibrary.metadataName, 0700) != 0 && errno != EEXIST {
+            if mkdirat(fd, ReceivedFileLibrary.metadataName, 0o700) != 0 && errno != EEXIST {
                 close(fd); throw Self.error()
             }
             metadata = openat(fd, ReceivedFileLibrary.metadataName, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
@@ -140,7 +140,7 @@ final class ReceivedFileLibrary {
         let data = try JSONEncoder().encode(journal)
         guard data.count <= 1024 * 1024 else { throw CocoaError(.fileWriteOutOfSpace) }
         let name = "transaction-" + UUID().uuidString
-        let fd = openat(state.metadata, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600)
+        let fd = openat(state.metadata, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw State.error() }
         defer { close(fd); unlinkat(state.metadata, name, 0) }
         try data.withUnsafeBytes { bytes in
