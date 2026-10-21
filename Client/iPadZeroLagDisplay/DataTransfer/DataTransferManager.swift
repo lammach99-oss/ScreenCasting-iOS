@@ -10,6 +10,10 @@ final class DataTransferManager {
         var failure: FailureDetail?
         var retainedBytes: UInt64 = 0
         var retainedCount = 0
+        var eligibleCount = 0
+        var eligibleBytes: UInt64 = 0
+        var storageBusy = false
+        var inventoryUnavailable = false
         var phase: Phase = .idle
         var count = 0, index = 0, published = 0
         var bytes: UInt64 = 0, total: UInt64 = 0
@@ -26,7 +30,7 @@ final class DataTransferManager {
             let reason: String
             if native.domain == NSCocoaErrorDomain && native.code == CocoaError.fileWriteOutOfSpace.rawValue { reason = "STORAGE_FULL" }
             else if error is TransferProtocol.Failure { reason = "INVALID_TRANSFER" }
-            else { reason = ["stage_create":"STAGING_CREATE", "write":"WRITE_FAILED", "verify_publish":"VERIFY_OR_PUBLISH_FAILED", "send":"SEND_FAILED"][stage] ?? "TRANSFER_FAILED" }
+            else { reason = ["stage_create":"STAGING_CREATE", "write":"WRITE_FAILED", "verify_publish":"VERIFY_OR_PUBLISH_FAILED", "send":"SEND_FAILED", "receipt_commit":"RECEIPT_COMMIT_FAILED"][stage] ?? "TRANSFER_FAILED" }
             return FailureDetail(reason: reason, domain: domain, code: native.code)
         }
     }
@@ -43,8 +47,13 @@ final class DataTransferManager {
         var lastProgress: TimeInterval = 0
         var waiting: TransferKind?
         var received: [URL] = []
+        var releaseStorage: (() -> Void)?
         init(id: UUID, generation: UInt64, outgoing: Bool, files: [TransferFile]) { self.id=id;self.generation=generation;self.outgoing=outgoing;self.files=files }
-        func close() { try? handle?.close();handle=nil;store?.retire();store=nil;for url in scoped {url.stopAccessingSecurityScopedResource()};scoped=[] }
+        func close() {
+            try? handle?.close(); handle=nil; store?.retire(); store=nil
+            for url in scoped { url.stopAccessingSecurityScopedResource() }; scoped=[]
+            let release = releaseStorage; releaseStorage = nil; release?()
+        }
         deinit { close() }
     }
     private let queue = DispatchQueue(label: "ScreenCasting.DataTransfer.IO", qos: .utility)
@@ -54,6 +63,7 @@ final class DataTransferManager {
     func owns(_ packet: TransferPacket) -> Bool {admission.lock();defer{admission.unlock()};return wireOwner?.0 == packet.id && wireOwner?.1 == packet.generation}
     private let generation: UInt64, directory: URL, sender: Sender
     private let transport: String
+    private var receivedLibrary: ReceivedFileLibrary? // IO-queue owned; shared app-storage authority.
     private var owner: Owner?, retired = false
     private var snapshot = Snapshot()
     private var retiredIDs: [UUID] = []
@@ -64,11 +74,23 @@ final class DataTransferManager {
     private var droppedDiagnostics = 0
     private var diagnosticStage = "idle"
     private var verifiedFiles: [URL] = []
-    init(generation: UInt64, directory: URL, transport: String = "Connected to PC", sender: @escaping Sender) {
+    init(generation: UInt64, directory: URL, transport: String = "Connected to PC",
+         receivedLibrary: ReceivedFileLibrary? = nil, onLibraryReady: ((ReceivedFileLibrary) -> Void)? = nil,
+         sender: @escaping Sender) {
         self.generation=generation;self.directory=directory;self.sender=sender;self.transport=transport
+        self.receivedLibrary = receivedLibrary
         queue.async {
-            let files=(try? FileManager.default.contentsOfDirectory(at:directory,includingPropertiesForKeys:nil)) ?? []
-            for file in files where file.lastPathComponent.hasPrefix(".scdt-") && file.pathExtension == "part" {try? FileManager.default.removeItem(at:file)}
+            if self.receivedLibrary == nil { self.receivedLibrary = try? ReceivedFileLibrary(directory: directory) }
+            if let library = self.receivedLibrary {
+                onLibraryReady?(library)
+                // Sweep abandoned stages only while holding exclusive storage ownership.
+                let sweep = UUID()
+                if library.beginTransfer(owner: sweep) {
+                    defer { library.endTransfer(owner: sweep) }
+                    let files=(try? FileManager.default.contentsOfDirectory(at:directory,includingPropertiesForKeys:nil)) ?? []
+                    for file in files where file.lastPathComponent.hasPrefix(".scdt-") && file.pathExtension == "part" {try? FileManager.default.removeItem(at:file)}
+                }
+            }
             self.refreshRetainedFiles()
             self.publish(.idle)
         }
@@ -105,34 +127,55 @@ final class DataTransferManager {
                 }
                 _ = try TransferProtocol.validate(files)
                 let active=Owner(id: UUID(),generation: self.generation,outgoing: true,files: files)
+                guard self.acquireStorage(active) else { throw CocoaError(.fileLocking) }
                 active.sources=urls;active.scoped=scoped;self.owner=active;self.admission.lock();self.wireOwner=(active.id,active.generation);self.admission.unlock();active.waiting = .response
                 self.publish(.offering);self.send(active,.offer) { _ in }
             } catch {for url in scoped {url.stopAccessingSecurityScopedResource()};self.snapshot.failure = FailureDetail.classify(error, stage: self.diagnosticStage);self.publish(.failed)}
         }
     }
-    func decide(_ accepted: Bool) {
-        queue.async { [weak self] in
-            guard let self, let active=self.owner, !active.outgoing, !active.accepted else {return}
-            do {
-                if accepted {
-                    self.event("admission")
-                    try FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true)
-                    let values=try self.directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-                    let total=try TransferProtocol.validate(active.files)
-                    let retained=(try? FileManager.default.contentsOfDirectory(at:self.directory,includingPropertiesForKeys:[.fileSizeKey])) ?? []
-                    let retainedBytes=retained.reduce(UInt64(0)){sum,url in sum+UInt64(max(0,(try? url.resourceValues(forKeys:[.fileSizeKey]).fileSize) ?? 0))}
-                    guard retained.count+active.files.count<=256,retainedBytes<=8*1024*1024*1024,total<=8*1024*1024*1024-retainedBytes else {throw CocoaError(.fileWriteOutOfSpace)}
-                    if let free=values.volumeAvailableCapacityForImportantUsage, free < 0 || UInt64(free)<total+64*1024*1024 {throw CocoaError(.fileWriteOutOfSpace)}
-                    self.event("stage_create")
-                    active.store=try TransferStore(directory:self.directory,metadata:active.files[0],id:active.id)
-                    active.accepted=true;self.publish(.receiving)
-                    var response=self.packet(active,.response);response.accepted=true;self.write(active,response) { _ in }
-                } else {
-                    var response=self.packet(active,.response);response.reason = .userRejected
-                    self.write(active,response) { [weak self] ok in if ok {self?.finish(.rejected)} }
-                }
-            } catch {self.fail(error: error)}
+    private func acquireStorage(_ active: Owner) -> Bool {
+        guard let library = receivedLibrary else { return false }
+        // A fresh local token fences equal peer UUIDs across generations and managers.
+        let token = UUID()
+        guard library.beginTransfer(owner: token) else { return false }
+        active.releaseStorage = { library.endTransfer(owner: token) }
+        return true
+    }
+    static func validateRetainedQuota(count: Int, bytes: UInt64, incomingCount: Int,
+                                      incomingBytes: UInt64, availableCapacity: Int64?) throws {
+        let limit: UInt64 = 8 * 1024 * 1024 * 1024
+        guard count >= 0, count <= 256, incomingCount > 0, incomingCount <= 256 - count,
+              bytes <= limit, incomingBytes <= limit - bytes else { throw CocoaError(.fileWriteOutOfSpace) }
+        if let free = availableCapacity, free < 0 || UInt64(free) < incomingBytes + 64 * 1024 * 1024 {
+            throw CocoaError(.fileWriteOutOfSpace)
         }
+    }
+    func decide(_ accepted: Bool) {
+        queue.async { [weak self] in self?.decideOnQueue(accepted, expectedTransferID: nil) }
+    }
+    private func decideOnQueue(_ accepted: Bool, expectedTransferID: UUID?) {
+        guard !retired, let active=owner, !active.outgoing, !active.accepted,
+              expectedTransferID == nil || expectedTransferID == active.id else { return }
+        do {
+            if accepted {
+                event("admission")
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                guard let receivedLibrary, active.releaseStorage != nil else { throw CocoaError(.fileReadUnknown) }
+                let values=try directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+                let total=try TransferProtocol.validate(active.files)
+                let inventory=try receivedLibrary.snapshot()
+                try Self.validateRetainedQuota(count: inventory.retainedCount, bytes: inventory.retainedBytes,
+                                              incomingCount: active.files.count, incomingBytes: total,
+                                              availableCapacity: values.volumeAvailableCapacityForImportantUsage)
+                event("stage_create")
+                active.store=try TransferStore(directory:directory,metadata:active.files[0],id:active.id)
+                active.accepted=true;publish(.receiving)
+                var response=packet(active,.response);response.accepted=true;write(active,response) { _ in }
+            } else {
+                var response=packet(active,.response);response.reason = .userRejected
+                write(active,response) { [weak self] ok in if ok {self?.finish(.rejected)} }
+            }
+        } catch {fail(error: error)}
     }
     func cancel(failed: Bool = false) {queue.async { [weak self] in self?.fail(phase: failed ? .failed : .cancelled) } }
     func retire() {queue.async { [weak self] in guard let self else{return};self.retired=true;self.finish(.retired)} }
@@ -152,7 +195,14 @@ final class DataTransferManager {
         guard now-active.lastProgress>=0.1 else{return};active.lastProgress=now
         snapshot.bytes=bytes;snapshot.phase=active.outgoing ? .sending : .receiving;changed?(snapshot)
     }
-    private func finish(_ phase: Phase) {admission.lock();wireOwner=nil;admission.unlock();publish(phase);if let active=owner {retiredIDs.append(active.id);if retiredIDs.count>256 {retiredIDs.removeFirst()}};owner?.close();owner=nil}
+    private func finish(_ phase: Phase) {
+        admission.lock();wireOwner=nil;admission.unlock()
+        if let active=owner {
+            retiredIDs.append(active.id);if retiredIDs.count>256 {retiredIDs.removeFirst()}
+            active.close() // Stage/source handles close before the one-use local lease releases.
+        }
+        refreshRetainedFiles();publish(phase);owner=nil
+    }
     private func fail(phase: Phase = .failed, error: Error? = nil) {
         guard let active=owner else {return}
         if phase == .failed {snapshot.failure = error.map {FailureDetail.classify($0, stage: diagnosticStage)} ?? snapshot.failure ?? FailureDetail(reason:"TRANSFER_FAILED",domain:"Transfer",code:0)}
@@ -174,7 +224,16 @@ final class DataTransferManager {
             guard !retiredIDs.contains(p.id), peerGeneration == nil || peerGeneration == p.generation else {return}
             peerGeneration = p.generation
             guard owner == nil else {var busy=TransferPacket(kind:.response,generation:p.generation,id:p.id);busy.reason = .busy;sender(busy){_ in};return}
-            _ = try TransferProtocol.validate(p.files);resetDiagnostics(outgoing:false);owner=Owner(id:p.id,generation:p.generation,outgoing:false,files:p.files);admission.lock();wireOwner=(p.id,p.generation);admission.unlock();event("offer");publish(.awaitingDecision);return
+            _ = try TransferProtocol.validate(p.files)
+            let active=Owner(id:p.id,generation:p.generation,outgoing:false,files:p.files)
+            // Invalid storage preserves the existing F03 manual admission failure stage.
+            // An available authority must fence Clear/export before exposing pending consent.
+            if receivedLibrary != nil && !acquireStorage(active) {
+                var busy=TransferPacket(kind:.response,generation:p.generation,id:p.id)
+                busy.reason = .busy;sender(busy){_ in};return
+            }
+            resetDiagnostics(outgoing:false);owner=active
+            admission.lock();wireOwner=(p.id,p.generation);admission.unlock();event("offer");publish(.awaitingDecision);return
         }
         guard let active=owner, active.id==p.id, active.generation==p.generation else {return}
         if p.kind != .chunk {event("receive_\(p.kind)")}
@@ -201,7 +260,17 @@ final class DataTransferManager {
             progress(active,bytes:active.bytes+store.written)
         case .fileEnd:
             guard p.fileIndex==active.index,let store=active.store else {throw TransferProtocol.Failure.invalid}
-            event("verify_publish");publish(.verifying);let final=try store.publish(length:p.offset,digest:p.bytes);active.store=nil;active.received.append(final);verifiedFiles.append(final);active.bytes+=p.offset;active.published+=1;active.index+=1
+            event("verify_publish");publish(.verifying)
+            let final=try store.publish(length:p.offset,digest:p.bytes);active.store=nil
+            event("receipt_commit")
+            do {
+                guard let receivedLibrary else { throw CocoaError(.fileReadUnknown) }
+                try receivedLibrary.recordPublished(final,length:p.offset,digest:p.bytes)
+            } catch {
+                // Published bytes survive as quota-counted legacy; no successful FileAck.
+                refreshRetainedFiles();throw error
+            }
+            active.received.append(final);active.bytes+=p.offset;active.published+=1;active.index+=1
             refreshRetainedFiles();event("published")
             if active.index<active.files.count {active.store=try TransferStore(directory:directory,metadata:active.files[active.index],id:active.id)}
             var ack=packet(active,.fileAck);ack.fileIndex=p.fileIndex;publish(.receiving);write(active,ack){_ in}
@@ -247,13 +316,15 @@ final class DataTransferManager {
         diagnostic?("component=DataTransfer direction=\(snapshot.outgoing ? "IPAD_TO_PC" : "PC_TO_IPAD") local_generation=\(generation) peer_generation=\(active?.generation ?? 0) transfer_id=\(active?.id.uuidString ?? "none") stage=\(stage) file_index=\(active?.index ?? 0) file_count=\(active?.files.count ?? 0) bytes=\((active?.bytes ?? 0)+offset) expected=\(expected) file_offset=\(offset) chunk_count=\(active?.outgoing == true ? (active?.chunk ?? 0) : (active?.receivedChunks ?? 0)) reason=\(snapshot.failure?.reason ?? "none") error_domain=\(snapshot.failure?.domain ?? "none") error_code=\(snapshot.failure?.code ?? 0) dropped=\(droppedDiagnostics)")
     }
     private func refreshRetainedFiles() {
-        let files=(try? FileManager.default.contentsOfDirectory(at:directory,includingPropertiesForKeys:[.isRegularFileKey,.fileSizeKey])) ?? []
-        verifiedFiles=files.filter {
-            guard !($0.lastPathComponent.hasPrefix(".scdt-") && $0.pathExtension == "part") else {return false}
-            guard let values=try? $0.resourceValues(forKeys:[.isRegularFileKey,.isSymbolicLinkKey]) else {return false}
-            return values.isRegularFile == true && values.isSymbolicLink != true
-        }.sorted {$0.lastPathComponent < $1.lastPathComponent}
-        snapshot.received=verifiedFiles;snapshot.retainedCount=verifiedFiles.count
-        snapshot.retainedBytes=verifiedFiles.reduce(0) {$0+UInt64(max(0,(try? $1.resourceValues(forKeys:[.fileSizeKey]).fileSize) ?? 0))}
+        // Event-driven IO-worker work, never a per-progress hash or network/main callback.
+        guard let receivedLibrary, let inventory=try? receivedLibrary.snapshot() else {
+            snapshot.inventoryUnavailable=true
+            return // Preserve last known values; unavailable is not an empty library.
+        }
+        verifiedFiles=inventory.files // Retained projection; deletion authority stays in receipts.
+        snapshot.received=inventory.files;snapshot.retainedCount=inventory.retainedCount
+        snapshot.retainedBytes=inventory.retainedBytes;snapshot.eligibleCount=inventory.eligibleCount
+        snapshot.eligibleBytes=inventory.eligibleBytes;snapshot.storageBusy=inventory.busy
+        snapshot.inventoryUnavailable=false
     }
 }

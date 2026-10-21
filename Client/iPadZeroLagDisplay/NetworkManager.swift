@@ -1884,6 +1884,9 @@ public class NetworkManager: ObservableObject {
     private var activeDirectTouchCommand: DirectTouchContactCommand?
     @Published private(set) var transferSnapshot = DataTransferManager.Snapshot()
     private var dataTransfers: DataTransferManager?
+    private let retainedTransferRoot = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("ScreenCasting Transfers")
+    private var retainedFileLibrary: ReceivedFileLibrary? // Strong across retired transport generations; networkQueue owned.
     private var transferReceivePending = 0
     private struct TransferReceiveSuffix {
         let data: Data
@@ -4188,8 +4191,13 @@ public class NetworkManager: ObservableObject {
     func cancelTransfer() { networkQueue.async { [weak self] in self?.controlChannelWriter.cancelBulk(); self?.dataTransfers?.cancel() } }
     private func beginDataTransfer(generation: UInt64) {
         guard generation == connectionGeneration, dataTransfers == nil else { return }
-        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("ScreenCasting Transfers")
-        let manager = DataTransferManager(generation: generation, directory: root, transport: activeTransportKind == .usb ? "USB-C" : "Wi-Fi") { [weak self] packet, completion in
+        let manager = DataTransferManager(generation: generation, directory: retainedTransferRoot,
+                                          transport: activeTransportKind == .usb ? "USB-C" : "Wi-Fi",
+                                          receivedLibrary: retainedFileLibrary,
+                                          onLibraryReady: { [weak self] library in
+            // Authority opens on the transfer IO worker, not the latency-sensitive network queue.
+            self?.networkQueue.async { [weak self] in self?.retainedFileLibrary = library }
+        }) { [weak self] packet, completion in
             guard let self else { completion(false); return }
             self.networkQueue.async {
                 guard generation == self.connectionGeneration, self.wireAuthenticatedGeneration == generation,

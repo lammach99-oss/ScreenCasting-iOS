@@ -6,6 +6,25 @@ import Foundation
 
 final class DataTransferTests: XCTestCase {
 
+    func testUX03RetainedQuotaBoundariesWithoutLargeDiskFixtures() throws {
+        let limit: UInt64 = 8 * 1024 * 1024 * 1024, reserve: Int64 = 64 * 1024 * 1024
+        XCTAssertNoThrow(try DataTransferManager.validateRetainedQuota(count: 255, bytes: limit - 1,
+                         incomingCount: 1, incomingBytes: 1, availableCapacity: reserve + 1))
+        XCTAssertThrowsError(try DataTransferManager.validateRetainedQuota(count: 256, bytes: 0,
+                             incomingCount: 1, incomingBytes: 0, availableCapacity: nil))
+        XCTAssertThrowsError(try DataTransferManager.validateRetainedQuota(count: 0, bytes: limit,
+                             incomingCount: 1, incomingBytes: 1, availableCapacity: nil))
+        XCTAssertThrowsError(try DataTransferManager.validateRetainedQuota(count: 0, bytes: UInt64.max,
+                             incomingCount: 1, incomingBytes: UInt64.max, availableCapacity: nil))
+        XCTAssertThrowsError(try DataTransferManager.validateRetainedQuota(count: 0, bytes: 0,
+                             incomingCount: 1, incomingBytes: UInt64.max, availableCapacity: nil))
+        XCTAssertThrowsError(try DataTransferManager.validateRetainedQuota(count: 0, bytes: 0,
+                             incomingCount: 1, incomingBytes: 1, availableCapacity: reserve))
+        XCTAssertThrowsError(try DataTransferManager.validateRetainedQuota(count: 0, bytes: 0,
+                             incomingCount: 1, incomingBytes: 0, availableCapacity: -1))
+    }
+
+
     // C2 v3.3 G1: packet-boundary integration tests; existing runtime API only.
     private final class UX03Receiver {
         let library: ReceivedFileLibrary
