@@ -61,6 +61,7 @@
 		D70111111111111111111106 = {isa = PBXBuildFile; fileRef = D70211111111111111111106; };
 		D70111111111111111111107 = {isa = PBXBuildFile; fileRef = D70211111111111111111107; };
 		D70111111111111111111108 = {isa = PBXBuildFile; fileRef = D70211111111111111111108; };
+		D70111111111111111111109 = {isa = PBXBuildFile; fileRef = D70211111111111111111109; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -131,6 +132,7 @@
 		D70211111111111111111106 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DataTransfer/TransferCenterSheet.swift; sourceTree = "<group>"; };
 		D70211111111111111111107 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DataTransfer/TransferPresentation.swift; sourceTree = "<group>"; };
 		D70211111111111111111108 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransferCenterPresentationTests.swift; sourceTree = "<group>"; };
+		D70211111111111111111109 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DataTransfer/ReceivedFileLibrary.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -168,6 +170,7 @@
 				D70211111111111111111105 /* TransferPanel.swift */,
 				D70211111111111111111106,
 				D70211111111111111111107,
+				D70211111111111111111109,
 				D70211111111111111111103 /* DataTransferManager.swift */,
 				D70211111111111111111102 /* TransferStore.swift */,
 				D70211111111111111111101 /* TransferProtocol.swift */,
@@ -335,6 +338,7 @@
 				D70111111111111111111105 /* TransferPanel.swift in Sources */,
 				D70111111111111111111106,
 				D70111111111111111111107,
+				D70111111111111111111109,
 				D70111111111111111111103 /* DataTransferManager.swift in Sources */,
 				D70111111111111111111102 /* TransferStore.swift in Sources */,
 				D70111111111111111111101 /* TransferProtocol.swift in Sources */,
