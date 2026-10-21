@@ -5,6 +5,135 @@ import Foundation
 @testable import iPadCasting
 
 final class DataTransferTests: XCTestCase {
+    func testUX03LegacyFilesRemainVisibleAndIneligibleAfterReopen() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let legacy = root.appendingPathComponent("legacy.bin")
+        let metadata = root.appendingPathComponent("unknown.json")
+        try Data([1, 2, 3]).write(to: legacy)
+        try Data("{}".utf8).write(to: metadata)
+        let library = try ReceivedFileLibrary(directory: root)
+        let inventory = try library.snapshot()
+        XCTAssertEqual(inventory.retainedCount, 2)
+        XCTAssertEqual(inventory.retainedBytes, 5)
+        XCTAssertEqual(inventory.eligibleCount, 0)
+        let result = try library.clear(library.confirmClear())
+        XCTAssertEqual(result.deletedCount, 0)
+        XCTAssertEqual(try Data(contentsOf: legacy), Data([1, 2, 3]))
+        XCTAssertEqual(try Data(contentsOf: metadata), Data("{}".utf8))
+        XCTAssertEqual(try ReceivedFileLibrary(directory: root).snapshot().retainedCount, 2)
+    }
+
+    func testUX03ReceiptBackedClearDeletesActualCopiesAndPreservesExport() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let retained = root.appendingPathComponent("retained")
+        let exported = root.appendingPathComponent("exported.bin")
+        let library = try ReceivedFileLibrary(directory: retained)
+        let fixtures: [(String, Data)] = [("empty.bin", Data()), ("received.bin", Data(repeating: 7, count: 1024)),
+                                           ("received (1).bin", Data([8]))]
+        for (name, bytes) in fixtures {
+            let url = retained.appendingPathComponent(name)
+            try bytes.write(to: url)
+            try library.recordPublished(url, length: UInt64(bytes.count), digest: Data(SHA256.hash(data: bytes)))
+        }
+        try FileManager.default.copyItem(at: retained.appendingPathComponent("received.bin"), to: exported)
+        let confirmation = try library.confirmClear()
+        XCTAssertEqual(confirmation.count, 3)
+        XCTAssertEqual(confirmation.bytes, 1025)
+        let result = try library.clear(confirmation)
+        XCTAssertEqual(result.deletedCount, 3)
+        XCTAssertEqual(result.failedCount, 0)
+        for (name, _) in fixtures { XCTAssertFalse(FileManager.default.fileExists(atPath: retained.appendingPathComponent(name).path)) }
+        XCTAssertEqual(try Data(contentsOf: exported), Data(repeating: 7, count: 1024))
+        let reopened = try ReceivedFileLibrary(directory: retained).snapshot()
+        XCTAssertEqual(reopened.retainedCount, 0)
+        XCTAssertEqual(reopened.retainedBytes, 0)
+        XCTAssertThrowsError(try library.clear(confirmation), "A consumed confirmation cannot authorize another deletion")
+    }
+
+    func testUX03ConfirmationDoesNotDeleteLaterPublishedFileOrSubstitutedIdentity() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ReceivedFileLibrary(directory: root)
+        let first = root.appendingPathComponent("first.bin"), later = root.appendingPathComponent("later.bin")
+        try Data([1]).write(to: first)
+        try library.recordPublished(first, length: 1, digest: Data(SHA256.hash(data: Data([1]))))
+        let confirmation = try library.confirmClear()
+        // Atomic replacement guarantees a new file identity, even for equal content.
+        try Data([1]).write(to: first, options: .atomic)
+        try Data([2]).write(to: later)
+        try library.recordPublished(later, length: 1, digest: Data(SHA256.hash(data: Data([2]))))
+        let result = try library.clear(confirmation)
+        XCTAssertEqual(result.deletedCount, 0)
+        XCTAssertEqual(result.failedCount, 1)
+        XCTAssertEqual(try Data(contentsOf: first), Data([1]))
+        XCTAssertEqual(try Data(contentsOf: later), Data([2]))
+        XCTAssertEqual(try library.snapshot().retainedCount, 2)
+    }
+
+    func testUX03ClearRefusesActiveTransferOrExportWithoutChangingFiles() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ReceivedFileLibrary(directory: root)
+        let file = root.appendingPathComponent("received.bin")
+        try Data([9]).write(to: file)
+        try library.recordPublished(file, length: 1, digest: Data(SHA256.hash(data: Data([9]))))
+        let transfer = UUID()
+        XCTAssertTrue(library.beginTransfer(owner: transfer))
+        XCTAssertFalse(library.beginTransfer(owner: UUID()))
+        XCTAssertThrowsError(try library.confirmClear())
+        library.endTransfer(owner: UUID())
+        XCTAssertThrowsError(try library.confirmClear(), "A foreign owner cannot release the active lease")
+        library.endTransfer(owner: transfer)
+        let confirmation = try library.confirmClear()
+        let export = try library.beginExport(file)
+        XCTAssertThrowsError(try library.clear(confirmation))
+        XCTAssertEqual(try Data(contentsOf: file), Data([9]))
+        library.endExport(export)
+        XCTAssertEqual(try library.clear(library.confirmClear()).deletedCount, 1)
+    }
+
+    func testUX03ConfinesDeletionAndRefusesSymlinkedStorageRoot() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let retained = root.appendingPathComponent("retained"), external = root.appendingPathComponent("external.bin")
+        let library = try ReceivedFileLibrary(directory: retained)
+        try Data([4]).write(to: external)
+        let link = retained.appendingPathComponent("link.bin")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: external)
+        let stage = retained.appendingPathComponent(".scdt-test.part")
+        try Data([5]).write(to: stage)
+        let nested = retained.appendingPathComponent("nested")
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try Data([6]).write(to: nested.appendingPathComponent("file.bin"))
+        let digest = Data(SHA256.hash(data: Data([4])))
+        XCTAssertThrowsError(try library.recordPublished(external, length: 1, digest: digest))
+        XCTAssertThrowsError(try library.recordPublished(link, length: 1, digest: digest))
+        XCTAssertThrowsError(try library.recordPublished(stage, length: 1, digest: Data(SHA256.hash(data: Data([5])))))
+        XCTAssertEqual(try library.clear(library.confirmClear()).deletedCount, 0)
+        XCTAssertEqual(try Data(contentsOf: external), Data([4]))
+        XCTAssertEqual(try Data(contentsOf: stage), Data([5]))
+        XCTAssertEqual(try Data(contentsOf: nested.appendingPathComponent("file.bin")), Data([6]))
+        let alias = root.appendingPathComponent("alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: retained)
+        XCTAssertThrowsError(try ReceivedFileLibrary(directory: alias))
+    }
+
+    func testUX03MismatchedDigestCannotCreateDeletionAuthority() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ReceivedFileLibrary(directory: root)
+        let file = root.appendingPathComponent("unverified.bin")
+        try Data([3]).write(to: file)
+        XCTAssertThrowsError(try library.recordPublished(file, length: 1, digest: Data(count: 32)))
+        XCTAssertEqual(try library.snapshot().eligibleCount, 0)
+        XCTAssertEqual(try library.clear(library.confirmClear()).deletedCount, 0)
+        XCTAssertEqual(try Data(contentsOf: file), Data([3]))
+    }
+
     func testF03AdmissionFailureRetainsStageAndSanitizedNativeError() async throws {
         let root=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try Data([1]).write(to:root)
