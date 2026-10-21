@@ -134,6 +134,110 @@ final class DataTransferTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: file), Data([3]))
     }
 
+    func testUX03PartialUnlinkFailureReportsRealBytesAndCanRetry() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var fail = true
+        var hooks = ReceivedFileLibrary.Hooks()
+        hooks.beforeUnlink = { name in if name == "blocked.bin" && fail { throw CocoaError(.fileWriteNoPermission) } }
+        let library = try ReceivedFileLibrary(directory: root, hooks: hooks)
+        for name in ["good.bin", "blocked.bin"] {
+            let url = root.appendingPathComponent(name)
+            try Data([1, 2]).write(to: url)
+            try library.recordPublished(url, length: 2, digest: Data(SHA256.hash(data: Data([1, 2]))))
+        }
+        let result = try library.clear(library.confirmClear())
+        XCTAssertEqual(result.deletedCount, 1); XCTAssertEqual(result.failedCount, 1)
+        XCTAssertEqual(result.deletedBytes, 2)
+        XCTAssertEqual(try library.snapshot().retainedBytes, 2)
+        fail = false
+        XCTAssertEqual(try library.clear(library.confirmClear()).deletedCount, 1)
+        XCTAssertEqual(try library.snapshot().retainedCount, 0)
+    }
+
+    func testUX03ReopenPreservesReceiptAndConsumesConfirmationDurably() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var confirmation: ReceivedFileLibrary.Confirmation!
+        do {
+            let library = try ReceivedFileLibrary(directory: root)
+            let url = root.appendingPathComponent("verified.bin")
+            try Data([5]).write(to: url)
+            try library.recordPublished(url, length: 1, digest: Data(SHA256.hash(data: Data([5]))))
+            confirmation = try library.confirmClear()
+        }
+        let reopened = try ReceivedFileLibrary(directory: root)
+        XCTAssertEqual(try reopened.snapshot().eligibleCount, 1)
+        XCTAssertEqual(try reopened.clear(confirmation).deletedCount, 1)
+        XCTAssertThrowsError(try reopened.clear(confirmation))
+    }
+
+    func testUX03CorruptAndUnsupportedReceiptsNeverAdoptLegacy() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ReceivedFileLibrary(directory: root)
+        let url = root.appendingPathComponent("legacy.bin")
+        try Data([1]).write(to: url)
+        let metadata = root.appendingPathComponent(ReceivedFileLibrary.metadataName).appendingPathComponent("receipts.json")
+        for bytes in [Data("torn{".utf8), Data("{\"version\":999}".utf8)] {
+            try bytes.write(to: metadata, options: .atomic)
+            XCTAssertEqual(try library.snapshot().retainedCount, 1)
+            XCTAssertEqual(try library.snapshot().retainedBytes, 1)
+            XCTAssertEqual(try library.snapshot().eligibleCount, 0)
+            XCTAssertThrowsError(try library.confirmClear())
+            XCTAssertEqual(try Data(contentsOf: url), Data([1]))
+        }
+    }
+
+    func testUX03SharedLibraryLeasesFenceWrongOwnersAndExports() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = try ReceivedFileLibrary(directory: root), second = try ReceivedFileLibrary(directory: root)
+        let owner = UUID()
+        XCTAssertTrue(first.beginTransfer(owner: owner))
+        XCTAssertFalse(second.beginTransfer(owner: UUID()))
+        second.endTransfer(owner: UUID())
+        XCTAssertThrowsError(try second.confirmClear())
+        first.endTransfer(owner: owner)
+        let file = root.appendingPathComponent("legacy.bin"); try Data([1]).write(to: file)
+        let export = try second.beginExport(file)
+        first.endExport(UUID())
+        XCTAssertThrowsError(try first.confirmClear())
+        XCTAssertFalse(first.beginTransfer(owner: UUID()))
+        second.endExport(export)
+        XCTAssertEqual(try first.confirmClear().count, 0)
+    }
+
+    func testUX03HardlinkAndInPlaceMutationLoseEligibility() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ReceivedFileLibrary(directory: root)
+        let file = root.appendingPathComponent("owned.bin"), alias = root.appendingPathComponent("alias.bin")
+        try Data([1]).write(to: file)
+        try FileManager.default.linkItem(at: file, to: alias)
+        XCTAssertThrowsError(try library.recordPublished(file, length: 1, digest: Data(SHA256.hash(data: Data([1])))))
+        try FileManager.default.removeItem(at: alias)
+        try library.recordPublished(file, length: 1, digest: Data(SHA256.hash(data: Data([1]))))
+        let confirmation = try library.confirmClear()
+        let handle = try FileHandle(forWritingTo: file); try handle.write(contentsOf: Data([2])); try handle.close()
+        XCTAssertEqual(try library.clear(confirmation).failedCount, 1)
+        XCTAssertEqual(try library.snapshot().eligibleCount, 0)
+        XCTAssertEqual(try Data(contentsOf: file), Data([2]))
+    }
+
+    func testUX03ReceiptCommitFailurePreservesPublishedBytesAsLegacy() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var hooks = ReceivedFileLibrary.Hooks()
+        hooks.beforeReceiptCommit = { throw CocoaError(.fileWriteOutOfSpace) }
+        let library = try ReceivedFileLibrary(directory: root, hooks: hooks)
+        let file = root.appendingPathComponent("retained.bin"); try Data([9]).write(to: file)
+        XCTAssertThrowsError(try library.recordPublished(file, length: 1, digest: Data(SHA256.hash(data: Data([9])))))
+        XCTAssertEqual(try library.snapshot().retainedCount, 1)
+        XCTAssertEqual(try library.snapshot().eligibleCount, 0)
+        XCTAssertEqual(try Data(contentsOf: file), Data([9]))
+    }
+
     func testF03AdmissionFailureRetainsStageAndSanitizedNativeError() async throws {
         let root=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try Data([1]).write(to:root)
@@ -239,7 +343,7 @@ final class DataTransferTests: XCTestCase {
     }
     func testUnsafeNamesAndBounds() throws {
         for name in ["",".","..","../x","/x","C:x","\\\\pc\\x","a/b","a\\b","NUL","CON.txt","COM1","LPT9.txt","x.","x ","a\0b",String(repeating:"a",count:256)] {XCTAssertFalse(TransferProtocol.validName(name))}
-        XCTAssertTrue(TransferProtocol.validName("đẹp.txt"))
+        XCTAssertTrue(TransferProtocol.validName("Ä‘áº¹p.txt"))
         XCTAssertEqual(TransferProtocol.defaultChunkBytes,16384);XCTAssertEqual(TransferProtocol.maxChunkBytes,65536)
         XCTAssertThrowsError(try TransferProtocol.validate([]))
     }
@@ -268,12 +372,12 @@ final class DataTransferTests: XCTestCase {
         defer{try? FileManager.default.removeItem(at:root)}
         for size in [0,1,15360,16384,16385,65536,65537,2*1024*1024] {
             let directory=root.appendingPathComponent(String(size)),bytes=Data(repeating:0x41,count:size)
-            let store=try TransferStore(directory:directory,metadata:TransferFile(name:"đẹp.bin",length:UInt64(size)),id:UUID())
+            let store=try TransferStore(directory:directory,metadata:TransferFile(name:"Ä‘áº¹p.bin",length:UInt64(size)),id:UUID())
             var offset=0,chunk:UInt64=0
             while offset<size {let count=min(16384,size-offset);try store.append(chunk:chunk,offset:UInt64(offset),bytes:bytes.subdata(in:offset..<offset+count));offset+=count;chunk+=1}
             let final=try store.publish(length:UInt64(size),digest:Data(SHA256.hash(data:bytes)))
             XCTAssertEqual(try Data(contentsOf:final),bytes)
-            let collision=try TransferStore(directory:directory,metadata:TransferFile(name:"đẹp.bin",length:0),id:UUID())
+            let collision=try TransferStore(directory:directory,metadata:TransferFile(name:"Ä‘áº¹p.bin",length:0),id:UUID())
             XCTAssertNotEqual(try collision.publish(length:0,digest:Data(SHA256.hash(data:Data()))),final)
         }
         let store=try TransferStore(directory:root,metadata:TransferFile(name:"invalid",length:3),id:UUID())
