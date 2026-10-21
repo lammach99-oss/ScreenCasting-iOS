@@ -5981,7 +5981,7 @@ public class NetworkManager: ObservableObject {
                                                    committed: Bool, usb: Bool = false) {
         networkQueue.sync {
             dataTransfers = manager
-            activeTransportKind = usb ? .usb : .wifi
+            usbListenerExplicitlyStarted = usb
             wireAuthenticatedGeneration = authenticated ? connectionGeneration : nil
             committedTransportGeneration = committed ? connectionGeneration : nil
             refreshAutoAcceptPolicyOnQueue()
