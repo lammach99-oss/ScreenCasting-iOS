@@ -3103,7 +3103,7 @@ final class USBListenerLifetimeTests: XCTestCase {
             audio.interruptionResumeForTesting = nil
             manager.controlSendForAudioTesting = nil
         }
-        let peer = try connect()
+        let peer = try connect(stage: "legacy_initial_after_manager_replacement")
         awaitLegacyPing(probe) { manager.simulateSessionAuthenticatedAndCommitted() }
         let generation = manager.usbSessionSnapshot().generation
         manager.networkQueueForTesting.sync { }
@@ -3579,7 +3579,7 @@ final class USBListenerLifetimeTests: XCTestCase {
             manager.networkQueueForTesting.sync { }
             let oldPing = try XCTUnwrap(probe.pings.last)
             try deliver(.failed(.posix(.ECONNRESET)), to: peer)
-            let replacement = try connect()
+            let replacement = try connect(stage: "legacy_replacement_after_old_terminal")
             awaitLegacyPing(probe) { manager.simulateSessionAuthenticatedAndCommitted() }
             manager.networkQueueForTesting.sync { }
             let next = manager.usbSessionSnapshot().generation
@@ -4375,26 +4375,89 @@ final class USBListenerLifetimeTests: XCTestCase {
         return try manager.networkQueueForTesting.sync { try XCTUnwrap(probe) }
     }
 
-    private func connect() throws -> NWConnection {
+    private enum USBListenerFixtureError: Error {
+        case readinessFailure(String)
+    }
+
+    private func connect(stage: String = "unspecified") throws -> NWConnection {
         let snapshot = manager.usbSessionSnapshot()
         let listener = try XCTUnwrap(snapshot.listener)
-        let acceptHandler = try XCTUnwrap(listener.newConnectionHandler)
-        let listenerReady = expectation(description: "ephemeral USB listener ready")
-        manager.networkQueueForTesting.sync {
-            if case .ready = listener.state {
-                listenerReady.fulfill()
-            } else {
-                let stateHandler = listener.stateUpdateHandler
+        let owner = try XCTUnwrap(manager)
+        let queue = owner.networkQueueForTesting
+        let acceptHandler = try queue.sync { try XCTUnwrap(listener.newConnectionHandler) }
+        let listenerReady = expectation(description: "ephemeral USB listener ready [\(stage)]")
+        var priorHandler: ((NWListener.State) -> Void)?
+        var probeInstalled = false
+        var resolved = false
+        var genuineReady = false
+        var observedState = "unobserved"
+        var terminalFailure: String?
+        queue.sync {
+            priorHandler = listener.stateUpdateHandler
+            func observe(_ state: NWListener.State, event: String) {
+                dispatchPrecondition(condition: .onQueue(queue))
+                observedState = String(describing: state)
+                let current = owner.usbSessionSnapshot()
+                print("[C2_USB_LISTENER_PROBE] stage=\(stage) event=\(event) " +
+                      "manager=\(ObjectIdentifier(owner)) listener=\(ObjectIdentifier(listener)) " +
+                      "generation=\(current.generation) sameOwner=\(current.listener === listener) " +
+                      "intent=\(current.listenerIntent) state=\(observedState) " +
+                      "port=\(listener.port?.rawValue ?? 0) queue=\(queue.label) " +
+                      "uptime=\(ProcessInfo.processInfo.systemUptime)")
+                guard !resolved else { return }
+                switch state {
+                case .ready:
+                    resolved = true
+                    genuineReady = true
+                    listenerReady.fulfill()
+                case .failed(let error):
+                    resolved = true
+                    terminalFailure = "failed(\(error))"
+                    listenerReady.fulfill()
+                case .cancelled:
+                    resolved = true
+                    terminalFailure = "cancelled"
+                    listenerReady.fulfill()
+                default:
+                    break
+                }
+            }
+            switch listener.state {
+            case .ready, .failed(_), .cancelled:
+                observe(listener.state, event: "initial_state")
+            default:
+                let upstream = priorHandler
+                probeInstalled = true
                 listener.stateUpdateHandler = { state in
-                    stateHandler?(state)
-                    if case .ready = state {
-                        listener.stateUpdateHandler = stateHandler
-                        listenerReady.fulfill()
-                    }
+                    upstream?(state)
+                    observe(state, event: "callback_after_upstream")
+                }
+                observe(listener.state, event: "installed_resample")
+            }
+        }
+        defer {
+            if probeInstalled {
+                queue.sync {
+                    listener.stateUpdateHandler = priorHandler
+                    print("[C2_USB_LISTENER_PROBE] stage=\(stage) event=handler_restored " +
+                          "listener=\(ObjectIdentifier(listener)) uptime=\(ProcessInfo.processInfo.systemUptime)")
                 }
             }
         }
-        wait(for: [listenerReady], timeout: 5)
+        let waitResult = XCTWaiter.wait(for: [listenerReady], timeout: 5)
+        let reading = queue.sync {
+            let current = owner.usbSessionSnapshot()
+            return (ready: genuineReady, state: observedState, terminal: terminalFailure,
+                    sameOwner: current.listener === listener, intent: current.listenerIntent)
+        }
+        guard waitResult == .completed, reading.ready, reading.terminal == nil,
+              reading.sameOwner, reading.intent else {
+            let reason = "stage=\(stage) waiter=\(waitResult) state=\(reading.state) " +
+                         "terminal=\(reading.terminal ?? "none") sameOwner=\(reading.sameOwner) " +
+                         "intent=\(reading.intent)"
+            XCTFail("USB native listener readiness failure: \(reason)")
+            throw USBListenerFixtureError.readinessFailure(reason)
+        }
         let port = try XCTUnwrap(listener.port)
         let acceptedReady = expectation(description: "USB candidate ready or rejected")
         var acceptedPeer: NWConnection?
