@@ -1851,7 +1851,9 @@ public class NetworkManager: ObservableObject {
     public var isListening:  Bool { connectionState == .listening }
 
     // MARK: Private
-    private var connection: NWConnection?
+    private var connection: NWConnection? {
+        didSet { if oldValue !== connection { refreshAutoAcceptPolicyOnQueue() } }
+    }
     private var transportState: ConnectionState = .idle
     private var verifiedHostFingerprint: String?
     private var verifiedHostIdentityCode: String?
@@ -1879,7 +1881,9 @@ public class NetworkManager: ObservableObject {
     private var wifiWaitingOwner: WifiWaitingOwner?
     private var connectionTimeoutWorkItem: DispatchWorkItem?
     private var usbListener: NWListener?
-    private var usbListenerExplicitlyStarted = false
+    private var usbListenerExplicitlyStarted = false {
+        didSet { if oldValue != usbListenerExplicitlyStarted { refreshAutoAcceptPolicyOnQueue() } }
+    }
     private var usbScdpConnection: NWConnection?
     private var activeDirectTouchCommand: DirectTouchContactCommand?
     @Published private(set) var transferSnapshot = DataTransferManager.Snapshot()
@@ -2009,8 +2013,12 @@ public class NetworkManager: ObservableObject {
     private var testingClientHelloCount = 0
     private var testingPingAttempts = 0
     #endif
-    private var wireAuthenticatedGeneration: UInt64?
-    private var committedTransportGeneration: UInt64?
+    private var wireAuthenticatedGeneration: UInt64? {
+        didSet { if oldValue != wireAuthenticatedGeneration { refreshAutoAcceptPolicyOnQueue() } }
+    }
+    private var committedTransportGeneration: UInt64? {
+        didSet { if oldValue != committedTransportGeneration { refreshAutoAcceptPolicyOnQueue() } }
+    }
     private var audioDiagnosticGeneration: UInt64?
     private var audioDiagnosticPublishedAt: TimeInterval = 0
     private var pendingTransportOffer: TransportOffer?
@@ -2251,6 +2259,7 @@ public class NetworkManager: ObservableObject {
         wifiLifecycleTransitionGeneration = nil
         wifiWaitingOwner = nil
         _ = connectionGenerationClock.advance()
+        resetAutoAcceptOnQueue()
         advanceReceivedRevisionOnQueue()
         resetDirectTouchSessionOnQueue()
         #if targetEnvironment(simulator)
@@ -3013,6 +3022,7 @@ public class NetworkManager: ObservableObject {
         #endif
         RecentWifiResumeStore.clear()
         let stoppedGeneration = connectionGenerationClock.advance()
+        resetAutoAcceptOnQueue()
         advanceReceivedRevisionOnQueue()
         resetDirectTouchSessionOnQueue()
         listenerGeneration &+= 1
@@ -3224,6 +3234,7 @@ public class NetworkManager: ObservableObject {
     private func installUsbCandidate(_ candidate: NWConnection) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         _ = connectionGenerationClock.advance()
+        resetAutoAcceptOnQueue()
         advanceReceivedRevisionOnQueue()
         resetDirectTouchSessionOnQueue()
         clientSettingsState.resetHostGeneration()
@@ -4380,13 +4391,72 @@ public class NetworkManager: ObservableObject {
         }
     }
 
-    // C2 v3.3 UX02 RED scaffold: fail-closed OFF; no policy is enabled yet.
+    private struct AutoAcceptScope: Equatable {
+        let generation: UInt64
+        let usb: Bool
+        let connectionID: ObjectIdentifier
+    }
+    private var autoAcceptScope: AutoAcceptScope?
+    private var autoAcceptObservedScope: AutoAcceptScope?
+    private let autoAcceptSessionClock = ConnectionGenerationClock()
+    private var autoAcceptPolicyRevision: UInt64 = 0
+    private var autoAcceptUIRevision: UInt64 = 0 // Main queue only.
     @Published private(set) var autoAcceptIncomingFiles = false
     @Published private(set) var canEnableAutoAccept = false
-    func setAutoAcceptIncomingFiles(_ requested: Bool) {
-        networkQueue.async { /* Explicit OFF/default path until executable RED. */ }
+    private func currentAutoAcceptScopeOnQueue() -> AutoAcceptScope? {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard let connection, wireAuthenticatedGeneration == connectionGeneration,
+              committedTransportGeneration == connectionGeneration else { return nil }
+        if case .authFailed = transportState { return nil }
+        return AutoAcceptScope(generation: connectionGeneration, usb: activeTransportKind == .usb,
+                               connectionID: ObjectIdentifier(connection))
     }
-    private func refreshAutoAcceptPolicyOnQueue() { }
+    private func publishAutoAcceptOnQueue() {
+        autoAcceptPolicyRevision &+= 1
+        let revision = autoAcceptPolicyRevision
+        let scope = currentAutoAcceptScopeOnQueue()
+        let enabled = scope != nil && autoAcceptScope == scope
+        let available = scope != nil
+        DispatchQueue.main.async { [weak self] in
+            guard let self, revision >= self.autoAcceptUIRevision else { return }
+            self.autoAcceptUIRevision = revision
+            self.autoAcceptIncomingFiles = enabled; self.canEnableAutoAccept = available
+        }
+    }
+    private func resetAutoAcceptOnQueue() {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        autoAcceptScope = nil; autoAcceptObservedScope = nil
+        _ = autoAcceptSessionClock.advance()
+        dataTransfers?.setAutoAccept(false, localGeneration: connectionGeneration)
+        publishAutoAcceptOnQueue()
+    }
+    private func refreshAutoAcceptPolicyOnQueue() {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        let scope = currentAutoAcceptScopeOnQueue()
+        let changed = scope != autoAcceptObservedScope
+        if changed {
+            autoAcceptObservedScope = scope; autoAcceptScope = nil
+            _ = autoAcceptSessionClock.advance()
+        }
+        dataTransfers?.setAutoAccept(scope != nil && autoAcceptScope == scope,
+                                    localGeneration: connectionGeneration)
+        // Packet admission rechecks scope without publishing UI work per chunk.
+        if changed { publishAutoAcceptOnQueue() }
+    }
+    func setAutoAcceptIncomingFiles(_ requested: Bool) {
+        // Lock-backed clocks fence commands queued before retirement/handover.
+        let generation = connectionGenerationClock.current
+        let epoch = autoAcceptSessionClock.current
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            let scope = self.currentAutoAcceptScopeOnQueue()
+            let allowed = requested && generation == self.connectionGeneration &&
+                epoch == self.autoAcceptSessionClock.current && scope != nil
+            self.autoAcceptScope = allowed ? scope : nil
+            self.dataTransfers?.setAutoAccept(allowed, localGeneration: self.connectionGeneration)
+            self.publishAutoAcceptOnQueue()
+        }
+    }
 
     func sendTransferFiles(_ urls: [URL]) { networkQueue.async { [weak self] in self?.dataTransfers?.sendFiles(urls) } }
     func decideTransfer(_ accepted: Bool) { networkQueue.async { [weak self] in self?.dataTransfers?.decide(accepted) } }
@@ -4427,6 +4497,7 @@ public class NetworkManager: ObservableObject {
             }
         }
         dataTransfers = manager
+        refreshAutoAcceptPolicyOnQueue()
     }
     private func sendWireMessage(
         type: WireMessageType,
@@ -4730,6 +4801,7 @@ public class NetworkManager: ObservableObject {
             do {
                 let packet = try TransferProtocol.decode(kind,payload)
                 if let manager = dataTransfers {
+                    refreshAutoAcceptPolicyOnQueue()
                     if kind == .cancel && manager.owns(packet) { controlChannelWriter.cancelBulk() }
                     transferReceivePending += 1
                     let post: (TransferPacket, @escaping () -> Void) -> Bool
@@ -5867,6 +5939,7 @@ public class NetworkManager: ObservableObject {
         connectionTimeoutWorkItem?.cancel()
         connectionTimeoutWorkItem = nil
         let failedGeneration = connectionGenerationClock.advance()
+        resetAutoAcceptOnQueue()
         advanceReceivedRevisionOnQueue()
         resetDirectTouchSessionOnQueue()
         wireReceiveActiveGeneration = nil
@@ -6194,6 +6267,7 @@ public class NetworkManager: ObservableObject {
         networkQueue.sync {
             let peer = NWConnection(host: "127.0.0.1", port: 27015, using: .tcp)
             let generation = connectionGenerationClock.advance()
+            resetAutoAcceptOnQueue()
             advanceReceivedRevisionOnQueue()
             resetDirectTouchSessionOnQueue()
             connection?.cancel()
@@ -6266,6 +6340,7 @@ public class NetworkManager: ObservableObject {
     private func setState(_ newState: ConnectionState) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         transportState = newState
+        if case .authFailed = newState { resetAutoAcceptOnQueue() }
         DispatchQueue.main.async {
             self.connectionState = newState
         }

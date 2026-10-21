@@ -59,6 +59,23 @@ final class DataTransferManager {
     private let queue = DispatchQueue(label: "ScreenCasting.DataTransfer.IO", qos: .utility)
     private let admission = NSLock()
     private var pending = 0
+    // Short admission-lock state only; no IO or callbacks while locked.
+    private var autoAcceptEnabled = false
+    private var autoAcceptRevision: UInt64 = 0
+    func setAutoAccept(_ enabled: Bool, localGeneration: UInt64) {
+        admission.lock(); defer { admission.unlock() }
+        let allowed = enabled && localGeneration == generation
+        if allowed != autoAcceptEnabled { autoAcceptRevision &+= 1 }
+        autoAcceptEnabled = allowed
+    }
+    private func currentAutoAcceptToken() -> UInt64? {
+        admission.lock(); defer { admission.unlock() }
+        return autoAcceptEnabled ? autoAcceptRevision : nil
+    }
+    private func ownsAutoAcceptToken(_ token: UInt64) -> Bool {
+        admission.lock(); defer { admission.unlock() }
+        return autoAcceptEnabled && token == autoAcceptRevision
+    }
     private var wireOwner: (UUID,UInt64)?
     func owns(_ packet: TransferPacket) -> Bool {admission.lock();defer{admission.unlock()};return wireOwner?.0 == packet.id && wireOwner?.1 == packet.generation}
     private let generation: UInt64, directory: URL, sender: Sender
@@ -105,10 +122,12 @@ final class DataTransferManager {
             }
             return false
         };pending += 1;admission.unlock()
+        // Capture before dispatch: later ON cannot adopt an already queued Offer.
+        let policyToken = packet.kind == .offer ? currentAutoAcceptToken() : nil
         queue.async { [weak self] in
             guard let self else {return}
             defer {self.admission.lock();self.pending -= 1;self.admission.unlock();completion()}
-            do {try self.receive(packet)} catch {self.fail(error: error)}
+            do {try self.receive(packet, autoAcceptToken: policyToken)} catch {self.fail(error: error)}
         }
         return true
     }
@@ -153,9 +172,10 @@ final class DataTransferManager {
     func decide(_ accepted: Bool) {
         queue.async { [weak self] in self?.decideOnQueue(accepted, expectedTransferID: nil) }
     }
-    private func decideOnQueue(_ accepted: Bool, expectedTransferID: UUID?) {
+    private func decideOnQueue(_ accepted: Bool, expectedTransferID: UUID?, policyToken: UInt64? = nil) {
         guard !retired, let active=owner, !active.outgoing, !active.accepted,
               expectedTransferID == nil || expectedTransferID == active.id else { return }
+        if let policyToken, !ownsAutoAcceptToken(policyToken) { return }
         do {
             if accepted {
                 event("admission")
@@ -167,8 +187,12 @@ final class DataTransferManager {
                 try Self.validateRetainedQuota(count: inventory.retainedCount, bytes: inventory.retainedBytes,
                                               incomingCount: active.files.count, incomingBytes: total,
                                               availableCapacity: values.volumeAvailableCapacityForImportantUsage)
+                if let policyToken, !ownsAutoAcceptToken(policyToken) { return }
                 event("stage_create")
                 active.store=try TransferStore(directory:directory,metadata:active.files[0],id:active.id)
+                if let policyToken, !ownsAutoAcceptToken(policyToken) {
+                    active.store?.retire(); active.store = nil; return
+                }
                 active.accepted=true;publish(.receiving)
                 var response=packet(active,.response);response.accepted=true;write(active,response) { _ in }
             } else {
@@ -178,7 +202,7 @@ final class DataTransferManager {
         } catch {fail(error: error)}
     }
     func cancel(failed: Bool = false) {queue.async { [weak self] in self?.fail(phase: failed ? .failed : .cancelled) } }
-    func retire() {queue.async { [weak self] in guard let self else{return};self.retired=true;self.finish(.retired)} }
+    func retire() {setAutoAccept(false, localGeneration: generation);queue.async { [weak self] in guard let self else{return};self.retired=true;self.finish(.retired)} }
     private func packet(_ active: Owner,_ kind: TransferKind) -> TransferPacket {TransferPacket(kind:kind,generation:active.generation,id:active.id)}
     private func current(_ active: Owner) -> Bool {!retired && owner === active}
     private func publish(_ phase: Phase) {
@@ -218,7 +242,7 @@ final class DataTransferManager {
     private func send(_ active: Owner,_ kind: TransferKind,_ done: @escaping (Bool)->Void) {
         var p=packet(active,kind);if kind == .offer {p.files=active.files};write(active,p,done)
     }
-    private func receive(_ p: TransferPacket) throws {
+    private func receive(_ p: TransferPacket, autoAcceptToken: UInt64?) throws {
         guard !retired else {return}
         if p.kind == .offer {
             guard !retiredIDs.contains(p.id), peerGeneration == nil || peerGeneration == p.generation else {return}
@@ -233,7 +257,11 @@ final class DataTransferManager {
                 busy.reason = .busy;sender(busy){_ in};return
             }
             resetDiagnostics(outgoing:false);owner=active
-            admission.lock();wireOwner=(p.id,p.generation);admission.unlock();event("offer");publish(.awaitingDecision);return
+            admission.lock();wireOwner=(p.id,p.generation);admission.unlock();event("offer");publish(.awaitingDecision)
+            if let token = autoAcceptToken, ownsAutoAcceptToken(token) {
+                decideOnQueue(true, expectedTransferID: p.id, policyToken: token)
+            }
+            return
         }
         guard let active=owner, active.id==p.id, active.generation==p.generation else {return}
         if p.kind != .chunk {event("receive_\(p.kind)")}

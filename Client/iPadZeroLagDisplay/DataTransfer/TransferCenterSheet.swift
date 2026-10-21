@@ -45,6 +45,14 @@ struct TransferCenterSheet: View {
                             HStack { sendButton; receivedButton { reader.scrollTo("received", anchor: .top) } }
                             VStack(alignment: .leading) { sendButton; receivedButton { reader.scrollTo("received", anchor: .top) } }
                         }
+                        Toggle("Auto Accept incoming files", isOn: Binding(
+                            get: { networkManager.autoAcceptIncomingFiles },
+                            set: { networkManager.setAutoAcceptIncomingFiles($0) }))
+                            .disabled(!networkManager.canEnableAutoAccept)
+                            .accessibilityLabel("Auto Accept incoming files for this PC connection")
+                            .frame(minHeight: 44)
+                        Text("For this connection only; turns off when disconnected.")
+                            .font(.footnote).foregroundStyle(.secondary)
                         if !networkManager.isConnected {
                             Text("Connect to your PC before sending or accepting files. Saved files remain available.").foregroundStyle(.secondary)
                         }
