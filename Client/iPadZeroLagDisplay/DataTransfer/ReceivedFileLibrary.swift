@@ -32,6 +32,7 @@ final class ReceivedFileLibrary {
     struct Hooks {
         var beforeReceiptCommit: (() throws -> Void)?
         var beforeUnlink: ((String) throws -> Void)?
+        var payloadBytesRead: ((Int) -> Void)?
     }
     fileprivate struct Identity: Codable, Equatable {
         let device: UInt64, inode: UInt64
@@ -206,6 +207,7 @@ final class ReceivedFileLibrary {
         while true {
             let n = read(fd, &buffer, buffer.count)
             guard n >= 0 else { throw State.error() }; if n == 0 { break }
+            state.hooks.payloadBytesRead?(n)
             hash.update(data: Data(buffer.prefix(n)))
         }
         var after = stat(), path = stat()

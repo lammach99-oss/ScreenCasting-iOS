@@ -5,6 +5,33 @@ import Foundation
 @testable import iPadCasting
 
 final class DataTransferTests: XCTestCase {
+    func testC04InventoryDoesNotRereadVerifiedPayload() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var readBytes = 0
+        var hooks = ReceivedFileLibrary.Hooks()
+        hooks.payloadBytesRead = { readBytes += $0 }
+        let library = try ReceivedFileLibrary(directory: root, hooks: hooks)
+        let bytes = Data(repeating: 0x41, count: 512 * 1024 + 1)
+        let store = try TransferStore(directory: root,
+            metadata: TransferFile(name: "io-fixture.bin", length: UInt64(bytes.count)), id: UUID())
+        var offset = 0
+        var chunk: UInt64 = 0
+        while offset < bytes.count {
+            let end = min(offset + 16 * 1024, bytes.count)
+            try store.append(chunk: chunk, offset: UInt64(offset), bytes: bytes.subdata(in: offset..<end))
+            offset = end; chunk += 1
+        }
+        let digest = Data(SHA256.hash(data: bytes))
+        let published = try store.publish(length: UInt64(bytes.count), digest: digest)
+        try library.recordPublished(published, length: UInt64(bytes.count), digest: digest)
+        let receiptReadBytes = readBytes
+        XCTAssertEqual(try library.snapshot().eligibleCount, 1)
+        XCTAssertEqual(try library.snapshot().eligibleCount, 1)
+        XCTAssertEqual(readBytes - receiptReadBytes, 0,
+            "Inventory must not reread payload after receipt verification")
+        XCTAssertEqual(try Data(contentsOf: published), bytes)
+    }
 
 
     // C2 v3.3 G3: executable tests against the fail-closed OFF/default API.
