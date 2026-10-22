@@ -4288,10 +4288,10 @@ public class NetworkManager: ObservableObject {
                 do {
                     let library = try self.receivedLibraryOnWorker(), inventory = try library.snapshot()
                     guard !inventory.busy else { throw CocoaError(.fileLocking) }
-                    guard inventory.eligibleCount > 0 else {
+                    guard inventory.retainedCount > 0 else {
                         self.networkQueue.async {
                             if self.pendingReceivedClearID == id { self.pendingReceivedClearID = nil }
-                            self.receivedMessage("No verified copies are available to delete. Older files remain.", revision: revision)
+                            self.receivedMessage("No received files are available to delete.", revision: revision)
                         }; return
                     }
                     let token = try library.confirmClear(), current = try library.snapshot()

@@ -21,7 +21,7 @@ final class ReceivedFileLibrary {
         let bytes: UInt64
         fileprivate let nonce: UUID
         fileprivate let root: Identity
-        fileprivate let receipts: [Receipt]
+        fileprivate let targets: [ClearTarget]
     }
     struct ClearResult {
         let deletedCount: Int
@@ -45,6 +45,20 @@ final class ReceivedFileLibrary {
         let digest: Data
         let modifiedSeconds: Int64, modifiedNanoseconds: Int64
         let birthSeconds: Int64, birthNanoseconds: Int64
+    }
+    fileprivate struct ClearTarget {
+        let name: String
+        let identity: Identity
+        let length: UInt64
+        let modifiedSeconds: Int64, modifiedNanoseconds: Int64
+        let birthSeconds: Int64, birthNanoseconds: Int64
+        let receiptID: UUID?
+        init(name: String, value: stat, receiptID: UUID?) {
+            self.name = name; identity = Identity(value); length = UInt64(value.st_size)
+            modifiedSeconds = Int64(value.st_mtimespec.tv_sec); modifiedNanoseconds = Int64(value.st_mtimespec.tv_nsec)
+            birthSeconds = Int64(value.st_birthtimespec.tv_sec); birthNanoseconds = Int64(value.st_birthtimespec.tv_nsec)
+            self.receiptID = receiptID
+        }
     }
     private struct Journal: Codable {
         var version = 1
@@ -175,6 +189,12 @@ final class ReceivedFileLibrary {
         Int64(value.st_mtimespec.tv_sec) == receipt.modifiedSeconds && Int64(value.st_mtimespec.tv_nsec) == receipt.modifiedNanoseconds &&
         Int64(value.st_birthtimespec.tv_sec) == receipt.birthSeconds && Int64(value.st_birthtimespec.tv_nsec) == receipt.birthNanoseconds
     }
+    private func same(_ value: stat, _ target: ClearTarget) -> Bool {
+        value.st_mode & S_IFMT == S_IFREG && value.st_nlink == 1 && value.st_size >= 0 &&
+        Identity(value) == target.identity && UInt64(value.st_size) == target.length &&
+        Int64(value.st_mtimespec.tv_sec) == target.modifiedSeconds && Int64(value.st_mtimespec.tv_nsec) == target.modifiedNanoseconds &&
+        Int64(value.st_birthtimespec.tv_sec) == target.birthSeconds && Int64(value.st_birthtimespec.tv_nsec) == target.birthNanoseconds
+    }
     private func verified(_ name: String, receipt: Receipt? = nil) throws -> (stat, Data) {
         guard validLeaf(name) else { throw CocoaError(.fileReadInvalidFileName) }
         let fd = openat(state.fd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
@@ -252,10 +272,22 @@ final class ReceivedFileLibrary {
     func confirmClear() throws -> Confirmation { try locked {
         guard state.transfer == nil, state.exports.isEmpty else { throw CocoaError(.fileLocking) }
         // Corrupt metadata never authorizes deletion, even when the inventory remains visible.
-        var journal = try readJournal(); let receipts = eligible(journal); let nonce = UUID()
-        journal.confirmation = nonce; try commit(journal)
-        return Confirmation(count: receipts.count, bytes: receipts.reduce(0) { $0 + $1.length },
-                            nonce: nonce, root: state.identity, receipts: receipts)
+        var journal = try readJournal()
+        let receipts = Dictionary(uniqueKeysWithValues: eligible(journal).map { ($0.name, $0) })
+        let children = try FileManager.default.contentsOfDirectory(at: state.directory, includingPropertiesForKeys: nil)
+        var targets: [ClearTarget] = [], bytes: UInt64 = 0
+        for url in children.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) where validLeaf(url.lastPathComponent) {
+            let name = url.lastPathComponent
+            var value = stat()
+            guard fstatat(state.fd, name, &value, AT_SYMLINK_NOFOLLOW) == 0,
+                  value.st_mode & S_IFMT == S_IFREG, value.st_nlink == 1, value.st_size >= 0 else { continue }
+            let (total, overflow) = bytes.addingReportingOverflow(UInt64(value.st_size))
+            guard !overflow else { throw CocoaError(.fileReadUnknown) }; bytes = total
+            let receiptID = receipts[name].flatMap { same(value, $0) ? $0.id : nil }
+            targets.append(ClearTarget(name: name, value: value, receiptID: receiptID))
+        }
+        let nonce = UUID(); journal.confirmation = nonce; try commit(journal)
+        return Confirmation(count: targets.count, bytes: bytes, nonce: nonce, root: state.identity, targets: targets)
     } }
     func clear(_ confirmation: Confirmation, expectedFingerprint: Data? = nil, expectedRevision: UInt64? = nil,
                authorize: (() -> Bool)? = nil) throws -> ClearResult { try locked {
@@ -270,17 +302,21 @@ final class ReceivedFileLibrary {
         guard confirmation.root == state.identity, journal.confirmation == confirmation.nonce else { throw CocoaError(.fileReadNoPermission) }
         journal.confirmation = nil; try commit(journal) // Consume durably BEFORE the first destructive operation.
         var deleted = 0, failed = 0, bytes: UInt64 = 0
-        for receipt in confirmation.receipts {
+        for target in confirmation.targets {
             do {
-                guard journal.receipts.contains(where: { $0.id == receipt.id }) else { throw CocoaError(.fileReadUnknown) }
-                _ = try verified(receipt.name, receipt: receipt)
-                try state.hooks.beforeUnlink?(receipt.name)
+                try validateRoot()
+                guard validLeaf(target.name) else { throw CocoaError(.fileReadInvalidFileName) }
+                if let receiptID = target.receiptID {
+                    guard let receipt = journal.receipts.first(where: { $0.id == receiptID }) else { throw CocoaError(.fileReadUnknown) }
+                    _ = try verified(target.name, receipt: receipt)
+                }
+                try state.hooks.beforeUnlink?(target.name)
                 try validateRoot()
                 var live = stat()
-                guard fstatat(state.fd, receipt.name, &live, AT_SYMLINK_NOFOLLOW) == 0, same(live, receipt) else { throw CocoaError(.fileReadUnknown) }
-                guard unlinkat(state.fd, receipt.name, 0) == 0 else { throw State.error() }
-                deleted += 1; bytes += receipt.length
-                journal.receipts.removeAll { $0.id == receipt.id }
+                guard fstatat(state.fd, target.name, &live, AT_SYMLINK_NOFOLLOW) == 0, same(live, target) else { throw CocoaError(.fileReadUnknown) }
+                guard unlinkat(state.fd, target.name, 0) == 0 else { throw State.error() }
+                deleted += 1; bytes += target.length
+                journal.receipts.removeAll { $0.name == target.name }
             } catch { failed += 1 }
         }
         // A failed metadata cleanup leaves only identity-bound stale records, never authority over a replacement.

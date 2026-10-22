@@ -95,7 +95,7 @@ struct TransferCenterSheet: View {
         .onChange(of: networkManager.receivedClearPrompt?.id) { _, newID in
             clearApprovedID = nil; clearDialogPresented = newID != nil
         }
-        .confirmationDialog("Delete verified copies stored in ScreenCasting?", isPresented: $clearDialogPresented, titleVisibility: .visible) {
+        .confirmationDialog("Delete files stored in ScreenCasting?", isPresented: $clearDialogPresented, titleVisibility: .visible) {
             if let prompt = networkManager.receivedClearPrompt {
                 Button("Delete \(prompt.count) Files", role: .destructive) {
                     clearApprovedID = prompt.id; networkManager.confirmClearReceivedFiles(id: prompt.id)
@@ -104,7 +104,7 @@ struct TransferCenterSheet: View {
             }
         } message: {
             if let prompt = networkManager.receivedClearPrompt {
-                Text("Delete \(prompt.count) verified copies (\(TransferPresentation.size(prompt.bytes))) from ScreenCasting. Copies saved to Files stay untouched. \(prompt.legacyCount) older/unclassified files (\(TransferPresentation.size(prompt.legacyBytes))) will remain.")
+                Text("Delete \(prompt.count) files (\(TransferPresentation.size(prompt.bytes))) stored in ScreenCasting? Copies already saved to Files will not be affected.")
             }
         }
         .onChange(of: clearDialogPresented) { _, presented in
@@ -171,21 +171,16 @@ struct TransferCenterSheet: View {
                 Button("Refresh Received Files") { networkManager.refreshReceivedFiles() }.frame(minHeight: 44)
             } else {
                 Text("\(retained.retainedCount) of 256 files · \(TransferPresentation.size(retained.retainedBytes)) of 8 GB retained")
-                Text("\(retained.eligibleCount) verified copies eligible for Clear · \(TransferPresentation.size(retained.eligibleBytes))")
-                if retained.legacyCount > 0 {
-                    Text("\(retained.legacyCount) older/unclassified files (\(TransferPresentation.size(retained.legacyBytes))) are kept and still use storage.").foregroundStyle(.secondary)
-                }
                 if retained.busy { Text("Cannot clear while a transfer or Save to Files is active.").foregroundStyle(.secondary) }
                 Button(role: .destructive) { networkManager.requestClearReceivedFiles() } label: {
                     Label("Clear Received Files", systemImage: "trash").frame(minHeight: 44)
-                }.disabled(retained.eligibleCount == 0 || retained.busy)
-                    .accessibilityLabel("Clear verified received copies stored in ScreenCasting")
-                if retained.eligibleCount == 0 { Text("No verified copies are eligible. Older/unclassified files remain.").foregroundStyle(.secondary) }
+                }.disabled(retained.retainedCount == 0 || retained.busy || !retained.loaded)
+                    .accessibilityLabel("Clear received files stored in ScreenCasting")
                 ForEach(retained.files, id: \.self) { url in
                     VStack(alignment: .leading, spacing: 6) {
                         Text(url.lastPathComponent).fixedSize(horizontal: false, vertical: true)
                         Text(TransferPresentation.size(retained.fileBytes[url] ?? 0)).font(.subheadline).foregroundStyle(.secondary)
-                        Text(retained.eligibleNames.contains(url.lastPathComponent) ? "Verified received copy" : "Older/unclassified - not clearable")
+                        Text(retained.eligibleNames.contains(url.lastPathComponent) ? "Verified received copy" : "Older/unclassified received file")
                             .font(.caption).foregroundStyle(.secondary)
                         Button { startExport(url) } label: {
                             Label("Save to Files", systemImage: "square.and.arrow.up").frame(minHeight: 44)
@@ -195,7 +190,7 @@ struct TransferCenterSheet: View {
                     }
                 }
             }
-            Text("Saving to Files creates a separate copy. Clear removes only verified copies stored in ScreenCasting; exported and older/unclassified files stay untouched.")
+            Text("Saving to Files creates a separate copy. Clear removes files stored in ScreenCasting; exported copies stay untouched.")
                 .font(.footnote).foregroundStyle(.secondary)
         }
     }

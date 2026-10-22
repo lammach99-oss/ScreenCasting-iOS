@@ -31,6 +31,6 @@ enum TransferPresentation {
             return deleted + " File deletion counts reflect disk operations, but metadata maintenance is incomplete. Refresh required."
         }
         if result.failedCount > 0 { return deleted + " \(result.failedCount) files could not be removed. Review files and retry." }
-        return deleted + " \(legacyCount) older/unclassified files remain in ScreenCasting. Copies saved to Files stay untouched."
+        return deleted + " Copies saved to Files stay untouched."
     }
 }
