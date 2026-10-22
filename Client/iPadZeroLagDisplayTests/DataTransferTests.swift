@@ -988,7 +988,7 @@ final class DataTransferTests: XCTestCase {
     }
 
     #if targetEnvironment(simulator)
-    func testT01AuthenticatedCoalescedChunksWaitForWorkerWithoutOverflow() async throws {
+    func testUSBSharedStreamBulkWindowAllowsControlProgressWhileTransferIOBlocked() async throws {
         let network = NetworkManager()
         let session = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -998,8 +998,9 @@ final class DataTransferTests: XCTestCase {
         let blocked = expectation(description: "first chunk holds real IO worker")
         let terminal = expectation(description: "verified transfer terminal")
         let release = DispatchSemaphore(value: 0)
-        let payload = Data(repeating: 0x5A, count: 6 * TransferProtocol.defaultChunkBytes)
+        let payload = Data((0..<(6 * TransferProtocol.defaultChunkBytes)).map { UInt8(truncatingIfNeeded: $0 / TransferProtocol.defaultChunkBytes + $0 % 251) })
         var cancels = 0, fileAcks = 0, acks = 0, rejectedPosts = 0
+        let pong = expectation(description: "control progresses before transfer IO releases")
         var final: DataTransferManager.Snapshot?
         let manager = DataTransferManager(generation: session.generation, directory: root) { packet, done in
             if packet.kind == .cancel { cancels += 1 }
@@ -1028,7 +1029,12 @@ final class DataTransferTests: XCTestCase {
             release.signal(); network.stopForTesting(); manager.retire()
             try? FileManager.default.removeItem(at: root)
         }
+        network.controlSendForAudioTesting = { data, completion in
+            if data.count >= 16 && data[5] == WireMessageType.pong.rawValue { pong.fulfill() }
+            completion(nil)
+        }
         network.startTransferReceiveForTesting(manager: manager)
+        network.configureTransferAuthorizationForTesting(manager: manager, authenticated: true, committed: true, usb: true)
         let offer = TransferPacket(kind: .offer, generation: peerGeneration, id: id,
                                    files: [TransferFile(name: "coalesced.bin", length: UInt64(payload.count))])
         network.networkQueueForTesting.sync {
@@ -1044,12 +1050,15 @@ final class DataTransferTests: XCTestCase {
             packet.bytes = payload.subdata(in: index * TransferProtocol.defaultChunkBytes..<(index + 1) * TransferProtocol.defaultChunkBytes)
             burst.append(transferTestFrame(.transferChunk, try TransferProtocol.encode(packet)))
         }
+        burst.append(transferTestFrame(.ping, Data(count: 16)))
         XCTAssertLessThanOrEqual(burst.count, 64 * 1024)
         network.networkQueueForTesting.sync { reads.removeFirst()(burst, nil, false, nil) }
         await fulfillment(of: [blocked], timeout: 3)
-        XCTAssertEqual(network.transferPendingForTesting, 2)
-        XCTAssertEqual(rejectedPosts, 0, "Valid third chunk must pause before the two-message admission guard")
-        XCTAssertTrue(reads.isEmpty)
+        await fulfillment(of: [pong], timeout: 1)
+        XCTAssertEqual(network.transferPendingForTesting, 3, "All three chunks must be admitted while the serial worker is blocked")
+        XCTAssertLessThanOrEqual(network.transferPendingForTesting, 32)
+        XCTAssertEqual(rejectedPosts, 0, "A burst within the bounded window must not fail admission")
+        network.networkQueueForTesting.sync { XCTAssertEqual(reads.count, 1, "Capacity must allow one outstanding receive") }
         release.signal()
         // Completion is observable through a fresh receive; it must drain the saved suffix first.
         let rearmed = expectation(description: "coalesced suffix drained")
