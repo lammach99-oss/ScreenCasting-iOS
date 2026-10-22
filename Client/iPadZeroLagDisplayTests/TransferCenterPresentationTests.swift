@@ -122,11 +122,11 @@ final class TransferCenterPresentationTests: XCTestCase {
         try Data([9]).write(to: root.appendingPathComponent("legacy.bin"))
         let network = NetworkManager(receivedFilesDirectory: root); defer { network.stopForTesting() }
         network.requestClearReceivedFiles(); await uxWait(network.$receivedClearPrompt) { $0 != nil }
-        let prompt = try XCTUnwrap(network.receivedClearPrompt); XCTAssertEqual(prompt.count, 2); XCTAssertEqual(prompt.bytes, 5)
+        let prompt = try XCTUnwrap(network.receivedClearPrompt); XCTAssertEqual(prompt.count, 3); XCTAssertEqual(prompt.bytes, 6)
         XCTAssertEqual(prompt.legacyCount, 1); XCTAssertEqual(prompt.legacyBytes, 1)
         network.confirmClearReceivedFiles(id: prompt.id)
         await uxWait(network.$receivedClearMessage) { $0?.contains("could not") == true }
-        await uxWait(network.$receivedFilesViewState) { $0.loaded && $0.retainedCount == 2 && $0.retainedBytes == 4 }
+        await uxWait(network.$receivedFilesViewState) { $0.loaded && $0.retainedCount == 1 && $0.retainedBytes == 3 }
         XCTAssertEqual(network.receivedFilesViewState.eligibleBytes, 3)
     }
     @MainActor func testUX03PostUnlinkJournalCommitFailureShowsWarning() async throws {
@@ -176,13 +176,16 @@ final class TransferCenterPresentationTests: XCTestCase {
         await uxWait(network.$receivedFilesViewState) { $0.loaded && $0.retainedCount == 0 }
         XCTAssertEqual(try Data(contentsOf: exported), Data([1, 2]))
     }
-    @MainActor func testUX03LegacyOnlyCannotPresentDestructivePrompt() async throws {
+    @MainActor func testUX03LegacyOnlyCanConfirmAndClearAppPrivateCopy() async throws {
         let root = uxRoot(); defer { try? FileManager.default.removeItem(at: root) }
         let library = try ReceivedFileLibrary(directory: root); try Data([8]).write(to: root.appendingPathComponent("legacy.bin"))
         let network = NetworkManager(receivedFilesDirectory: root); defer { network.stopForTesting() }
         await uxWait(network.$receivedFilesViewState) { $0.loaded && $0.retainedCount == 1 }
-        network.requestClearReceivedFiles(); await uxWait(network.$receivedClearMessage) { $0?.contains("No verified") == true }
-        XCTAssertNil(network.receivedClearPrompt); XCTAssertEqual(try library.snapshot().retainedBytes, 1)
+        network.requestClearReceivedFiles(); await uxWait(network.$receivedClearPrompt) { $0 != nil }
+        let prompt = try XCTUnwrap(network.receivedClearPrompt); XCTAssertEqual(prompt.count, 1); XCTAssertEqual(prompt.bytes, 1)
+        network.confirmClearReceivedFiles(id: prompt.id)
+        await uxWait(network.$receivedFilesViewState) { $0.loaded && $0.retainedCount == 0 }
+        XCTAssertEqual(try library.snapshot().retainedBytes, 0)
     }
     @MainActor func testUX03CancelAndStaleDismissCannotDeleteOrRevokeNextPrompt() async throws {
         let root = uxRoot(); defer { try? FileManager.default.removeItem(at: root) }

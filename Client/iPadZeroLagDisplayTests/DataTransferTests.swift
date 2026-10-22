@@ -471,7 +471,7 @@ final class DataTransferTests: XCTestCase {
         receiver.manager.retire(); await ux03Barrier(receiver.manager)
     }
 
-    func testUX03LegacyFilesRemainVisibleAndIneligibleAfterReopen() throws {
+    func testUX03LegacyFilesRemainVisibleAndAreClearableAfterReopen() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -484,11 +484,13 @@ final class DataTransferTests: XCTestCase {
         XCTAssertEqual(inventory.retainedCount, 2)
         XCTAssertEqual(inventory.retainedBytes, 5)
         XCTAssertEqual(inventory.eligibleCount, 0)
-        let result = try library.clear(library.confirmClear())
-        XCTAssertEqual(result.deletedCount, 0)
-        XCTAssertEqual(try Data(contentsOf: legacy), Data([1, 2, 3]))
-        XCTAssertEqual(try Data(contentsOf: metadata), Data("{}".utf8))
-        XCTAssertEqual(try ReceivedFileLibrary(directory: root).snapshot().retainedCount, 2)
+        let confirmation = try library.confirmClear()
+        XCTAssertEqual(confirmation.count, 2); XCTAssertEqual(confirmation.bytes, 5)
+        let result = try library.clear(confirmation)
+        XCTAssertEqual(result.deletedCount, 2); XCTAssertEqual(result.deletedBytes, 5); XCTAssertEqual(result.failedCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacy.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: metadata.path))
+        XCTAssertEqual(try ReceivedFileLibrary(directory: root).snapshot().retainedCount, 0)
     }
 
     func testUX03ReceiptBackedClearDeletesActualCopiesAndPreservesExport() throws {
@@ -561,7 +563,7 @@ final class DataTransferTests: XCTestCase {
         XCTAssertEqual(try library.clear(library.confirmClear()).deletedCount, 1)
     }
 
-    func testUX03ConfinesDeletionAndRefusesSymlinkedStorageRoot() throws {
+    func testUX03MixedClearDeletesVerifiedAndLegacyButProtectsStageSymlinkNestedAndExport() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -575,11 +577,24 @@ final class DataTransferTests: XCTestCase {
         let nested = retained.appendingPathComponent("nested")
         try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
         try Data([6]).write(to: nested.appendingPathComponent("file.bin"))
+        let verified = retained.appendingPathComponent("verified.bin"), legacy = retained.appendingPathComponent("legacy.bin")
+        try Data([1, 2]).write(to: verified); try Data([3]).write(to: legacy)
+        try library.recordPublished(verified, length: 2, digest: Data(SHA256.hash(data: Data([1, 2]))))
+        let exported = root.appendingPathComponent("exported.bin")
+        try FileManager.default.copyItem(at: verified, to: exported)
         let digest = Data(SHA256.hash(data: Data([4])))
         XCTAssertThrowsError(try library.recordPublished(external, length: 1, digest: digest))
         XCTAssertThrowsError(try library.recordPublished(link, length: 1, digest: digest))
         XCTAssertThrowsError(try library.recordPublished(stage, length: 1, digest: Data(SHA256.hash(data: Data([5])))))
-        XCTAssertEqual(try library.clear(library.confirmClear()).deletedCount, 0)
+        let confirmation = try library.confirmClear()
+        XCTAssertEqual(confirmation.count, 2); XCTAssertEqual(confirmation.bytes, 3)
+        let result = try library.clear(confirmation)
+        XCTAssertEqual(result.deletedCount, 2); XCTAssertEqual(result.deletedBytes, 3); XCTAssertEqual(result.failedCount, 0)
+        XCTAssertEqual(try library.snapshot().retainedCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: verified.path)); XCTAssertFalse(FileManager.default.fileExists(atPath: legacy.path))
+        XCTAssertEqual(try Data(contentsOf: exported), Data([1, 2]))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: link.path))
+        XCTAssertThrowsError(try library.clear(confirmation))
         XCTAssertEqual(try Data(contentsOf: external), Data([4]))
         XCTAssertEqual(try Data(contentsOf: stage), Data([5]))
         XCTAssertEqual(try Data(contentsOf: nested.appendingPathComponent("file.bin")), Data([6]))
@@ -588,7 +603,7 @@ final class DataTransferTests: XCTestCase {
         XCTAssertThrowsError(try ReceivedFileLibrary(directory: alias))
     }
 
-    func testUX03MismatchedDigestCannotCreateDeletionAuthority() throws {
+    func testUX03MismatchedDigestRemainsUnverifiedButAppOwnedFileCanClear() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let library = try ReceivedFileLibrary(directory: root)
@@ -596,8 +611,27 @@ final class DataTransferTests: XCTestCase {
         try Data([3]).write(to: file)
         XCTAssertThrowsError(try library.recordPublished(file, length: 1, digest: Data(count: 32)))
         XCTAssertEqual(try library.snapshot().eligibleCount, 0)
-        XCTAssertEqual(try library.clear(library.confirmClear()).deletedCount, 0)
-        XCTAssertEqual(try Data(contentsOf: file), Data([3]))
+        XCTAssertEqual(try library.clear(library.confirmClear()).deletedCount, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    func testUX03LegacyConfirmationRejectsReplacementAndRevalidatesImmediatelyBeforeUnlink() throws {
+        for replaceAtUnlink in [false, true] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            var hooks = ReceivedFileLibrary.Hooks()
+            if replaceAtUnlink {
+                hooks.beforeUnlink = { name in try Data([9]).write(to: root.appendingPathComponent(name), options: .atomic) }
+            }
+            let library = try ReceivedFileLibrary(directory: root, hooks: hooks)
+            let file = root.appendingPathComponent("legacy.bin"); try Data([1]).write(to: file)
+            let confirmation = try library.confirmClear(); XCTAssertEqual(confirmation.count, 1)
+            if !replaceAtUnlink { try Data([9]).write(to: file, options: .atomic) }
+            let result = try library.clear(confirmation)
+            XCTAssertEqual(result.deletedCount, 0); XCTAssertEqual(result.failedCount, 1); XCTAssertEqual(result.deletedBytes, 0)
+            XCTAssertEqual(try Data(contentsOf: file), Data([9]))
+            XCTAssertThrowsError(try library.clear(confirmation))
+        }
     }
 
     func testUX03PartialUnlinkFailureReportsRealBytesAndCanRetry() throws {
@@ -671,7 +705,8 @@ final class DataTransferTests: XCTestCase {
         XCTAssertThrowsError(try first.confirmClear())
         XCTAssertFalse(first.beginTransfer(owner: UUID()))
         second.endExport(export)
-        XCTAssertEqual(try first.confirmClear().count, 0)
+        XCTAssertEqual(try first.confirmClear().count, 1)
+        XCTAssertEqual(try first.clear(first.confirmClear()).deletedCount, 1)
     }
 
     func testUX03HardlinkAndInPlaceMutationLoseEligibility() throws {
