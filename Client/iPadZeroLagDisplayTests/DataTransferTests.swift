@@ -5,6 +5,25 @@ import Foundation
 @testable import iPadCasting
 
 final class DataTransferTests: XCTestCase {
+    func testC04InventoryRejectsReplacementWithoutPayloadReads() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var readBytes = 0
+        var hooks = ReceivedFileLibrary.Hooks()
+        hooks.payloadBytesRead = { readBytes += $0 }
+        let library = try ReceivedFileLibrary(directory: root, hooks: hooks)
+        let file = root.appendingPathComponent("identity.bin"), bytes = Data([1, 2, 3])
+        try bytes.write(to: file)
+        try library.recordPublished(file, length: 3, digest: Data(SHA256.hash(data: bytes)))
+        readBytes = 0
+        XCTAssertEqual(try library.snapshot().eligibleCount, 1)
+        // Atomic replacement keeps equal bytes/length but changes inode ownership.
+        try bytes.write(to: file, options: .atomic)
+        XCTAssertEqual(try library.snapshot().eligibleCount, 0)
+        XCTAssertEqual(try library.snapshot().retainedBytes, 3)
+        XCTAssertEqual(readBytes, 0)
+    }
+
     func testC04InventoryDoesNotRereadVerifiedPayload() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

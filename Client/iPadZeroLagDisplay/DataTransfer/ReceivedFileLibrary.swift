@@ -223,10 +223,18 @@ final class ReceivedFileLibrary {
     private func eligible(_ journal: Journal) -> [Receipt] {
         journal.receipts.filter { (try? verified($0.name, receipt: $0)) != nil }
     }
+    // Inventory is advisory; destructive Clear still verifies payload digests.
+    private func inventoryReceipts(_ journal: Journal) -> [Receipt] {
+        journal.receipts.filter { receipt in
+            var value = stat()
+            return fstatat(state.fd, receipt.name, &value, AT_SYMLINK_NOFOLLOW) == 0 &&
+                same(value, receipt)
+        }
+    }
     func snapshot() throws -> Inventory { try locked { try snapshotOnLock() } }
     private func snapshotOnLock() throws -> Inventory {
         try validateRoot()
-        let receipts = (try? readJournal()).map(eligible) ?? []
+        let receipts = (try? readJournal()).map(inventoryReceipts) ?? []
         let children = try FileManager.default.contentsOfDirectory(at: state.directory, includingPropertiesForKeys: nil)
         var files: [URL] = [], bytes: UInt64 = 0
         var fileBytes: [URL: UInt64] = [:], identities: [String] = []
