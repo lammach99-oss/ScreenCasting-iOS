@@ -1056,7 +1056,7 @@ final class DataTransferTests: XCTestCase {
         await fulfillment(of: [blocked], timeout: 3)
         await fulfillment(of: [pong], timeout: 1)
         XCTAssertEqual(network.transferPendingForTesting, 3, "All three chunks must be admitted while the serial worker is blocked")
-        XCTAssertLessThanOrEqual(network.transferPendingForTesting, 32)
+        XCTAssertLessThanOrEqual(network.transferPendingForTesting, DataTransferManager.maxPendingPackets)
         XCTAssertEqual(rejectedPosts, 0, "A burst within the bounded window must not fail admission")
         network.networkQueueForTesting.sync { XCTAssertEqual(reads.count, 1, "Capacity must allow one outstanding receive") }
         release.signal()
@@ -1141,15 +1141,15 @@ final class DataTransferTests: XCTestCase {
         defer { network.stopForTesting(); manager.retire(); try? FileManager.default.removeItem(at: root) }
         network.startTransferReceiveForTesting(manager: manager)
         var bytes = Data()
-        for _ in 0..<2 {
+        for _ in 0..<DataTransferManager.maxPendingPackets {
             let offer = TransferPacket(kind: .offer, generation: 7, id: UUID(), files: [TransferFile(name: "x", length: 0)])
             bytes.append(transferTestFrame(.transferOffer, try TransferProtocol.encode(offer)))
         }
         network.networkQueueForTesting.sync { reads.removeFirst()(bytes, nil, false, nil) }
         await fulfillment(of: [blocked], timeout: 3)
-        XCTAssertEqual(network.transferPendingForTesting, 2); XCTAssertTrue(reads.isEmpty); XCTAssertEqual(arms, 1)
+        XCTAssertEqual(network.transferPendingForTesting, DataTransferManager.maxPendingPackets); XCTAssertTrue(reads.isEmpty); XCTAssertEqual(arms, 1)
         // The parser now pauses before overflow. Exercise a true manager refusal
-        // independently, while its two real worker admissions remain held.
+        // independently, while its entire bounded worker window remains held.
         XCTAssertFalse(manager.post(TransferPacket(kind: .offer, generation: 7, id: UUID(),
             files: [TransferFile(name: "overflow", length: 0)])))
         release.signal()
@@ -1163,7 +1163,8 @@ final class DataTransferTests: XCTestCase {
     func testT01ParserPausedMixedBurstPreservesEveryByteAtEverySplit() throws {
         let packet = TransferPacket(kind: .chunk, generation: 7, id: UUID(), bytes: Data(repeating: 3, count: 31))
         let chunk = transferTestFrame(.transferChunk, try TransferProtocol.encode(packet))
-        let mixed = chunk + chunk + transferTestFrame(.ping, Data(count: 16)) +
+        let prefix = (0..<DataTransferManager.maxPendingPackets).reduce(into: Data()) { bytes, _ in bytes.append(chunk) }
+        let mixed = prefix + transferTestFrame(.ping, Data(count: 16)) +
             transferTestFrame(.pointerInput, Data(count: 8)) + chunk + chunk + chunk
         XCTAssertLessThanOrEqual(mixed.count, WireProtocol.receiveChunkSize)
         for split in 0...mixed.count {
@@ -1173,20 +1174,20 @@ final class DataTransferTests: XCTestCase {
                 var offset = 0
                 while offset < fragment.count {
                     let count = parser.consume(Data(fragment.dropFirst(offset)), generation: 7,
-                        shouldContinue: { admitted < 2 }) { event in
+                        shouldContinue: { admitted < DataTransferManager.maxPendingPackets }) { event in
                             if case .message(let message) = event {
                                 frames.append(message.header.type)
                                 if message.header.type == .transferChunk { admitted += 1 }
                             }
                         }
                     offset += count
-                    XCTAssertLessThanOrEqual(admitted, 2)
-                    if admitted == 2 { admitted = 0 }
+                    XCTAssertLessThanOrEqual(admitted, DataTransferManager.maxPendingPackets)
+                    if admitted == DataTransferManager.maxPendingPackets { admitted = 0 }
                     else { XCTAssertGreaterThan(count, 0) }
                 }
             }
-            XCTAssertEqual(frames, [.transferChunk, .transferChunk, .ping, .pointerInput,
-                                     .transferChunk, .transferChunk, .transferChunk])
+            XCTAssertEqual(frames, Array(repeating: .transferChunk, count: DataTransferManager.maxPendingPackets) +
+                                  [.ping, .pointerInput, .transferChunk, .transferChunk, .transferChunk])
         }
     }
 
@@ -1230,7 +1231,7 @@ final class DataTransferTests: XCTestCase {
         XCTAssertEqual(posts, 16); XCTAssertEqual(arms, 17)
     }
 
-    func testTransferAdmissionAcceptedThenRefusedWaitsForExactlyOneOwnerCompletion() throws {
+    func testTransferAdmissionAcceptedThenRefusedPreservesOneReadAndRejectsStaleCompletion() throws {
         let network = NetworkManager(), session = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let manager = DataTransferManager(generation: session.generation, directory: root) { _, completion in completion(true) }
@@ -1246,16 +1247,19 @@ final class DataTransferTests: XCTestCase {
         network.startTransferReceiveForTesting(manager: manager)
         let frame = transferTestFrame(.transferEnd, try TransferProtocol.encode(TransferPacket(kind: .end, generation: 7, id: UUID())))
         network.networkQueueForTesting.sync { reads.removeFirst()(frame + frame, nil, false, nil) }
-        XCTAssertEqual(posts, 2); XCTAssertEqual(arms, 1); XCTAssertTrue(reads.isEmpty); XCTAssertEqual(network.transferPendingForTesting, 1)
+        XCTAssertEqual(posts, 2); XCTAssertEqual(arms, 2); XCTAssertEqual(reads.count, 1); XCTAssertEqual(network.transferPendingForTesting, 1)
         finishes.removeFirst()(); network.networkQueueForTesting.sync {}
         XCTAssertEqual(arms, 2); XCTAssertEqual(reads.count, 1); XCTAssertEqual(network.transferPendingForTesting, 0)
         // Hold an accepted completion, reconnect, then release it: no stale rearm.
         posts = 0
         network.networkQueueForTesting.sync { reads.removeFirst()(frame, nil, false, nil) }
         XCTAssertEqual(network.transferPendingForTesting, 1)
+        XCTAssertEqual(arms, 3); XCTAssertEqual(reads.count, 1)
+        let staleRead = reads.removeFirst()
         _ = network.simulateCommittedWifiSessionForTesting()
         finishes.removeFirst()(); network.networkQueueForTesting.sync {}
-        XCTAssertEqual(arms, 2); XCTAssertTrue(reads.isEmpty)
+        network.networkQueueForTesting.sync { staleRead(frame, nil, false, nil) }
+        XCTAssertEqual(arms, 3); XCTAssertTrue(reads.isEmpty)
     }
 
     func testTransferAdmissionWithoutManagerOrAuthenticationHasNoSideEffects() throws {

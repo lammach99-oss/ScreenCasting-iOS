@@ -2,6 +2,8 @@ import Foundation
 import CryptoKit
 
 final class DataTransferManager {
+    // Serial receive backlog: <= 2 MiB of maximum-size chunk payloads.
+    static let maxPendingPackets = 32
     enum Phase: String { case idle = "Connect to your PC first.", offering = "Waiting for approval", awaitingDecision = "Incoming files", sending = "Sending", receiving = "Receiving", verifying = "Verifying", awaitingAck = "Waiting for confirmation", completed = "Completed", rejected = "Rejected", cancelled = "Cancelled", failed = "Failed", retired = "Disconnected" }
     struct Snapshot {
         var outgoing = false
@@ -113,7 +115,7 @@ final class DataTransferManager {
         }
     }
     @discardableResult func post(_ packet: TransferPacket, completion: @escaping () -> Void = {}) -> Bool {
-        admission.lock();guard pending < 2 else {
+        admission.lock();guard pending < Self.maxPendingPackets else {
             admission.unlock()
             queue.async { [weak self] in
                 guard let self else { return }

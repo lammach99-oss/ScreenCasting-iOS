@@ -4607,6 +4607,10 @@ public class NetworkManager: ObservableObject {
         receiveWireChunk(generation: generation)
     }
 
+    private var transferReceiveHasCapacity: Bool {
+        transferReceivePending < DataTransferManager.maxPendingPackets
+    }
+
     private func receiveWireChunk(generation: UInt64) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard generation == connectionGeneration,
@@ -4621,13 +4625,13 @@ public class NetworkManager: ObservableObject {
                 transferReceiveSuffix = nil
                 return
             }
-            guard transferReceivePending == 0 else { return }
+            guard transferReceiveHasCapacity else { return }
             transferReceiveSuffix = nil
             consumeWireReceive(suffix.data, generation: generation, connection: connection,
                                receivedAt: suffix.receivedAt, isComplete: suffix.isComplete)
             return
         }
-        guard transferReceivePending == 0 else { return }
+        guard transferReceiveHasCapacity else { return }
         wireReceiveOutstanding = (generation, ObjectIdentifier(connection))
 
         let maximumLength = wireParser.suggestedReceiveLength
@@ -4663,7 +4667,7 @@ public class NetworkManager: ObservableObject {
             return
         }
         let consumed = wireParser.consume(data, generation: generation, receivedAt: receivedAt,
-            shouldContinue: { self.transferReceivePending < 2 }) { event in
+            shouldContinue: { self.transferReceiveHasCapacity }) { event in
                 self.handleWireParserEvent(event, generation: generation)
             }
         guard generation == connectionGeneration, self.connection === connection,
@@ -4678,7 +4682,7 @@ public class NetworkManager: ObservableObject {
             handleStreamError("Server closed the stream.")
             return
         }
-        if transferReceivePending == 0 { receiveWireChunk(generation: generation) }
+        if transferReceiveHasCapacity { receiveWireChunk(generation: generation) }
     }
 
     private func handleWireReceiveError(
@@ -4815,7 +4819,7 @@ public class NetworkManager: ObservableObject {
                         self.networkQueue.async {
                             guard generation == self.connectionGeneration, self.dataTransfers === manager else {return}
                             self.transferReceivePending = max(0,self.transferReceivePending-1)
-                            if self.transferReceivePending == 0 { self.receiveWireChunk(generation:generation) }
+                            if self.transferReceiveHasCapacity { self.receiveWireChunk(generation:generation) }
                         }
                     }) { transferReceivePending -= 1 }
                 }
