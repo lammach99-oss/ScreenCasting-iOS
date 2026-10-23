@@ -3051,8 +3051,7 @@ public class NetworkManager: ObservableObject {
         clearPendingTransportOffer()
         wireParser.reset(generation: stoppedGeneration)
         dataTransfers?.retire(); dataTransfers = nil; transferReceivePending = 0
-        controlChannelWriter.cancel()
-        if wasUSB { controlChannelWriter.abandonConnection() }
+        controlChannelWriter.abandonConnection()
         stopTelemetryTimer()
         if wasUSB {
             recordUsbLifecycleDiagnostic("[USB_LISTENER_STATE] state=cancelled reason=explicit_stop")
@@ -5913,9 +5912,6 @@ public class NetworkManager: ObservableObject {
             replacement = nil
         }
         teardownCurrentSession()
-        // Sends are serialized per socket. A retired socket must not hold the
-        // replacement socket behind a completion that may never arrive.
-        controlChannelWriter.abandonConnection()
         recordUsbLifecycleDiagnostic(
             "[USB_LISTENER_REUSE] oldGeneration=\(generation) acceptingNext=\(listenerStillReady)")
         recordUsbLifecycleDiagnostic(
@@ -5962,11 +5958,12 @@ public class NetworkManager: ObservableObject {
         clearPendingTransportOffer()
         wireParser.reset(generation: failedGeneration)
         dataTransfers?.retire(); dataTransfers = nil; transferReceivePending = 0
-        controlChannelWriter.cancel()
         decoder.invalidate(waitForCompletion: !usbListenerExplicitlyStarted)
         AudioManager.shared.reset()
         connection?.cancel()
         connection = nil
+        // The socket is retired; late completion IDs must not gate its successor.
+        controlChannelWriter.abandonConnection()
         usbScdpConnection = nil
         usbLaneServer.abort()
         usbLaneConnections.values.forEach { $0.cancel() }
