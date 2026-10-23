@@ -7,7 +7,7 @@ import Foundation
 final class DataTransferTests: XCTestCase {
     #if targetEnvironment(simulator)
     func testV310AudioIngressIsBoundedBeforeBlockedWorker() {
-        for opus in [false, true] {
+        for (opus, size) in [(false, 1920), (true, 1920), (false, 32768), (true, 32768)] {
             let audio = AudioManager.makeForTesting()
             let lock = NSLock()
             var packets = 0, bytes = 0
@@ -19,13 +19,14 @@ final class DataTransferTests: XCTestCase {
             audio.audioQueueForTesting.async { held.signal(); release.wait() }
             XCTAssertEqual(held.wait(timeout: .now() + 1), .success)
             for index in 0..<100 {
-                let data = Data(repeating: 0, count: 1920)
+                let data = Data(repeating: 0, count: size)
                 if opus { audio.playOpusData(data, sequence: UInt16(index), timestamp: UInt32(index * 480), generation: 70) }
                 else { audio.playPCMData(data, generation: 70) }
             }
             lock.lock(); let retained = (packets, bytes); lock.unlock()
             XCTAssertLessThanOrEqual(retained.0, 64, "Pre-dispatch packet bound")
             XCTAssertLessThanOrEqual(retained.1, 256 * 1024, "Pre-dispatch byte bound")
+            audio.reset() // Queued reset cannot return old retained-payload credit early.
             release.signal()
             audio.audioQueueForTesting.sync {}
             lock.lock(); let drained = (packets, bytes); lock.unlock()

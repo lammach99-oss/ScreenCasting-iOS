@@ -116,6 +116,8 @@ public final class AudioManager {
             packets -= 1; bytes -= count
         }
     }
+    // Never reset this budget on an epoch change: queued old closures still
+    // retain their payloads and must release their own exact reservations.
     private let ingressBudget = IngressBudget()
     private var engineStarted = false
     private var queuedFrames = 0
