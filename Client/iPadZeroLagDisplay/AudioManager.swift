@@ -238,7 +238,6 @@ public final class AudioManager {
 
     // MARK: Init
     private init() {
-        audioQueue.setSpecific(key: audioQueueKey, value: true)
         guard let fmt = AVAudioFormat(
             commonFormat : .pcmFormatInt16,
             sampleRate   : sampleRate,
@@ -248,6 +247,7 @@ public final class AudioManager {
             fatalError("[AudioManager] Failed to create AVAudioFormat — impossible on iOS.")
         }
         pcmFormat = fmt
+        audioQueue.setSpecific(key: audioQueueKey, value: true)
         setupEngine()
     }
 
