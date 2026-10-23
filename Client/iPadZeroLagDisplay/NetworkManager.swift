@@ -6039,6 +6039,13 @@ public class NetworkManager: ObservableObject {
     }
 
     #if targetEnvironment(simulator)
+    func transferObserverForTesting() -> (DataTransferManager, (DataTransferManager.Snapshot) -> Void) {
+        networkQueue.sync {
+            beginDataTransfer(generation: connectionGeneration)
+            return (dataTransfers!, dataTransfers!.changed!)
+        }
+    }
+    var receivedRevisionForTesting: UInt64 { receivedActionClock.current }
     // Deterministic admission/receive boundary only; absent from device builds.
     var transferReceiveForTesting: ((Int, @escaping (Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void) -> Void)?
     var transferPostForTesting: ((TransferPacket, @escaping () -> Void) -> Bool)?

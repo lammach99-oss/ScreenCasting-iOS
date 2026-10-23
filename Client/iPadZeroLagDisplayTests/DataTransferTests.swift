@@ -5,6 +5,99 @@ import Foundation
 @testable import iPadCasting
 
 final class DataTransferTests: XCTestCase {
+    func testV310ReservedNamespaceRejectedWithoutRejectingOrdinaryHiddenOrPartFiles() throws {
+        for name in [".scdt-receipts-v1", ".SCDT-RECEIPTS-V1", ".scdt-user.part", ".SCDT-X.PART", ".scdt-anything"] {
+            XCTAssertFalse(TransferProtocol.validName(name), name)
+            XCTAssertThrowsError(try TransferProtocol.encode(TransferPacket(kind: .offer, generation: 1, id: UUID(),
+                files: [TransferFile(name: name, length: 0)])), name)
+        }
+        for name in ["normal.part", ".hidden", "report.pdf"] { XCTAssertTrue(TransferProtocol.validName(name), name) }
+    }
+
+    func testV310RestartPreservesUnprovenGlobMatchingFile() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let library = try ReceivedFileLibrary(directory: root)
+        let legacy = root.appendingPathComponent(".scdt-historical-user.part")
+        try Data([3, 7]).write(to: legacy)
+        let manager = DataTransferManager(generation: 1, directory: root, receivedLibrary: library) { _, done in done(true) }
+        await ux03Barrier(manager)
+        XCTAssertEqual(try Data(contentsOf: legacy), Data([3, 7]), "A filename glob is not deletion authority")
+        manager.retire(); await ux03Barrier(manager)
+        try FileManager.default.removeItem(at: root)
+    }
+
+    func testV310PublishingNewReceiptDoesNotReadOlderPayloads() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var readBytes = 0
+        var hooks = ReceivedFileLibrary.Hooks(); hooks.payloadBytesRead = { readBytes += $0 }
+        let library = try ReceivedFileLibrary(directory: root, hooks: hooks)
+        let old = root.appendingPathComponent("old.bin"), oldBytes = Data(repeating: 1, count: 65537)
+        try oldBytes.write(to: old)
+        try library.recordPublished(old, length: UInt64(oldBytes.count), digest: Data(SHA256.hash(data: oldBytes)))
+        readBytes = 0
+        let fresh = root.appendingPathComponent("fresh.bin"), freshBytes = Data([8, 9, 10])
+        try freshBytes.write(to: fresh)
+        try library.recordPublished(fresh, length: 3, digest: Data(SHA256.hash(data: freshBytes)))
+        XCTAssertEqual(readBytes, 3, "Only the new arbitrary URL must be digest verified")
+        XCTAssertEqual(try library.snapshot().eligibleCount, 2)
+        XCTAssertThrowsError(try library.recordPublished(fresh, length: 3, digest: Data(count: 32)))
+    }
+
+    func testV310TransferDiagnosticTotalsAreMonotonicAndExactInBothDirections() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source.bin"), empty = root.appendingPathComponent("empty.bin")
+        try Data([1, 2, 3]).write(to: source); try Data().write(to: empty)
+        let approval = expectation(description: "explicit approval"), completed = expectation(description: "batch completed")
+        var left: DataTransferManager!, right: DataTransferManager!
+        var outgoing: [String] = [], incoming: [String] = []
+        left = DataTransferManager(generation: 1, directory: root.appendingPathComponent("left")) { packet, done in
+            if !right.post(packet, completion: { done(true) }) { done(false) }
+        }
+        right = DataTransferManager(generation: 2, directory: root.appendingPathComponent("right")) { packet, done in
+            if !left.post(packet, completion: { done(true) }) { done(false) }
+        }
+        left.diagnostic = { outgoing.append($0) }; right.diagnostic = { incoming.append($0) }
+        right.changed = { if $0.phase == .awaitingDecision { approval.fulfill() } }
+        left.changed = { if $0.phase == .completed { completed.fulfill() } }
+        left.sendFiles([source, empty]); await fulfillment(of: [approval], timeout: 3)
+        right.decide(true); await fulfillment(of: [completed], timeout: 5)
+        await ux03Barrier(left); await ux03Barrier(right)
+        for lines in [outgoing, incoming] {
+            let counts = lines.filter { $0.contains("transfer_id=") && !$0.contains("transfer_id=none") }.compactMap { line in
+                line.split(separator: " ").first { $0.hasPrefix("bytes=") }.flatMap { UInt64($0.dropFirst(6)) }
+            }
+            XCTAssertFalse(counts.isEmpty)
+            XCTAssertTrue(zip(counts, counts.dropFirst()).allSatisfy { $0 <= $1 }, "Diagnostic observed bytes decreased: \(counts)")
+            XCTAssertTrue(counts.allSatisfy { $0 <= 3 }, "Diagnostic total double-counted: \(counts)")
+            XCTAssertEqual(counts.last, 3)
+        }
+        left.retire(); right.retire(); await ux03Barrier(left); await ux03Barrier(right)
+    }
+
+    #if targetEnvironment(simulator)
+    func testV310RetiredTransferObserverCannotAdvanceCurrentClearRevision() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let network = NetworkManager(receivedFilesDirectory: root)
+        _ = network.simulateCommittedWifiSessionForTesting()
+        let (old, observer) = network.transferObserverForTesting()
+        await ux03Barrier(old); network.networkQueueForTesting.sync {}
+        _ = network.simulateCommittedWifiSessionForTesting()
+        network.configureTransferAuthorizationForTesting(manager: nil, authenticated: true, committed: true)
+        let (current, _) = network.transferObserverForTesting()
+        await ux03Barrier(current); network.networkQueueForTesting.sync {}
+        let revision = network.receivedRevisionForTesting
+        var stale = DataTransferManager.Snapshot(); stale.phase = .completed; stale.published = 1
+        observer(stale); network.networkQueueForTesting.sync {}
+        XCTAssertEqual(network.receivedRevisionForTesting, revision)
+        network.stopForTesting(); old.retire(); current.retire()
+        await ux03Barrier(old); await ux03Barrier(current)
+        try? FileManager.default.removeItem(at: root)
+    }
+    #endif
+
     func testC04InventoryRejectsReplacementWithoutPayloadReads() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
