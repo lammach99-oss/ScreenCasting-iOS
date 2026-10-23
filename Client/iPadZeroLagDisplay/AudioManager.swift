@@ -191,6 +191,7 @@ public final class AudioManager {
     func startEngineForTesting() { audioQueue.sync { startEngineIfNeeded() } }
     func playoutTickForTesting() { audioQueue.sync { playoutTick() } }
     var audioQueueForTesting: DispatchQueue { audioQueue }
+    var ingressRetentionForTesting: ((Int) -> Void)?
 
     static func makeForTesting() -> AudioManager { AudioManager() }
 
@@ -623,7 +624,13 @@ public final class AudioManager {
     ) {
         guard !data.isEmpty else { return }
         let arrivedAt = ProcessInfo.processInfo.systemUptime
+        #if targetEnvironment(simulator)
+        ingressRetentionForTesting?(data.count)
+        #endif
         audioQueue.async { [weak self] in
+            #if targetEnvironment(simulator)
+            defer { self?.ingressRetentionForTesting?(-data.count) }
+            #endif
             guard let self,
                   self.realtimeGeneration == generation,
                   self.activePlaybackGeneration == generation,
@@ -647,8 +654,13 @@ public final class AudioManager {
 
     private func enqueuePCMData(_ data: Data, generation: UInt64?, expectedEpoch: UInt64?) {
         guard !data.isEmpty else { return }
-
+        #if targetEnvironment(simulator)
+        ingressRetentionForTesting?(data.count)
+        #endif
         audioQueue.async { [weak self] in
+            #if targetEnvironment(simulator)
+            defer { self?.ingressRetentionForTesting?(-data.count) }
+            #endif
             guard let self, self.activePlaybackGeneration != nil,
                   !self.playbackInterrupted,
                   generation == nil || self.activePlaybackGeneration == generation,

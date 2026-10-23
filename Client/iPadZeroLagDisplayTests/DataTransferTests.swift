@@ -6,6 +6,32 @@ import Foundation
 
 final class DataTransferTests: XCTestCase {
     #if targetEnvironment(simulator)
+    func testV310AudioIngressIsBoundedBeforeBlockedWorker() {
+        for opus in [false, true] {
+            let audio = AudioManager.makeForTesting()
+            let lock = NSLock()
+            var packets = 0, bytes = 0
+            audio.ingressRetentionForTesting = { count in
+                lock.lock(); defer { lock.unlock() }
+                packets += count > 0 ? 1 : -1; bytes += count
+            }
+            audio.audioQueueForTesting.sync {
+                for index in 0..<100 {
+                    let data = Data(repeating: 0, count: 1920)
+                    if opus { audio.playOpusData(data, sequence: UInt16(index), timestamp: UInt32(index * 480), generation: 70) }
+                    else { audio.playPCMData(data, generation: 70) }
+                }
+                lock.lock(); let retained = (packets, bytes); lock.unlock()
+                XCTAssertLessThanOrEqual(retained.0, 64, "Pre-dispatch packet bound")
+                XCTAssertLessThanOrEqual(retained.1, 256 * 1024, "Pre-dispatch byte bound")
+            }
+            audio.audioQueueForTesting.sync {}
+            lock.lock(); let drained = (packets, bytes); lock.unlock()
+            XCTAssertEqual(drained.0, 0); XCTAssertEqual(drained.1, 0)
+            audio.reset(); audio.audioQueueForTesting.sync {}
+        }
+    }
+
     func testV310RetiredWifiControlCompletionCannotBlockNewOwner() {
         let network = NetworkManager()
         var callbacks: [(NWError?) -> Void] = []
