@@ -100,6 +100,23 @@ public final class AudioManager {
     private let audioQueue = DispatchQueue(
         label: "com.iPadCasting.audio",
         qos: .userInteractive)
+    private let audioQueueKey = DispatchSpecificKey<Bool>()
+    // Separate ingress bound; does not alter the existing jitter/playout limits.
+    // 64 packets admit ordinary short bursts; 256 KiB also bounds large payloads.
+    private final class IngressBudget {
+        private let lock = NSLock()
+        private var packets = 0, bytes = 0
+        func reserve(_ count: Int) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            guard count > 0, packets < 64, count <= 256 * 1024 - bytes else { return false }
+            packets += 1; bytes += count; return true
+        }
+        func release(_ count: Int) {
+            lock.lock(); defer { lock.unlock() }
+            packets -= 1; bytes -= count
+        }
+    }
+    private let ingressBudget = IngressBudget()
     private var engineStarted = false
     private var queuedFrames = 0
     private let maxQueuedFrames = 9_600
@@ -219,6 +236,7 @@ public final class AudioManager {
 
     // MARK: Init
     private init() {
+        audioQueue.setSpecific(key: audioQueueKey, value: true)
         guard let fmt = AVAudioFormat(
             commonFormat : .pcmFormatInt16,
             sampleRate   : sampleRate,
@@ -624,10 +642,13 @@ public final class AudioManager {
     ) {
         guard !data.isEmpty else { return }
         let arrivedAt = ProcessInfo.processInfo.systemUptime
+        let budget = ingressBudget
+        guard budget.reserve(data.count) else { return }
         #if targetEnvironment(simulator)
         ingressRetentionForTesting?(data.count)
         #endif
-        audioQueue.async { [weak self] in
+        audioQueue.async { [weak self, budget] in
+            defer { budget.release(data.count) }
             #if targetEnvironment(simulator)
             defer { self?.ingressRetentionForTesting?(-data.count) }
             #endif
@@ -654,14 +675,27 @@ public final class AudioManager {
 
     private func enqueuePCMData(_ data: Data, generation: UInt64?, expectedEpoch: UInt64?) {
         guard !data.isEmpty else { return }
+        if DispatchQueue.getSpecific(key: audioQueueKey) == true {
+            enqueuePCMOnAudioQueue(data, generation: generation, expectedEpoch: expectedEpoch)
+            return
+        }
+        let budget = ingressBudget
+        guard budget.reserve(data.count) else { return }
         #if targetEnvironment(simulator)
         ingressRetentionForTesting?(data.count)
         #endif
-        audioQueue.async { [weak self] in
+        audioQueue.async { [weak self, budget] in
+            defer { budget.release(data.count) }
             #if targetEnvironment(simulator)
             defer { self?.ingressRetentionForTesting?(-data.count) }
             #endif
-            guard let self, self.activePlaybackGeneration != nil,
+            self?.enqueuePCMOnAudioQueue(data, generation: generation, expectedEpoch: expectedEpoch)
+        }
+    }
+
+    private func enqueuePCMOnAudioQueue(_ data: Data, generation: UInt64?, expectedEpoch: UInt64?) {
+            dispatchPrecondition(condition: .onQueue(audioQueue))
+            guard self.activePlaybackGeneration != nil,
                   !self.playbackInterrupted,
                   generation == nil || self.activePlaybackGeneration == generation,
                   expectedEpoch == nil || self.playbackEpoch == expectedEpoch else { return }
@@ -762,7 +796,6 @@ public final class AudioManager {
                 self.playerNode.play()
                 self.playoutDiagnostics.record(.playerStart)
             }
-        }
     }
 
     // Render callbacks publish credit only. All queue accounting stays on audioQueue.

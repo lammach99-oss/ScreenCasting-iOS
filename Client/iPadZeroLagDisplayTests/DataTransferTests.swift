@@ -15,16 +15,18 @@ final class DataTransferTests: XCTestCase {
                 lock.lock(); defer { lock.unlock() }
                 packets += count > 0 ? 1 : -1; bytes += count
             }
-            audio.audioQueueForTesting.sync {
-                for index in 0..<100 {
-                    let data = Data(repeating: 0, count: 1920)
-                    if opus { audio.playOpusData(data, sequence: UInt16(index), timestamp: UInt32(index * 480), generation: 70) }
-                    else { audio.playPCMData(data, generation: 70) }
-                }
-                lock.lock(); let retained = (packets, bytes); lock.unlock()
-                XCTAssertLessThanOrEqual(retained.0, 64, "Pre-dispatch packet bound")
-                XCTAssertLessThanOrEqual(retained.1, 256 * 1024, "Pre-dispatch byte bound")
+            let held = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+            audio.audioQueueForTesting.async { held.signal(); release.wait() }
+            XCTAssertEqual(held.wait(timeout: .now() + 1), .success)
+            for index in 0..<100 {
+                let data = Data(repeating: 0, count: 1920)
+                if opus { audio.playOpusData(data, sequence: UInt16(index), timestamp: UInt32(index * 480), generation: 70) }
+                else { audio.playPCMData(data, generation: 70) }
             }
+            lock.lock(); let retained = (packets, bytes); lock.unlock()
+            XCTAssertLessThanOrEqual(retained.0, 64, "Pre-dispatch packet bound")
+            XCTAssertLessThanOrEqual(retained.1, 256 * 1024, "Pre-dispatch byte bound")
+            release.signal()
             audio.audioQueueForTesting.sync {}
             lock.lock(); let drained = (packets, bytes); lock.unlock()
             XCTAssertEqual(drained.0, 0); XCTAssertEqual(drained.1, 0)
