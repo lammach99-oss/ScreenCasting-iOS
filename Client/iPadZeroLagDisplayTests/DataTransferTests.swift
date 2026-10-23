@@ -5,6 +5,29 @@ import Foundation
 @testable import iPadCasting
 
 final class DataTransferTests: XCTestCase {
+    #if targetEnvironment(simulator)
+    func testV310RetiredWifiControlCompletionCannotBlockNewOwner() {
+        let network = NetworkManager()
+        var callbacks: [(NWError?) -> Void] = []
+        var stale = 0, current = 0
+        network.controlSendForAudioTesting = { _, done in callbacks.append(done) }
+        _ = network.simulateCommittedWifiSessionForTesting()
+        network.enqueueControlForTesting { _ in stale += 1 }
+        network.networkQueueForTesting.sync {}
+        XCTAssertEqual(callbacks.count, 1)
+        network.stopForTesting()
+        _ = network.simulateCommittedWifiSessionForTesting()
+        network.enqueueControlForTesting { _ in current += 1 }
+        network.networkQueueForTesting.sync {}
+        XCTAssertEqual(callbacks.count, 2, "Replacement must progress before old completion")
+        guard callbacks.count == 2 else { network.stopForTesting(); return }
+        callbacks[0](nil); network.networkQueueForTesting.sync {}
+        XCTAssertEqual(stale, 0); XCTAssertEqual(current, 0)
+        callbacks[1](nil); network.networkQueueForTesting.sync {}
+        XCTAssertEqual(current, 1)
+        network.stopForTesting()
+    }
+    #endif
     func testV310ReservedNamespaceRejectedWithoutRejectingOrdinaryHiddenOrPartFiles() throws {
         for name in [".scdt-receipts-v1", ".SCDT-RECEIPTS-V1", ".scdt-user.part", ".SCDT-X.PART", ".scdt-anything"] {
             XCTAssertFalse(TransferProtocol.validName(name), name)
