@@ -4482,14 +4482,15 @@ public class NetworkManager: ObservableObject {
         manager.diagnostic = { [weak self] line in
             self?.recordDiagnosticLine(line + " transport=\(transferTransport)")
         }
-        manager.changed = { [weak self] snapshot in
+        manager.changed = { [weak self, weak manager] snapshot in
             guard let self else { return }
             self.networkQueue.async {
+                guard let manager, self.dataTransfers === manager,
+                      self.connectionGeneration == generation else { return }
                 let event = "\(generation)|\(snapshot.phase.rawValue)|\(snapshot.published)|\(snapshot.count)|\(snapshot.outgoing)"
                 if self.receivedTransferEvent != event {
                     self.receivedTransferEvent = event; self.advanceReceivedRevisionOnQueue()
                 }
-                guard self.connectionGeneration == generation else { return }
                 DispatchQueue.main.async {
                     guard self.connectionGenerationClock.current == generation else { return }
                     self.transferSnapshot = snapshot

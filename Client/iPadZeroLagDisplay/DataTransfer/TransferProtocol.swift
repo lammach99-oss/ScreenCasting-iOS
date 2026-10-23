@@ -22,6 +22,7 @@ enum TransferProtocol {
     static let maxPayloadBytes = 25 + 10 + 256 * (2 + 2 + 255 + 8)
     enum Failure: Error { case invalid }
     static func validName(_ name: String) -> Bool {
+        guard !name.lowercased().hasPrefix(".scdt-") else { return false }
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               name != ".", name != "..", !name.hasSuffix("."), !name.hasSuffix(" "), name.utf8.count <= maxNameBytes,
               !name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) || "/\\:<>\"|?*".unicodeScalars.contains($0) }) else { return false }

@@ -43,6 +43,7 @@ final class DataTransferManager {
         var accepted = false, index = 0, published = 0
         var bytes: UInt64 = 0, offset: UInt64 = 0, chunk: UInt64 = 0
         var receivedChunks: UInt64 = 0
+        var observedBytes: UInt64 = 0
         var handle: FileHandle?, store: TransferStore?
         var hash = SHA256()
         var initialDate: Date?
@@ -102,13 +103,8 @@ final class DataTransferManager {
             if self.receivedLibrary == nil { self.receivedLibrary = try? ReceivedFileLibrary(directory: directory) }
             if let library = self.receivedLibrary {
                 onLibraryReady?(library)
-                // Sweep abandoned stages only while holding exclusive storage ownership.
-                let sweep = UUID()
-                if library.beginTransfer(owner: sweep) {
-                    defer { library.endTransfer(owner: sweep) }
-                    let files=(try? FileManager.default.contentsOfDirectory(at:directory,includingPropertiesForKeys:nil)) ?? []
-                    for file in files where file.lastPathComponent.hasPrefix(".scdt-") && file.pathExtension == "part" {try? FileManager.default.removeItem(at:file)}
-                }
+                // A historical filename glob is not deletion authority. Each live
+                // TransferStore retires only the stage it created.
             }
             self.refreshRetainedFiles()
             self.publish(.idle)
@@ -285,6 +281,7 @@ final class DataTransferManager {
             diagnosticStage = "write"
             guard p.fileIndex==active.index,let store=active.store else {throw TransferProtocol.Failure.invalid}
             try store.append(chunk:p.chunkIndex,offset:p.offset,bytes:p.bytes)
+            active.observedBytes += UInt64(p.bytes.count)
             active.receivedChunks += 1
             if p.chunkIndex == 0 {event("first_chunk", updateStage:false)}
             progress(active,bytes:active.bytes+store.written)
@@ -323,7 +320,7 @@ final class DataTransferManager {
             if active.offset<length {
                 guard let bytes=try active.handle?.read(upToCount:Int(min(UInt64(TransferProtocol.defaultChunkBytes),length-active.offset))),!bytes.isEmpty else {throw TransferProtocol.Failure.invalid}
                 active.hash.update(data:bytes);var p=packet(active,.chunk);p.fileIndex=UInt16(active.index);p.offset=active.offset;p.chunkIndex=active.chunk;p.bytes=bytes
-                write(active,p){ [weak self,weak active] _ in guard let self,let active else{return};active.offset+=UInt64(bytes.count);active.chunk+=1;self.progress(active,bytes:active.bytes+active.offset);self.pump(active) }
+                write(active,p){ [weak self,weak active] _ in guard let self,let active else{return};active.offset+=UInt64(bytes.count);active.observedBytes+=UInt64(bytes.count);active.chunk+=1;self.progress(active,bytes:active.bytes+active.offset);self.pump(active) }
             } else {
                 let values=try active.sources[active.index].resourceValues(forKeys:[.fileSizeKey,.contentModificationDateKey])
                 guard values.fileSize==Int(length),values.contentModificationDate==active.initialDate else {throw TransferProtocol.Failure.invalid}
@@ -342,8 +339,9 @@ final class DataTransferManager {
         diagnosticCount += 1
         let active=owner
         let offset = active?.outgoing == true ? (active?.offset ?? 0) : (active?.store?.written ?? 0)
+        let observedBytes = active?.observedBytes ?? 0
         let expected = active?.files.reduce(UInt64(0)) {$0+$1.length} ?? snapshot.total
-        diagnostic?("component=DataTransfer direction=\(snapshot.outgoing ? "IPAD_TO_PC" : "PC_TO_IPAD") local_generation=\(generation) peer_generation=\(active?.generation ?? 0) transfer_id=\(active?.id.uuidString ?? "none") stage=\(stage) file_index=\(active?.index ?? 0) file_count=\(active?.files.count ?? 0) bytes=\((active?.bytes ?? 0)+offset) expected=\(expected) file_offset=\(offset) chunk_count=\(active?.outgoing == true ? (active?.chunk ?? 0) : (active?.receivedChunks ?? 0)) reason=\(snapshot.failure?.reason ?? "none") error_domain=\(snapshot.failure?.domain ?? "none") error_code=\(snapshot.failure?.code ?? 0) dropped=\(droppedDiagnostics)")
+        diagnostic?("component=DataTransfer direction=\(snapshot.outgoing ? "IPAD_TO_PC" : "PC_TO_IPAD") local_generation=\(generation) peer_generation=\(active?.generation ?? 0) transfer_id=\(active?.id.uuidString ?? "none") stage=\(stage) file_index=\(active?.index ?? 0) file_count=\(active?.files.count ?? 0) bytes=\(observedBytes) expected=\(expected) file_offset=\(offset) chunk_count=\(active?.outgoing == true ? (active?.chunk ?? 0) : (active?.receivedChunks ?? 0)) reason=\(snapshot.failure?.reason ?? "none") error_domain=\(snapshot.failure?.domain ?? "none") error_code=\(snapshot.failure?.code ?? 0) dropped=\(droppedDiagnostics)")
     }
     private func refreshRetainedFiles() {
         // Event-driven IO-worker work, never a per-progress hash or network/main callback.

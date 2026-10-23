@@ -264,7 +264,7 @@ final class ReceivedFileLibrary {
                               modifiedSeconds: Int64(value.st_mtimespec.tv_sec), modifiedNanoseconds: Int64(value.st_mtimespec.tv_nsec),
                               birthSeconds: Int64(value.st_birthtimespec.tv_sec), birthNanoseconds: Int64(value.st_birthtimespec.tv_nsec))
         // Missing files cannot accumulate unbounded stale receipts after a crash.
-        journal.receipts = journal.receipts.filter { $0.name != name && (try? verified($0.name, receipt: $0)) != nil }
+        journal.receipts = inventoryReceipts(journal).filter { $0.name != name }
         guard journal.receipts.count < 256 else { throw CocoaError(.fileWriteOutOfSpace) }
         journal.receipts.append(receipt); try commit(journal); state.revision &+= 1
     } }
