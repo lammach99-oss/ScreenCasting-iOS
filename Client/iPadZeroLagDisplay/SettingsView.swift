@@ -56,6 +56,9 @@ public struct SettingsView: View {
                                     Text(physical.mode == .active ? "Remote control allowed for this source" : "View only · Host approval required")
                                     Button("Request Host control approval") { networkManager.requestMirrorControl() }
                                     Button("Release control") { networkManager.suspendMirrorInputForSettings() }
+                                    if networkManager.mirrorMonitorSwitchPending {
+                                        Text("Monitor request pending. Waiting for a presented source.")
+                                    }
                                     if let catalogue=networkManager.mirrorMonitorCatalogue {
                                         ForEach(catalogue.monitors) { monitor in
                                             Button(monitor.label) { networkManager.requestMirrorMonitor(monitor.id,catalogue:catalogue) }

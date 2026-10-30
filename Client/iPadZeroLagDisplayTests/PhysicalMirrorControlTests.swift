@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 @testable import iPadCasting
 
 final class PhysicalMirrorControlTests: XCTestCase {
@@ -70,6 +71,51 @@ final class PhysicalMirrorControlTests: XCTestCase {
     }
     #if targetEnvironment(simulator)
     @MainActor
+    func testActualSurfaceAdmissionAndRetirementPreserveLegacyAndDenyViewOnly() async throws {
+        let network=NetworkManager()
+        network.controlSendForAudioTesting={_,done in done(nil)}
+        let session=network.simulateCommittedWifiSessionForTesting()
+        defer {network.stopForTesting()}
+        network.beginTransferWriterForTesting()
+        network.networkQueueForTesting.sync {network.beginMirrorControlForTesting(generation:session.generation)}
+        let window=UIWindow(frame:CGRect(x:0,y:0,width:400,height:300))
+        let container=ConnectedPresentationContainer(frame:window.bounds)
+        window.addSubview(container)
+        defer {container.removeFromSuperview()}
+        container.touchView.frame=window.bounds
+        container.touchView.contentViewport=VideoContentViewport(rect:CGRect(x:0,y:0,width:1,height:1))
+        var buttons:[PointerInputCommand]=[],contacts:[DirectTouchContactCommand]=[]
+        var surface=ConnectedPresentationSurface(networkManager:network,remoteKeyboardActive:true,
+            onDirectTouchContact:{contacts.append($0)},onPointerInput:{buttons.append($0)})
+        let coordinator=surface.makeCoordinator()
+        func receive(_ state:MirrorControlState) throws {
+            network.receiveMirrorWireForTesting(type:.mirrorState,payload:try MirrorControlCodec.encodeState(state),
+                generation:session.generation,connection:session.connection)
+        }
+        func drain() async {
+            let flushed=expectation(description:"input registration publication")
+            DispatchQueue.main.async {flushed.fulfill()}
+            await fulfillment(of:[flushed],timeout:2)
+        }
+        func down(_ id:UInt64) {
+            container.touchView.handleExternalPointer(id:id,phase:1,point:CGPoint(x:200,y:150),primary:true,generation:network.mirrorInputRevision)
+            container.touchView.emitDirectOutputs([.directTouch(.down,id,CGPoint(x:200,y:150),255)])
+        }
+        try receive(MirrorControlState(revision:1,epoch:1,source:0,mode:.virtualDisplay,token:zero,geometry:nil,firstFrame:nil,lastSent:nil))
+        await drain();surface.configureInputForTesting(container,coordinator:coordinator);down(1)
+        XCTAssertEqual(buttons.map(\.action),[.leftDown]);XCTAssertEqual(contacts.map(\.phase),[.down])
+        surface.remoteKeyboardActive=false
+        surface.configureInputForTesting(container,coordinator:coordinator)
+        XCTAssertEqual(buttons.map(\.action),[.leftDown,.leftUp]);XCTAssertEqual(contacts.map(\.phase),[.down,.cancel])
+        down(2);XCTAssertEqual(buttons.count,2);XCTAssertEqual(contacts.count,2)
+        try receive(MirrorControlState(revision:2,epoch:2,source:1,mode:.awaitingPresentation,token:zero,geometry:geometry,firstFrame:100,lastSent:100))
+        await drain();surface.remoteKeyboardActive=true
+        surface.configureInputForTesting(container,coordinator:coordinator);down(3)
+        XCTAssertEqual(buttons.count,2);XCTAssertEqual(contacts.count,2)
+        ConnectedPresentationSurface.dismantleUIView(container,coordinator:coordinator)
+        XCTAssertEqual(buttons.count,2);XCTAssertEqual(contacts.count,2)
+    }
+    @MainActor
     func testMonitorSelectionWaitsForCurrentSourceRender() async throws {
         let network=NetworkManager()
         network.controlSendForAudioTesting={_,done in done(nil)}
@@ -111,6 +157,9 @@ final class PhysicalMirrorControlTests: XCTestCase {
         network.requestMirrorMonitor(2,catalogue:choices);await drain()
         XCTAssertNil(network.mirrorTicketAtRegistration,"request retires the local sending scope immediately")
         XCTAssertNil(network.mirrorMonitorCatalogue,"consumed choices cannot imply switch completion")
+        XCTAssertTrue(network.mirrorMonitorSwitchPending)
+        receive(.mirrorCatalogue,catalogue(7,1));await drain()
+        XCTAssertNil(network.mirrorMonitorCatalogue,"a consumed revision cannot re-admit selection")
         receive(.mirrorState,try state(3,2,2,.awaitingPresentation,zero,200))
         let freshDecoder=try XCTUnwrap(network.mirrorDecoderGenerationForTesting)
         receive(.mirrorCatalogue,catalogue(8,2));await drain()
@@ -119,6 +168,7 @@ final class PhysicalMirrorControlTests: XCTestCase {
         XCTAssertNil(network.mirrorMonitorCatalogue,"old decoder cannot complete B selection")
         network.recordRenderCompletion(sequence:200,generation:freshDecoder);await drain()
         XCTAssertEqual(network.mirrorMonitorCatalogue?.selected,2)
+        XCTAssertFalse(network.mirrorMonitorSwitchPending)
     }
     func testActualNetworkFallbackRetiresDecoderAndOldInputScope() throws {
         let network=NetworkManager()

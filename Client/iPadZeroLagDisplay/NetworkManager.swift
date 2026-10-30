@@ -1972,7 +1972,11 @@ public class NetworkManager: ObservableObject {
     private let mirrorControl = MirrorClientControl()
     @Published public private(set) var mirrorControlState: MirrorControlState?
     @Published public private(set) var mirrorMonitorCatalogue: MirrorMonitorCatalogue?
+    @Published public private(set) var mirrorMonitorSwitchPending=false
     private var currentMirrorCatalogue: MirrorMonitorCatalogue?
+    private var mirrorCatalogueSource: (epoch:UInt64,source:UInt64)?
+    private var lastMirrorCatalogueRevision:UInt64=0
+    private var mirrorSwitchPending=false
     private var mirrorSwitchAdvertised=false
     @Published public private(set) var mirrorInputRevision: UInt64 = 0
     private struct MirrorDecoderOwner: Equatable {
@@ -2045,8 +2049,8 @@ public class NetworkManager: ObservableObject {
         didSet { if oldValue != wireAuthenticatedGeneration {
             refreshAutoAcceptPolicyOnQueue()
             mirrorControl.beginSession(wireAuthenticatedGeneration ?? 0)
-            currentMirrorCatalogue=nil;mirrorSwitchAdvertised=false
-            DispatchQueue.main.async { [weak self] in self?.mirrorMonitorCatalogue=nil }
+            currentMirrorCatalogue=nil;mirrorCatalogueSource=nil;lastMirrorCatalogueRevision=0
+            mirrorSwitchAdvertised=false;mirrorSwitchPending=false
             mirrorDecoderLock.lock(); mirrorDecoderOwner = nil; mirrorDecoderLock.unlock()
             publishMirrorStateOnQueue()
         } }
@@ -4976,6 +4980,7 @@ public class NetworkManager: ObservableObject {
                 let oldState = mirrorControl.currentState
                 if let transition = try mirrorControl.receiveState(session: generation, data: payload) {
                     if oldState?.epoch != transition.state.epoch {
+                        currentMirrorCatalogue=nil;mirrorCatalogueSource=nil
                         decoder.invalidate(waitForCompletion: false)
                         beginOwnedDecoderSession(networkGeneration: generation)
                     }
@@ -4998,12 +5003,12 @@ public class NetworkManager: ObservableObject {
             guard committedTransportGeneration==generation,mirrorSwitchAdvertised,header.flags==0 else {return}
             do {
                 let catalogue=try MirrorMonitorCatalogue.decode(payload)
-                guard currentMirrorCatalogue.map({catalogue.revision>$0.revision}) ?? true else {return}
+                guard catalogue.revision>lastMirrorCatalogueRevision,
+                      let source=mirrorControl.currentState,source.geometry != nil else {return}
+                lastMirrorCatalogueRevision=catalogue.revision
                 currentMirrorCatalogue=catalogue
-                DispatchQueue.main.async { [weak self] in
-                    guard let self,self.connectionGenerationClock.current==generation else {return}
-                    self.mirrorMonitorCatalogue=catalogue
-                }
+                mirrorCatalogueSource=(source.epoch,source.source)
+                publishMirrorStateOnQueue()
             } catch {handleStreamError("Invalid physical monitor list.")}
             return
         case .mirrorHello, .mirrorInput, .mirrorAction, .mirrorSwitchRequest:
@@ -6498,9 +6503,17 @@ public class NetworkManager: ObservableObject {
         let generation = connectionGenerationClock.current
         let state = mirrorControl.currentState
         let revision = mirrorControl.gestureRevision
+        let catalogue:MirrorMonitorCatalogue?
+        if let state,mirrorCatalogueSource?.epoch==state.epoch,
+           mirrorCatalogueSource?.source==state.source,mirrorControl.hasPresentedCurrentSource {
+            catalogue=currentMirrorCatalogue
+            if catalogue != nil {mirrorSwitchPending=false}
+        } else {catalogue=nil}
+        let pending=mirrorSwitchPending
         DispatchQueue.main.async { [weak self] in
             guard let self, self.connectionGenerationClock.current == generation else { return }
             self.mirrorControlState = state; self.mirrorInputRevision = revision
+            self.mirrorMonitorCatalogue=catalogue;self.mirrorMonitorSwitchPending=pending
         }
     }
     public var mirrorTicketAtRegistration: MirrorInputTicket? { mirrorControl.captureTicket() }
@@ -6530,9 +6543,15 @@ public class NetworkManager: ObservableObject {
             guard let self,generation==self.connectionGeneration,
                   self.wireAuthenticatedGeneration==generation,self.committedTransportGeneration==generation,
                   self.currentMirrorCatalogue==catalogue,
+                  self.mirrorControl.hasPresentedCurrentSource,
                   let payload=try? catalogue.switchRequest(id) else {return}
             // A consumed catalogue cannot submit another switch while its transaction is pending.
             self.currentMirrorCatalogue=nil
+            self.mirrorCatalogueSource=nil;self.mirrorSwitchPending=true
+            if let retirement=self.mirrorControl.suspendInput() {
+                self.sendWireMessage(type:.mirrorAction,payload:retirement,sequence:0)
+            }
+            self.publishMirrorStateOnQueue()
             self.sendWireMessage(type:.mirrorSwitchRequest,payload:payload,sequence:0)
         }
     }
@@ -6577,9 +6596,11 @@ public class NetworkManager: ObservableObject {
                 guard let self, captured.connection == self.connectionGeneration,
                       self.currentMirrorDecoderOwner == captured,
                       self.mirrorControl.currentState?.epoch == captured.epoch,
-                      self.mirrorControl.currentState?.source == captured.source,
-                      let ack = self.mirrorControl.observeRendered(session: captured.connection, sequence: sequence) else { return }
-                self.sendWireMessage(type: .mirrorAction, payload: ack, sequence: 0)
+                      self.mirrorControl.currentState?.source == captured.source else { return }
+                if let ack=self.mirrorControl.observeRendered(session: captured.connection, sequence: sequence) {
+                    self.sendWireMessage(type: .mirrorAction, payload: ack, sequence: 0)
+                    self.publishMirrorStateOnQueue()
+                }
             }
         } else if generation & 0x8000_0000_0000_0000 == 0 {
             transportTelemetry.recordRenderCompletion(sequence: sequence, generation: generation)

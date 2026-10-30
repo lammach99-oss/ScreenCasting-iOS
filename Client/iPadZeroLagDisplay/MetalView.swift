@@ -787,6 +787,12 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         }
     }
 
+    #if targetEnvironment(simulator)
+    func configureInputForTesting(_ container: ConnectedPresentationContainer, coordinator: Coordinator) {
+        configure(container, coordinator: coordinator, createRenderer: false)
+    }
+    #endif
+
     public final class Coordinator {
         var mirrorBindingRevision: UInt64?
         var mirrorBindingSession: UInt64?

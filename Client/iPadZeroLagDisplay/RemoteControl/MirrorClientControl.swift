@@ -41,6 +41,13 @@ public final class MirrorClientControl {
         }
     }
     public var currentState:MirrorControlState? { synchronized{state} }
+    public var hasPresentedCurrentSource:Bool {
+        synchronized {
+            guard transportFloor == nil,foreground,let s=state,let first=s.firstFrame,let seen=rendered,
+                  s.mode == .awaitingPresentation || s.mode == .viewOnly || s.mode == .active else {return false}
+            return acknowledgedEpoch==s.epoch && MirrorControlCodec.sequenceAtOrAfter(seen,first)
+        }
+    }
     /// Once PMR is advertised, absence of a descriptor is not permission to send legacy input.
     public var allowsLegacyVirtualInput:Bool { synchronized{session != 0 && foreground && (!advertised || state?.mode == .virtualDisplay)} }
 

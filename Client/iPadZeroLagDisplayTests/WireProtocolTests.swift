@@ -939,8 +939,19 @@ final class ExternalPointerInputTests: XCTestCase {
         XCTAssertTrue(source.contains("if note.name == UIApplication.willResignActiveNotification {\n            retireRemotePointerInputs()"))
         XCTAssertTrue(source.contains("uiView.retireRemotePointerInputs()"))
         XCTAssertTrue(source.contains("container?.retireRemotePointerInputs()"))
-        XCTAssertTrue(source.contains("touchView.configureExternalPointer(active: remoteKeyboardActive"))
-        XCTAssertTrue(source.contains("touchView.configureDirectTouch(active: remoteKeyboardActive"))
+        func scopedRegistration(_ text: String) -> Bool {
+            text.contains("let admitted = remoteKeyboardActive && (ticket != nil || legacy)") &&
+                text.contains("touchView.configureExternalPointer(active: admitted") &&
+                text.contains("touchView.configureDirectTouch(active: admitted")
+        }
+        XCTAssertTrue(scopedRegistration(source))
+        XCTAssertFalse(scopedRegistration(source.replacingOccurrences(
+            of: "let admitted = remoteKeyboardActive && (ticket != nil || legacy)",
+            with: "let admitted = remoteKeyboardActive")))
+        for owner in ["configureExternalPointer", "configureDirectTouch"] {
+            XCTAssertFalse(scopedRegistration(source.replacingOccurrences(
+                of: "touchView.\(owner)(active: admitted", with: "touchView.\(owner)(active: remoteKeyboardActive")))
+        }
         XCTAssertFalse(source.contains("touchpadModeEnabled"))
     }
 
