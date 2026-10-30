@@ -49,6 +49,23 @@ public struct SettingsView: View {
 
                 ScrollView {
                     VStack(spacing: 20) {
+                        if let physical = networkManager.mirrorControlState, physical.geometry != nil {
+                            settingsCard {
+                                VStack(alignment: .leading, spacing: 12) {
+                                    Label("Physical monitor", systemImage: "display")
+                                    Text(physical.mode == .active ? "Remote control allowed for this source" : "View only · Host approval required")
+                                    Button("Request Host control approval") { networkManager.requestMirrorControl() }
+                                    Button("Release control") { networkManager.suspendMirrorInputForSettings() }
+                                    if let catalogue=networkManager.mirrorMonitorCatalogue {
+                                        ForEach(catalogue.monitors) { monitor in
+                                            Button(monitor.label) { networkManager.requestMirrorMonitor(monitor.id,catalogue:catalogue) }
+                                                .disabled(!catalogue.allowed || monitor.id==catalogue.selected)
+                                        }
+                                        if !catalogue.allowed { Text("Monitor switching requires Host permission.") }
+                                    }
+                                }.foregroundColor(.white)
+                            }
+                        }
                         settingsCard {
                             TransferPanel(networkManager: networkManager)
                         }

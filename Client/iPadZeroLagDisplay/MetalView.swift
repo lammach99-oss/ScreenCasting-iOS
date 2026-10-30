@@ -652,6 +652,16 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         container.setNeedsLayout()
 
         let touchView = container.touchView
+        let binding = networkManager.mirrorInputRevision
+        let ticket = networkManager.mirrorTicketAtRegistration
+        let legacy = networkManager.permitsLegacyVirtualInput
+        if coordinator.mirrorBindingRevision != binding || coordinator.mirrorBindingSession != networkManager.remoteKeyboardGeneration {
+            touchView.retireMirrorInputScope()
+            container.retireRemotePointerInputs()
+            container.retireRemoteKeyboard() // Discards marked text before a new callback can acquire ownership.
+            coordinator.mirrorBindingRevision = binding
+            coordinator.mirrorBindingSession = networkManager.remoteKeyboardGeneration
+        }
         let pencilInput = onPencilInput
         touchView.onPencilInput = { [weak container] packet in
             pencilInput?(packet)
@@ -660,19 +670,43 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             }
         }
         let sendTouchEvent = onSendTouchEvent
-        touchView.onSendTouchEvent = { type, x, y, pressure in
-            sendTouchEvent?(type, x, y, pressure)
+        touchView.onSendTouchEvent = { [weak networkManager] type, x, y, pressure in
+            if let ticket {
+                networkManager?.sendMirrorInput(ticket: ticket, kind: .pencil,
+                    payload: NetworkManager.mirrorPencilPayload(type: type, x: x, y: y, pressure: pressure))
+            } else if legacy { sendTouchEvent?(type, x, y, pressure) }
         }
-        touchView.onKeyboardInput = onKeyboardInput
-        container.onTextCommit = onTextCommit
+        let keyInput = onKeyboardInput
+        touchView.onKeyboardInput = { [weak networkManager] command in
+            if let ticket { networkManager?.sendMirrorInput(ticket: ticket, kind: .keyboard, payload: command.encode()) }
+            else if legacy { keyInput?(command) }
+        }
+        let textInput = onTextCommit
+        container.onTextCommit = { [weak networkManager] text in
+            if let ticket {
+                for command in TextCommitCommand.chunks(text) {
+                    guard let bytes = command.encode() else { return }
+                    networkManager?.sendMirrorInput(ticket: ticket, kind: .text, payload: bytes)
+                }
+            } else if legacy { textInput?(text) }
+        }
         touchView.diagnosticSink = { [weak networkManager] line in networkManager?.recordDiagnosticLine(line) }
         container.configureRemoteKeyboard(active: remoteKeyboardActive, generation: networkManager.remoteKeyboardGeneration)
         container.configureClientCursor(ownership: networkManager.cursorOwnershipState,
             generation: networkManager.remoteKeyboardGeneration, active: remoteKeyboardActive)
-        touchView.onDirectTouchContact = onDirectTouchContact
-        touchView.configureDirectTouch(active: remoteKeyboardActive, generation: networkManager.remoteKeyboardGeneration)
-        touchView.configureExternalPointer(active: remoteKeyboardActive, generation: networkManager.remoteKeyboardGeneration)
-        touchView.onPointerInput = onPointerInput
+        let directInput = onDirectTouchContact
+        touchView.onDirectTouchContact = { [weak networkManager] command in
+            if let ticket { networkManager?.sendMirrorInput(ticket: ticket, kind: .directTouch, payload: command.encode()) }
+            else if legacy { directInput?(command) }
+        }
+        let admitted = remoteKeyboardActive && (ticket != nil || legacy)
+        touchView.configureDirectTouch(active: admitted, generation: binding)
+        touchView.configureExternalPointer(active: admitted, generation: binding)
+        let pointerInput = onPointerInput
+        touchView.onPointerInput = { [weak networkManager] command in
+            if let ticket { networkManager?.sendMirrorInput(ticket: ticket, kind: .pointer, payload: command.encode()) }
+            else if legacy { pointerInput?(command) }
+        }
         let openSettings = onOpenSettings
         touchView.onOpenSettings = { [weak container] in
             container?.retireRemotePointerInputs()
@@ -754,6 +788,8 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     }
 
     public final class Coordinator {
+        var mirrorBindingRevision: UInt64?
+        var mirrorBindingSession: UInt64?
         var renderer: Renderer?
         weak var touchView: PencilUIKitView?
         var inputGeometryContext: InputGeometryDiagnosticContext?

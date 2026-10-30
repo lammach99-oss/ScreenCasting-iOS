@@ -88,6 +88,8 @@ enum WireMessageType: UInt8 {
     case directTouchContact = 41
     case cursorOwnership = 42
     case transferOffer = 43, transferResponse, transferChunk, transferFileEnd, transferFileAck, transferCancel, transferEnd, transferAck
+    case mirrorHello = 51, mirrorState = 52, mirrorInput = 53, mirrorAction = 54
+    case mirrorCatalogue = 55, mirrorSwitchRequest = 56
 }
 
 public enum DirectTouchPhase: UInt8 { case down = 0, update = 1, up = 2, cancel = 3 }
@@ -1572,6 +1574,20 @@ final class WireStreamParser {
         switch type {
         case .ping, .pong, .videoFeedback:
             fixedLength = 16
+        case .mirrorHello: fixedLength = 8
+        case .mirrorState: fixedLength = MirrorControlCodec.stateBytes
+        case .mirrorAction: fixedLength = 32
+        case .mirrorSwitchRequest: fixedLength = 24
+        case .mirrorCatalogue:
+            guard (20...24576).contains(payloadLength) else {
+                state = .failed; payload = Data(); onEvent(.failure(.invalidHeader)); return
+            }
+            fixedLength = nil
+        case .mirrorInput:
+            guard (48...4147).contains(payloadLength) else {
+                state = .failed; payload = Data(); onEvent(.failure(.invalidHeader)); return
+            }
+            fixedLength = nil
         case .displayCapabilities:
             fixedLength = DisplayCapabilities.encodedSize
         case .displayConfigurationRequest:
@@ -1953,6 +1969,18 @@ public class NetworkManager: ObservableObject {
     var manualUsbCandidateDeadlineForTesting = false
     var usbCandidateInstalledForTesting: ((NWConnection) -> Void)?
     #endif
+    private let mirrorControl = MirrorClientControl()
+    @Published public private(set) var mirrorControlState: MirrorControlState?
+    @Published public private(set) var mirrorMonitorCatalogue: MirrorMonitorCatalogue?
+    private var currentMirrorCatalogue: MirrorMonitorCatalogue?
+    private var mirrorSwitchAdvertised=false
+    @Published public private(set) var mirrorInputRevision: UInt64 = 0
+    private struct MirrorDecoderOwner: Equatable {
+        let connection: UInt64, decoder: UInt64, epoch: UInt64, source: UInt64
+    }
+    private let mirrorDecoderLock = NSLock()
+    private var mirrorDecoderOwner: MirrorDecoderOwner?
+    private var nextMirrorDecoder: UInt64 = 0x8000_0000_0000_0000
     private let networkQueueKey = DispatchSpecificKey<Bool>()
     private let networkQueue = DispatchQueue(label: "com.iPadCasting.network", qos: .userInteractive)
     private lazy var controlChannelWriter = ControlChannelWriter(
@@ -2014,7 +2042,14 @@ public class NetworkManager: ObservableObject {
     private var testingPingAttempts = 0
     #endif
     private var wireAuthenticatedGeneration: UInt64? {
-        didSet { if oldValue != wireAuthenticatedGeneration { refreshAutoAcceptPolicyOnQueue() } }
+        didSet { if oldValue != wireAuthenticatedGeneration {
+            refreshAutoAcceptPolicyOnQueue()
+            mirrorControl.beginSession(wireAuthenticatedGeneration ?? 0)
+            currentMirrorCatalogue=nil;mirrorSwitchAdvertised=false
+            DispatchQueue.main.async { [weak self] in self?.mirrorMonitorCatalogue=nil }
+            mirrorDecoderLock.lock(); mirrorDecoderOwner = nil; mirrorDecoderLock.unlock()
+            publishMirrorStateOnQueue()
+        } }
     }
     private var committedTransportGeneration: UInt64? {
         didSet { if oldValue != committedTransportGeneration { refreshAutoAcceptPolicyOnQueue() } }
@@ -2033,6 +2068,7 @@ public class NetworkManager: ObservableObject {
             guard let self,
                   self.committedTransportGeneration == self.connectionGeneration,
                   self.committedRealtimeMode == RealtimeTransportMode.wifiRTP else { return }
+            guard self.mirrorControl.permitsVideoSequence(sequence) else { return }
             self.recordVideoPayloadReceived(data.count, sequence: sequence)
             self.decoder.processInputData(
                 data,
@@ -2197,9 +2233,13 @@ public class NetworkManager: ObservableObject {
             [weak self] sequence, generation, succeeded in
             guard let self else { return }
             self.networkQueue.async {
+                let networkGeneration: UInt64
+                if let owner = self.currentMirrorDecoderOwner, owner.decoder == generation { networkGeneration = owner.connection }
+                else if generation & 0x8000_0000_0000_0000 == 0 { networkGeneration = generation }
+                else { return }
                 self.wifiMediaReceiver.decoderDidComplete(
                     sequence: sequence,
-                    generation: generation,
+                    generation: networkGeneration,
                     succeeded: succeeded)
             }
         }
@@ -2316,6 +2356,7 @@ public class NetworkManager: ObservableObject {
     }
 
     public func applicationDidBecomeActive() {
+        setMirrorInputForeground(true)
         networkQueue.async { [weak self] in
             guard let self else { return }
             let diagnosticForegroundBefore = self.isForegroundActive
@@ -2373,7 +2414,7 @@ public class NetworkManager: ObservableObject {
                     return
                 }
                 self.armLegacyUsbPcmFreshFence(generation: generation)
-                self.decoder.beginSession(generation: generation)
+                self.beginOwnedDecoderSession(networkGeneration: generation)
                 self.sendVideoFeedback()
                 self.recordUsbLifecycleDiagnostic(
                     "[USB_MEDIA_RECOVERY] generation=\(generation) " +
@@ -2421,6 +2462,7 @@ public class NetworkManager: ObservableObject {
     }
 
     public func applicationWillResignActive() {
+        setMirrorInputForeground(false)
         networkQueue.async { [weak self] in
             guard let self else { return }
             let diagnosticForegroundBefore = self.isForegroundActive
@@ -2446,6 +2488,7 @@ public class NetworkManager: ObservableObject {
     }
 
     public func applicationDidEnterBackground() {
+        setMirrorInputForeground(false)
         networkQueue.async { [weak self] in
             guard let self else { return }
             let diagnosticForegroundBefore = self.isForegroundActive
@@ -2619,6 +2662,8 @@ public class NetworkManager: ObservableObject {
     ///   - y:        Vertical position in logical pixels (0–65535 for normalised use).
     ///   - pressure: Normalised pressure mapped to 0–255 byte range.
     public func sendTouchEvent(type: TouchEventType, x: UInt16, y: UInt16, pressure: UInt8) {
+        guard mirrorControl.allowsLegacyVirtualInput else { return }
+        let requestedGeneration = connectionGenerationClock.current
         // Build the 8-byte packet inline — stack allocation, no heap alloc.
         var packet = Data(count: TouchWireProtocol.packetSize)
         packet.withUnsafeMutableBytes { buf in
@@ -2640,8 +2685,8 @@ public class NetworkManager: ObservableObject {
         }
 
         networkQueue.async { [weak self] in
-            guard let self else { return }
-            let generation = self.connectionGeneration
+            guard let self, requestedGeneration == self.connectionGeneration, self.mirrorControl.allowsLegacyVirtualInput else { return }
+            let generation = requestedGeneration
             let isUsb = self.activeTransportKind == .usb
             let diagnostic = isUsb
                 ? self.nextUsbTouchDiagnostic(type: type)
@@ -2722,9 +2767,11 @@ public class NetworkManager: ObservableObject {
     }
 
     public func sendTextCommit(_ text: String) {
+        guard mirrorControl.allowsLegacyVirtualInput else { return }
+        let requestedGeneration = connectionGenerationClock.current
         networkQueue.async { [weak self] in
-            guard let self else { return }
-            let generation = self.connectionGeneration
+            guard let self, requestedGeneration == self.connectionGeneration, self.mirrorControl.allowsLegacyVirtualInput else { return }
+            let generation = requestedGeneration
             guard self.transportState == .streaming,
                   self.committedTransportGeneration == generation,
                   TextCommitDeliveryPolicy.maySend(inputSuppressed: self.displayRequestGate.isInputSuppressed) else { return }
@@ -2736,9 +2783,11 @@ public class NetworkManager: ObservableObject {
     }
 
     public func sendKeyboardInput(_ command: KeyboardInputCommand) {
+        guard mirrorControl.allowsLegacyVirtualInput else { return }
+        let requestedGeneration = connectionGenerationClock.current
         networkQueue.async { [weak self] in
-            guard let self else { return }
-            let generation = self.connectionGeneration
+            guard let self, requestedGeneration == self.connectionGeneration, self.mirrorControl.allowsLegacyVirtualInput else { return }
+            let generation = requestedGeneration
             guard self.transportState == .streaming,
                   self.committedTransportGeneration == generation,
                   command.virtualKey != 0,
@@ -2772,9 +2821,10 @@ public class NetworkManager: ObservableObject {
     }
 
     public func sendDirectTouchContact(_ command: DirectTouchContactCommand) {
+        guard mirrorControl.allowsLegacyVirtualInput else { return }
         let requestedGeneration = connectionGenerationClock.current
         networkQueue.async { [weak self] in
-            guard let self, requestedGeneration == self.connectionGeneration,
+            guard let self, requestedGeneration == self.connectionGeneration, self.mirrorControl.allowsLegacyVirtualInput,
                   self.transportState == .streaming,
                   self.committedTransportGeneration == requestedGeneration,
                   command.contactID != 0,
@@ -2793,9 +2843,11 @@ public class NetworkManager: ObservableObject {
     }
 
     public func sendPointerInput(_ command: PointerInputCommand) {
+        guard mirrorControl.allowsLegacyVirtualInput else { return }
+        let requestedGeneration = connectionGenerationClock.current
         networkQueue.async { [weak self] in
-            guard let self else { return }
-            let generation = self.connectionGeneration
+            guard let self, requestedGeneration == self.connectionGeneration, self.mirrorControl.allowsLegacyVirtualInput else { return }
+            let generation = requestedGeneration
             guard self.transportState == .streaming,
                   self.committedTransportGeneration == generation,
                   PointerInputDeliveryPolicy.maySend(
@@ -4873,6 +4925,10 @@ public class NetworkManager: ObservableObject {
                 handleStreamError("Malformed display capabilities.")
                 return
             }
+            if let hello = mirrorControl.helloIfAdvertised(session: generation, flags: header.flags) {
+                mirrorSwitchAdvertised=header.flags & 0x2000 != 0
+                sendWireMessage(type: .mirrorHello, payload: hello, sequence: 0)
+            }
             receiveDisplayCapabilities(capabilities)
 
         case .displayReady:
@@ -4914,6 +4970,45 @@ public class NetworkManager: ObservableObject {
             }
             return
 
+        case .mirrorState:
+            guard committedTransportGeneration == generation, header.flags == 0 else { return }
+            do {
+                let oldState = mirrorControl.currentState
+                if let transition = try mirrorControl.receiveState(session: generation, data: payload) {
+                    if oldState?.epoch != transition.state.epoch {
+                        decoder.invalidate(waitForCompletion: false)
+                        beginOwnedDecoderSession(networkGeneration: generation)
+                    }
+                    // The first anchor is reported after its completed write. That IDR may
+                    // already have been discarded while metadata was pending; request a fresh
+                    // dependency root using the existing recovery owner, not a media retry lane.
+                    if oldState?.firstFrame == nil, transition.state.firstFrame != nil {
+                        if committedRealtimeMode == RealtimeTransportMode.wifiRTP {
+                            wifiMediaReceiver.requestImmediateRecoveryFeedback(generation: generation)
+                        } else if let recovery=mirrorControl.presentationRecoveryRequest() {
+                            sendWireMessage(type:.mirrorAction,payload:recovery,sequence:0)
+                        }
+                    }
+                    if let ack = transition.acknowledgement { sendWireMessage(type: .mirrorAction, payload: ack, sequence: 0) }
+                    publishMirrorStateOnQueue()
+                }
+            } catch { handleStreamError("Invalid physical-source control state.") }
+            return
+        case .mirrorCatalogue:
+            guard committedTransportGeneration==generation,mirrorSwitchAdvertised,header.flags==0 else {return}
+            do {
+                let catalogue=try MirrorMonitorCatalogue.decode(payload)
+                guard currentMirrorCatalogue.map({catalogue.revision>$0.revision}) ?? true else {return}
+                currentMirrorCatalogue=catalogue
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,self.connectionGenerationClock.current==generation else {return}
+                    self.mirrorMonitorCatalogue=catalogue
+                }
+            } catch {handleStreamError("Invalid physical monitor list.")}
+            return
+        case .mirrorHello, .mirrorInput, .mirrorAction, .mirrorSwitchRequest:
+            handleStreamError("Invalid physical-source control direction.")
+            return
         case .directTouchContact, .pointerInput, .keyboardInput, .textCommit:
             return
 
@@ -4924,6 +5019,7 @@ public class NetworkManager: ObservableObject {
                 // exact host commit must arrive first on authenticated TLS.
                 return
             }
+            guard mirrorControl.permitsVideoSequence(header.sequence) else { return }
             let receivedAt = CACurrentMediaTime()
             let receiveDurationMs = max(0, (receivedAt - message.firstByteAt) * 1_000.0)
             recordVideoPayloadReceived(payload.count, sequence: header.sequence)
@@ -5391,7 +5487,7 @@ public class NetworkManager: ObservableObject {
             recordDiagnosticLine(stale)
             return false
         }
-        decoder.beginSession(generation: generation)
+        beginOwnedDecoderSession(networkGeneration: generation)
         wifiMediaReceiver.reanchorForPreservedSessionRecovery(generation: generation)
         AudioManager.shared.resumeCurrentRealtimeSession(generation: generation, profile: .wifi)
         sendClientPingIfDue()
@@ -5632,7 +5728,7 @@ public class NetworkManager: ObservableObject {
         committedTransportAudioAvailable = audioEnabled
         wifiLegacyFallbackGeneration = nil
         wifiLegacyFallbackRequestGeneration = nil
-        decoder.beginSession(generation: generation)
+        beginOwnedDecoderSession(networkGeneration: generation)
         reconcileRealtimeAudioPlayback(
             generation: generation,
             mode: mode,
@@ -5843,6 +5939,8 @@ public class NetworkManager: ObservableObject {
         }
         wifiLegacyFallbackGeneration = generation
         wifiLegacyFallbackRequestGeneration = nil
+        mirrorControl.retireTransportPresentation()
+        publishMirrorStateOnQueue()
         committedRealtimeMode = RealtimeTransportMode.legacyTLS
         committedTransportAudioAvailable = true
         wifiMediaReceiver.clearOffer()
@@ -5853,7 +5951,7 @@ public class NetworkManager: ObservableObject {
               committedTransportGeneration == generation,
               committedRealtimeMode == RealtimeTransportMode.legacyTLS,
               wifiLegacyFallbackGeneration == generation else { return false }
-        decoder.beginSession(generation: generation)
+        beginOwnedDecoderSession(networkGeneration: generation)
         videoPayloadCounter.begin(generation: generation)
         videoRxSampler.reset()
         lastHudSnapshotPublishedAt = 0
@@ -6037,6 +6135,18 @@ public class NetworkManager: ObservableObject {
     }
 
     #if targetEnvironment(simulator)
+    func beginMirrorControlForTesting(generation:UInt64) {
+        mirrorControl.beginSession(generation)
+        _=mirrorControl.helloIfAdvertised(session:generation,flags:0x4000)
+    }
+    var mirrorDecoderGenerationForTesting:UInt64? {currentMirrorDecoderOwner?.decoder}
+    func receiveMirrorWireForTesting(type:WireMessageType,payload:Data,generation:UInt64,connection owner:NWConnection) {
+        networkQueue.sync {
+            guard generation==connectionGeneration,connection===owner,wireAuthenticatedGeneration==generation else {return}
+            handleWireMessage(WireMessage(header:WireHeader(type:type,flags:0,payloadLength:payload.count,sequence:0),
+                payload:payload,firstByteAt:ProcessInfo.processInfo.systemUptime),generation:generation)
+        }
+    }
     func transferObserverForTesting() -> (DataTransferManager, (DataTransferManager.Snapshot) -> Void) {
         networkQueue.sync {
             beginDataTransfer(generation: connectionGeneration)
@@ -6293,7 +6403,7 @@ public class NetworkManager: ObservableObject {
             committedRealtimeMode = mode
             committedTransportAudioAvailable = true
             lastClientPingSentAt = .greatestFiniteMagnitude
-            decoder.beginSession(generation: generation)
+            beginOwnedDecoderSession(networkGeneration: generation)
             setState(.streaming)
             return (peer, generation)
         }
@@ -6370,14 +6480,109 @@ public class NetworkManager: ObservableObject {
         frameReceiveMs: 0,
         decodeMs: 0)
 
+    private var currentMirrorDecoderOwner: MirrorDecoderOwner? {
+        mirrorDecoderLock.lock(); defer { mirrorDecoderLock.unlock() }; return mirrorDecoderOwner
+    }
+    private func beginOwnedDecoderSession(networkGeneration generation: UInt64) {
+        guard let state = mirrorControl.currentState else { decoder.beginSession(generation: generation); return }
+        guard generation & 0x8000_0000_0000_0000 == 0, nextMirrorDecoder != UInt64.max else {
+            handleStreamError("Physical-source decoder identity exhausted."); return
+        }
+        nextMirrorDecoder += 1
+        let owner = MirrorDecoderOwner(connection: generation, decoder: nextMirrorDecoder, epoch: state.epoch, source: state.source)
+        mirrorDecoderLock.lock(); mirrorDecoderOwner = owner; mirrorDecoderLock.unlock()
+        decoder.beginSession(generation: owner.decoder)
+    }
+    private func publishMirrorStateOnQueue() {
+        let generation = connectionGenerationClock.current
+        let state = mirrorControl.currentState
+        let revision = mirrorControl.gestureRevision
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.connectionGenerationClock.current == generation else { return }
+            self.mirrorControlState = state; self.mirrorInputRevision = revision
+        }
+    }
+    public var mirrorTicketAtRegistration: MirrorInputTicket? { mirrorControl.captureTicket() }
+    public var permitsLegacyVirtualInput: Bool { mirrorControl.allowsLegacyVirtualInput }
+    public func suspendMirrorInputForSettings() {
+        let generation = connectionGenerationClock.current
+        let action = mirrorControl.suspendInput()
+        networkQueue.async { [weak self] in
+            guard let self, generation == self.connectionGeneration else { return }
+            if let action, self.wireAuthenticatedGeneration == generation {
+                self.sendWireMessage(type: .mirrorAction, payload: action, sequence: 0)
+            }
+            self.publishMirrorStateOnQueue()
+        }
+    }
+    public func requestMirrorControl() {
+        let generation = connectionGenerationClock.current
+        networkQueue.async { [weak self] in
+            guard let self, generation == self.connectionGeneration,
+                  let action = self.mirrorControl.requestControl() else { return }
+            self.sendWireMessage(type: .mirrorAction, payload: action, sequence: 0)
+        }
+    }
+    public func requestMirrorMonitor(_ id:UInt64, catalogue:MirrorMonitorCatalogue) {
+        let generation=connectionGenerationClock.current
+        networkQueue.async { [weak self] in
+            guard let self,generation==self.connectionGeneration,
+                  self.wireAuthenticatedGeneration==generation,self.committedTransportGeneration==generation,
+                  self.currentMirrorCatalogue==catalogue,
+                  let payload=try? catalogue.switchRequest(id) else {return}
+            // A consumed catalogue cannot submit another switch while its transaction is pending.
+            self.currentMirrorCatalogue=nil
+            self.sendWireMessage(type:.mirrorSwitchRequest,payload:payload,sequence:0)
+        }
+    }
+    public func setMirrorInputForeground(_ active: Bool) {
+        let generation = connectionGenerationClock.current
+        let action = mirrorControl.setForeground(active)
+        networkQueue.async { [weak self] in
+            guard let self, generation == self.connectionGeneration else { return }
+            if let action, self.wireAuthenticatedGeneration == generation {
+                self.sendWireMessage(type: .mirrorAction, payload: action, sequence: 0)
+            }
+            self.publishMirrorStateOnQueue()
+        }
+    }
+    public func sendMirrorInput(ticket: MirrorInputTicket, kind: MirrorInputKind, payload: Data) {
+        networkQueue.async { [weak self] in
+            guard let self, ticket.session == self.connectionGeneration,
+                  self.wireAuthenticatedGeneration == ticket.session,
+                  self.committedTransportGeneration == ticket.session,
+                  self.transportState == .streaming,
+                  let envelope = try? self.mirrorControl.encodeInput(ticket: ticket, kind: kind, payload: payload) else { return }
+            // Existing bounded reliable lane. No UDP/raw fallback, no terminal coalescing.
+            self.sendWireMessage(type: .mirrorInput, payload: envelope, sequence: 0, movement: false)
+        }
+    }
+    public static func mirrorPencilPayload(type: TouchEventType, x: UInt16, y: UInt16, pressure: UInt8) -> Data {
+        var bytes = [UInt8](repeating: 0, count: 8)
+        bytes[0] = 0x49; bytes[1] = 0x54; bytes[2] = type.rawValue; bytes[3] = pressure
+        bytes[4] = UInt8(truncatingIfNeeded: x); bytes[5] = UInt8(truncatingIfNeeded: x >> 8)
+        bytes[6] = UInt8(truncatingIfNeeded: y); bytes[7] = UInt8(truncatingIfNeeded: y >> 8)
+        return Data(bytes)
+    }
+
     /// Records completion of the Metal command buffer as a distinct presentation stage.
-    public func recordRenderCompletion(
-        sequence: UInt32,
-        generation: UInt64
-    ) {
-        transportTelemetry.recordRenderCompletion(
-            sequence: sequence,
-            generation: generation)
+    public func recordRenderCompletion(sequence: UInt32, generation: UInt64) {
+        mirrorDecoderLock.lock()
+        let captured = mirrorDecoderOwner
+        mirrorDecoderLock.unlock()
+        if let captured, captured.decoder == generation {
+            transportTelemetry.recordRenderCompletion(sequence: sequence, generation: captured.connection)
+            networkQueue.async { [weak self] in
+                guard let self, captured.connection == self.connectionGeneration,
+                      self.currentMirrorDecoderOwner == captured,
+                      self.mirrorControl.currentState?.epoch == captured.epoch,
+                      self.mirrorControl.currentState?.source == captured.source,
+                      let ack = self.mirrorControl.observeRendered(session: captured.connection, sequence: sequence) else { return }
+                self.sendWireMessage(type: .mirrorAction, payload: ack, sequence: 0)
+            }
+        } else if generation & 0x8000_0000_0000_0000 == 0 {
+            transportTelemetry.recordRenderCompletion(sequence: sequence, generation: generation)
+        }
     }
 
     public func recordDrawableCommitted(

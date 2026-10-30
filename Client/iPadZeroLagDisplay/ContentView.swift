@@ -386,6 +386,9 @@ public struct ContentView: View {
                 break
             }
         }
+        .onChange(of: isSettingsPresented) { _, open in
+            if open { networkManager.suspendMirrorInputForSettings() }
+        }
         .sheet(isPresented: $isSettingsPresented) {
             SettingsView(networkManager: networkManager)
         }

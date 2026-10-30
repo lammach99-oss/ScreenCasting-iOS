@@ -973,6 +973,15 @@ public class PencilUIKitView: UIView {
     var diagnosticSink: ((String) -> Void)?
     public var onBoundsChanged: ((CGRect) -> Void)?
 
+    func retireMirrorInputScope() {
+        if activeTouchIdentifier != nil, let point = lastNormalizedPoint {
+            let x = UInt16(clamping: Int((point.x * 65535).rounded()))
+            let y = UInt16(clamping: Int((point.y * 65535).rounded()))
+            onSendTouchEvent?(.up, x, y, 0)
+        }
+        activeTouchIdentifier = nil; lastNormalizedPoint = nil
+        retireDirectTouch(); retireExternalPointer(); releaseActiveRemoteKeys()
+    }
     private var activeTouchIdentifier: ObjectIdentifier?
     private var lastNormalizedPoint: CGPoint?
     private var lastReportedBounds: CGRect?
