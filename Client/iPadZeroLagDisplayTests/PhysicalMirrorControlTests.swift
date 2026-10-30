@@ -69,6 +69,57 @@ final class PhysicalMirrorControlTests: XCTestCase {
         XCTAssertNil(model.captureTicket())
     }
     #if targetEnvironment(simulator)
+    @MainActor
+    func testMonitorSelectionWaitsForCurrentSourceRender() async throws {
+        let network=NetworkManager()
+        network.controlSendForAudioTesting={_,done in done(nil)}
+        let session=network.simulateCommittedWifiSessionForTesting()
+        defer {network.stopForTesting()}
+        network.beginTransferWriterForTesting()
+        network.networkQueueForTesting.sync {
+            network.beginMirrorControlForTesting(generation:session.generation,monitorSelection:true)
+        }
+        func receive(_ type:WireMessageType,_ payload:Data) {
+            network.receiveMirrorWireForTesting(type:type,payload:payload,generation:session.generation,connection:session.connection)
+        }
+        func drain() async {
+            network.networkQueueForTesting.sync {}
+            let flushed=expectation(description:"source-owned UI publication")
+            DispatchQueue.main.async {flushed.fulfill()}
+            await fulfillment(of:[flushed],timeout:2)
+        }
+        func catalogue(_ revision:UInt64,_ selected:UInt64)->Data {
+            var bytes=[UInt8](repeating:0,count:20)
+            bytes[0]=1;bytes[1]=1;bytes[2]=2
+            MirrorControlCodec.put(revision,&bytes,4,8);MirrorControlCodec.put(selected,&bytes,12,8)
+            for id in UInt64(1)...2 {
+                var row=[UInt8](repeating:0,count:10)
+                MirrorControlCodec.put(id,&row,0,8);row[8]=1
+                bytes+=row+[id==1 ? 65:66]
+            }
+            return Data(bytes)
+        }
+        receive(.mirrorState,try state(1,1,1,.awaitingPresentation,zero,100))
+        let oldDecoder=try XCTUnwrap(network.mirrorDecoderGenerationForTesting)
+        receive(.mirrorCatalogue,catalogue(7,1));await drain()
+        XCTAssertNil(network.mirrorMonitorCatalogue,"receipt alone is not current-source presentation")
+        network.recordRenderCompletion(sequence:100,generation:oldDecoder);await drain()
+        let choices=try XCTUnwrap(network.mirrorMonitorCatalogue)
+        XCTAssertEqual(choices.selected,1)
+        receive(.mirrorState,try state(2,1,1,.active,token,100));await drain()
+        XCTAssertNotNil(network.mirrorTicketAtRegistration)
+        network.requestMirrorMonitor(2,catalogue:choices);await drain()
+        XCTAssertNil(network.mirrorTicketAtRegistration,"request retires the local sending scope immediately")
+        XCTAssertNil(network.mirrorMonitorCatalogue,"consumed choices cannot imply switch completion")
+        receive(.mirrorState,try state(3,2,2,.awaitingPresentation,zero,200))
+        let freshDecoder=try XCTUnwrap(network.mirrorDecoderGenerationForTesting)
+        receive(.mirrorCatalogue,catalogue(8,2));await drain()
+        XCTAssertNil(network.mirrorMonitorCatalogue)
+        network.recordRenderCompletion(sequence:200,generation:oldDecoder);await drain()
+        XCTAssertNil(network.mirrorMonitorCatalogue,"old decoder cannot complete B selection")
+        network.recordRenderCompletion(sequence:200,generation:freshDecoder);await drain()
+        XCTAssertEqual(network.mirrorMonitorCatalogue?.selected,2)
+    }
     func testActualNetworkFallbackRetiresDecoderAndOldInputScope() throws {
         let network=NetworkManager()
         network.controlSendForAudioTesting={_,done in done(nil)}

@@ -6135,9 +6135,10 @@ public class NetworkManager: ObservableObject {
     }
 
     #if targetEnvironment(simulator)
-    func beginMirrorControlForTesting(generation:UInt64) {
+    func beginMirrorControlForTesting(generation:UInt64, monitorSelection:Bool=false) {
         mirrorControl.beginSession(generation)
-        _=mirrorControl.helloIfAdvertised(session:generation,flags:0x4000)
+        _=mirrorControl.helloIfAdvertised(session:generation,flags:monitorSelection ? 0x6000:0x4000)
+        mirrorSwitchAdvertised=monitorSelection
     }
     var mirrorDecoderGenerationForTesting:UInt64? {currentMirrorDecoderOwner?.decoder}
     func receiveMirrorWireForTesting(type:WireMessageType,payload:Data,generation:UInt64,connection owner:NWConnection) {
