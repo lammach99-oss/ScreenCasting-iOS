@@ -1977,6 +1977,7 @@ public class NetworkManager: ObservableObject {
     private var mirrorCatalogueSource: (epoch:UInt64,source:UInt64)?
     private var lastMirrorCatalogueRevision:UInt64=0
     private var mirrorSwitchPending=false
+    private var mirrorSwitchAttempt: UUID?
     private var mirrorSwitchAdvertised=false
     @Published public private(set) var mirrorInputRevision: UInt64 = 0
     private struct MirrorDecoderOwner: Equatable {
@@ -2051,6 +2052,7 @@ public class NetworkManager: ObservableObject {
             mirrorControl.beginSession(wireAuthenticatedGeneration ?? 0)
             currentMirrorCatalogue=nil;mirrorCatalogueSource=nil;lastMirrorCatalogueRevision=0
             mirrorSwitchAdvertised=false;mirrorSwitchPending=false
+            mirrorSwitchAttempt=nil
             mirrorDecoderLock.lock(); mirrorDecoderOwner = nil; mirrorDecoderLock.unlock()
             publishMirrorStateOnQueue()
         } }
@@ -6509,7 +6511,7 @@ public class NetworkManager: ObservableObject {
         if let state,mirrorCatalogueSource?.epoch==state.epoch,
            mirrorCatalogueSource?.source==state.source,mirrorControl.hasPresentedCurrentSource {
             catalogue=currentMirrorCatalogue
-            if catalogue != nil {mirrorSwitchPending=false}
+            if catalogue != nil {mirrorSwitchPending=false;mirrorSwitchAttempt=nil}
         } else {catalogue=nil}
         let pending=mirrorSwitchPending
         DispatchQueue.main.async { [weak self] in
@@ -6544,17 +6546,34 @@ public class NetworkManager: ObservableObject {
         networkQueue.async { [weak self] in
             guard let self,generation==self.connectionGeneration,
                   self.wireAuthenticatedGeneration==generation,self.committedTransportGeneration==generation,
+                  !self.mirrorSwitchPending,let connection=self.activeControlConnection,
                   self.currentMirrorCatalogue==catalogue,
                   self.mirrorControl.hasPresentedCurrentSource,
                   let payload=try? catalogue.switchRequest(id) else {return}
             // A consumed catalogue cannot submit another switch while its transaction is pending.
             self.currentMirrorCatalogue=nil
             self.mirrorCatalogueSource=nil;self.mirrorSwitchPending=true
+            let attempt=UUID()
+            self.mirrorSwitchAttempt=attempt
             if let retirement=self.mirrorControl.suspendInput() {
                 self.sendWireMessage(type:.mirrorAction,payload:retirement,sequence:0)
             }
             self.publishMirrorStateOnQueue()
             self.sendWireMessage(type:.mirrorSwitchRequest,payload:payload,sequence:0)
+            let completion: () -> Void = { [weak self, weak connection] in
+                guard let self,let connection,self.mirrorSwitchAttempt==attempt,
+                      self.connectionGeneration==generation,self.wireAuthenticatedGeneration==generation,
+                      self.committedTransportGeneration==generation,
+                      self.activeControlConnection === connection else {return}
+                // No response means unknown, never a selected monitor or renewed input grant.
+                self.mirrorSwitchAttempt=nil;self.mirrorSwitchPending=false
+                self.currentMirrorCatalogue=nil;self.mirrorCatalogueSource=nil
+                self.publishMirrorStateOnQueue()
+            }
+            #if targetEnvironment(simulator)
+            if let schedule=self.mirrorSwitchDeadlineForTesting {schedule(5,completion);return}
+            #endif
+            self.networkQueue.asyncAfter(deadline:.now()+5,execute:completion)
         }
     }
     public func setMirrorInputForeground(_ active: Bool) {
