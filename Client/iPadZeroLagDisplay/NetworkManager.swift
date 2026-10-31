@@ -6140,6 +6140,8 @@ public class NetworkManager: ObservableObject {
     }
 
     #if targetEnvironment(simulator)
+    // Captures the real pending-switch completion without wall-clock sleeps in XCTest.
+    var mirrorSwitchDeadlineForTesting: ((TimeInterval, @escaping () -> Void) -> Void)?
     func beginMirrorControlForTesting(generation:UInt64, monitorSelection:Bool=false) {
         mirrorControl.beginSession(generation)
         _=mirrorControl.helloIfAdvertised(session:generation,flags:monitorSelection ? 0x6000:0x4000)

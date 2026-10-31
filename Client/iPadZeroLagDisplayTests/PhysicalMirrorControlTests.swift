@@ -221,6 +221,107 @@ final class PhysicalMirrorControlTests: XCTestCase {
         XCTAssertEqual(buttons.count,2);XCTAssertEqual(contacts.count,2)
     }
     @MainActor
+    func testLostMonitorSwitchResponseHasBoundedUnknownSettlement() async throws {
+        try await exerciseSwitchDeadline(replaceConnection: false, recoverCatalogue: false)
+    }
+    @MainActor
+    func testMonitorSwitchDeadlineCannotSettleReplacementConnectionAttempt() async throws {
+        try await exerciseSwitchDeadline(replaceConnection: true, recoverCatalogue: false)
+    }
+    @MainActor
+    func testRecoveredSwitchIgnoresItsLateDeadline() async throws {
+        try await exerciseSwitchDeadline(replaceConnection: false, recoverCatalogue: true)
+    }
+    @MainActor
+    private func exerciseSwitchDeadline(replaceConnection: Bool, recoverCatalogue: Bool) async throws {
+        let network = NetworkManager()
+        var sent: [Data] = []
+        network.controlSendForAudioTesting = { bytes, done in sent.append(bytes); done(nil) }
+        var deadlines: [(TimeInterval, () -> Void)] = []
+        network.mirrorSwitchDeadlineForTesting = { delay, completion in deadlines.append((delay, completion)) }
+        var session = network.simulateCommittedWifiSessionForTesting()
+        defer { network.stopForTesting() }
+        func begin() {
+            network.beginTransferWriterForTesting()
+            network.networkQueueForTesting.sync {
+                network.beginMirrorControlForTesting(generation: session.generation, monitorSelection: true)
+            }
+        }
+        func receive(_ type: WireMessageType, _ payload: Data) {
+            network.receiveMirrorWireForTesting(type: type, payload: payload,
+                generation: session.generation, connection: session.connection)
+        }
+        func drain() async {
+            network.networkQueueForTesting.sync {}
+            let flushed = expectation(description: "owned switch UI publication")
+            DispatchQueue.main.async { flushed.fulfill() }
+            await fulfillment(of: [flushed], timeout: 2)
+        }
+        func catalogue(_ revision: UInt64, _ selected: UInt64) -> Data {
+            var bytes = [UInt8](repeating: 0, count: 20)
+            bytes[0] = 1; bytes[1] = 1; bytes[2] = 2
+            MirrorControlCodec.put(revision, &bytes, 4, 8); MirrorControlCodec.put(selected, &bytes, 12, 8)
+            for id in UInt64(1)...2 {
+                var row = [UInt8](repeating: 0, count: 10)
+                MirrorControlCodec.put(id, &row, 0, 8); row[8] = 1
+                bytes += row + [id == 1 ? 65 : 66]
+            }
+            return Data(bytes)
+        }
+        func prepare() async throws -> MirrorMonitorCatalogue {
+            receive(.mirrorState, try state(1, 1, 1, .awaitingPresentation, zero, 100))
+            let decoder = try XCTUnwrap(network.mirrorDecoderGenerationForTesting)
+            network.recordRenderCompletion(sequence: 100, generation: decoder)
+            receive(.mirrorState, try state(2, 1, 1, .active, token, 100))
+            receive(.mirrorCatalogue, catalogue(7, 1)); await drain()
+            XCTAssertNotNil(network.mirrorTicketAtRegistration)
+            return try XCTUnwrap(network.mirrorMonitorCatalogue)
+        }
+        begin()
+        let choices = try await prepare()
+        network.requestMirrorMonitor(2, catalogue: choices); await drain()
+        XCTAssertTrue(network.mirrorMonitorSwitchPending)
+        XCTAssertNil(network.mirrorTicketAtRegistration)
+        XCTAssertNil(network.mirrorMonitorCatalogue)
+        XCTAssertEqual(deadlines.count, 1, "lost response needs one finite completion, not permanent Pending")
+        guard deadlines.count == 1 else { return }
+        XCTAssertGreaterThan(deadlines[0].0, 0)
+        XCTAssertLessThanOrEqual(deadlines[0].0, 10, "bounded recovery must not wait for the 30-second Host lease")
+        let oldDeadline = deadlines[0].1
+        if replaceConnection {
+            session = network.simulateCommittedWifiSessionForTesting()
+            begin()
+            let nextChoices = try await prepare()
+            network.requestMirrorMonitor(2, catalogue: nextChoices); await drain()
+            XCTAssertEqual(deadlines.count, 2)
+            network.networkQueueForTesting.sync { oldDeadline() }; await drain()
+            XCTAssertTrue(network.mirrorMonitorSwitchPending, "old owner cannot settle new Pending")
+            XCTAssertNil(network.mirrorTicketAtRegistration)
+            guard deadlines.count == 2 else { return }
+            network.networkQueueForTesting.sync { deadlines[1].1() }
+        } else if recoverCatalogue {
+            receive(.mirrorState, try state(3, 2, 2, .awaitingPresentation, zero, 200))
+            let decoder = try XCTUnwrap(network.mirrorDecoderGenerationForTesting)
+            receive(.mirrorCatalogue, catalogue(8, 2)); await drain()
+            XCTAssertTrue(network.mirrorMonitorSwitchPending, "received B catalogue is not rendered B")
+            network.recordRenderCompletion(sequence: 200, generation: decoder); await drain()
+            XCTAssertFalse(network.mirrorMonitorSwitchPending)
+            XCTAssertEqual(network.mirrorMonitorCatalogue?.selected, 2)
+            network.networkQueueForTesting.sync { oldDeadline() }; await drain()
+            XCTAssertEqual(network.mirrorMonitorCatalogue?.selected, 2, "late deadline cannot erase known rendered source")
+            return
+        } else {
+            network.networkQueueForTesting.sync { oldDeadline() }
+        }
+        await drain()
+        XCTAssertFalse(network.mirrorMonitorSwitchPending, "lost response settles without implying switch success")
+        XCTAssertNil(network.mirrorMonitorCatalogue, "timeout does not assert A or B is current")
+        XCTAssertNil(network.mirrorTicketAtRegistration, "timeout never restores input authority")
+        let count = sent.count
+        network.networkQueueForTesting.sync { oldDeadline() }; await drain()
+        XCTAssertEqual(sent.count, count, "one-shot timeout cannot generate retry traffic")
+    }
+    @MainActor
     func testMonitorSelectionWaitsForCurrentSourceRender() async throws {
         let network=NetworkManager()
         network.controlSendForAudioTesting={_,done in done(nil)}
