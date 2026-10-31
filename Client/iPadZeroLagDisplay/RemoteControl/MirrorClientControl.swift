@@ -83,7 +83,7 @@ public final class MirrorClientControl {
         if old?.epoch != next.epoch {acknowledgedEpoch=nil;lastAcknowledged=nil;rendered=nil}
         if old?.token != next.token || next.mode != .active {suspended=false}
         state=next
-        if let floor=transportFloor, next.epoch>=floor, next.mode != .active {
+        if let floor=transportFloor, next.epoch>floor, next.mode != .active {
             transportFloor=nil
         }
         let ack=acknowledgeIfReady()
@@ -130,7 +130,7 @@ public final class MirrorClientControl {
         synchronized {
             guard advertised, let s=state, s.mode != .virtualDisplay else { return }
             revision &+= 1;ordinal=0;suspended=true;rendered=nil;acknowledgedEpoch=nil;lastAcknowledged=nil
-            transportFloor=s.mode == .active ? (s.epoch == UInt64.max ? UInt64.max:s.epoch+1):s.epoch
+            transportFloor=s.epoch
         }
     }
     public func presentationRecoveryRequest()->Data? {
