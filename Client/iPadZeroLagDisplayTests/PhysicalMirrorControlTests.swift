@@ -58,6 +58,111 @@ final class PhysicalMirrorControlTests: XCTestCase {
         XCTAssertNotNil(model.captureTicket())
         XCTAssertThrowsError(try model.encodeInput(ticket:ticket,kind:.keyboard,payload:Data([1,0,65,0])))
     }
+    func testTransportRetirementRejectsSameEpochInEveryMirrorMode() throws {
+        for mode in [MirrorControlMode.awaitingPresentation, .viewOnly, .active] {
+            for first in [UInt32(100), UInt32.max] {
+                let model = self.model()
+                _ = try model.receiveState(session: 7, data: state(1, 1, 1, .awaitingPresentation, zero, first))
+                XCTAssertNotNil(model.observeRendered(session: 7, sequence: first))
+                _ = try model.receiveState(session: 7, data: state(2, 1, 1, mode, mode == .active ? token : zero, first))
+                let ticket = model.captureTicket()
+                if mode == .active { XCTAssertNotNil(ticket) }
+                model.retireTransportPresentation()
+                XCTAssertNil(model.captureTicket())
+                // A later revision, mode change, or overlapping/wrapped sequence is not a new transport epoch.
+                for (index, delayedMode) in [MirrorControlMode.viewOnly, .awaitingPresentation, .active].enumerated() {
+                    let transition = try model.receiveState(session: 7,
+                        data: state(UInt64(index + 3), 1, 1, delayedMode, delayedMode == .active ? token : zero, first))
+                    XCTAssertNil(transition?.acknowledgement)
+                    for delayed in [first, first &+ 1] {
+                        XCTAssertFalse(model.permitsVideoSequence(delayed), "retired mode=\(mode), delayed mode=\(delayedMode)")
+                        XCTAssertNil(model.observeRendered(session: 7, sequence: delayed))
+                    }
+                    XCTAssertFalse(model.hasPresentedCurrentSource)
+                    XCTAssertNil(model.captureTicket())
+                    if let ticket {
+                        XCTAssertThrowsError(try model.encodeInput(ticket: ticket, kind: .keyboard, payload: Data([1, 0, 65, 0])))
+                    }
+                }
+            }
+        }
+    }
+    func testTransportRetirementRequiresFreshEpochAnchorRenderAndToken() throws {
+        for mode in [MirrorControlMode.awaitingPresentation, .viewOnly, .active] {
+            let model = self.model()
+            let oldTicket = try active(model)
+            _ = try model.receiveState(session: 7, data: state(3, 1, 1, mode, mode == .active ? token : zero, 100))
+            model.retireTransportPresentation()
+            // A fresh epoch without the Host's published IDR anchor is still closed.
+            _ = try model.receiveState(session: 7, data: state(4, 2, 1, .awaitingPresentation, zero))
+            XCTAssertFalse(model.permitsVideoSequence(0))
+            XCTAssertNil(model.observeRendered(session: 7, sequence: 0))
+            XCTAssertNil(model.captureTicket())
+            _ = try model.receiveState(session: 7, data: state(5, 2, 1, .awaitingPresentation, zero, 0))
+            XCTAssertTrue(model.permitsVideoSequence(0))
+            XCTAssertFalse(model.permitsVideoSequence(UInt32.max))
+            let freshToken = MirrorToken(low: 13, high: 14)
+            _ = try model.receiveState(session: 7, data: state(6, 2, 1, .active, freshToken, 0))
+            XCTAssertNil(model.captureTicket(), "a grant cannot replace an actual completed new-domain render")
+            XCTAssertNotNil(model.observeRendered(session: 7, sequence: 0))
+            XCTAssertNil(model.observeRendered(session: 7, sequence: 0), "ACK each epoch once")
+            let freshTicket = try XCTUnwrap(model.captureTicket())
+            XCTAssertEqual(freshTicket.epoch, 2)
+            XCTAssertEqual(freshTicket.token, freshToken)
+            XCTAssertThrowsError(try model.encodeInput(ticket: oldTicket, kind: .keyboard, payload: Data([1, 0, 65, 0])))
+            XCTAssertNoThrow(try model.encodeInput(ticket: freshTicket, kind: .keyboard, payload: Data([1, 0, 65, 0])))
+        }
+    }
+    func testNewActiveDescriptorAloneCannotReleaseRetiredTransportFence() throws {
+        let model = self.model()
+        _ = try active(model)
+        model.retireTransportPresentation()
+        let freshToken = MirrorToken(low: 13, high: 14)
+        _ = try model.receiveState(session: 7, data: state(3, 2, 1, .active, freshToken, 0))
+        XCTAssertFalse(model.permitsVideoSequence(0))
+        XCTAssertNil(model.observeRendered(session: 7, sequence: 0))
+        XCTAssertNil(model.captureTicket())
+        _ = try model.receiveState(session: 7, data: state(4, 2, 1, .awaitingPresentation, zero, 0))
+        XCTAssertTrue(model.permitsVideoSequence(0))
+        XCTAssertNotNil(model.observeRendered(session: 7, sequence: 0))
+        _ = try model.receiveState(session: 7, data: state(5, 2, 1, .active, freshToken, 0))
+        XCTAssertNotNil(model.captureTicket())
+    }
+    func testTransportRetirementAtMaximumEpochCannotReopenOrWrap() throws {
+        for mode in [MirrorControlMode.awaitingPresentation, .viewOnly, .active] {
+            let model = self.model()
+            _ = try model.receiveState(session: 7, data: state(1, UInt64.max, 1, .awaitingPresentation, zero, UInt32.max))
+            XCTAssertNotNil(model.observeRendered(session: 7, sequence: UInt32.max))
+            _ = try model.receiveState(session: 7, data: state(2, UInt64.max, 1, mode, mode == .active ? token : zero, UInt32.max))
+            let ticket = model.captureTicket()
+            model.retireTransportPresentation()
+            _ = try model.receiveState(session: 7, data: state(3, UInt64.max, 1, .viewOnly, zero, UInt32.max))
+            for sequence in [UInt32.max, 0] {
+                XCTAssertFalse(model.permitsVideoSequence(sequence))
+                XCTAssertNil(model.observeRendered(session: 7, sequence: sequence))
+            }
+            XCTAssertThrowsError(try model.receiveState(session: 7, data: state(4, 1, 1, .awaitingPresentation, zero, 0)))
+            XCTAssertNil(model.captureTicket())
+            if let ticket {
+                XCTAssertThrowsError(try model.encodeInput(ticket: ticket, kind: .keyboard, payload: Data([1, 0, 65, 0])))
+            }
+        }
+    }
+    func testTransportRetirementLeavesVirtualAndUnnegotiatedBehaviorUnchanged() throws {
+        let legacy = MirrorClientControl()
+        legacy.beginSession(7)
+        legacy.retireTransportPresentation()
+        XCTAssertTrue(legacy.allowsLegacyVirtualInput)
+        XCTAssertTrue(legacy.permitsVideoSequence(0))
+        let model = self.model()
+        let virtual = MirrorControlState(revision: 1, epoch: 1, source: 0, mode: .virtualDisplay,
+            token: zero, geometry: nil, firstFrame: nil, lastSent: nil)
+        _ = try model.receiveState(session: 7, data: MirrorControlCodec.encodeState(virtual))
+        model.retireTransportPresentation()
+        XCTAssertTrue(model.allowsLegacyVirtualInput)
+        XCTAssertTrue(model.permitsVideoSequence(UInt32.max))
+        XCTAssertNil(model.captureTicket())
+    }
     func testPresentationRecoveryIsExplicitScopedAndCannotGrant() throws {
         let model=self.model()
         XCTAssertNil(model.presentationRecoveryRequest())
