@@ -1978,7 +1978,16 @@ public class NetworkManager: ObservableObject {
     private var lastMirrorCatalogueRevision:UInt64=0
     private var mirrorSwitchPending=false
     private var mirrorSwitchAttempt: UUID?
+    private var mirrorSwitchDeadlineToken:UUID?
     private var mirrorSwitchAdvertised=false
+    private struct MirrorTerminalSend {
+        let attempt:UUID, nonce:UInt64, generation:UInt64, connection:NWConnection, payload:Data
+        let catalogueReceivedAt:TimeInterval
+        var written=false
+    }
+    private var mirrorTerminalSend:MirrorTerminalSend?
+    private var nextMirrorTerminalNonce:UInt64=0
+    private var mirrorCatalogueReceivedAt:TimeInterval=0
     @Published public private(set) var mirrorInputRevision: UInt64 = 0
     private struct MirrorDecoderOwner: Equatable {
         let connection: UInt64, decoder: UInt64, epoch: UInt64, source: UInt64
@@ -2052,7 +2061,8 @@ public class NetworkManager: ObservableObject {
             mirrorControl.beginSession(wireAuthenticatedGeneration ?? 0)
             currentMirrorCatalogue=nil;mirrorCatalogueSource=nil;lastMirrorCatalogueRevision=0
             mirrorSwitchAdvertised=false;mirrorSwitchPending=false
-            mirrorSwitchAttempt=nil
+            mirrorSwitchAttempt=nil;mirrorSwitchDeadlineToken=nil
+            mirrorTerminalSend=nil;mirrorCatalogueReceivedAt=0
             mirrorDecoderLock.lock(); mirrorDecoderOwner = nil; mirrorDecoderLock.unlock()
             publishMirrorStateOnQueue()
         } }
@@ -4997,6 +5007,7 @@ public class NetworkManager: ObservableObject {
                         }
                     }
                     if let ack = transition.acknowledgement { sendWireMessage(type: .mirrorAction, payload: ack, sequence: 0) }
+                    advanceMirrorTerminalSwitchOnQueue()
                     publishMirrorStateOnQueue()
                 }
             } catch { handleStreamError("Invalid physical-source control state.") }
@@ -5008,12 +5019,27 @@ public class NetworkManager: ObservableObject {
                 guard catalogue.revision>lastMirrorCatalogueRevision,
                       let source=mirrorControl.currentState,source.geometry != nil else {return}
                 lastMirrorCatalogueRevision=catalogue.revision
+                mirrorCatalogueReceivedAt=ProcessInfo.processInfo.systemUptime
                 currentMirrorCatalogue=catalogue
                 mirrorCatalogueSource=(source.epoch,source.source)
                 publishMirrorStateOnQueue()
             } catch {handleStreamError("Invalid physical monitor list.")}
             return
-        case .mirrorHello, .mirrorInput, .mirrorAction, .mirrorSwitchRequest:
+        case .mirrorAction:
+            guard committedTransportGeneration==generation,header.flags==0,
+                  mirrorControl.supportsTerminalSwitch else {
+                handleStreamError("Invalid physical-source control direction.");return
+            }
+            guard mirrorTerminalSend != nil else {return}
+            do {
+                try mirrorControl.receiveTerminalAcknowledgement(session:generation,data:payload)
+                advanceMirrorTerminalSwitchOnQueue()
+            } catch {
+                // An unmatched terminal response is never switch or input authority.
+                mirrorControl.cancelTerminalSwitch();mirrorTerminalSend=nil
+            }
+            publishMirrorStateOnQueue();return
+        case .mirrorHello, .mirrorInput, .mirrorSwitchRequest:
             handleStreamError("Invalid physical-source control direction.")
             return
         case .directTouchContact, .pointerInput, .keyboardInput, .textCommit:
@@ -5947,6 +5973,7 @@ public class NetworkManager: ObservableObject {
         wifiLegacyFallbackGeneration = generation
         wifiLegacyFallbackRequestGeneration = nil
         mirrorControl.retireTransportPresentation()
+        mirrorTerminalSend=nil
         publishMirrorStateOnQueue()
         committedRealtimeMode = RealtimeTransportMode.legacyTLS
         committedTransportAudioAvailable = true
@@ -6144,9 +6171,9 @@ public class NetworkManager: ObservableObject {
     #if targetEnvironment(simulator)
     // Captures the real pending-switch completion without wall-clock sleeps in XCTest.
     var mirrorSwitchDeadlineForTesting: ((TimeInterval, @escaping () -> Void) -> Void)?
-    func beginMirrorControlForTesting(generation:UInt64, monitorSelection:Bool=false) {
+    func beginMirrorControlForTesting(generation:UInt64, monitorSelection:Bool=false, terminal:Bool=false) {
         mirrorControl.beginSession(generation)
-        _=mirrorControl.helloIfAdvertised(session:generation,flags:monitorSelection ? 0x6000:0x4000)
+        _=mirrorControl.helloIfAdvertised(session:generation,flags:terminal ? 0x7000:(monitorSelection ? 0x6000:0x4000))
         mirrorSwitchAdvertised=monitorSelection
     }
     var mirrorDecoderGenerationForTesting:UInt64? {currentMirrorDecoderOwner?.decoder}
@@ -6511,7 +6538,7 @@ public class NetworkManager: ObservableObject {
         if let state,mirrorCatalogueSource?.epoch==state.epoch,
            mirrorCatalogueSource?.source==state.source,mirrorControl.hasPresentedCurrentSource {
             catalogue=currentMirrorCatalogue
-            if catalogue != nil {mirrorSwitchPending=false;mirrorSwitchAttempt=nil}
+            if catalogue != nil {mirrorSwitchPending=false;mirrorSwitchAttempt=nil;mirrorSwitchDeadlineToken=nil}
         } else {catalogue=nil}
         let pending=mirrorSwitchPending
         DispatchQueue.main.async { [weak self] in
@@ -6527,6 +6554,7 @@ public class NetworkManager: ObservableObject {
         let action = mirrorControl.suspendInput()
         networkQueue.async { [weak self] in
             guard let self, generation == self.connectionGeneration else { return }
+            self.mirrorTerminalSend=nil
             if let action, self.wireAuthenticatedGeneration == generation {
                 self.sendWireMessage(type: .mirrorAction, payload: action, sequence: 0)
             }
@@ -6549,38 +6577,88 @@ public class NetworkManager: ObservableObject {
                   !self.mirrorSwitchPending,let connection=self.activeControlConnection,
                   self.currentMirrorCatalogue==catalogue,
                   self.mirrorControl.hasPresentedCurrentSource,
+                  ProcessInfo.processInfo.systemUptime-self.mirrorCatalogueReceivedAt<30,
                   let payload=try? catalogue.switchRequest(id) else {return}
             // A consumed catalogue cannot submit another switch while its transaction is pending.
             self.currentMirrorCatalogue=nil
             self.mirrorCatalogueSource=nil;self.mirrorSwitchPending=true
             let attempt=UUID()
             self.mirrorSwitchAttempt=attempt
-            if let retirement=self.mirrorControl.suspendInput() {
-                self.sendWireMessage(type:.mirrorAction,payload:retirement,sequence:0)
+            if self.mirrorControl.supportsTerminalSwitch {
+                guard self.nextMirrorTerminalNonce != UInt64.max else {
+                    self.mirrorControl.cancelTerminalSwitch();self.mirrorSwitchPending=false
+                    self.mirrorSwitchAttempt=nil;self.publishMirrorStateOnQueue();return
+                }
+                self.nextMirrorTerminalNonce+=1
+                let nonce=self.nextMirrorTerminalNonce
+                guard let retirement=self.mirrorControl.beginTerminalSwitch(nonce:nonce) else {
+                    self.mirrorSwitchPending=false;self.mirrorSwitchAttempt=nil
+                    self.publishMirrorStateOnQueue();return
+                }
+                self.mirrorTerminalSend=MirrorTerminalSend(attempt:attempt,nonce:nonce,generation:generation,
+                    connection:connection,payload:payload,catalogueReceivedAt:self.mirrorCatalogueReceivedAt)
+                self.sendWireMessage(type:.mirrorAction,payload:retirement,sequence:0) { [weak self] error in
+                    guard let self,var pending=self.mirrorTerminalSend,pending.attempt==attempt,
+                          self.connectionGeneration==generation,self.activeControlConnection === connection else {return}
+                    guard error == nil else {
+                        self.mirrorControl.cancelTerminalSwitch();self.mirrorTerminalSend=nil;return
+                    }
+                    pending.written=true;self.mirrorTerminalSend=pending
+                    self.advanceMirrorTerminalSwitchOnQueue()
+                }
+            } else {
+                if let retirement=self.mirrorControl.suspendInput() {
+                    self.sendWireMessage(type:.mirrorAction,payload:retirement,sequence:0)
+                }
+                self.sendWireMessage(type:.mirrorSwitchRequest,payload:payload,sequence:0)
             }
             self.publishMirrorStateOnQueue()
-            self.sendWireMessage(type:.mirrorSwitchRequest,payload:payload,sequence:0)
+            self.scheduleMirrorSwitchDeadlineOnQueue(attempt:attempt,generation:generation,connection:connection)
+        }
+    }
+    private func scheduleMirrorSwitchDeadlineOnQueue(attempt:UUID,generation:UInt64,connection:NWConnection) {
+            let deadlineToken=UUID();mirrorSwitchDeadlineToken=deadlineToken
             let completion: () -> Void = { [weak self, weak connection] in
                 guard let self,let connection,self.mirrorSwitchAttempt==attempt,
+                      self.mirrorSwitchDeadlineToken==deadlineToken,
                       self.connectionGeneration==generation,self.wireAuthenticatedGeneration==generation,
                       self.committedTransportGeneration==generation,
                       self.activeControlConnection === connection else {return}
                 // No response means unknown, never a selected monitor or renewed input grant.
                 self.mirrorSwitchAttempt=nil;self.mirrorSwitchPending=false
+                self.mirrorSwitchDeadlineToken=nil
+                if self.mirrorControl.supportsTerminalSwitch {self.mirrorControl.cancelTerminalSwitch()}
+                self.mirrorTerminalSend=nil
                 self.currentMirrorCatalogue=nil;self.mirrorCatalogueSource=nil
                 self.publishMirrorStateOnQueue()
             }
             #if targetEnvironment(simulator)
-            if let schedule=self.mirrorSwitchDeadlineForTesting {schedule(5,completion);return}
+            if let schedule=mirrorSwitchDeadlineForTesting {schedule(5,completion);return}
             #endif
-            self.networkQueue.asyncAfter(deadline:.now()+5,execute:completion)
+            networkQueue.asyncAfter(deadline:.now()+5,execute:completion)
+    }
+    private func advanceMirrorTerminalSwitchOnQueue() {
+        dispatchPrecondition(condition:.onQueue(networkQueue))
+        guard let pending=mirrorTerminalSend,pending.written,
+              mirrorSwitchAttempt==pending.attempt,mirrorSwitchPending,
+              connectionGeneration==pending.generation,wireAuthenticatedGeneration==pending.generation,
+              committedTransportGeneration==pending.generation,
+              activeControlConnection === pending.connection else {return}
+        guard ProcessInfo.processInfo.systemUptime-pending.catalogueReceivedAt<30 else {
+            mirrorControl.cancelTerminalSwitch();mirrorTerminalSend=nil;return
         }
+        guard mirrorControl.takeTerminalSwitch(nonce:pending.nonce) else {return}
+        mirrorTerminalSend=nil
+        sendWireMessage(type:.mirrorSwitchRequest,payload:pending.payload,sequence:0)
+        // Terminal retirement and the D03-P response are distinct bounded phases.
+        scheduleMirrorSwitchDeadlineOnQueue(attempt:pending.attempt,generation:pending.generation,connection:pending.connection)
     }
     public func setMirrorInputForeground(_ active: Bool) {
         let generation = connectionGenerationClock.current
         let action = mirrorControl.setForeground(active)
         networkQueue.async { [weak self] in
             guard let self, generation == self.connectionGeneration else { return }
+            if !active {self.mirrorTerminalSend=nil}
             if let action, self.wireAuthenticatedGeneration == generation {
                 self.sendWireMessage(type: .mirrorAction, payload: action, sequence: 0)
             }

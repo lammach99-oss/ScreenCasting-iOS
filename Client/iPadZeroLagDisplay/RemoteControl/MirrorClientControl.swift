@@ -20,6 +20,12 @@ public final class MirrorClientControl {
     private var rendered:UInt32?, acknowledgedEpoch:UInt64?
     private var lastAcknowledged:UInt32?
     private var transportFloor:UInt64?
+    private var terminalCapable=false
+    private struct TerminalSwitch {
+        let nonce:UInt64, epoch:UInt64, source:UInt64
+        var retiredEpoch:UInt64?
+    }
+    private var terminalSwitch:TerminalSwitch?
     public init() {}
     private func synchronized<T>(_ body:()->T)->T { lock.lock();defer{lock.unlock()};return body() }
 
@@ -27,6 +33,7 @@ public final class MirrorClientControl {
         synchronized {
             session=generation;revision &+= 1;ordinal=0;advertised=false;helloSent=false
             state=nil;rendered=nil;acknowledgedEpoch=nil;lastAcknowledged=nil;suspended=false;transportFloor=nil
+            terminalCapable=false;terminalSwitch=nil
         }
     }
     public func endSession() {beginSession(0)}
@@ -37,7 +44,8 @@ public final class MirrorClientControl {
             advertised=true
             guard !helloSent else {return nil}
             helloSent=true
-            return Data([1,0,0,0,flags & 0x2000 != 0 ? 3:1,0,0,0])
+            terminalCapable=(flags & 0x7000)==0x7000
+            return Data([1,0,0,0,terminalCapable ? 7:(flags & 0x2000 != 0 ? 3:1),0,0,0])
         }
     }
     public var currentState:MirrorControlState? { synchronized{state} }
@@ -101,7 +109,7 @@ public final class MirrorClientControl {
         }
     }
     private func acknowledgeIfReady()->Data? {
-        guard transportFloor == nil,foreground,!suspended,let s=state,let first=s.firstFrame,let seen=rendered,
+        guard terminalSwitch == nil,transportFloor == nil,foreground,!suspended,let s=state,let first=s.firstFrame,let seen=rendered,
               s.mode == .awaitingPresentation || s.mode == .viewOnly || s.mode == .active,
               MirrorControlCodec.sequenceAtOrAfter(seen,first) else {return nil}
         guard acknowledgedEpoch != s.epoch else {return nil}
@@ -114,6 +122,7 @@ public final class MirrorClientControl {
             foreground=active
             guard !active else {return nil}
             revision &+= 1;ordinal=0;suspended=true
+            terminalSwitch=nil
             guard let s=state,s.epoch>0,s.source>0 else {return nil}
             return Self.action(kind:3,epoch:s.epoch,source:s.source,sequence:0)
         }
@@ -121,6 +130,7 @@ public final class MirrorClientControl {
     public func suspendInput()->Data? {
         synchronized {
             revision &+= 1; ordinal=0; suspended=true
+            terminalSwitch=nil
             guard let s=state,s.epoch>0,s.source>0 else {return nil}
             return Self.action(kind:3,epoch:s.epoch,source:s.source,sequence:0)
         }
@@ -130,6 +140,7 @@ public final class MirrorClientControl {
         synchronized {
             guard advertised, let s=state, s.mode != .virtualDisplay else { return }
             revision &+= 1;ordinal=0;suspended=true;rendered=nil;acknowledgedEpoch=nil;lastAcknowledged=nil
+            terminalSwitch=nil
             transportFloor=s.epoch
         }
     }
@@ -147,9 +158,53 @@ public final class MirrorClientControl {
             return Self.action(kind:1,epoch:s.epoch,source:s.source,sequence:0)
         }
     }
+    public var supportsTerminalSwitch:Bool {synchronized{terminalCapable}}
+    public func beginTerminalSwitch(nonce:UInt64)->Data? {
+        synchronized {
+            guard terminalCapable,terminalSwitch == nil,nonce != 0,transportFloor == nil,
+                  foreground,let s=state,s.epoch>0,s.source>0,
+                  s.mode == .active || s.mode == .viewOnly || s.mode == .awaitingPresentation,
+                  acknowledgedEpoch==s.epoch else {return nil}
+            revision &+= 1;ordinal=0;suspended=true;rendered=nil;acknowledgedEpoch=nil;lastAcknowledged=nil
+            transportFloor=s.epoch
+            terminalSwitch=TerminalSwitch(nonce:nonce,epoch:s.epoch,source:s.source)
+            var bytes=Array(Self.action(kind:3,epoch:s.epoch,source:s.source,sequence:0))
+            bytes[0]=2;bytes[1]=5;MirrorControlCodec.put(nonce,&bytes,24,8)
+            return Data(bytes)
+        }
+    }
+    public func receiveTerminalAcknowledgement(session generation:UInt64,data:Data)throws {
+        try synchronized {
+            let b=Array(data)
+            guard generation != 0,generation==session,terminalCapable,var pending=terminalSwitch else {throw MirrorControlError.stale}
+            guard b.count==32,b[0]==2,b[1]==6,b[2]==0,b[3]==0,
+                  MirrorControlCodec.read(b,20,4)==0,
+                  MirrorControlCodec.read(b,24,8)==pending.nonce,
+                  MirrorControlCodec.read(b,12,8)==pending.source,
+                  MirrorControlCodec.read(b,4,8)>pending.epoch else {throw MirrorControlError.malformed}
+            let epoch=MirrorControlCodec.read(b,4,8)
+            guard pending.retiredEpoch == nil || pending.retiredEpoch==epoch else {throw MirrorControlError.stale}
+            pending.retiredEpoch=epoch;terminalSwitch=pending
+        }
+    }
+    public func takeTerminalSwitch(nonce:UInt64)->Bool {
+        synchronized {
+            guard let pending=terminalSwitch,pending.nonce==nonce,let s=state,
+                  let retiredEpoch=pending.retiredEpoch,s.epoch==retiredEpoch,s.source==pending.source,
+                  s.mode == .unavailable,s.token.isEmpty,s.firstFrame == nil else {return false}
+            terminalSwitch=nil;suspended=true;return true
+        }
+    }
+    public func cancelTerminalSwitch() {
+        synchronized {
+            terminalSwitch=nil;revision &+= 1;ordinal=0;suspended=true
+            if let s=state {transportFloor=s.epoch}
+            rendered=nil;acknowledgedEpoch=nil;lastAcknowledged=nil
+        }
+    }
     public func captureTicket()->MirrorInputTicket? {
         synchronized {
-            guard transportFloor == nil,foreground,!suspended,let s=state,s.mode == .active,!s.token.isEmpty,
+            guard terminalSwitch == nil,transportFloor == nil,foreground,!suspended,let s=state,s.mode == .active,!s.token.isEmpty,
                   acknowledgedEpoch==s.epoch,let first=s.firstFrame,let seen=rendered,
                   MirrorControlCodec.sequenceAtOrAfter(seen,first) else {return nil}
             return MirrorInputTicket(session:session,uiRevision:revision,epoch:s.epoch,source:s.source,token:s.token)
@@ -158,7 +213,7 @@ public final class MirrorClientControl {
     /// Invoke on the serialized control-send lane. Movement may be coalesced; terminal input must not be.
     public func encodeInput(ticket:MirrorInputTicket,kind:MirrorInputKind,payload:Data)throws->Data {
         lock.lock();defer{lock.unlock()}
-        guard transportFloor == nil,foreground,!suspended,let s=state,s.mode == .active,acknowledgedEpoch==s.epoch,
+        guard terminalSwitch == nil,transportFloor == nil,foreground,!suspended,let s=state,s.mode == .active,acknowledgedEpoch==s.epoch,
               ticket.session==session,ticket.uiRevision==revision,ticket.epoch==s.epoch,
               ticket.source==s.source,ticket.token==s.token else {throw MirrorControlError.stale}
         guard ordinal != UInt64.max else {suspended=true;throw MirrorControlError.sequenceExhausted}
