@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import Network
 @testable import iPadCasting
 
 final class PhysicalMirrorControlTests: XCTestCase {
@@ -485,6 +486,175 @@ final class PhysicalMirrorControlTests: XCTestCase {
     func testMonitorSelectionRequiresSeparatelyAdvertisedCapability() {
         let model=MirrorClientControl();model.beginSession(7)
         XCTAssertEqual(model.helloIfAdvertised(session:7,flags:0x6000),Data([1,0,0,0,3,0,0,0]))
+    }
+    func testTerminalRetirementRequiresSeparatelyAdvertisedCapability() {
+        let legacy=MirrorClientControl();legacy.beginSession(7)
+        XCTAssertEqual(legacy.helloIfAdvertised(session:7,flags:0x6000),Data([1,0,0,0,3,0,0,0]))
+        let noSelection=MirrorClientControl();noSelection.beginSession(7)
+        XCTAssertEqual(noSelection.helloIfAdvertised(session:7,flags:0x5000),Data([1,0,0,0,1,0,0,0]))
+        let terminal=MirrorClientControl();terminal.beginSession(7)
+        XCTAssertEqual(terminal.helloIfAdvertised(session:7,flags:0x7000),Data([1,0,0,0,7,0,0,0]))
+    }
+    private func terminalAck(_ nonce:UInt64,_ epoch:UInt64=2,_ source:UInt64=1)->Data {
+        var bytes=[UInt8](repeating:0,count:32);bytes[0]=2;bytes[1]=6
+        MirrorControlCodec.put(epoch,&bytes,4,8);MirrorControlCodec.put(source,&bytes,12,8)
+        MirrorControlCodec.put(nonce,&bytes,24,8);return Data(bytes)
+    }
+    private func terminalModel() throws -> MirrorClientControl {
+        let model=MirrorClientControl();model.beginSession(7)
+        XCTAssertEqual(model.helloIfAdvertised(session:7,flags:0x7000),Data([1,0,0,0,7,0,0,0]))
+        _=try active(model);return model
+    }
+    func testTerminalBarrierRequiresMatchingStateAndAckInEitherOrder() throws {
+        for ackFirst in [false,true] {
+            let model=try terminalModel(),ticket=try XCTUnwrap(model.captureTicket())
+            let request=try XCTUnwrap(model.beginTerminalSwitch(nonce:91))
+            XCTAssertEqual(request[0],2);XCTAssertEqual(request[1],5)
+            XCTAssertEqual(MirrorControlCodec.read(Array(request),24,8),91)
+            XCTAssertNil(model.captureTicket())
+            XCTAssertThrowsError(try model.encodeInput(ticket:ticket,kind:.keyboard,payload:Data([1,0,65,0])))
+            if ackFirst {try model.receiveTerminalAcknowledgement(session:7,data:terminalAck(91))}
+            else {_=try model.receiveState(session:7,data:state(3,2,1,.unavailable,zero))}
+            XCTAssertFalse(model.takeTerminalSwitch(nonce:91))
+            if ackFirst {_=try model.receiveState(session:7,data:state(3,2,1,.unavailable,zero))}
+            else {try model.receiveTerminalAcknowledgement(session:7,data:terminalAck(91))}
+            XCTAssertTrue(model.takeTerminalSwitch(nonce:91));XCTAssertFalse(model.takeTerminalSwitch(nonce:91))
+            XCTAssertNil(model.captureTicket())
+        }
+    }
+    #if targetEnvironment(simulator)
+    @MainActor
+    func testActualTerminalWriterRequiresCompletedKind5AndBothResponses() async throws {
+        for ackFirst in [false,true] {
+            let network=NetworkManager()
+            var writes:[Data]=[],completions:[(NWError?)->Void]=[]
+            network.controlSendForAudioTesting={bytes,done in writes.append(bytes);completions.append(done)}
+            let session=network.simulateCommittedWifiSessionForTesting()
+            network.beginTransferWriterForTesting()
+            network.networkQueueForTesting.sync {
+                network.beginMirrorControlForTesting(generation:session.generation,monitorSelection:true,terminal:true)
+            }
+            func drain() async {
+                network.networkQueueForTesting.sync {}
+                let done=expectation(description:"terminal writer owner")
+                DispatchQueue.main.async{done.fulfill()}
+                await fulfillment(of:[done],timeout:2)
+                network.networkQueueForTesting.sync {}
+            }
+            func receive(_ type:WireMessageType,_ bytes:Data) {
+                network.receiveMirrorWireForTesting(type:type,payload:bytes,generation:session.generation,connection:session.connection)
+            }
+            receive(.mirrorState,try state(1,1,1,.awaitingPresentation,zero,100))
+            let decoder=try XCTUnwrap(network.mirrorDecoderGenerationForTesting)
+            network.recordRenderCompletion(sequence:100,generation:decoder)
+            receive(.mirrorState,try state(2,1,1,.active,token,100))
+            receive(.mirrorCatalogue,catalogueBytes());await drain()
+            // Drain initial render ACKs before measuring the terminal barrier.
+            while !completions.isEmpty {
+                let completion=completions.removeFirst()
+                network.networkQueueForTesting.sync{completion(nil)};await drain()
+            }
+            writes.removeAll()
+            let catalogue=try XCTUnwrap(network.mirrorMonitorCatalogue)
+            network.requestMirrorMonitor(1,catalogue:catalogue);await drain()
+            XCTAssertNil(network.mirrorTicketAtRegistration)
+            let terminal=try XCTUnwrap(writes.first)
+            XCTAssertEqual(terminal[5],WireMessageType.mirrorAction.rawValue)
+            XCTAssertEqual(terminal[16],2);XCTAssertEqual(terminal[17],5)
+            let nonce=MirrorControlCodec.read(Array(terminal),40,8)
+            if ackFirst {receive(.mirrorAction,terminalAck(nonce))}
+            else {receive(.mirrorState,try state(3,2,1,.unavailable,zero))}
+            await drain();XCTAssertFalse(writes.contains{$0[5]==WireMessageType.mirrorSwitchRequest.rawValue})
+            if ackFirst {receive(.mirrorState,try state(3,2,1,.unavailable,zero))}
+            else {receive(.mirrorAction,terminalAck(nonce))}
+            await drain();XCTAssertFalse(writes.contains{$0[5]==WireMessageType.mirrorSwitchRequest.rawValue},"ACK/state are not local writer completion")
+            let terminalCompletion=try XCTUnwrap(completions.first);completions.removeFirst()
+            network.networkQueueForTesting.sync{terminalCompletion(nil)};await drain()
+            XCTAssertEqual(writes.filter{$0[5]==WireMessageType.mirrorSwitchRequest.rawValue}.count,1)
+            receive(.mirrorAction,terminalAck(nonce));await drain()
+            XCTAssertEqual(writes.filter{$0[5]==WireMessageType.mirrorSwitchRequest.rawValue}.count,1)
+            network.stopForTesting()
+        }
+    }
+    @MainActor
+    func testActualTerminalLostResponseDeadlineNeverSendsSwitchOrRestoresInput() async throws {
+        let network=NetworkManager();var writes:[Data]=[];var deadline:(()->Void)?
+        network.controlSendForAudioTesting={bytes,done in writes.append(bytes);done(nil)}
+        network.mirrorSwitchDeadlineForTesting={seconds,done in XCTAssertEqual(seconds,5);deadline=done}
+        let session=network.simulateCommittedWifiSessionForTesting();defer{network.stopForTesting()}
+        network.beginTransferWriterForTesting()
+        network.networkQueueForTesting.sync {
+            network.beginMirrorControlForTesting(generation:session.generation,monitorSelection:true,terminal:true)
+        }
+        func receive(_ type:WireMessageType,_ bytes:Data) {
+            network.receiveMirrorWireForTesting(type:type,payload:bytes,generation:session.generation,connection:session.connection)
+        }
+        func drain() async {
+            network.networkQueueForTesting.sync {}
+            let done=expectation(description:"terminal deadline owner")
+            DispatchQueue.main.async{done.fulfill()};await fulfillment(of:[done],timeout:2)
+            network.networkQueueForTesting.sync {}
+        }
+        receive(.mirrorState,try state(1,1,1,.awaitingPresentation,zero,100))
+        let decoder=try XCTUnwrap(network.mirrorDecoderGenerationForTesting)
+        network.recordRenderCompletion(sequence:100,generation:decoder)
+        receive(.mirrorState,try state(2,1,1,.active,token,100))
+        receive(.mirrorCatalogue,catalogueBytes());await drain()
+        let catalogue=try XCTUnwrap(network.mirrorMonitorCatalogue)
+        network.requestMirrorMonitor(1,catalogue:catalogue);await drain()
+        let expire=try XCTUnwrap(deadline)
+        network.networkQueueForTesting.sync{expire()};await drain()
+        XCTAssertFalse(network.mirrorMonitorSwitchPending);XCTAssertNil(network.mirrorTicketAtRegistration)
+        XCTAssertFalse(writes.contains{$0[5]==WireMessageType.mirrorSwitchRequest.rawValue})
+        network.networkQueueForTesting.sync{expire()};await drain()
+        XCTAssertFalse(writes.contains{$0[5]==WireMessageType.mirrorSwitchRequest.rawValue})
+    }
+    #endif
+    func testTerminalBarrierRejectsNonceSourceReservedAndOldEpoch() throws {
+        for mutation in 0..<6 {
+            let model=try terminalModel();_=model.beginTerminalSwitch(nonce:92)
+            var ack=terminalAck(92)
+            switch mutation {
+            case 0: ack[24]=93
+            case 1: ack[12]=2
+            case 2: ack[4]=1
+            case 3: ack[2]=1
+            case 4: ack[20]=1
+            default: ack[0]=1
+            }
+            XCTAssertThrowsError(try model.receiveTerminalAcknowledgement(session:7,data:ack))
+            XCTAssertFalse(model.takeTerminalSwitch(nonce:92));XCTAssertNil(model.captureTicket())
+        }
+    }
+    func testTerminalBarrierCancellationAndReplacementNeverRestoreTicket() throws {
+        for reason in 0..<4 {
+            let model=try terminalModel();_=model.beginTerminalSwitch(nonce:93)
+            switch reason {
+            case 0: model.cancelTerminalSwitch()
+            case 1: model.retireTransportPresentation()
+            case 2: XCTAssertEqual(model.suspendInput()?[1],3)
+            default: model.beginSession(8)
+            }
+            XCTAssertThrowsError(try model.receiveTerminalAcknowledgement(session:7,data:terminalAck(93)))
+            XCTAssertFalse(model.takeTerminalSwitch(nonce:93));XCTAssertNil(model.captureTicket())
+        }
+    }
+    func testTerminalBarrierCannotNegotiateFromLegacyOrChangedAdvertisement() throws {
+        let model=self.model();_=try active(model)
+        XCTAssertNil(model.beginTerminalSwitch(nonce:1))
+        XCTAssertNil(model.helloIfAdvertised(session:7,flags:0x7000))
+        XCTAssertNil(model.beginTerminalSwitch(nonce:2))
+        XCTAssertEqual(model.suspendInput()?[1],3)
+    }
+    func testTerminalSuccessorStillRequiresFreshRenderedSource() throws {
+        let model=try terminalModel();_=model.beginTerminalSwitch(nonce:94)
+        try model.receiveTerminalAcknowledgement(session:7,data:terminalAck(94))
+        _=try model.receiveState(session:7,data:state(3,2,1,.unavailable,zero))
+        XCTAssertTrue(model.takeTerminalSwitch(nonce:94))
+        _=try model.receiveState(session:7,data:state(4,3,2,.awaitingPresentation,zero,200))
+        _=try model.receiveState(session:7,data:state(5,3,2,.active,MirrorToken(low:21,high:22),200))
+        XCTAssertNil(model.captureTicket());XCTAssertNil(model.observeRendered(session:7,sequence:199))
+        XCTAssertNotNil(model.observeRendered(session:7,sequence:200));XCTAssertNotNil(model.captureTicket())
     }
     func testMonitorCatalogueAndOpaqueSwitchRequestExactBytes() throws {
         let catalogue=try MirrorMonitorCatalogue.decode(catalogueBytes())
