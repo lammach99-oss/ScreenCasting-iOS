@@ -1005,6 +1005,8 @@ final class WifiMediaReceiver {
         episode: UInt32
     )?
     private var rttSamplesMs: [UInt16] = []
+    // p95 is read for every packet but only changes when an RTT sample lands.
+    private var cachedRttP95Ms: UInt16 = 0
     private var smoothedRttMs: Double?
     private(set) var securityDropCounters = WifiSecurityDropCounters()
     private(set) var audioParseRejects = 0
@@ -1396,6 +1398,7 @@ final class WifiMediaReceiver {
         pendingRecoveryIdr = nil
         feedbackLedger.reset()
         rttSamplesMs.removeAll(keepingCapacity: false)
+        cachedRttP95Ms = 0
         smoothedRttMs = nil
         securityDropCounters = WifiSecurityDropCounters()
         audioParseRejects = 0
@@ -1777,7 +1780,9 @@ final class WifiMediaReceiver {
         }
     }
 
-    private func rttP95Ms() -> UInt16 {
+    private func rttP95Ms() -> UInt16 { cachedRttP95Ms }
+
+    private func computeRttP95Ms() -> UInt16 {
         guard !rttSamplesMs.isEmpty else { return 0 }
         let sorted = rttSamplesMs.sorted()
         let index = min(
@@ -1814,6 +1819,7 @@ final class WifiMediaReceiver {
         if rttSamplesMs.count > 64 {
             rttSamplesMs.removeFirst(rttSamplesMs.count - 64)
         }
+        cachedRttP95Ms = computeRttP95Ms()
         rttObserver?(Double(milliseconds))
     }
 

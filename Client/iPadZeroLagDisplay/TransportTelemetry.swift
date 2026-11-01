@@ -540,6 +540,8 @@ final class TransportTelemetry {
     private var mailboxAge = RollingHistogram()
     private var presentation = RollingHistogram()
     private var rtt = RollingHistogram()
+    // Dimensions are built per packet; rtt only changes when a probe sample lands.
+    private var rttP95Cached: UInt16 = 0
     private var exportRtt = RollingHistogram(capacity: 4_096)
     private var exportReceive = RollingHistogram(capacity: 4_096)
     private var exportDecode = RollingHistogram(capacity: 4_096)
@@ -980,6 +982,7 @@ final class TransportTelemetry {
 
     private func recordRttLocked(durationMs: Double) {
         rtt.add(durationMs)
+        rttP95Cached = rtt.p95()
         exportRtt.add(durationMs)
         sessionRtt.add(durationMs)
     }
@@ -1230,6 +1233,7 @@ final class TransportTelemetry {
         mailboxAge.removeAll()
         presentation.removeAll()
         rtt.removeAll()
+        rttP95Cached = 0
         exportRtt.removeAll()
         exportReceive.removeAll()
         exportDecode.removeAll()
@@ -1428,7 +1432,7 @@ final class TransportTelemetry {
             packetCount: packetCount,
             bytes: bytes,
             lossCount: Int(clamping: totalDropped),
-            rttMilliseconds: Double(rtt.p95()),
+            rttMilliseconds: Double(rttP95Cached),
             routeKind: routeKind)
     }
 

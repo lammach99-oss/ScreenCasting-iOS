@@ -128,7 +128,10 @@ final class HevcRtpReassembler {
                     rttP95Ms: rttP95Ms,
                     isIDR: randomAccess))
         }
-        guard var frame = frames[packet.timestamp] else {
+        // Take the frame out so `frame.packets` is uniquely referenced: mutating a copy that the
+        // dictionary still shares would copy the whole packet map on every packet (O(n^2) per IDR).
+        // Every path below either reinserts it or drops it (drop removes it anyway).
+        guard var frame = frames.removeValue(forKey: packet.timestamp) else {
             enqueue(.malformed)
             return priorOutcome ?? drainOutcome()!
         }
@@ -139,6 +142,7 @@ final class HevcRtpReassembler {
             return priorOutcome ?? drainOutcome()!
         }
         if frame.packets[packet.sequence] != nil {
+            frames[packet.timestamp] = frame
             enqueue(.duplicate)
             return priorOutcome ?? drainOutcome()!
         }
