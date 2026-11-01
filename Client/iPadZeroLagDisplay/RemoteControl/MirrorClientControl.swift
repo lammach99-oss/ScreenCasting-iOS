@@ -27,7 +27,7 @@ public final class MirrorClientControl {
     }
     private var terminalSwitch:TerminalSwitch?
     public init() {}
-    private func synchronized<T>(_ body:()->T)->T { lock.lock();defer{lock.unlock()};return body() }
+    private func synchronized<T>(_ body:() throws->T) rethrows->T { lock.lock();defer{lock.unlock()};return try body() }
 
     public func beginSession(_ generation:UInt64) {
         synchronized {
