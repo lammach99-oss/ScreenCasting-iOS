@@ -16,6 +16,10 @@
 		300111111111111111111116 /* H264VideoConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200611111111111111111116 /* H264VideoConfiguration.swift */; };
 		300111111111111111111107 /* NetworkManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200711111111111111111107 /* NetworkManager.swift */; };
 		300111111111111111111108 /* PencilTouchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200911111111111111111109 /* PencilTouchView.swift */; };
+		FB2500000000000000000004 /* WireStreamParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000004 /* WireStreamParser.swift */; };
+		FB2500000000000000000003 /* DisplayConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000003 /* DisplayConfiguration.swift */; };
+		FB2500000000000000000002 /* TrustedHostSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000002 /* TrustedHostSettings.swift */; };
+		FB2500000000000000000001 /* WireCommands.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000001 /* WireCommands.swift */; };
 		300111111111111111111109 /* StreamManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201011111111111111111110 /* StreamManager.swift */; };
 		30011111111111111111110A /* DiscoveryManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201111111111111111111111 /* DiscoveryManager.swift */; };
 		30011111111111111111110B /* AudioManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201211111111111111111112 /* AudioManager.swift */; };
@@ -88,6 +92,10 @@
 		200611111111111111111116 /* H264VideoConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = H264VideoConfiguration.swift; sourceTree = "<group>"; };
 		200711111111111111111107 /* NetworkManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkManager.swift; sourceTree = "<group>"; };
 		200811111111111111111108 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		FB2400000000000000000004 /* WireStreamParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WireStreamParser.swift; sourceTree = "<group>"; };
+		FB2400000000000000000003 /* DisplayConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayConfiguration.swift; sourceTree = "<group>"; };
+		FB2400000000000000000002 /* TrustedHostSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrustedHostSettings.swift; sourceTree = "<group>"; };
+		FB2400000000000000000001 /* WireCommands.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WireCommands.swift; sourceTree = "<group>"; };
 		200911111111111111111109 /* PencilTouchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PencilTouchView.swift; sourceTree = "<group>"; };
 		201011111111111111111110 /* StreamManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamManager.swift; sourceTree = "<group>"; };
 		201111111111111111111111 /* DiscoveryManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiscoveryManager.swift; sourceTree = "<group>"; };
@@ -173,6 +181,10 @@
 				200611111111111111111106 /* DecoderManager.swift */,
 				200611111111111111111116 /* H264VideoConfiguration.swift */,
 				200711111111111111111107 /* NetworkManager.swift */,
+				FB2400000000000000000004 /* WireStreamParser.swift */,
+				FB2400000000000000000003 /* DisplayConfiguration.swift */,
+				FB2400000000000000000002 /* TrustedHostSettings.swift */,
+				FB2400000000000000000001 /* WireCommands.swift */,
 				FA2200000000000000000002 /* MirrorClientControl.swift */,
 				FA2200000000000000000001 /* MirrorControlProtocol.swift */,
 				D70211111111111111111105 /* TransferPanel.swift */,
@@ -344,6 +356,10 @@
 				300111111111111111111106 /* DecoderManager.swift in Sources */,
 				300111111111111111111116 /* H264VideoConfiguration.swift in Sources */,
 				300111111111111111111107 /* NetworkManager.swift in Sources */,
+				FB2500000000000000000004 /* WireStreamParser.swift in Sources */,
+				FB2500000000000000000003 /* DisplayConfiguration.swift in Sources */,
+				FB2500000000000000000002 /* TrustedHostSettings.swift in Sources */,
+				FB2500000000000000000001 /* WireCommands.swift in Sources */,
 				FA2300000000000000000002 /* MirrorClientControl.swift in Sources */,
 				FA2300000000000000000001 /* MirrorControlProtocol.swift in Sources */,
 				D70111111111111111111105 /* TransferPanel.swift in Sources */,
