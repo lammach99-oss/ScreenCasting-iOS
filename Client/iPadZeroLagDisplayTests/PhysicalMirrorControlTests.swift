@@ -639,6 +639,45 @@ final class PhysicalMirrorControlTests: XCTestCase {
             XCTAssertFalse(model.takeTerminalSwitch(nonce:93));XCTAssertNil(model.captureTicket())
         }
     }
+    func testUnretiredTerminalCancellationResumesCurrentSource() throws {
+        // Switch policy OFF: the Host revokes consent without retiring the requested epoch.
+        for abandon in 0..<3 {
+            let model=try terminalModel();_=model.beginTerminalSwitch(nonce:95)
+            _=try model.receiveState(session:7,data:state(3,1,1,.viewOnly,zero,100))
+            XCTAssertFalse(model.permitsVideoSequence(101))
+            switch abandon {
+            case 0: model.cancelTerminalSwitch()
+            case 1: XCTAssertEqual(model.suspendInput()?[1],3)
+            default: XCTAssertEqual(model.setForeground(false)?[1],3);model.setForeground(true)
+            }
+            XCTAssertTrue(model.permitsVideoSequence(101),"unretired source is still the current presentation: \(abandon)")
+            XCTAssertNil(model.captureTicket())
+        }
+        let model=try terminalModel();_=model.beginTerminalSwitch(nonce:95)
+        _=try model.receiveState(session:7,data:state(3,1,1,.viewOnly,zero,100))
+        model.cancelTerminalSwitch()
+        XCTAssertNotNil(model.observeRendered(session:7,sequence:101),"view-only source re-acknowledges its render")
+        XCTAssertTrue(model.hasPresentedCurrentSource)
+    }
+    func testDeadlineAfterTakenSwitchNeverFloorsHostOwnedSuccessor() throws {
+        let model=try terminalModel();_=model.beginTerminalSwitch(nonce:96)
+        try model.receiveTerminalAcknowledgement(session:7,data:terminalAck(96))
+        _=try model.receiveState(session:7,data:state(3,2,1,.unavailable,zero))
+        XCTAssertTrue(model.takeTerminalSwitch(nonce:96))
+        _=try model.receiveState(session:7,data:state(4,3,2,.awaitingPresentation,zero,200))
+        model.cancelTerminalSwitch() // Response deadline after the switch request was sent.
+        XCTAssertTrue(model.permitsVideoSequence(200),"successor media is the Host's to present")
+        XCTAssertNotNil(model.observeRendered(session:7,sequence:200))
+    }
+    func testCancelAfterHostRetirementStillFloorsRetiredEpoch() throws {
+        let model=try terminalModel();_=model.beginTerminalSwitch(nonce:97)
+        _=try model.receiveState(session:7,data:state(3,2,1,.unavailable,zero))
+        model.cancelTerminalSwitch()
+        XCTAssertFalse(model.permitsVideoSequence(100))
+        // The Host re-presents the retained source at a newer epoch.
+        _=try model.receiveState(session:7,data:state(4,3,2,.awaitingPresentation,zero,300))
+        XCTAssertTrue(model.permitsVideoSequence(300))
+    }
     func testTerminalBarrierCannotNegotiateFromLegacyOrChangedAdvertisement() throws {
         let model=self.model();_=try active(model)
         XCTAssertNil(model.beginTerminalSwitch(nonce:1))
