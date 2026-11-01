@@ -4283,9 +4283,12 @@ public class NetworkManager: ObservableObject {
         guard now - lastHudSnapshotPublishedAt >= 0.5 else { return }
         lastHudSnapshotPublishedAt = now
         let stages = transportTelemetry.hudSnapshot()
-        let snapshot = TransportHudSnapshot(frameReceiveMs: stages.frameReceiveMs,
+        publishHudSnapshot(TransportHudSnapshot(frameReceiveMs: stages.frameReceiveMs,
             decodeMs: stages.decodeMs,
-            videoRxMbps: videoRxSampler.sample(totalBytes: videoPayloadCounter.totalBytes, at: now))
+            videoRxMbps: videoRxSampler.sample(totalBytes: videoPayloadCounter.totalBytes, at: now)))
+    }
+    private func publishHudSnapshot(_ snapshot: TransportHudSnapshot) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
         let generation = connectionGeneration
         let mode = committedRealtimeMode
         DispatchQueue.main.async { [weak self] in
@@ -6448,6 +6451,14 @@ public class NetworkManager: ObservableObject {
 
     func stopForTesting() {
         networkQueue.sync { self.stopOnQueue() }
+    }
+
+    func publishHudSnapshotForTesting(_ snapshot: TransportHudSnapshot) {
+        networkQueue.sync { publishHudSnapshot(snapshot) }
+    }
+
+    func setCommittedRealtimeModeForTesting(_ mode: UInt8?) {
+        networkQueue.sync { committedRealtimeMode = mode }
     }
 
     func enqueueControlForTesting(

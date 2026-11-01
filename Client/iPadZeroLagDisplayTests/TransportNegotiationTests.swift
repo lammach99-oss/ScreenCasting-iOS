@@ -1755,6 +1755,32 @@ final class VideoThroughputV1Tests: XCTestCase {
         wait(for: [sampled], timeout: 2)
     }
 
+    func testExplicitStopCancelsWifiMediaReceiver() {
+        let manager = NetworkManager()
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        let receiver = manager.wifiMediaReceiverForTesting
+        manager.networkQueueForTesting.sync {
+            receiver.start(generation: session.generation) { _ in }
+        }
+        XCTAssertTrue(manager.networkQueueForTesting.sync { receiver.isListeningForTesting })
+        manager.stopForTesting()
+        XCTAssertFalse(manager.networkQueueForTesting.sync { receiver.isListeningForTesting },
+            "explicit Stop must not leave the Wi-Fi media listener, feedback timer or keys alive")
+    }
+
+    func testHudSnapshotFromRetiredModeIsNotPublishedAfterModeReturns() {
+        let manager = NetworkManager()
+        _ = manager.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.wifiRTP)
+        defer { manager.stopForTesting() }
+        let stale = TransportHudSnapshot(frameReceiveMs: 41, decodeMs: 42, videoRxMbps: 43)
+        // The main-thread apply is queued behind this test, so the mode can change A -> B -> A first.
+        manager.publishHudSnapshotForTesting(stale)
+        manager.setCommittedRealtimeModeForTesting(RealtimeTransportMode.legacyTLS)
+        manager.setCommittedRealtimeModeForTesting(RealtimeTransportMode.wifiRTP)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        XCTAssertNotEqual(manager.hudTelemetry, stale, "a snapshot from a retired mode epoch was applied")
+    }
+
     func testCommittedFallbackRearmsDecoderOnceWithoutReplacingSession() {
         let manager = NetworkManager()
         let session = manager.simulateCommittedWifiSessionForTesting()

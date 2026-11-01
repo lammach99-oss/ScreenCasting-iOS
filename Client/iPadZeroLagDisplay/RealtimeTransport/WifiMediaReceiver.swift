@@ -1294,6 +1294,11 @@ final class WifiMediaReceiver {
     }
 
     #if targetEnvironment(simulator)
+    var isListeningForTesting: Bool {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        return listener != nil
+    }
+
     func simulateActivePacketSequenceForTesting(_ sequence: UInt16, generation: UInt64) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         activeGeneration = generation
