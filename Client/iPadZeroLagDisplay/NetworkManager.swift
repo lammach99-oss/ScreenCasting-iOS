@@ -2172,7 +2172,11 @@ public class NetworkManager: ObservableObject {
     private var performanceFeedbackTimer: DispatchSourceTimer?
     private var performanceFeedbackSequence: UInt32 = 0
     private var adaptiveTelemetryTimer: DispatchSourceTimer?
-    private var committedRealtimeMode: UInt8?
+    private var committedRealtimeMode: UInt8? {
+        didSet { if oldValue != committedRealtimeMode { _ = realtimeModeClock.advance() } }
+    }
+    // Lock-protected epoch of committedRealtimeMode so main-thread closures never read the queue-owned value.
+    private let realtimeModeClock = ConnectionGenerationClock()
     private var committedTransportAudioAvailable = false
     private var committedRealtimeSessionID: SessionID?
     private var wifiLegacyFallbackGeneration: UInt64?
@@ -3113,6 +3117,12 @@ public class NetworkManager: ObservableObject {
         committedRealtimeMode = nil
         committedTransportAudioAvailable = false
         committedRealtimeSessionID = nil
+        // Mirror teardownCurrentSession: Stop must also retire the Wi-Fi media path.
+        connectionTimeoutWorkItem?.cancel()
+        connectionTimeoutWorkItem = nil
+        wifiLegacyFallbackGeneration = nil
+        wifiLegacyFallbackRequestGeneration = nil
+        wifiMediaReceiver.cancel()
         advertisedClientCapabilities = nil
         settingsSyncPolicy.reset()
         resetDisplaySession()
@@ -4290,11 +4300,11 @@ public class NetworkManager: ObservableObject {
     private func publishHudSnapshot(_ snapshot: TransportHudSnapshot) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         let generation = connectionGeneration
-        let mode = committedRealtimeMode
+        let modeEpoch = realtimeModeClock.current
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             guard self.connectionGeneration == generation,
-                  self.committedRealtimeMode == mode else { return }
+                  self.realtimeModeClock.current == modeEpoch else { return }
             self.hudTelemetry = snapshot
             self.lastFrameReceiveDurationMs = snapshot.frameReceiveMs
             self.lastDecodeLatencyMs = snapshot.decodeMs
