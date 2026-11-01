@@ -122,7 +122,7 @@ public final class MirrorClientControl {
             foreground=active
             guard !active else {return nil}
             revision &+= 1;ordinal=0;suspended=true
-            terminalSwitch=nil
+            abandonTerminalSwitch()
             guard let s=state,s.epoch>0,s.source>0 else {return nil}
             return Self.action(kind:3,epoch:s.epoch,source:s.source,sequence:0)
         }
@@ -130,7 +130,7 @@ public final class MirrorClientControl {
     public func suspendInput()->Data? {
         synchronized {
             revision &+= 1; ordinal=0; suspended=true
-            terminalSwitch=nil
+            abandonTerminalSwitch()
             guard let s=state,s.epoch>0,s.source>0 else {return nil}
             return Self.action(kind:3,epoch:s.epoch,source:s.source,sequence:0)
         }
@@ -195,12 +195,23 @@ public final class MirrorClientControl {
             terminalSwitch=nil;suspended=true;return true
         }
     }
+    /// Cancels only an unanswered request. After takeTerminalSwitch the Host owns the outcome (successor or
+    /// re-presentation at a newer epoch); flooring it here would reject that media for good.
     public func cancelTerminalSwitch() {
         synchronized {
-            terminalSwitch=nil;revision &+= 1;ordinal=0;suspended=true
-            if let s=state {transportFloor=s.epoch}
-            rendered=nil;acknowledgedEpoch=nil;lastAcknowledged=nil
+            guard terminalSwitch != nil else {return}
+            abandonTerminalSwitch()
+            revision &+= 1;ordinal=0;rendered=nil;acknowledgedEpoch=nil;lastAcknowledged=nil
+            // A retired or still-active token is never reused; a non-active unretired source may re-acknowledge.
+            suspended=transportFloor != nil || state?.mode == .active
         }
+    }
+    /// Caller holds the lock. Floors only an epoch the Host advanced past the request. Otherwise the requested
+    /// source was never retired (switch policy off, lost request) and remains the current presentation.
+    private func abandonTerminalSwitch() {
+        guard let pending=terminalSwitch else {return}
+        terminalSwitch=nil
+        if let s=state,s.epoch>pending.epoch {transportFloor=s.epoch} else {transportFloor=nil}
     }
     public func captureTicket()->MirrorInputTicket? {
         synchronized {
