@@ -52,6 +52,7 @@
 		700111111111111111111001 /* AudioJitterBuffer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 700211111111111111111001 /* AudioJitterBuffer.swift */; };
 		700111111111111111111002 /* AudioJitterBufferTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 700211111111111111111002 /* AudioJitterBufferTests.swift */; };
 		800111111111111111111001 /* THIRD-PARTY-NOTICES.txt in Resources */ = {isa = PBXBuildFile; fileRef = 800211111111111111111001 /* THIRD-PARTY-NOTICES.txt */; };
+		A00111111111111111111001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A00211111111111111111001 /* Assets.xcassets */; };
 		900111111111111111111001 /* SettingsFoundation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 900211111111111111111001 /* SettingsFoundation.swift */; };
 		900111111111111111111002 /* SettingsFoundationContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 900211111111111111111002 /* SettingsFoundationContractTests.swift */; };
 		901111111111111111111001 /* DisplayOrientationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 901211111111111111111001 /* DisplayOrientationTests.swift */; };
@@ -92,6 +93,7 @@
 		200611111111111111111116 /* H264VideoConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = H264VideoConfiguration.swift; sourceTree = "<group>"; };
 		200711111111111111111107 /* NetworkManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkManager.swift; sourceTree = "<group>"; };
 		200811111111111111111108 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A00211111111111111111001 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		FB2400000000000000000004 /* WireStreamParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WireStreamParser.swift; sourceTree = "<group>"; };
 		FB2400000000000000000003 /* DisplayConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayConfiguration.swift; sourceTree = "<group>"; };
 		FB2400000000000000000002 /* TrustedHostSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrustedHostSettings.swift; sourceTree = "<group>"; };
@@ -220,6 +222,7 @@
 				500211111111111111111008 /* OpenSSLCrypto.xcframework */,
 				500211111111111111111006 /* libopus.xcframework */,
 				800211111111111111111001 /* THIRD-PARTY-NOTICES.txt */,
+				A00211111111111111111001 /* Assets.xcassets */,
 				200811111111111111111108 /* Info.plist */,
 				111111111111111111111122 /* iPadCastingTests */,
 				111111111111111111111100 /* iPadCasting.app */,
@@ -331,6 +334,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				800111111111111111111001 /* THIRD-PARTY-NOTICES.txt in Resources */,
+				A00111111111111111111001 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -477,6 +481,7 @@
 		11111111111111111111110B /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGN_IDENTITY = "";
 				ENABLE_TESTABILITY = YES;
@@ -500,6 +505,7 @@
 		11111111111111111111110C /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGN_IDENTITY = "";
 				FRAMEWORK_SEARCH_PATHS = (

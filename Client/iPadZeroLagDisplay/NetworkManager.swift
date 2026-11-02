@@ -4940,7 +4940,17 @@ public class NetworkManager: ObservableObject {
     }
     public var mirrorTicketAtRegistration: MirrorInputTicket? { mirrorControl.captureTicket() }
     public var permitsLegacyVirtualInput: Bool { mirrorControl.allowsLegacyVirtualInput }
-    public func suspendMirrorInputForSettings() {
+    /// Settings over the stream pauses local input only; the Host keeps its attended grant.
+    public func setMirrorInputSettingsPresented(_ open: Bool) {
+        let generation = connectionGenerationClock.current
+        mirrorControl.setSettingsPresented(open)
+        networkQueue.async { [weak self] in
+            guard let self, generation == self.connectionGeneration else { return }
+            self.publishMirrorStateOnQueue()
+        }
+    }
+    /// Explicit Release control: revokes the Host grant.
+    public func releaseMirrorControl() {
         let generation = connectionGenerationClock.current
         let action = mirrorControl.suspendInput()
         networkQueue.async { [weak self] in

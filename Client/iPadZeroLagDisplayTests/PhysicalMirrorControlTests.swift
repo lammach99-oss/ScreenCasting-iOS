@@ -426,11 +426,67 @@ final class PhysicalMirrorControlTests: XCTestCase {
         _ = try model.receiveState(session: 7, data: state(3, 2, 2, .awaitingPresentation, zero, 200))
         XCTAssertThrowsError(try delayed()); XCTAssertNil(model.captureTicket())
     }
-    func testBackgroundReturnCannotReuseGrantedToken() throws {
+    func testBackgroundPauseKeepsHostGrantAndResumesWithFreshTicket() throws {
         let model = self.model(); let ticket = try active(model)
-        XCTAssertEqual(model.setForeground(false)?[1], 3)
-        _ = model.setForeground(true); XCTAssertNil(model.captureTicket())
-        XCTAssertThrowsError(try model.encodeInput(ticket: ticket, kind: .keyboard, payload: Data([1, 0, 65, 0])))
+        XCTAssertNoThrow(try model.encodeInput(ticket: ticket, kind: .keyboard, payload: Data([1, 0, 65, 0])))
+        XCTAssertNil(model.setForeground(false), "a local pause never revokes the attended Host grant")
+        XCTAssertNil(model.captureTicket())
+        XCTAssertThrowsError(try model.encodeInput(ticket: ticket, kind: .keyboard, payload: Data([1, 0, 66, 0])))
+        XCTAssertNil(model.setForeground(true))
+        let resumed = try XCTUnwrap(model.captureTicket(), "same Host token resumes without a new approval")
+        XCTAssertEqual(resumed.token, token); XCTAssertNotEqual(resumed.uiRevision, ticket.uiRevision)
+        XCTAssertThrowsError(try model.encodeInput(ticket: ticket, kind: .keyboard, payload: Data([1, 0, 66, 0])),
+            "callbacks bound before the pause stay retired")
+        let next = try MirrorControlCodec.decodeInput(model.encodeInput(ticket: resumed, kind: .keyboard, payload: Data([1, 0, 66, 0])))
+        XCTAssertEqual(next.sequence, 2, "ordinal continues: the Host never reset its input floor")
+    }
+    func testPauseStillDeliversHeldInputReleasesOnly() throws {
+        for pause in 0..<2 {
+            let model = self.model(); let ticket = try active(model)
+            _ = try model.encodeInput(ticket: ticket, kind: .keyboard, payload: Data([1, 0, 65, 0]))
+            if pause == 0 { model.setForeground(false) } else { model.setSettingsPresented(true) }
+            // Retired gestures emit their terminal records with the ticket they were bound to.
+            let releases: [(MirrorInputKind, Data)] = [
+                (.keyboard, Data([1, 1, 65, 0])),
+                (.pointer, Data([1, 3, 0, 0, 0, 0, 0, 0])),
+                (.directTouch, Data([1, 3, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])),
+                (.directTouch, Data([1, 2, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])),
+                (.pencil, Data([0x49, 0x54, 2, 0, 0, 0, 0, 0]))]
+            var sequence: UInt64 = 1
+            for (kind, payload) in releases {
+                let sent = try MirrorControlCodec.decodeInput(model.encodeInput(ticket: ticket, kind: kind, payload: payload))
+                XCTAssertGreaterThan(sent.sequence, sequence); sequence = sent.sequence
+            }
+            let blocked: [(MirrorInputKind, Data)] = [
+                (.keyboard, Data([1, 0, 65, 0])),
+                (.pointer, Data([1, 0, 0, 0, 0, 0, 0, 0])),
+                (.pointer, Data([1, 2, 0, 0, 0, 0, 0, 0])),
+                (.directTouch, Data([1, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])),
+                (.pencil, Data([0x49, 0x54, 1, 0, 0, 0, 0, 0])),
+                (.text, Data([1, 1, 0, 65]))]
+            for (kind, payload) in blocked {
+                XCTAssertThrowsError(try model.encodeInput(ticket: ticket, kind: kind, payload: payload), "pause \(pause) \(kind)")
+            }
+        }
+    }
+    func testSettingsPauseKeepsGrantButExplicitReleaseStillRevokes() throws {
+        let model = self.model(); let ticket = try active(model)
+        model.setSettingsPresented(true); XCTAssertNil(model.captureTicket())
+        model.setSettingsPresented(false)
+        let resumed = try XCTUnwrap(model.captureTicket()); XCTAssertEqual(resumed.token, token)
+        model.setSettingsPresented(true)
+        XCTAssertEqual(model.suspendInput()?[1], 3, "the Release control button is an explicit revoke")
+        model.setSettingsPresented(false); XCTAssertNil(model.captureTicket())
+        XCTAssertThrowsError(try model.encodeInput(ticket: ticket, kind: .keyboard, payload: Data([1, 1, 65, 0])),
+            "after a revoke the Host already retired held input")
+    }
+    func testSettingsPauseDoesNotAbandonMonitorSwitch() throws {
+        let model = try terminalModel(); model.setSettingsPresented(true) // the catalogue lives in Settings
+        XCTAssertNotNil(model.beginTerminalSwitch(nonce: 98))
+        model.setSettingsPresented(false)
+        try model.receiveTerminalAcknowledgement(session: 7, data: terminalAck(98))
+        _ = try model.receiveState(session: 7, data: state(3, 2, 1, .unavailable, zero))
+        XCTAssertTrue(model.takeTerminalSwitch(nonce: 98), "closing Settings is not a switch cancellation")
     }
     func testSettingsSuspensionRetiresModelScopeWithoutGrantingRequest() throws {
         let model = self.model(); let ticket = try active(model)
