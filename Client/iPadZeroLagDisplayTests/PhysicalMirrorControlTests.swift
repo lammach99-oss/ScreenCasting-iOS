@@ -539,6 +539,61 @@ final class PhysicalMirrorControlTests: XCTestCase {
         b += [1,0,0,0,0,0,0,0,7,0] + Array("Panel A".utf8)
         return Data(b)
     }
+    private func catalogue(selected:UInt64,allowed:Bool,_ monitors:[(UInt64,String)])throws->MirrorMonitorCatalogue {
+        var b=[UInt8](repeating:0,count:20);b[0]=1;b[1]=allowed ? 1:0
+        MirrorControlCodec.put(UInt64(monitors.count),&b,2,2);MirrorControlCodec.put(9,&b,4,8);MirrorControlCodec.put(selected,&b,12,8)
+        for (id,label) in monitors {
+            var row=[UInt8](repeating:0,count:10);MirrorControlCodec.put(id,&row,0,8)
+            MirrorControlCodec.put(UInt64(label.utf8.count),&row,8,2);b += row+Array(label.utf8)
+        }
+        return try MirrorMonitorCatalogue.decode(Data(b))
+    }
+    func testScreenPickerActionsRequireAdvertisedCapability() throws {
+        let legacy=try terminalModel()
+        XCTAssertFalse(legacy.supportsScreenPicker)
+        XCTAssertNil(legacy.screenListRequest());XCTAssertNil(legacy.switchPermissionRequest())
+        let model=MirrorClientControl();model.beginSession(7)
+        XCTAssertEqual(model.helloIfAdvertised(session:7,flags:0x7800),Data([1,0,0,0,7,0,0,0]),"picker does not change the hello")
+        XCTAssertNil(model.screenListRequest(),"no source to name yet")
+        _=try active(model)
+        XCTAssertTrue(model.supportsScreenPicker)
+        let list=Array(try XCTUnwrap(model.screenListRequest())),ask=Array(try XCTUnwrap(model.switchPermissionRequest()))
+        XCTAssertEqual(list.count,32);XCTAssertEqual(Array(list[0..<4]),[1,7,0,0])
+        XCTAssertEqual(MirrorControlCodec.read(list,4,8),1);XCTAssertEqual(MirrorControlCodec.read(list,12,8),1)
+        XCTAssertEqual(MirrorControlCodec.read(list,20,4),0);XCTAssertEqual(MirrorControlCodec.read(list,24,8),0)
+        XCTAssertEqual(Array(ask[0..<4]),[1,8,0,0])
+        XCTAssertNotNil(model.captureTicket(),"asking for the list or for permission never retires input")
+        model.beginSession(8);XCTAssertFalse(model.supportsScreenPicker,"capability belongs to one connection")
+    }
+    func testScreenPickerSnapshotStates() throws {
+        let active=try MirrorControlCodec.decodeState(state(2,1,1,.active,token,100))
+        let viewOnly=try MirrorControlCodec.decodeState(state(2,1,1,.viewOnly,zero,100))
+        let loading=ScreenPickerSnapshot.make(catalogue:nil,state:viewOnly,switchingTo:nil,switchPending:false,
+            pickerSupported:true,permissionAsked:false)
+        XCTAssertEqual(loading.phase,.loading);XCTAssertTrue(loading.tiles.isEmpty);XCTAssertEqual(loading.control,.viewOnly)
+        let two=[(UInt64(1),"Built-in display"),(UInt64(2),"VX2758-2K-PRO")]
+        let locked=ScreenPickerSnapshot.make(catalogue:try catalogue(selected:1,allowed:false,two),state:active,switchingTo:nil,
+            switchPending:false,pickerSupported:true,permissionAsked:false)
+        XCTAssertEqual(locked.phase,.locked);XCTAssertTrue(locked.canAskPermission);XCTAssertEqual(locked.control,.on)
+        XCTAssertEqual(locked.tiles.map(\.status),[.showing,.locked]);XCTAssertEqual(locked.tiles.map(\.isBuiltIn),[true,false])
+        XCTAssertEqual(locked.currentLabel,"Built-in display")
+        XCTAssertFalse(ScreenPickerSnapshot.make(catalogue:try catalogue(selected:1,allowed:false,two),state:active,switchingTo:nil,
+            switchPending:false,pickerSupported:true,permissionAsked:true).canAskPermission,"one ask until the Host decides")
+        XCTAssertFalse(ScreenPickerSnapshot.make(catalogue:try catalogue(selected:1,allowed:false,two),state:active,switchingTo:nil,
+            switchPending:false,pickerSupported:false,permissionAsked:false).canAskPermission,"an older Host cannot be asked")
+        let ready=ScreenPickerSnapshot.make(catalogue:try catalogue(selected:1,allowed:true,two),state:active,switchingTo:nil,
+            switchPending:false,pickerSupported:true,permissionAsked:false)
+        XCTAssertEqual(ready.phase,.ready);XCTAssertEqual(ready.tiles.map(\.status),[.showing,.available]);XCTAssertFalse(ready.canAskPermission)
+        let switching=ScreenPickerSnapshot.make(catalogue:try catalogue(selected:1,allowed:true,two),state:active,switchingTo:2,
+            switchPending:true,pickerSupported:true,permissionAsked:false)
+        XCTAssertEqual(switching.tiles.map(\.status),[.showing,.switching]);XCTAssertTrue(switching.isSwitching)
+        let three=two+[(UInt64(3),"DELL U2720Q")]
+        let busy=ScreenPickerSnapshot.make(catalogue:try catalogue(selected:1,allowed:true,three),state:active,switchingTo:2,
+            switchPending:true,pickerSupported:true,permissionAsked:false)
+        XCTAssertEqual(busy.tiles.map(\.status),[.showing,.switching,.locked],"one switch at a time")
+        XCTAssertEqual(ScreenPickerSnapshot.make(catalogue:nil,state:nil,switchingTo:nil,switchPending:false,
+            pickerSupported:true,permissionAsked:false).control,.unavailable)
+    }
     func testMonitorSelectionRequiresSeparatelyAdvertisedCapability() {
         let model=MirrorClientControl();model.beginSession(7)
         XCTAssertEqual(model.helloIfAdvertised(session:7,flags:0x6000),Data([1,0,0,0,3,0,0,0]))
