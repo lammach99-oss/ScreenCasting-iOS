@@ -268,7 +268,7 @@ public final class ConnectedPresentationContainer: UIView {
     let keyboardButton = UIButton(type: .system)
     let keyboardHintLabel = KeyboardHintLabel()
     /// iPadOS keeps the keyboard hidden while it expects Pencil handwriting (Scribble).
-    var pencilInputExpected: @MainActor () -> Bool ={ UIScribbleInteraction.isPencilInputExpected }
+    var pencilInputExpected: @MainActor () -> Bool = { UIScribbleInteraction.isPencilInputExpected }
     var keyboardWithheldDelay: TimeInterval = 0.6
     private(set) var softwareKeyboardWithheld = false
     private static let maximumWithheldRetries = 2
