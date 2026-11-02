@@ -175,9 +175,46 @@ enum FloatingKeyboardPlacement {
 }
 /// What tapped the floating keyboard button; iPadOS treats a Pencil tap as handwriting intent.
 enum KeyboardTapSource: String {
-    case pencil, finger, unknown
+    case pencil, finger, pointer, unknown
     init(touchType: UITouch.TouchType?) {
-        self = .unknown
+        switch touchType {
+        case .some(.pencil): self = .pencil
+        case .some(.direct): self = .finger
+        case .some(.indirectPointer): self = .pointer
+        default: self = .unknown
+        }
+    }
+}
+
+/// Explains a keyboard that iPadOS withheld; sits above the keyboard button and takes no touches.
+final class KeyboardHintLabel: UILabel {
+    static let pencilText = "Apple Pencil is set for handwriting, so iPad hid the keyboard. " +
+        "Tap the keyboard button with your finger, or turn off Scribble in Settings › Apple Pencil."
+    private let insets = UIEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isHidden = true
+        isUserInteractionEnabled = false
+        numberOfLines = 0
+        font = .preferredFont(forTextStyle: .footnote)
+        adjustsFontForContentSizeCategory = true
+        textColor = .white
+        backgroundColor = UIColor.black.withAlphaComponent(0.78)
+        layer.cornerRadius = 12
+        clipsToBounds = true
+    }
+    required init?(coder: NSCoder) { nil }
+    override func drawText(in rect: CGRect) { super.drawText(in: rect.inset(by: insets)) }
+    override func sizeThatFits(_ size: CGSize) -> CGSize {
+        let inner = super.sizeThatFits(CGSize(width: size.width - insets.left - insets.right, height: size.height))
+        return CGSize(width: inner.width + insets.left + insets.right, height: inner.height + insets.top + insets.bottom)
+    }
+    func frame(above button: CGRect, bounds: CGRect, safeArea: UIEdgeInsets) -> CGRect {
+        let margin: CGFloat = 12
+        let size = sizeThatFits(CGSize(width: max(120, min(360, bounds.width - 2 * margin)), height: .greatestFiniteMagnitude))
+        return CGRect(x: max(bounds.minX + safeArea.left + margin, button.maxX - size.width),
+                      y: max(bounds.minY + safeArea.top + margin, button.minY - 8 - size.height),
+                      width: size.width, height: size.height)
     }
 }
 
@@ -229,10 +266,16 @@ public final class ConnectedPresentationContainer: UIView {
     let softwareTextView = RemoteSoftwareKeyboardTextView(frame: .zero, textContainer: nil)
     private var clientCursor = ClientCursorState()
     let keyboardButton = UIButton(type: .system)
-    let keyboardHintLabel = UILabel()
-    var pencilInputExpected: () -> Bool = { UIScribbleInteraction.isPencilInputExpected }
+    let keyboardHintLabel = KeyboardHintLabel()
+    /// iPadOS keeps the keyboard hidden while it expects Pencil handwriting (Scribble).
+    var pencilInputExpected: @MainActor () -> Bool ={ UIScribbleInteraction.isPencilInputExpected }
     var keyboardWithheldDelay: TimeInterval = 0.6
     private(set) var softwareKeyboardWithheld = false
+    private static let maximumWithheldRetries = 2
+    private var withheldRetries = 0
+    private var withheldCheckTask: Task<Void, Never>?
+    private var hintTask: Task<Void, Never>?
+    private var lastKeyboardTapSource = KeyboardTapSource.unknown
     private let hardwareMonitor = HardwareKeyboardMonitor()
     private var keyboardObservers: [NSObjectProtocol] = []
     private var fadeTask: Task<Void, Never>?
@@ -267,7 +310,7 @@ public final class ConnectedPresentationContainer: UIView {
         keyboardButton.tintColor = .white
         keyboardButton.layer.cornerRadius = 12
         keyboardButton.accessibilityLabel = "Software keyboard"
-        keyboardButton.addTarget(self, action: #selector(toggleSoftwareKeyboard), for: .touchUpInside)
+        keyboardButton.addTarget(self, action: #selector(toggleSoftwareKeyboard(_:forEvent:)), for: .touchUpInside)
         keyboardButton.isHidden = true
         softwareTextView.onEmission = { [weak self] emission in
             guard let self, self.keyboardMode == .softwareOpen, self.softwareTextView.deliveryEnabled else { return }
@@ -313,6 +356,7 @@ public final class ConnectedPresentationContainer: UIView {
         // UIButton owns only its 48pt target, above the unchanged remote touch surface.
         bringSubviewToFront(softwareTextView)
         addSubview(keyboardButton)
+        addSubview(keyboardHintLabel)
         NSLayoutConstraint.activate([
             metalView.leadingAnchor.constraint(equalTo: leadingAnchor),
             metalView.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -339,6 +383,9 @@ public final class ConnectedPresentationContainer: UIView {
     override public func layoutSubviews() {
         super.layoutSubviews()
         keyboardButton.frame = FloatingKeyboardPlacement.frame(bounds: bounds, safeArea: safeAreaInsets, keyboard: keyboardFrame)
+        if !keyboardHintLabel.isHidden {
+            keyboardHintLabel.frame = keyboardHintLabel.frame(above: keyboardButton.frame, bounds: bounds, safeArea: safeAreaInsets)
+        }
 
         let scale = window?.screen.scale ?? traitCollection.displayScale
         guard scale > 0 else { return }
@@ -416,6 +463,7 @@ public final class ConnectedPresentationContainer: UIView {
             softwareRequested = false
             keyboardFrame = nil
             softwareTextView.deactivateAndDiscardComposition()
+            clearSoftwareKeyboardWithheld()
             setNeedsLayout()
         }
         keyboardButton.isHidden = mode == .none
@@ -434,14 +482,22 @@ public final class ConnectedPresentationContainer: UIView {
         }
     }
     fileprivate func recordKeyboardAuthority(reason: String, previousMode: RemoteKeyboardMode? = nil) {
-        let line = "[KEYBOARD_AUTHORITY] reason=\(reason) gc_keyboard_present=\(GCKeyboard.coalesced != nil ? 1 : 0) hardware_monitor=\(hardwareMonitor.isConnected ? 1 : 0) keyboard_active=\(keyboardActive ? 1 : 0) software_requested=\(softwareRequested ? 1 : 0) native_keyboard_visible=\(softwareNativeVisible ? 1 : 0) native_keyboard_suppressed=\(softwareNativeSuppressed ? 1 : 0) keyboard_frame=\(keyboardFrame.map { String(describing: $0) } ?? "none") show_attempt=\(softwareShowAttempts) old_mode=\(previousMode ?? keyboardMode) new_mode=\(keyboardMode) software_first_responder=\(softwareTextView.isFirstResponder ? 1 : 0) responder_result=\(lastSoftwareResponderResult.map { $0 ? "success" : "failure" } ?? "not_attempted") keyboard_button_hidden=\(keyboardButton.isHidden ? 1 : 0)"
+        let line = "[KEYBOARD_AUTHORITY] reason=\(reason) gc_keyboard_present=\(GCKeyboard.coalesced != nil ? 1 : 0) hardware_monitor=\(hardwareMonitor.isConnected ? 1 : 0) keyboard_active=\(keyboardActive ? 1 : 0) software_requested=\(softwareRequested ? 1 : 0) native_keyboard_visible=\(softwareNativeVisible ? 1 : 0) native_keyboard_suppressed=\(softwareNativeSuppressed ? 1 : 0) keyboard_frame=\(keyboardFrame.map { String(describing: $0) } ?? "none") show_attempt=\(softwareShowAttempts) old_mode=\(previousMode ?? keyboardMode) new_mode=\(keyboardMode) software_first_responder=\(softwareTextView.isFirstResponder ? 1 : 0) responder_result=\(lastSoftwareResponderResult.map { $0 ? "success" : "failure" } ?? "not_attempted") keyboard_button_hidden=\(keyboardButton.isHidden ? 1 : 0) keyboard_tap=\(lastKeyboardTapSource.rawValue) pencil_expected=\(pencilInputExpected() ? 1 : 0) keyboard_withheld=\(softwareKeyboardWithheld ? 1 : 0)"
         guard line != lastKeyboardAuthorityDiagnostic else { return }
         lastKeyboardAuthorityDiagnostic = line
         touchView.diagnosticSink?(line)
     }
-    @objc private func toggleSoftwareKeyboard() {
+    @objc private func toggleSoftwareKeyboard(_ sender: UIButton, forEvent event: UIEvent?) {
+        lastKeyboardTapSource = KeyboardTapSource(touchType: event?.allTouches?.first?.type)
         guard keyboardMode != .none else {
             recordKeyboardAuthority(reason: "software_toggle_blocked")
+            return
+        }
+        // A withheld keyboard was never seen, so the tap means "try again", not "close".
+        if softwareRequested && softwareKeyboardWithheld && withheldRetries < Self.maximumWithheldRetries {
+            withheldRetries += 1
+            retryWithheldSoftwareKeyboard()
+            restartKeyboardFade()
             return
         }
         softwareRequested = !softwareRequested
@@ -457,8 +513,63 @@ public final class ConnectedPresentationContainer: UIView {
             lastSoftwareResponderResult = acquired
             reconcileKeyboardResponderOwnershipAfterSoftwareShowAttempt(softwareResponderAcquired: acquired)
             recordKeyboardAuthority(reason: acquired ? "native_show_request" : "native_show_request_failed")
+            if acquired { scheduleWithheldCheck() }
         }
         restartKeyboardFade()
+    }
+    private func retryWithheldSoftwareKeyboard() {
+        softwareShowAttempts += 1
+        softwareNativeSuppressed = false
+        softwareKeyboardWithheld = false
+        hideKeyboardHint()
+        softwareTextView.reloadInputViews()
+        let acquired = softwareTextView.isFirstResponder
+            ? softwareTextView.recyclePreservingComposition { self.acquireSoftwareKeyboardResponder() }
+            : acquireSoftwareKeyboardResponder()
+        lastSoftwareResponderResult = acquired
+        reconcileKeyboardResponderOwnershipAfterSoftwareShowAttempt(softwareResponderAcquired: acquired)
+        recordKeyboardAuthority(reason: acquired ? "native_show_retry" : "native_show_retry_failed")
+        if acquired { scheduleWithheldCheck() }
+    }
+    /// The responder was taken but iPadOS may still not show the keyboard; look again shortly.
+    private func scheduleWithheldCheck() {
+        withheldCheckTask?.cancel()
+        let attempt = softwareShowAttempts
+        let generation = keyboardGeneration
+        let delay = UInt64(max(0, keyboardWithheldDelay) * 1_000_000_000)
+        withheldCheckTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: delay)
+            guard !Task.isCancelled, let self, self.softwareShowAttempts == attempt,
+                  self.keyboardGeneration == generation, self.keyboardMode == .softwareOpen,
+                  self.softwareRequested, !self.softwareNativeVisible else { return }
+            if self.pencilInputExpected() || self.lastKeyboardTapSource == .pencil {
+                self.softwareKeyboardWithheld = true
+                self.showKeyboardHint(KeyboardHintLabel.pencilText)
+            }
+            self.recordKeyboardAuthority(reason: "native_keyboard_withheld")
+        }
+    }
+    private func showKeyboardHint(_ text: String) {
+        keyboardHintLabel.text = text
+        keyboardHintLabel.isHidden = false
+        setNeedsLayout()
+        UIAccessibility.post(notification: .announcement, argument: text)
+        hintTask?.cancel()
+        hintTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.hideKeyboardHint()
+        }
+    }
+    private func hideKeyboardHint() {
+        hintTask?.cancel(); hintTask = nil
+        keyboardHintLabel.isHidden = true
+    }
+    private func clearSoftwareKeyboardWithheld() {
+        withheldCheckTask?.cancel(); withheldCheckTask = nil
+        softwareKeyboardWithheld = false
+        withheldRetries = 0
+        hideKeyboardHint()
     }
     private func acquireSoftwareKeyboardResponder() -> Bool {
         #if targetEnvironment(simulator)
@@ -544,12 +655,15 @@ public final class ConnectedPresentationContainer: UIView {
                 softwareKeyboardHideInProgress = false
                 softwareKeyboardRecoveryAttemptedForHide = false
                 softwareNativeSuppressed = false
+                clearSoftwareKeyboardWithheld()
             }
         }
         setNeedsLayout()
     }
     deinit {
         fadeTask?.cancel()
+        withheldCheckTask?.cancel()
+        hintTask?.cancel()
         keyboardObservers.forEach(NotificationCenter.default.removeObserver)
     }
 
