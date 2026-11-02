@@ -55,7 +55,7 @@ public struct SettingsView: View {
                                     Label("Physical monitor", systemImage: "display")
                                     Text(physical.mode == .active ? "Remote control allowed for this source" : "View only · Host approval required")
                                     Button("Request Host control approval") { networkManager.requestMirrorControl() }
-                                    Button("Release control") { networkManager.suspendMirrorInputForSettings() }
+                                    Button("Release control") { networkManager.releaseMirrorControl() }
                                     if networkManager.mirrorMonitorSwitchPending {
                                         Text("Monitor request pending. Waiting for a presented source.")
                                     }
