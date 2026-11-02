@@ -173,6 +173,14 @@ enum FloatingKeyboardPlacement {
         return frame
     }
 }
+/// What tapped the floating keyboard button; iPadOS treats a Pencil tap as handwriting intent.
+enum KeyboardTapSource: String {
+    case pencil, finger, unknown
+    init(touchType: UITouch.TouchType?) {
+        self = .unknown
+    }
+}
+
 @MainActor final class HardwareKeyboardMonitor {
     private(set) var isConnected = false
     private let candidatePresence: () -> Bool
@@ -221,6 +229,10 @@ public final class ConnectedPresentationContainer: UIView {
     let softwareTextView = RemoteSoftwareKeyboardTextView(frame: .zero, textContainer: nil)
     private var clientCursor = ClientCursorState()
     let keyboardButton = UIButton(type: .system)
+    let keyboardHintLabel = UILabel()
+    var pencilInputExpected: () -> Bool = { UIScribbleInteraction.isPencilInputExpected }
+    var keyboardWithheldDelay: TimeInterval = 0.6
+    private(set) var softwareKeyboardWithheld = false
     private let hardwareMonitor = HardwareKeyboardMonitor()
     private var keyboardObservers: [NSObjectProtocol] = []
     private var fadeTask: Task<Void, Never>?

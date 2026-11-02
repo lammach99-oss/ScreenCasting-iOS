@@ -72,6 +72,7 @@
 		FA2300000000000000000001 /* MirrorControlProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000001 /* MirrorControlProtocol.swift */; };
 		FA2300000000000000000002 /* MirrorClientControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000002 /* MirrorClientControl.swift */; };
 		FA2300000000000000000003 /* PhysicalMirrorControlTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000003 /* PhysicalMirrorControlTests.swift */; };
+		FA2300000000000000000004 /* PencilKeyboardTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000004 /* PencilKeyboardTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -153,6 +154,7 @@
 		FA2200000000000000000001 /* MirrorControlProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/MirrorControlProtocol.swift; sourceTree = "<group>"; };
 		FA2200000000000000000002 /* MirrorClientControl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/MirrorClientControl.swift; sourceTree = "<group>"; };
 		FA2200000000000000000003 /* PhysicalMirrorControlTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhysicalMirrorControlTests.swift; sourceTree = "<group>"; };
+		FA2200000000000000000004 /* PencilKeyboardTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PencilKeyboardTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -240,6 +242,7 @@
 			isa = PBXGroup;
 			children = (
 				FA2200000000000000000003 /* PhysicalMirrorControlTests.swift */,
+				FA2200000000000000000004 /* PencilKeyboardTests.swift */,
 				201711111111111111111117 /* WireProtocolTests.swift */,
 				D70211111111111111111104 /* DataTransferTests.swift */,
 				D70211111111111111111108,
@@ -411,6 +414,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				FA2300000000000000000003 /* PhysicalMirrorControlTests.swift in Sources */,
+				FA2300000000000000000004 /* PencilKeyboardTests.swift in Sources */,
 				300111111111111111111110 /* WireProtocolTests.swift in Sources */,
 				D70111111111111111111104 /* DataTransferTests.swift in Sources */,
 				D70111111111111111111108,
