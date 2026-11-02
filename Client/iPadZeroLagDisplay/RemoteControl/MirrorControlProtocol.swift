@@ -72,6 +72,8 @@ public struct MirrorMonitorCatalogue: Equatable {
 public enum MirrorControlCodec {
     public static let helloType:UInt8=51, stateType:UInt8=52, inputType:UInt8=53, actionType:UInt8=54
     public static let advertisementFlag:UInt16=0x4000
+    /// Host accepts action 7 (resend screen list) and 8 (ask to allow monitor switching).
+    public static let screenPickerFlag:UInt16=0x0800
     public static let stateBytes=96, inputHeaderBytes=48, maxPayloadBytes=4099
     static func read(_ b:[UInt8],_ p:Int,_ n:Int)->UInt64 {
         var value:UInt64=0

@@ -343,6 +343,7 @@ public class NetworkManager: ObservableObject {
     @Published public private(set) var mirrorControlState: MirrorControlState?
     @Published public private(set) var mirrorMonitorCatalogue: MirrorMonitorCatalogue?
     @Published public private(set) var mirrorMonitorSwitchPending=false
+    @Published public private(set) var mirrorScreenPickerSupported=false
     private var currentMirrorCatalogue: MirrorMonitorCatalogue?
     private var mirrorCatalogueSource: (epoch:UInt64,source:UInt64)?
     private var lastMirrorCatalogueRevision:UInt64=0
@@ -4932,10 +4933,25 @@ public class NetworkManager: ObservableObject {
             if catalogue != nil {mirrorSwitchPending=false;mirrorSwitchAttempt=nil;mirrorSwitchDeadlineToken=nil}
         } else {catalogue=nil}
         let pending=mirrorSwitchPending
+        let picker=mirrorControl.supportsScreenPicker
         DispatchQueue.main.async { [weak self] in
             guard let self, self.connectionGenerationClock.current == generation else { return }
             self.mirrorControlState = state; self.mirrorInputRevision = revision
             self.mirrorMonitorCatalogue=catalogue;self.mirrorMonitorSwitchPending=pending
+            self.mirrorScreenPickerSupported=picker
+        }
+    }
+    /// Screen picker opened: ask the Host for a fresh list (the stored one goes stale after 30 s).
+    public func refreshMirrorScreens() { sendScreenPickerAction { $0.screenListRequest() } }
+    /// Ask the attended Host to allow monitor switching. The Host shows a notice; nothing is granted here.
+    public func requestMirrorSwitchPermission() { sendScreenPickerAction { $0.switchPermissionRequest() } }
+    private func sendScreenPickerAction(_ make: @escaping (MirrorClientControl) -> Data?) {
+        let generation = connectionGenerationClock.current
+        networkQueue.async { [weak self] in
+            guard let self, generation == self.connectionGeneration,
+                  self.wireAuthenticatedGeneration == generation,
+                  let action = make(self.mirrorControl) else { return }
+            self.sendWireMessage(type: .mirrorAction, payload: action, sequence: 0)
         }
     }
     public var mirrorTicketAtRegistration: MirrorInputTicket? { mirrorControl.captureTicket() }

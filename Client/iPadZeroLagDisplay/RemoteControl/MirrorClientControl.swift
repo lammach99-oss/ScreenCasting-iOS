@@ -21,6 +21,7 @@ public final class MirrorClientControl {
     private var lastAcknowledged:UInt32?
     private var transportFloor:UInt64?
     private var terminalCapable=false
+    private var screenPickerCapable=false
     private struct TerminalSwitch {
         let nonce:UInt64, epoch:UInt64, source:UInt64
         var retiredEpoch:UInt64?
@@ -33,7 +34,7 @@ public final class MirrorClientControl {
         synchronized {
             session=generation;revision &+= 1;ordinal=0;advertised=false;helloSent=false
             state=nil;rendered=nil;acknowledgedEpoch=nil;lastAcknowledged=nil;suspended=false;transportFloor=nil;settingsOpen=false
-            terminalCapable=false;terminalSwitch=nil
+            terminalCapable=false;terminalSwitch=nil;screenPickerCapable=false
         }
     }
     public func endSession() {beginSession(0)}
@@ -45,6 +46,7 @@ public final class MirrorClientControl {
             guard !helloSent else {return nil}
             helloSent=true
             terminalCapable=(flags & 0x7000)==0x7000
+            screenPickerCapable=flags & MirrorControlCodec.screenPickerFlag != 0
             return Data([1,0,0,0,terminalCapable ? 7:(flags & 0x2000 != 0 ? 3:1),0,0,0])
         }
     }
@@ -170,6 +172,17 @@ public final class MirrorClientControl {
         }
     }
     public var supportsTerminalSwitch:Bool {synchronized{terminalCapable}}
+    public var supportsScreenPicker:Bool {synchronized{advertised && screenPickerCapable}}
+    /// Asks the Host to resend its screen list. Grants nothing and never touches input.
+    public func screenListRequest()->Data? {pickerAction(kind:7)}
+    /// Asks the attended Host to allow monitor switching. The Host decides; nothing changes here.
+    public func switchPermissionRequest()->Data? {pickerAction(kind:8)}
+    private func pickerAction(kind:UInt8)->Data? {
+        synchronized {
+            guard advertised,screenPickerCapable,let s=state,s.epoch>0,s.source>0 else {return nil}
+            return Self.action(kind:kind,epoch:s.epoch,source:s.source,sequence:0)
+        }
+    }
     public func beginTerminalSwitch(nonce:UInt64)->Data? {
         synchronized {
             guard terminalCapable,terminalSwitch == nil,nonce != 0,transportFloor == nil,

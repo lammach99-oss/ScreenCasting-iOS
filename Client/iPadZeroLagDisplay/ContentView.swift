@@ -581,7 +581,11 @@ public struct ContentView: View {
     @ViewBuilder
     private var foregroundLayer: some View {
         if streamManager.isConnected {
-            streamingHUD
+            ZStack {
+                streamingHUD
+                // Only while mirroring a physical monitor; renders nothing otherwise.
+                ScreenPickerOverlay(networkManager: networkManager)
+            }
         } else {
             disconnectedDashboard
         }
