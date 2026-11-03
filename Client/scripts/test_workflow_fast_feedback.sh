@@ -9,6 +9,7 @@ require_text() { grep -Fq "$1" "$WORKFLOW" || fail "workflow text missing: $1"; 
 job_block() {
   local job="$1"
   awk -v job="$job" '
+    { sub(/\r$/, "") }  # the workflow may be stored with CRLF line endings
     $0 == "  " job ":" { in_job = 1; next }
     in_job && $0 ~ /^  [A-Za-z0-9_-]+:/ { exit }
     in_job { print }
@@ -17,6 +18,7 @@ job_block() {
 step_block() {
   local step="$1"
   awk -v step="$step" '
+    { sub(/\r$/, "") }
     $0 == "      - name: " step { in_step = 1; next }
     in_step && $0 ~ /^      - name:/ { exit }
     in_step { print }
