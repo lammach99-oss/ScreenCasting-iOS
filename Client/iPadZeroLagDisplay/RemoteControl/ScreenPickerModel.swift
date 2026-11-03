@@ -79,15 +79,20 @@ public struct SessionPanelSnapshot: Equatable {
 }
 
 public extension SessionPanelSnapshot {
-    /// The PC to name in the pill. RED stub.
-    static func sessionHost(current: String, lastWifi: String, usb: Bool) -> String { current }
+    /// The PC to name in the pill. A Wi-Fi session started by auto-reconnect has no fresh label, so it falls back to
+    /// the last Wi-Fi PC; a USB-C session never does, since that PC may be a different one.
+    static func sessionHost(current: String, lastWifi: String, usb: Bool) -> String {
+        current.isEmpty && !usb ? lastWifi : current
+    }
 }
 
-/// Full pill, or a slim handle that keeps the top of the PC picture clear. RED stub.
+/// Full pill, or a slim handle that keeps the top of the PC picture clear once the iPad is left alone.
 public enum SessionPillPresentation: Equatable {
     case full, handle
     public static let idleDelay: TimeInterval = 3
-    public static func make(isOpen: Bool, idleFor: TimeInterval, reconnecting: Bool) -> Self { .full }
+    public static func make(isOpen: Bool, idleFor: TimeInterval, reconnecting: Bool) -> Self {
+        isOpen || reconnecting || idleFor < idleDelay ? .full : .handle
+    }
 }
 
 /// Disconnect asks once inline: the first tap arms it, a second tap within the window confirms.

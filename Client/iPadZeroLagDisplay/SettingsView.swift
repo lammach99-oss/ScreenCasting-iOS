@@ -38,8 +38,8 @@ public struct SettingsView: View {
 
     private let rowBackground = Color(uiColor: SessionInk.surface)
     private let secondary = Color(uiColor: SessionInk.secondary)
-    /// Switches use the one positive green; the ink text colour would hide the white knob.
-    private let switchTint = Color(uiColor: SessionInk.positive)
+    /// Switches and controls share the one signal-blue accent.
+    private let switchTint = Color(uiColor: SessionInk.accent)
 
     // MARK: Body
 
@@ -84,7 +84,7 @@ public struct SettingsView: View {
             }
         }
         .preferredColorScheme(.dark)
-        .tint(Color(uiColor: SessionInk.text))
+        .tint(Color(uiColor: SessionInk.accent))
         .onReceive(networkManager.$desiredBitrateMbps) { newMbps in
             draftBitrate = newMbps
         }
