@@ -51,3 +51,31 @@ public struct ScreenPickerSnapshot: Equatable {
         label.caseInsensitiveCompare("Built-in display") == .orderedSame
     }
 }
+
+/// What the session pill says in every session: which PC, over what, which screen, and whether it is reconnecting.
+public struct SessionPanelSnapshot: Equatable {
+    public enum Icon: Equatable { case extended, monitor, laptop }
+    public let title: String
+    public let hostLabel: String
+    public let transport: String?
+    public let isMirror: Bool
+    public let control: ScreenPickerSnapshot.Control
+    public let reconnecting: Bool
+    public let icon: Icon
+    public var reconnectingText: String { "" }
+
+    public static func make(hostLabel: String?, transport: String, connection: ConnectionState,
+                            control: ScreenPickerSnapshot.Control, mirrorLabel: String?) -> Self {
+        Self(title: "", hostLabel: "", transport: nil, isMirror: false, control: control, reconnecting: false, icon: .extended)
+    }
+}
+
+/// Disconnect asks once inline: the first tap arms it, a second tap within the window confirms.
+public struct DisconnectArming: Equatable {
+    public static let window: TimeInterval = 4
+    private var armedAt: Date?
+    public init() {}
+    public func isArmed(at now: Date) -> Bool { false }
+    public mutating func tap(at now: Date) -> Bool { false }
+    public mutating func reset() {}
+}

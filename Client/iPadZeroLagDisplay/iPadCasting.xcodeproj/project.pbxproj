@@ -21,7 +21,7 @@
 		FB2500000000000000000002 /* TrustedHostSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000002 /* TrustedHostSettings.swift */; };
 		FB2500000000000000000001 /* WireCommands.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000001 /* WireCommands.swift */; };
 		FB2500000000000000000005 /* ScreenPickerModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000005 /* ScreenPickerModel.swift */; };
-		FB2500000000000000000006 /* ScreenPickerOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000006 /* ScreenPickerOverlay.swift */; };
+		FB2500000000000000000006 /* SessionPanelOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000006 /* SessionPanelOverlay.swift */; };
 		300111111111111111111109 /* StreamManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201011111111111111111110 /* StreamManager.swift */; };
 		30011111111111111111110A /* DiscoveryManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201111111111111111111111 /* DiscoveryManager.swift */; };
 		30011111111111111111110B /* AudioManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201211111111111111111112 /* AudioManager.swift */; };
@@ -73,6 +73,7 @@
 		FA2300000000000000000002 /* MirrorClientControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000002 /* MirrorClientControl.swift */; };
 		FA2300000000000000000003 /* PhysicalMirrorControlTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000003 /* PhysicalMirrorControlTests.swift */; };
 		FA2300000000000000000004 /* PencilKeyboardTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000004 /* PencilKeyboardTests.swift */; };
+		FA2300000000000000000005 /* SessionPanelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000005 /* SessionPanelTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -102,7 +103,7 @@
 		FB2400000000000000000002 /* TrustedHostSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrustedHostSettings.swift; sourceTree = "<group>"; };
 		FB2400000000000000000001 /* WireCommands.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WireCommands.swift; sourceTree = "<group>"; };
 		FB2400000000000000000005 /* ScreenPickerModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/ScreenPickerModel.swift; sourceTree = "<group>"; };
-		FB2400000000000000000006 /* ScreenPickerOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenPickerOverlay.swift; sourceTree = "<group>"; };
+		FB2400000000000000000006 /* SessionPanelOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionPanelOverlay.swift; sourceTree = "<group>"; };
 		200911111111111111111109 /* PencilTouchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PencilTouchView.swift; sourceTree = "<group>"; };
 		201011111111111111111110 /* StreamManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamManager.swift; sourceTree = "<group>"; };
 		201111111111111111111111 /* DiscoveryManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiscoveryManager.swift; sourceTree = "<group>"; };
@@ -155,6 +156,7 @@
 		FA2200000000000000000002 /* MirrorClientControl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/MirrorClientControl.swift; sourceTree = "<group>"; };
 		FA2200000000000000000003 /* PhysicalMirrorControlTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhysicalMirrorControlTests.swift; sourceTree = "<group>"; };
 		FA2200000000000000000004 /* PencilKeyboardTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PencilKeyboardTests.swift; sourceTree = "<group>"; };
+		FA2200000000000000000005 /* SessionPanelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionPanelTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -194,7 +196,7 @@
 				FB2400000000000000000002 /* TrustedHostSettings.swift */,
 				FB2400000000000000000001 /* WireCommands.swift */,
 				FB2400000000000000000005 /* ScreenPickerModel.swift */,
-				FB2400000000000000000006 /* ScreenPickerOverlay.swift */,
+				FB2400000000000000000006 /* SessionPanelOverlay.swift */,
 				FA2200000000000000000002 /* MirrorClientControl.swift */,
 				FA2200000000000000000001 /* MirrorControlProtocol.swift */,
 				D70211111111111111111105 /* TransferPanel.swift */,
@@ -243,6 +245,7 @@
 			children = (
 				FA2200000000000000000003 /* PhysicalMirrorControlTests.swift */,
 				FA2200000000000000000004 /* PencilKeyboardTests.swift */,
+				FA2200000000000000000005 /* SessionPanelTests.swift */,
 				201711111111111111111117 /* WireProtocolTests.swift */,
 				D70211111111111111111104 /* DataTransferTests.swift */,
 				D70211111111111111111108,
@@ -374,7 +377,7 @@
 				FB2500000000000000000002 /* TrustedHostSettings.swift in Sources */,
 				FB2500000000000000000001 /* WireCommands.swift in Sources */,
 				FB2500000000000000000005 /* ScreenPickerModel.swift in Sources */,
-				FB2500000000000000000006 /* ScreenPickerOverlay.swift in Sources */,
+				FB2500000000000000000006 /* SessionPanelOverlay.swift in Sources */,
 				FA2300000000000000000002 /* MirrorClientControl.swift in Sources */,
 				FA2300000000000000000001 /* MirrorControlProtocol.swift in Sources */,
 				D70111111111111111111105 /* TransferPanel.swift in Sources */,
@@ -415,6 +418,7 @@
 			files = (
 				FA2300000000000000000003 /* PhysicalMirrorControlTests.swift in Sources */,
 				FA2300000000000000000004 /* PencilKeyboardTests.swift in Sources */,
+				FA2300000000000000000005 /* SessionPanelTests.swift in Sources */,
 				300111111111111111111110 /* WireProtocolTests.swift in Sources */,
 				D70111111111111111111104 /* DataTransferTests.swift in Sources */,
 				D70111111111111111111108,

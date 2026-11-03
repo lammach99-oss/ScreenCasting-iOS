@@ -174,8 +174,13 @@ enum FloatingKeyboardPlacement {
     }
 }
 /// What tapped the floating keyboard button; iPadOS treats a Pencil tap as handwriting intent.
+extension Notification.Name {
+    /// The session panel's Keyboard button; the presentation container owns the keyboard responder.
+    static let sessionPanelToggleKeyboard = Notification.Name("ScreenCasting.sessionPanelToggleKeyboard")
+}
+
 enum KeyboardTapSource: String {
-    case pencil, finger, pointer, unknown
+    case pencil, finger, pointer, panel, unknown
     init(touchType: UITouch.TouchType?) {
         switch touchType {
         case .some(.pencil): self = .pencil

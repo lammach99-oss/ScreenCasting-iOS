@@ -1,0 +1,70 @@
+import XCTest
+import UIKit
+@testable import iPadCasting
+
+/// The session pill is the one visible handle for every session: what it says, and how Disconnect is confirmed.
+final class SessionPanelTests: XCTestCase {
+    func testExtendedWifiSessionNamesThePC() {
+        let s = SessionPanelSnapshot.make(hostLabel: "Lam-Laptop", transport: "Wi-Fi", connection: .streaming,
+                                          control: .unavailable, mirrorLabel: nil)
+        XCTAssertEqual(s.title, "Lam-Laptop")
+        XCTAssertEqual(s.hostLabel, "Lam-Laptop")
+        XCTAssertEqual(s.transport, "Wi-Fi")
+        XCTAssertFalse(s.isMirror)
+        XCTAssertFalse(s.reconnecting)
+        XCTAssertEqual(s.icon, .extended)
+    }
+
+    func testMirrorSessionNamesTheScreenAndControl() {
+        let s = SessionPanelSnapshot.make(hostLabel: "Lam-Laptop", transport: "USB-C", connection: .streaming,
+                                          control: .on, mirrorLabel: "Built-in display")
+        XCTAssertEqual(s.title, "Built-in display")
+        XCTAssertEqual(s.hostLabel, "Lam-Laptop")
+        XCTAssertTrue(s.isMirror)
+        XCTAssertEqual(s.control, .on)
+        XCTAssertEqual(s.icon, .laptop)
+        let monitor = SessionPanelSnapshot.make(hostLabel: "Lam-Laptop", transport: "USB-C", connection: .streaming,
+                                                control: .viewOnly, mirrorLabel: nil)
+        XCTAssertEqual(monitor.title, "Lam-Laptop")
+        XCTAssertEqual(monitor.icon, .monitor)
+    }
+
+    func testUnknownPCAndPlaceholderTransport() {
+        let s = SessionPanelSnapshot.make(hostLabel: "  ", transport: "Connected to PC", connection: .streaming,
+                                          control: .unavailable, mirrorLabel: nil)
+        XCTAssertEqual(s.hostLabel, "Your PC")
+        XCTAssertNil(s.transport)
+    }
+
+    func testReconnectingSaysSo() {
+        let s = SessionPanelSnapshot.make(hostLabel: "Lam-Laptop", transport: "Wi-Fi", connection: .connecting,
+                                          control: .unavailable, mirrorLabel: nil)
+        XCTAssertTrue(s.reconnecting)
+        XCTAssertEqual(s.reconnectingText, "Reconnecting to Lam-Laptop…")
+    }
+
+    func testDisconnectNeedsASecondTapWithinFourSeconds() {
+        var arming = DisconnectArming()
+        let t0 = Date(timeIntervalSince1970: 1000)
+        XCTAssertFalse(arming.tap(at: t0))
+        XCTAssertTrue(arming.isArmed(at: t0.addingTimeInterval(1)))
+        XCTAssertTrue(arming.tap(at: t0.addingTimeInterval(2)))
+        XCTAssertFalse(arming.isArmed(at: t0.addingTimeInterval(2)))
+        XCTAssertFalse(arming.tap(at: t0.addingTimeInterval(10)))
+        XCTAssertFalse(arming.tap(at: t0.addingTimeInterval(15)), "a stale arm must not confirm")
+        arming.reset()
+        XCTAssertFalse(arming.isArmed(at: t0.addingTimeInterval(15)))
+    }
+
+    @MainActor func testPanelKeyboardRequestOpensTheKeyboard() {
+        let container = ConnectedPresentationContainer(frame: CGRect(x: 0, y: 0, width: 1194, height: 834))
+        container.configureRemoteKeyboard(active: true, generation: 5101)
+        container.softwareResponderAcquisitionForTesting = { true }
+        var lines: [String] = []
+        container.touchView.diagnosticSink = { lines.append($0) }
+        NotificationCenter.default.post(name: .sessionPanelToggleKeyboard, object: nil)
+        XCTAssertEqual(container.keyboardMode, .softwareOpen)
+        XCTAssertTrue(lines.last?.contains("keyboard_tap=panel") == true)
+        container.retireRemoteKeyboard()
+    }
+}
