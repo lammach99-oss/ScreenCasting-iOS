@@ -18,6 +18,11 @@ enum SessionInk {
     static let danger = rgb(0xF09595)
     static let dangerFill = rgb(0xE24B4A)
     static let onDanger = rgb(0x1F0A0A)
+    static let accent = rgb(0x262625)
+    static let onAccent = rgb(0x262625)
+
+    /// WCAG contrast ratio. RED stub.
+    static func contrast(_ a: UIColor, _ b: UIColor) -> CGFloat { 1 }
 }
 
 private extension Color {
