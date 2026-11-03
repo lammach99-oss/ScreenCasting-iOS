@@ -58,6 +58,7 @@ struct SessionPanelOverlay: View {
     @State private var disconnectTick = 0
     @AppStorage("ScreenCasting.client.screenPickerOffset") private var storedOffset: Double = 0
     @Environment(\.dynamicTypeSize) private var typeSize
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOver
 
     private var picker: ScreenPickerSnapshot {
         .make(catalogue: networkManager.mirrorMonitorCatalogue, state: networkManager.mirrorControlState,
@@ -80,7 +81,8 @@ struct SessionPanelOverlay: View {
                 VStack(spacing: 10) {
                     // After a few idle seconds the pill shrinks to a slim handle so the top of the PC stays visible.
                     TimelineView(.periodic(from: .now, by: 1)) { context in
-                        let mode = SessionPillPresentation.make(isOpen: isOpen,
+                        // VoiceOver keeps the full pill: swapping views every idle cycle would drop its focus.
+                        let mode = SessionPillPresentation.make(isOpen: isOpen || voiceOver,
                                                                 idleFor: context.date.timeIntervalSince(lastInteraction),
                                                                 reconnecting: session.reconnecting)
                         ZStack(alignment: .top) {
@@ -144,8 +146,7 @@ struct SessionPanelOverlay: View {
             .foregroundStyle(Color(ink: s.reconnecting ? SessionInk.warning : SessionInk.text))
             .padding(.horizontal, 14).padding(.vertical, 10)
             .frame(minHeight: 44)
-            .background(Color(ink: SessionInk.surface).opacity(0.82), in: Capsule())
-            .background(.ultraThinMaterial, in: Capsule())
+            .background(Color(ink: SessionInk.surface).opacity(0.94), in: Capsule())
             .overlay(Capsule().stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
             .shadow(color: .black.opacity(0.35), radius: 10, y: 4)
             .contentShape(Capsule())
@@ -162,10 +163,13 @@ struct SessionPanelOverlay: View {
     private func handle(maxX: CGFloat) -> some View {
         let s = session
         return Button { open() } label: {
+            // A dark backing keeps the bar visible over a white PC title bar.
             Capsule()
-                .fill(Color(ink: s.control == .on ? SessionInk.positive : SessionInk.text).opacity(0.75))
+                .fill(Color(ink: s.control == .on ? SessionInk.positive : SessionInk.text))
                 .frame(width: 56, height: 5)
-                .shadow(color: .black.opacity(0.6), radius: 2, y: 1)
+                .frame(width: 66, height: 13)
+                .background(Color(ink: SessionInk.canvas).opacity(0.72), in: Capsule())
+                .overlay(Capsule().stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
                 .frame(width: 96, height: 22)
                 .contentShape(Rectangle())
         }
@@ -223,8 +227,7 @@ struct SessionPanelOverlay: View {
         .foregroundStyle(Color(ink: SessionInk.text))
         .padding(16)
         .frame(width: width)
-        .background(Color(ink: SessionInk.surface).opacity(0.9), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .background(Color(ink: SessionInk.surface).opacity(0.96), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
         .shadow(color: .black.opacity(0.45), radius: 24, y: 12)
         .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))

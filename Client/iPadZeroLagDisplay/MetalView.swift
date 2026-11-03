@@ -314,7 +314,7 @@ public final class ConnectedPresentationContainer: UIView {
         addSubview(softwareTextView)
         keyboardButton.setImage(UIImage(systemName: "keyboard"), for: .normal)
         keyboardButton.backgroundColor = SessionInk.surface.withAlphaComponent(0.94)
-        keyboardButton.tintColor = SessionInk.text
+        keyboardButton.tintColor = SessionInk.accent
         keyboardButton.layer.borderColor = SessionInk.hairline.cgColor
         keyboardButton.layer.borderWidth = 0.5
         keyboardButton.layer.cornerRadius = 12

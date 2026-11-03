@@ -132,9 +132,9 @@ struct PINEntryView: View {
                     Button(action: onSubmit) {
                         Text("Confirm PIN")
                             .font(.headline)
-                            .foregroundStyle(pin.count == 4 ? Color.inkSurface : Color.inkSecondary)
+                            .foregroundStyle(pin.count == 4 ? Color.inkOnAccent : Color.inkSecondary)
                             .frame(maxWidth: .infinity, minHeight: 50)
-                            .background(pin.count == 4 ? Color.inkText : Color.inkRaised,
+                            .background(pin.count == 4 ? Color.inkAccent : Color.inkRaised,
                                         in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
                     .disabled(pin.count != 4)

@@ -31,7 +31,9 @@ struct TransferCenterSheet: View {
             exportLease = token; exportFile = ExportFile(id: token, url: url)
         }
     }
-    private let background = Color(red: 15/255, green: 23/255, blue: 42/255)
+    private let background = Color(uiColor: SessionInk.canvas)
+    /// White on the accent fails contrast; prominent buttons use the dark on-accent ink.
+    private let onAccent = Color(uiColor: SessionInk.onAccent)
     private var state: DataTransferManager.Snapshot { networkManager.transferSnapshot }
 
     var body: some View {
@@ -40,7 +42,7 @@ struct TransferCenterSheet: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 24) {
                         Label(networkManager.isConnected ? "Connected to PC · \(state.transport)" : "PC disconnected", systemImage: networkManager.isConnected ? "checkmark.circle.fill" : "wifi.slash")
-                            .foregroundStyle(networkManager.isConnected ? Color.green : Color.gray)
+                            .foregroundStyle(Color(uiColor: networkManager.isConnected ? SessionInk.positive : SessionInk.secondary))
                         ViewThatFits(in: .horizontal) {
                             HStack { sendButton; receivedButton { reader.scrollTo("received", anchor: .top) } }
                             VStack(alignment: .leading) { sendButton; receivedButton { reader.scrollTo("received", anchor: .top) } }
@@ -56,7 +58,7 @@ struct TransferCenterSheet: View {
                         if !networkManager.isConnected {
                             Text("Connect to your PC before sending or accepting files. Saved files remain available.").foregroundStyle(.secondary)
                         }
-                        if let localError { Label(localError, systemImage: "exclamationmark.triangle").foregroundStyle(.yellow) }
+                        if let localError { Label(localError, systemImage: "exclamationmark.triangle").foregroundStyle(Color(uiColor: SessionInk.warning)) }
                         if state.phase == .awaitingDecision { incoming }
                         else if state.count > 0 { transfer }
                         received.id("received")
@@ -74,6 +76,7 @@ struct TransferCenterSheet: View {
             }
         }
         .preferredColorScheme(.dark)
+        .tint(Color(uiColor: SessionInk.accent))
         .fileImporter(isPresented: $importing, allowedContentTypes: [.data,.content], allowsMultipleSelection: true) { result in
             switch result {
             case .success(let urls): localError=nil; networkManager.sendTransferFiles(urls)
@@ -113,8 +116,8 @@ struct TransferCenterSheet: View {
         }
     }
     private var sendButton: some View {
-        Button { importing=true } label: { Label("Send to PC", systemImage: "arrow.up.doc").frame(minHeight: 44) }
-            .buttonStyle(.borderedProminent).tint(.cyan)
+        Button { importing=true } label: { Label("Send to PC", systemImage: "arrow.up.doc").foregroundStyle(onAccent).frame(minHeight: 44) }
+            .buttonStyle(.borderedProminent)
             .disabled(!networkManager.isConnected || TransferPresentation.active(state.phase))
     }
     private func receivedButton(_ action: @escaping () -> Void) -> some View {
@@ -131,10 +134,10 @@ struct TransferCenterSheet: View {
                 HStack { consentButtons }
                 VStack(alignment: .leading) { consentButtons }
             }
-        }.padding(18).background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+        }.padding(18).background(Color(uiColor: SessionInk.raised), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
     @ViewBuilder private var consentButtons: some View {
-        Button { networkManager.decideTransfer(true) } label: { Label("Accept", systemImage: "checkmark").frame(minHeight: 44) }
+        Button { networkManager.decideTransfer(true) } label: { Label("Accept", systemImage: "checkmark").foregroundStyle(onAccent).frame(minHeight: 44) }
             .buttonStyle(.borderedProminent).disabled(!networkManager.isConnected)
         Button(role: .destructive) { networkManager.decideTransfer(false) } label: { Label("Decline", systemImage: "xmark").frame(minHeight: 44) }
             .buttonStyle(.bordered)
@@ -146,7 +149,7 @@ struct TransferCenterSheet: View {
             Text("\(min(state.index+1,state.count)) of \(state.count) files · \(TransferPresentation.size(state.total))").foregroundStyle(.secondary)
             Text(state.phase.rawValue).font(.headline)
             if state.phase == .failed {
-                Label(TransferPresentation.failure(state), systemImage: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
+                Label(TransferPresentation.failure(state), systemImage: "exclamationmark.triangle.fill").foregroundStyle(Color(uiColor: SessionInk.warning))
                 Text(TransferPresentation.nextAction(state)).font(.subheadline)
                 DisclosureGroup("Diagnostics") {
                     Text("Stage: \(state.stage)\nReason: \(state.failure?.reason ?? "UNKNOWN")\n\(state.failure?.domain ?? "Transfer") / \(state.failure?.code ?? 0)")
@@ -158,7 +161,7 @@ struct TransferCenterSheet: View {
                 Text("\(TransferPresentation.size(state.bytes)) of \(TransferPresentation.size(state.total))").font(.subheadline).foregroundStyle(.secondary)
                 Button("Cancel transfer", role: .destructive) { networkManager.cancelTransfer() }.frame(minHeight: 44)
             }
-        }.padding(18).background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+        }.padding(18).background(Color(uiColor: SessionInk.raised), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
     private var received: some View {
         VStack(alignment: .leading, spacing: 14) {
