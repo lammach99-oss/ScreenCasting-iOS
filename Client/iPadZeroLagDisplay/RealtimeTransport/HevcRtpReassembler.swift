@@ -24,7 +24,8 @@ enum HevcReassemblyOutcome: Equatable {
 }
 
 final class HevcRtpReassembler {
-    private static let maximumPendingOutcomes = 3
+    private static let maximumBufferedFrames = 6
+    private static let maximumPendingOutcomes = maximumBufferedFrames + 1
 
     private struct Frame {
         let timestamp: UInt32
@@ -40,6 +41,7 @@ final class HevcRtpReassembler {
     private var expectedNextSequence: UInt16?
     private var maySelfAnchor: Bool
     private var requiresIDRAnchor = false
+    private var requiresDecoderConfigurationAnchor = false
     private var pendingOutcomes: [HevcReassemblyOutcome] = []
     private let mtu: Int
 
@@ -63,7 +65,17 @@ final class HevcRtpReassembler {
         expectedNextSequence = sequence
         maySelfAnchor = false
         requiresIDRAnchor = false
+        requiresDecoderConfigurationAnchor = false
         reevaluateBufferedFrames()
+    }
+
+    func prepareForFreshIDRAnchor() {
+        frames.removeAll()
+        pendingOutcomes.removeAll()
+        expectedNextSequence = nil
+        maySelfAnchor = true
+        requiresIDRAnchor = true
+        requiresDecoderConfigurationAnchor = true
     }
 
     func drainOutcome() -> HevcReassemblyOutcome? {
@@ -92,7 +104,8 @@ final class HevcRtpReassembler {
         }
 
         expireFrames(at: arrivalTime)
-        if frames[packet.timestamp] == nil && frames.count == 2 {
+        if frames[packet.timestamp] == nil &&
+           frames.count >= Self.maximumBufferedFrames {
             if let oldest = frames.values.min(by: {
                 $0.firstArrival < $1.firstArrival
             }) {
@@ -104,7 +117,8 @@ final class HevcRtpReassembler {
         }
 
         if frames[packet.timestamp] == nil {
-            let idr = Self.isIDR(packet.payload)
+            let randomAccess = Self.isRandomAccessPayloadType(
+                packet.payload)
             frames[packet.timestamp] = Frame(
                 timestamp: packet.timestamp,
                 frameSequence: packet.frameSequence,
@@ -112,9 +126,12 @@ final class HevcRtpReassembler {
                 firstArrival: arrivalTime,
                 deadline: arrivalTime + ReassemblyDeadline.interval(
                     rttP95Ms: rttP95Ms,
-                    isIDR: idr))
+                    isIDR: randomAccess))
         }
-        guard var frame = frames[packet.timestamp] else {
+        // Take the frame out so `frame.packets` is uniquely referenced: mutating a copy that the
+        // dictionary still shares would copy the whole packet map on every packet (O(n^2) per IDR).
+        // Every path below either reinserts it or drops it (drop removes it anyway).
+        guard var frame = frames.removeValue(forKey: packet.timestamp) else {
             enqueue(.malformed)
             return priorOutcome ?? drainOutcome()!
         }
@@ -125,10 +142,11 @@ final class HevcRtpReassembler {
             return priorOutcome ?? drainOutcome()!
         }
         if frame.packets[packet.sequence] != nil {
+            frames[packet.timestamp] = frame
             enqueue(.duplicate)
             return priorOutcome ?? drainOutcome()!
         }
-        if Self.isIDR(packet.payload) {
+        if Self.isRandomAccessPayloadType(packet.payload) {
             frame.deadline = max(
                 frame.deadline,
                 frame.firstArrival + 0.050)
@@ -146,13 +164,19 @@ final class HevcRtpReassembler {
         frames[packet.timestamp] = frame
 
         if maySelfAnchor {
-            let canAnchor = requiresIDRAnchor
-                ? Self.isIDR(packet.payload) &&
-                    Self.isNalBoundary(packet.payload)
-                : !packet.marker && Self.isNalBoundary(packet.payload)
-            if canAnchor {
+            if requiresIDRAnchor,
+               let anchor = Self.recoveryAnchorSequence(
+                   in: frame,
+                   requiresDecoderConfiguration:
+                       requiresDecoderConfigurationAnchor) {
                 maySelfAnchor = false
                 requiresIDRAnchor = false
+                requiresDecoderConfigurationAnchor = false
+                expectedNextSequence = anchor
+            } else if !requiresIDRAnchor,
+                      !packet.marker,
+                      Self.isNalBoundary(packet.payload) {
+                maySelfAnchor = false
                 expectedNextSequence = packet.sequence
             }
         }
@@ -207,6 +231,7 @@ final class HevcRtpReassembler {
         expectedNextSequence = nil
         maySelfAnchor = true
         requiresIDRAnchor = true
+        requiresDecoderConfigurationAnchor = false
         enqueue(.sequenceAnchorLost(expectedSequence: expected))
     }
 
@@ -353,12 +378,100 @@ final class HevcRtpReassembler {
         output.append(nal)
     }
 
-    private static func isIDR(_ payload: Data) -> Bool {
+    private static func nalType(_ payload: Data) -> UInt8? {
+        guard payload.count >= 2 else { return nil }
         let type = (payload[0] >> 1) & 0x3F
-        let nalType = type == 49 && payload.count >= 3
-            ? payload[2] & 0x3F
-            : type
-        return nalType == 19 || nalType == 20 || nalType == 21
+        if type == 49 {
+            guard payload.count >= 3 else { return nil }
+            return payload[2] & 0x3F
+        }
+        return type
+    }
+
+    private static func isIDR(_ payload: Data) -> Bool {
+        guard let nalType = nalType(payload) else { return false }
+        return nalType == 19 || nalType == 20
+    }
+
+    private static func isRandomAccessPayloadType(_ payload: Data) -> Bool {
+        guard let type = nalType(payload) else { return false }
+        return type == 32 || type == 33 || type == 34 ||
+            type == 19 || type == 20 || type == 21
+    }
+
+    private static func recoveryAnchorSequence(
+        in frame: Frame,
+        requiresDecoderConfiguration: Bool
+    ) -> UInt16? {
+        let idrBoundaries = frame.packets.values.filter {
+            isIDR($0.payload) && isNalBoundary($0.payload)
+        }
+        for idr in idrBoundaries {
+            if requiresDecoderConfiguration {
+                let vpsBoundaries = frame.packets.values.filter {
+                    nalType($0.payload) == 32 &&
+                        isNalBoundary($0.payload) &&
+                        UInt16(truncatingIfNeeded:
+                            idr.sequence &- $0.sequence) < 0x8000
+                }.sorted {
+                    UInt16(truncatingIfNeeded:
+                        idr.sequence &- $0.sequence) >
+                    UInt16(truncatingIfNeeded:
+                        idr.sequence &- $1.sequence)
+                }
+                for vps in vpsBoundaries where hasDecoderConfigurationPrefix(
+                    in: frame,
+                    from: vps.sequence,
+                    through: idr.sequence) {
+                    return vps.sequence
+                }
+                continue
+            }
+            let prefix = frame.packets.values.filter {
+                UInt16(truncatingIfNeeded: idr.sequence &- $0.sequence) < 0x8000
+            }
+            guard let first = prefix.max(by: {
+                UInt16(truncatingIfNeeded: idr.sequence &- $0.sequence) <
+                    UInt16(truncatingIfNeeded: idr.sequence &- $1.sequence)
+            }), isNalBoundary(first.payload) else { continue }
+            var sequence = first.sequence
+            for _ in 0..<prefix.count {
+                guard frame.packets[sequence] != nil else { break }
+                if sequence == idr.sequence { return first.sequence }
+                sequence &+= 1
+            }
+        }
+        return nil
+    }
+
+    private static func hasDecoderConfigurationPrefix(
+        in frame: Frame,
+        from start: UInt16,
+        through idr: UInt16
+    ) -> Bool {
+        let distance = Int(UInt16(truncatingIfNeeded: idr &- start))
+        guard distance < frame.packets.count else { return false }
+        var sawVPS = false
+        var sawSPS = false
+        var sawPPS = false
+        var sequence = start
+        for _ in 0...distance {
+            guard let packet = frame.packets[sequence] else { return false }
+            if isNalBoundary(packet.payload), let type = nalType(packet.payload) {
+                switch type {
+                case 32 where !sawSPS && !sawPPS:
+                    sawVPS = true
+                case 33 where sawVPS && !sawPPS:
+                    sawSPS = true
+                case 34 where sawVPS && sawSPS:
+                    sawPPS = true
+                default:
+                    break
+                }
+            }
+            sequence &+= 1
+        }
+        return sawVPS && sawSPS && sawPPS
     }
 
     private static func isNalBoundary(_ payload: Data) -> Bool {

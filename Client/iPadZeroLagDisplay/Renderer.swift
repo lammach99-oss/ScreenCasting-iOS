@@ -104,6 +104,13 @@ enum RenderCommitDecision: Equatable {
 struct RenderFrameIdentity: Equatable {
     let generation: UInt64
     let sequence: UInt32
+    let mediaResetIdentity: UInt64
+
+    init(generation: UInt64, sequence: UInt32, mediaResetIdentity: UInt64 = 0) {
+        self.generation = generation
+        self.sequence = sequence
+        self.mediaResetIdentity = mediaResetIdentity
+    }
 }
 
 enum RenderCadenceStage {
@@ -324,11 +331,14 @@ struct OfficePresentationHandoff {
 /// Persistent, wrap-safe sequence watermarks scoped to one wire session.
 struct RenderFreshnessTracker {
     private(set) var sessionGeneration: UInt64?
+    private var mediaResetIdentity: UInt64 = 0
     private(set) var acceptedSequence: UInt32?
     private(set) var presentedSequence: UInt32?
     private(set) var pendingIdentity: RenderFrameIdentity?
 
     mutating func beginSession(generation: UInt64) {
+        // A media re-anchor can retain the wire generation while retiring old draws.
+        if sessionGeneration != nil { mediaResetIdentity &+= 1 }
         sessionGeneration = generation
         acceptedSequence = nil
         presentedSequence = nil
@@ -348,7 +358,8 @@ struct RenderFreshnessTracker {
         acceptedSequence = sequence
         pendingIdentity = RenderFrameIdentity(
             generation: generation,
-            sequence: sequence)
+            sequence: sequence,
+            mediaResetIdentity: mediaResetIdentity)
         return .accepted(replaced: replaced)
     }
 
@@ -359,7 +370,7 @@ struct RenderFreshnessTracker {
     }
 
     func shouldCommit(_ identity: RenderFrameIdentity) -> Bool {
-        guard identity.generation == sessionGeneration else { return false }
+        guard isCurrent(identity) else { return false }
         let sequence = identity.sequence
         if let acceptedSequence,
            acceptedSequence != sequence,
@@ -378,7 +389,7 @@ struct RenderFreshnessTracker {
     }
 
     mutating func markPresented(_ identity: RenderFrameIdentity) -> Bool {
-        guard identity.generation == sessionGeneration else { return false }
+        guard isCurrent(identity) else { return false }
         let sequence = identity.sequence
         if let presentedSequence,
            !Self.isNewer(sequence, than: presentedSequence) {
@@ -389,7 +400,8 @@ struct RenderFreshnessTracker {
     }
 
     func isCurrent(_ identity: RenderFrameIdentity) -> Bool {
-        identity.generation == sessionGeneration
+        identity.generation == sessionGeneration &&
+            identity.mediaResetIdentity == mediaResetIdentity
     }
 
     static func isNewer(_ candidate: UInt32, than reference: UInt32) -> Bool {
@@ -512,24 +524,60 @@ struct RendererGeometryPublishKey: Equatable {
     let contentViewport: VideoContentViewport
 }
 
+struct RendererGeometryPublishToken: Equatable {
+    let identity: RenderFrameIdentity
+    let key: RendererGeometryPublishKey
+    let revision: UInt64
+}
+
 struct RendererGeometryPublishGate {
     private(set) var lastScheduledKey: RendererGeometryPublishKey?
+    private(set) var revision: UInt64 = 0
+    private var latestToken: RendererGeometryPublishToken?
+    private var delivered = false
 
-    mutating func shouldSchedule(
-        _ key: RendererGeometryPublishKey,
-        force: Bool = false
-    ) -> Bool {
-        if !force, lastScheduledKey == key {
-            return false
-        }
-
+    mutating func shouldSchedule(_ key: RendererGeometryPublishKey, force: Bool = false) -> Bool {
+        if !force, lastScheduledKey == key { return false }
         lastScheduledKey = key
         return true
     }
 
-    mutating func reset() {
-        lastScheduledKey = nil
+    mutating func schedule(_ key: RendererGeometryPublishKey,
+        identity: RenderFrameIdentity, force: Bool = false) -> RendererGeometryPublishToken? {
+        if let latestToken {
+            let old = latestToken.identity
+            if old.generation == identity.generation,
+               old.mediaResetIdentity == identity.mediaResetIdentity {
+                let distance = identity.sequence &- old.sequence
+                guard distance == 0 || distance < 0x8000_0000 else { return nil }
+                if !force, old == identity, latestToken.key == key { return nil }
+            }
+        }
+        revision &+= 1
+        let token = RendererGeometryPublishToken(identity: identity, key: key, revision: revision)
+        latestToken = token
+        lastScheduledKey = key
+        delivered = false
+        return token
     }
+
+    mutating func authorize(_ token: RendererGeometryPublishToken,
+        identity: RenderFrameIdentity) -> Bool {
+        guard token == latestToken, token.identity == identity, !delivered else { return false }
+        delivered = true
+        return true
+    }
+
+    mutating func reset() {
+        revision &+= 1
+        lastScheduledKey = nil
+        latestToken = nil
+        delivered = false
+    }
+}
+
+enum RenderCommandCompletionPolicy {
+    static func succeeded(_ status: MTLCommandBufferStatus) -> Bool { status == .completed }
 }
 
 public class Renderer: NSObject, MTKViewDelegate {
@@ -559,7 +607,6 @@ public class Renderer: NSObject, MTKViewDelegate {
     private let commandQueue: MTLCommandQueue
     private var pipelineState: MTLRenderPipelineState?
     private var textureCache: CVMetalTextureCache?
-    private var aspectRatioBuffer: MTLBuffer?
     private var officeHandoff = OfficePresentationHandoff()
     private var officeReadyFrame: OfficeFrame?
     private var officeLookAheadFrame: OfficeFrame?
@@ -589,6 +636,10 @@ public class Renderer: NSObject, MTKViewDelegate {
     }
 
     private var lastDecodedFrameSize: CGSize?
+    private var lastGeometryIdentity: RenderFrameIdentity?
+    private var pendingGeometryPublication: RendererGeometryPublishToken?
+    private weak var geometryPublicationView: MTKView?
+    private var geometryPublicationScheduled = false
     private let lock = NSLock()
 
     public init?(
@@ -646,9 +697,6 @@ public class Renderer: NSObject, MTKViewDelegate {
         descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
         do {
             pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
-            aspectRatioBuffer = device.makeBuffer(
-                length: MemoryLayout<SIMD2<Float>>.size,
-                options: .storageModeShared)
         } catch {
             print("[Renderer] Failed to create render pipeline: \(error)")
         }
@@ -671,6 +719,9 @@ public class Renderer: NSObject, MTKViewDelegate {
         publishedGeometrySnapshot = nil
         geometryPublishGate.reset()
         lastDecodedFrameSize = nil
+        lastGeometryIdentity = nil
+        pendingGeometryPublication = nil
+        let resetGeometryRevision = geometryPublishGate.revision
         lock.unlock()
         let resetCadence = { [weak self] in
             guard let self else { return }
@@ -685,7 +736,13 @@ public class Renderer: NSObject, MTKViewDelegate {
         }
         if shouldResetContentViewport {
             DispatchQueue.main.async { [weak self] in
-                self?.onContentViewportChanged?(nil)
+                guard let self else { return }
+                self.lock.lock()
+                let stillReset = self.geometryPublishGate.revision == resetGeometryRevision &&
+                    self.freshness.sessionGeneration == generation && self.publishedContentViewport == nil
+                self.lock.unlock()
+                guard stillReset else { return }
+                self.onContentViewportChanged?(nil)
             }
         }
     }
@@ -821,14 +878,15 @@ public class Renderer: NSObject, MTKViewDelegate {
     public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         lock.lock()
         let decodedFrameSize = lastDecodedFrameSize
+        let identity = lastGeometryIdentity
         lock.unlock()
-        guard let decodedFrameSize,
+        guard let decodedFrameSize, let identity,
               let contentViewport = Self.contentViewport(
                 forDrawableSize: size,
                 videoSize: decodedFrameSize) else { return }
-        publishContentViewport(contentViewport)
         publishGeometrySnapshot(
             for: view,
+            identity: identity,
             decodedFrameSize: decodedFrameSize,
             drawableSize: size,
             contentViewport: contentViewport,
@@ -901,9 +959,6 @@ public class Renderer: NSObject, MTKViewDelegate {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         let decodedFrameSize = CGSize(width: width, height: height)
-        lock.lock()
-        lastDecodedFrameSize = decodedFrameSize
-        lock.unlock()
         guard CVPixelBufferGetPixelFormatType(pixelBuffer) == DecoderOutputBufferAttributes.pixelFormat else {
             print("[Renderer] Metal presentation rejected: pixelFormat=\(CVPixelBufferGetPixelFormatType(pixelBuffer)) expected=\(DecoderOutputBufferAttributes.pixelFormat)")
             abandon(identity, reportFrameDrop: reportsFrameDrop)
@@ -962,18 +1017,11 @@ public class Renderer: NSObject, MTKViewDelegate {
             collectibleSink: diagnosticSink,
             details:
                 "normalized=\(VideoQualityDiagnostics.rect(contentViewport.rect)) pixels=\(VideoQualityDiagnostics.rect(contentViewport.contentRect(in: CGRect(origin: .zero, size: view.drawableSize))))")
-        publishContentViewport(contentViewport)
-        publishGeometrySnapshot(
-            for: view,
-            decodedFrameSize: decodedFrameSize,
-            drawableSize: view.drawableSize,
-            contentViewport: contentViewport)
-        let scale = SIMD2<Float>(
+        var scale = SIMD2<Float>(
             Float(contentViewport.rect.width),
             Float(contentViewport.rect.height))
-        aspectRatioBuffer?.contents().storeBytes(of: scale, as: SIMD2<Float>.self)
         encoder.setRenderPipelineState(pipelineState)
-        encoder.setVertexBuffer(aspectRatioBuffer, offset: 0, index: 0)
+        encoder.setVertexBytes(&scale, length: MemoryLayout<SIMD2<Float>>.size, index: 0)
         encoder.setFragmentTexture(yTexture, index: 0)
         encoder.setFragmentTexture(uvTexture, index: 1)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
@@ -982,21 +1030,26 @@ public class Renderer: NSObject, MTKViewDelegate {
         lock.lock()
         let commitDecision: RenderCommitDecision =
             freshness.isCurrent(identity) ? .commit : .superseded
-        lock.unlock()
         guard commitDecision == .commit else {
+            lock.unlock()
             recordCadence(
                 .precommitSuperseded,
                 generation: identity.generation)
             return
         }
 
+        let presentedDrawableSize = CGSize(width: drawable.texture.width, height: drawable.texture.height)
         commandBuffer.present(drawable)
         let retainedPixelBuffer = pixelBuffer
-        commandBuffer.addCompletedHandler { [weak self] _ in
+        commandBuffer.addCompletedHandler { [weak self] completedBuffer in
             _ = yTextureRef
             _ = uvTextureRef
             _ = retainedPixelBuffer
             guard let self else { return }
+            guard RenderCommandCompletionPolicy.succeeded(completedBuffer.status) else {
+                self.abandon(identity, reportFrameDrop: reportsFrameDrop)
+                return
+            }
             self.recordCadence(
                 .commandCompleted,
                 generation: identity.generation)
@@ -1014,14 +1067,25 @@ public class Renderer: NSObject, MTKViewDelegate {
                     self.gameLastPresentedFrame = selectedFrame
                 }
             }
+            if isCurrent, self.freshness.presentedSequence == identity.sequence {
+                self.lastDecodedFrameSize = decodedFrameSize
+                self.lastGeometryIdentity = identity
+            }
             self.lock.unlock()
             guard isCurrent else { return }
+            self.publishGeometrySnapshot(for: view, identity: identity,
+                decodedFrameSize: decodedFrameSize, drawableSize: presentedDrawableSize,
+                contentViewport: contentViewport)
             if drawKind == .gameRepeated {
                 self.recordCadence(
                     .gameRePresented,
                     generation: identity.generation)
             }
             DispatchQueue.main.async {
+                self.lock.lock()
+                let stillCurrent = self.freshness.isCurrent(identity)
+                self.lock.unlock()
+                guard stillCurrent else { return }
                 if drawKind != .gameRepeated {
                     self.onFrameRendered?(
                         identity.sequence,
@@ -1030,6 +1094,7 @@ public class Renderer: NSObject, MTKViewDelegate {
             }
         }
         commandBuffer.commit()
+        lock.unlock()
         recordCadence(.commandCommitted, generation: identity.generation)
         if drawKind != .gameRepeated {
             onDrawableCommitted?(identity.sequence, identity.generation)
@@ -1086,61 +1151,80 @@ public class Renderer: NSObject, MTKViewDelegate {
         diagnosticSink?(line)
     }
 
-    private func publishContentViewport(_ contentViewport: VideoContentViewport) {
+    private func publishGeometrySnapshot(
+        for view: MTKView, identity: RenderFrameIdentity,
+        decodedFrameSize: CGSize, drawableSize: CGSize,
+        contentViewport: VideoContentViewport, force: Bool = false
+    ) {
+        let key = RendererGeometryPublishKey(decodedFrameSize: decodedFrameSize,
+            drawableSize: drawableSize, contentViewport: contentViewport)
         lock.lock()
-        let changed = publishedContentViewport != contentViewport
-        publishedContentViewport = contentViewport
+        guard freshness.isCurrent(identity), lastGeometryIdentity == identity,
+              let token = geometryPublishGate.schedule(key, identity: identity, force: force) else {
+            lock.unlock()
+            return
+        }
+        pendingGeometryPublication = token
+        geometryPublicationView = view
+        let enqueue = !geometryPublicationScheduled
+        geometryPublicationScheduled = true
         lock.unlock()
-        guard changed else { return }
+        guard enqueue else { return }
+        // One pending main-queue publication coalesces all later frame/layout revisions.
+        DispatchQueue.main.async { [weak self] in self?.publishPendingGeometry() }
+    }
 
-        DispatchQueue.main.async { [weak self] in
-            self?.onContentViewportChanged?(contentViewport)
+    private func publishPendingGeometry() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        lock.lock()
+        geometryPublicationScheduled = false
+        guard let token = pendingGeometryPublication, let view = geometryPublicationView,
+              freshness.isCurrent(token.identity), lastGeometryIdentity == token.identity,
+              view.drawableSize == token.key.drawableSize,
+              geometryPublishGate.authorize(token, identity: token.identity) else {
+            pendingGeometryPublication = nil
+            lock.unlock()
+            return
+        }
+        pendingGeometryPublication = nil
+        let snapshot = RendererGeometrySnapshot(
+            decodedFrameSize: token.key.decodedFrameSize,
+            windowBounds: view.window?.bounds ?? .zero,
+            safeAreaInsets: view.window?.safeAreaInsets ?? view.safeAreaInsets,
+            metalBounds: view.bounds, drawableSize: token.key.drawableSize,
+            contentScaleFactor: view.contentScaleFactor, contentViewport: token.key.contentViewport)
+        let viewportChanged = publishedContentViewport != token.key.contentViewport
+        let geometryChanged = publishedGeometrySnapshot != snapshot
+        lock.unlock()
+        if viewportChanged { publishContentViewport(token.key.contentViewport, token: token) }
+        if geometryChanged, publicationIsCurrent(token) {
+            onGeometrySnapshotChanged?(snapshot)
+            lock.lock()
+            if freshness.isCurrent(token.identity), lastGeometryIdentity == token.identity,
+               geometryPublishGate.revision == token.revision {
+                publishedGeometrySnapshot = snapshot
+            }
+            lock.unlock()
         }
     }
 
-    private func publishGeometrySnapshot(
-        for view: MTKView,
-        decodedFrameSize: CGSize,
-        drawableSize: CGSize,
-        contentViewport: VideoContentViewport,
-        force: Bool = false
-    ) {
-        let key = RendererGeometryPublishKey(
-            decodedFrameSize: decodedFrameSize,
-            drawableSize: drawableSize,
-            contentViewport: contentViewport)
-
+    private func publicationIsCurrent(_ token: RendererGeometryPublishToken) -> Bool {
         lock.lock()
-        let shouldSchedule = geometryPublishGate.shouldSchedule(
-            key,
-            force: force)
+        defer { lock.unlock() }
+        return freshness.isCurrent(token.identity) && lastGeometryIdentity == token.identity &&
+            geometryPublishGate.revision == token.revision
+    }
+
+    private func publishContentViewport(_ contentViewport: VideoContentViewport,
+        token: RendererGeometryPublishToken) {
+        guard publicationIsCurrent(token) else { return }
+        onContentViewportChanged?(contentViewport)
+        lock.lock()
+        if freshness.isCurrent(token.identity), lastGeometryIdentity == token.identity,
+           geometryPublishGate.revision == token.revision {
+            publishedContentViewport = contentViewport
+        }
         lock.unlock()
-
-        guard shouldSchedule else {
-            return
-        }
-
-        DispatchQueue.main.async { [weak self, weak view] in
-            guard let self,
-                  let view else {
-                return
-            }
-
-            let snapshot = RendererGeometrySnapshot(
-                decodedFrameSize: decodedFrameSize,
-                windowBounds: view.window?.bounds ?? .zero,
-                safeAreaInsets: view.window?.safeAreaInsets ?? view.safeAreaInsets,
-                metalBounds: view.bounds,
-                drawableSize: drawableSize,
-                contentScaleFactor: view.contentScaleFactor,
-                contentViewport: contentViewport)
-            self.lock.lock()
-            let changed = self.publishedGeometrySnapshot != snapshot
-            self.publishedGeometrySnapshot = snapshot
-            self.lock.unlock()
-            guard changed else { return }
-            self.onGeometrySnapshotChanged?(snapshot)
-        }
     }
 
     private func abandon(

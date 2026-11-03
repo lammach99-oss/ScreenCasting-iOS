@@ -2,6 +2,349 @@ import XCTest
 @testable import iPadCasting
 
 final class TransportTelemetryTests: XCTestCase {
+    func testFreshRateWindowCountsUniqueFramesWithoutDisplayRepeats() throws {
+        var window = FreshFrameRateWindow()
+        window.begin(generation: 7, at: 10)
+        for sequence in UInt32(1)...120 {
+            window.recordDecode(sequence: sequence, generation: 7)
+            if sequence <= 80 {
+                window.recordPresentation(sequence: sequence, generation: 7)
+                window.recordPresentation(sequence: sequence, generation: 7)
+            }
+        }
+        XCTAssertNil(window.sample(generation: 7, at: 10.9))
+        let sample = try XCTUnwrap(window.sample(generation: 7, at: 11))
+        XCTAssertEqual(sample.decodedFps, 120)
+        XCTAssertEqual(sample.freshPresentedFps, 80)
+        XCTAssertNil(window.sample(generation: 7, at: 11))
+        window.begin(generation: 8, at: 12)
+        window.recordDecode(sequence: 121, generation: 7)
+        window.recordPresentation(sequence: 121, generation: 7)
+        let reset = try XCTUnwrap(window.sample(generation: 8, at: 13))
+        XCTAssertEqual(reset.decodedFps, 0)
+        XCTAssertEqual(reset.freshPresentedFps, 0)
+    }
+
+    func testFreshRateWindowHealthyWrapAndDropsAreBounded() throws {
+        var window = FreshFrameRateWindow()
+        window.begin(generation: 1, at: 0)
+        for i in UInt32(0)..<120 {
+            let sequence = UInt32.max &- 60 &+ i
+            window.recordDecode(sequence: sequence, generation: 1)
+            window.recordPresentation(sequence: sequence, generation: 1)
+        }
+        window.recordDrop(generation: 2)
+        window.recordDrop(generation: 1)
+        let sample = try XCTUnwrap(window.sample(generation: 1, at: 1))
+        XCTAssertEqual(sample.decodedFps, 120)
+        XCTAssertEqual(sample.freshPresentedFps, 120)
+        XCTAssertEqual(sample.droppedFrames, 1)
+        XCTAssertNil(window.sample(generation: 1, at: .infinity))
+    }
+
+    func testPerformanceFeedbackAndCommittedModeAuthority() throws {
+        XCTAssertEqual(WireMessageType.clientPerformanceFeedback.rawValue, 39)
+        let feedback = ClientPerformanceFeedback(mode: .game, flags: 3,
+            generation: 0x0102030405060708, targetFps: 120, decodedFpsX10: 1190,
+            freshPresentedFpsX10: 800, windowMs: 1000, droppedFrames: 7)
+        let bytes = feedback.encode()
+        XCTAssertEqual(bytes.count, 24)
+        XCTAssertEqual(bytes[4], 8)
+        XCTAssertEqual(ClientPerformanceFeedback.decode(bytes), feedback)
+        for offset in [0, 1, 2, 3] {
+            var bad = bytes
+            bad[offset] = 255
+            XCTAssertNil(ClientPerformanceFeedback.decode(bad))
+        }
+        var mode = CommittedPipelineModeState()
+        mode.request(.game)
+        XCTAssertNil(mode.active)
+        XCTAssertFalse(mode.acknowledge(.office))
+        XCTAssertTrue(mode.acknowledge(.game, at: 10))
+        XCTAssertEqual(mode.active?.targetFps, 120)
+        XCTAssertFalse(mode.readyForFeedback(at: 11.999))
+        XCTAssertTrue(mode.readyForFeedback(at: 12))
+        mode.request(.office)
+        XCTAssertNil(mode.active)
+        XCTAssertFalse(mode.acknowledge(.game))
+        XCTAssertTrue(mode.acknowledge(.office))
+        XCTAssertEqual(mode.active?.targetFps, 60)
+        mode.reset()
+        XCTAssertNil(mode.active)
+    }
+
+    func testGameRepeatsNeverInvokeFreshDrawableCallback() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/Renderer.swift"), encoding: .utf8)
+        XCTAssertTrue(source.replacingOccurrences(of: "\r\n", with: "\n")
+            .contains("if drawKind != .gameRepeated {\n            onDrawableCommitted?"))
+    }
+
+    func testDeleteStoredLogsRemovesOnlyManagedFiles() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let managed = [
+            "ScreenCasting-Telemetry-old.csv",
+            "ScreenCasting-Frame-Telemetry-old.csv",
+            "ScreenCasting-Diagnostics-old.log"
+        ]
+        let unrelated = ["unrelated.csv", "notes.log", "some-document.txt"]
+        for name in managed + unrelated {
+            try Data(name.utf8).write(to: directory.appendingPathComponent(name))
+        }
+
+        let telemetry = TransportTelemetry()
+        let deleted = expectation(description: "managed logs deleted")
+        telemetry.deleteStoredLogs(directoryURL: directory) { result in
+            XCTAssertEqual(try? result.get(), 3)
+            deleted.fulfill()
+        }
+        wait(for: [deleted], timeout: 2)
+
+        for name in managed {
+            XCTAssertFalse(FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent(name).path))
+        }
+        for name in unrelated {
+            XCTAssertTrue(FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent(name).path))
+        }
+    }
+
+    func testDeleteStoredLogsProtectsActiveTripletAndLoggingContinues() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let telemetry = TransportTelemetry()
+        let started = expectation(description: "logging started")
+        _ = telemetry.startLogging(directoryURL: directory) { url in
+            XCTAssertNotNil(url)
+            started.fulfill()
+        }
+        wait(for: [started], timeout: 2)
+        for name in [
+            "ScreenCasting-Telemetry-old.csv",
+            "ScreenCasting-Frame-Telemetry-old.csv",
+            "ScreenCasting-Diagnostics-old.log"
+        ] {
+            try Data(name.utf8).write(to: directory.appendingPathComponent(name))
+        }
+
+        let deleted = expectation(description: "old logs deleted")
+        telemetry.deleteStoredLogs(directoryURL: directory) { result in
+            XCTAssertEqual(try? result.get(), 3)
+            deleted.fulfill()
+        }
+        wait(for: [deleted], timeout: 2)
+        let activeFiles = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil)
+        XCTAssertEqual(activeFiles.count, 3)
+        let diagnosticURL = try XCTUnwrap(activeFiles.first {
+            $0.lastPathComponent.hasPrefix("ScreenCasting-Diagnostics-")
+        })
+
+        telemetry.recordDiagnosticLine("after-delete")
+        let stopped = expectation(description: "active logging stopped")
+        telemetry.stopLogging { stopped.fulfill() }
+        wait(for: [stopped], timeout: 2)
+        XCTAssertTrue(
+            try String(contentsOf: diagnosticURL, encoding: .utf8)
+                .contains("after-delete"))
+    }
+
+    func testDeleteStoredLogsRemovesCompletedLoggingSession() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let telemetry = TransportTelemetry()
+        let started = expectation(description: "logging started")
+        _ = telemetry.startLogging(directoryURL: directory) { _ in started.fulfill() }
+        wait(for: [started], timeout: 2)
+        let stopped = expectation(description: "logging stopped")
+        telemetry.stopLogging { stopped.fulfill() }
+        wait(for: [stopped], timeout: 2)
+
+        let deleted = expectation(description: "completed logs deleted")
+        telemetry.deleteStoredLogs(directoryURL: directory) { result in
+            XCTAssertEqual(try? result.get(), 3)
+            deleted.fulfill()
+        }
+        wait(for: [deleted], timeout: 2)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: directory.path),
+            [])
+    }
+
+    func testDeleteStoredLogsPreservesRuntimeTelemetry() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data().write(to: directory.appendingPathComponent(
+            "ScreenCasting-Telemetry-old.csv"))
+        let telemetry = TransportTelemetry()
+        telemetry.recordPayloadReceived(sequence: 9, receiveDurationMs: 4)
+        telemetry.recordDecodeCallback(
+            sequence: 9,
+            generation: 0,
+            decodeStartedAt: ProcessInfo.processInfo.systemUptime,
+            durationMs: 6)
+        telemetry.recordRtt(durationMs: 8)
+
+        let deleted = expectation(description: "stored logs deleted")
+        telemetry.deleteStoredLogs(directoryURL: directory) { result in
+            XCTAssertEqual(try? result.get(), 1)
+            deleted.fulfill()
+        }
+        wait(for: [deleted], timeout: 2)
+
+        XCTAssertEqual(telemetry.makeFeedback().2, 8)
+        XCTAssertEqual(telemetry.hudSnapshot().frameReceiveMs, 4)
+        XCTAssertEqual(telemetry.hudSnapshot().decodeMs, 6)
+        XCTAssertNotEqual(
+            telemetry.feedbackValidityFlags() &
+                VideoFeedbackValidityFlags.frameReceive,
+            0)
+    }
+
+    func testRuntimeTelemetryRemainsActiveWithoutPersistentLogging() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let telemetry = TransportTelemetry()
+
+        telemetry.recordPayloadReceived(sequence: 11, receiveDurationMs: 4)
+        telemetry.recordDecodeCallback(
+            sequence: 11,
+            generation: 0,
+            decodeStartedAt: ProcessInfo.processInfo.systemUptime,
+            durationMs: 6)
+        telemetry.recordRtt(durationMs: 8)
+        telemetry.recordDiagnosticLine("logging-disabled")
+        let drained = expectation(description: "disabled sink drained")
+        telemetry.stopLogging { drained.fulfill() }
+        wait(for: [drained], timeout: 2)
+
+        let feedback = telemetry.makeFeedback()
+        XCTAssertEqual(feedback.2, 8)
+        XCTAssertNotEqual(
+            telemetry.feedbackValidityFlags() &
+                VideoFeedbackValidityFlags.frameReceive,
+            0)
+        XCTAssertNotEqual(
+            telemetry.feedbackValidityFlags() & VideoFeedbackValidityFlags.decode,
+            0)
+        XCTAssertEqual(telemetry.hudSnapshot().frameReceiveMs, 4)
+        XCTAssertEqual(telemetry.hudSnapshot().decodeMs, 6)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    func testPersistentLoggingStartIsIdempotentAndStopPreservesRuntimeState() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let telemetry = TransportTelemetry()
+        telemetry.recordPayloadReceived(sequence: 41, receiveDurationMs: 3)
+
+        var firstURL: URL?
+        let firstStarted = expectation(description: "first logging start")
+        _ = telemetry.startLogging(directoryURL: directory) { url in
+            firstURL = url
+            firstStarted.fulfill()
+        }
+        wait(for: [firstStarted], timeout: 2)
+
+        var secondURL: URL?
+        let secondStarted = expectation(description: "idempotent logging start")
+        _ = telemetry.startLogging(directoryURL: directory) { url in
+            secondURL = url
+            secondStarted.fulfill()
+        }
+        wait(for: [secondStarted], timeout: 2)
+        XCTAssertEqual(firstURL, secondURL)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: directory.path).count,
+            3)
+
+        telemetry.recordDiagnosticLine("before-disable")
+        let stopped = expectation(description: "logging stopped")
+        telemetry.stopLogging { stopped.fulfill() }
+        wait(for: [stopped], timeout: 2)
+        let diagnosticURL = try XCTUnwrap(try FileManager.default
+            .contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .first { $0.lastPathComponent.hasPrefix("ScreenCasting-Diagnostics-") })
+        let sizeAfterStop = try Data(contentsOf: diagnosticURL).count
+
+        telemetry.recordDiagnosticLine("after-disable")
+        let stoppedAgain = expectation(description: "logging stop is idempotent")
+        telemetry.stopLogging { stoppedAgain.fulfill() }
+        wait(for: [stoppedAgain], timeout: 2)
+        XCTAssertEqual(try Data(contentsOf: diagnosticURL).count, sizeAfterStop)
+        XCTAssertEqual(telemetry.hudSnapshot().frameReceiveMs, 3)
+    }
+
+    func testWifiCompletedFrameRecordsOneReceiveSample() {
+        let telemetry = TransportTelemetry()
+        telemetry.recordWifiPacket(
+            sequence: 7, marker: false, isIDR: false, bytes: 600,
+            arrivalTime: 1.000, generation: 3)
+        telemetry.recordWifiPacket(
+            sequence: 7, marker: true, isIDR: false, bytes: 400,
+            arrivalTime: 1.004, generation: 3)
+        telemetry.recordWifiReassembly(
+            outcome: .completed(
+                accessUnit: Data([1]), frameSequence: 7, captureTime90k: 1),
+            observedAt: 1.005,
+            generation: 3)
+
+        let counts = telemetry.summaryCountsForTesting()
+        XCTAssertEqual(counts.receive, 1)
+        XCTAssertEqual(telemetry.frameReceivePercentilesMs().p50, 4)
+    }
+
+    func testWifiExpiredFrameDoesNotRecordSuccessfulReceive() {
+        let telemetry = TransportTelemetry()
+        telemetry.recordWifiPacket(
+            sequence: 8, marker: false, isIDR: false, bytes: 600,
+            arrivalTime: 2.000, generation: 3)
+        telemetry.recordWifiPacket(
+            sequence: 8, marker: true, isIDR: false, bytes: 400,
+            arrivalTime: 2.006, generation: 3)
+        telemetry.recordWifiReassembly(
+            outcome: .expired(frameSequence: 8),
+            observedAt: 2.040,
+            generation: 3)
+
+        XCTAssertEqual(telemetry.summaryCountsForTesting().receive, 0)
+    }
+
+    func testWifiAuthenticatedFeedbackRttReachesTelemetryOnce() {
+        let telemetry = TransportTelemetry()
+        let queue = DispatchQueue(label: "test.wifi.rtt.telemetry")
+        let receiver = WifiMediaReceiver(
+            networkQueue: queue,
+            decoder: { _, _, _, _ in },
+            audioConsumer: { _, _, _, _ in },
+            onProbeAuthenticated: { _, _ in },
+            onCommittedFailure: { _, _ in },
+            rttObserver: { telemetry.recordRtt(durationMs: $0) })
+
+        queue.sync {
+            receiver.recordAcceptedRttSampleForTesting(milliseconds: 5)
+        }
+
+        XCTAssertEqual(telemetry.summaryCountsForTesting().rtt, 1)
+        XCTAssertEqual(telemetry.makeFeedback().2, 5)
+    }
+
     func testWifiSecurityDropSnapshotIsOperationallyVisible() {
         let telemetry = TransportTelemetry()
         var counters = WifiSecurityDropCounters()

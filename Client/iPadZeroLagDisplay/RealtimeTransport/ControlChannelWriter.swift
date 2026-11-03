@@ -19,6 +19,7 @@ final class ControlChannelWriter {
         case reliable
         case telemetry
         case movement
+        case bulk
     }
 
     private struct Pending {
@@ -73,6 +74,15 @@ final class ControlChannelWriter {
         return true
     }
 
+    @discardableResult
+    func enqueueBulk(_ data: Data, completion: @escaping (NWError?) -> Void) -> Bool {
+        dispatchPrecondition(condition: .onQueue(queue))
+        let count = pending.filter { $0.priority == .bulk }.count + (inFlight?.priority == .bulk ? 1 : 0)
+        guard count < 2 else { return false }
+        pending.append(Pending(data: data, priority: .bulk, generation: generation, diagnostic: nil, completion: completion))
+        drain()
+        return true
+    }
     /// Telemetry is latest-wins. Replacing an unsent report keeps reliable input
     /// transitions within the bounded queue without creating a second writer.
     func enqueueTelemetry(
@@ -114,7 +124,8 @@ final class ControlChannelWriter {
     func drain() {
         dispatchPrecondition(condition: .onQueue(queue))
         guard !sending, !pending.isEmpty else { return }
-        let next = pending.removeFirst()
+        let index = pending.firstIndex { $0.priority != .bulk } ?? 0
+        let next = pending.remove(at: index)
         sending = true
         inFlight = next
         activeSendID &+= 1
@@ -131,6 +142,15 @@ final class ControlChannelWriter {
                 self.drain()
             }
         }
+    }
+
+    /// Retires queued transfer frames without disturbing reliable input or the active write.
+    func cancelBulk() {
+        dispatchPrecondition(condition: .onQueue(queue))
+        let removed = pending.filter { $0.priority == .bulk }
+        pending.removeAll { $0.priority == .bulk }
+        // Settle ownership after queue mutation so callbacks may safely enqueue.
+        for item in removed { item.completion(.posix(.ECANCELED)) }
     }
 
     /// Keeps an in-flight send serialized, but drops all stale queued work.

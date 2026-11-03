@@ -43,648 +43,8 @@ private enum USBListenerError: LocalizedError {
         }
     }
 }
-
-enum WireMessageType: UInt8 {
-    case authResult = 1
-    case video = 2
-    case audio = 3
-    case bitrate = 4
-    case protocolError = 5
-    case ping = 6
-    case pong = 7
-    case videoFeedback = 8
-    case clientCapabilities = 9
-    case transportOffer = 10
-    case transportReady = 11
-    case transportCommit = 12
-    case usbLaneBind = 13
-    case usbLaneBindResult = 14
-    case videoConfiguration = 15
-    case videoConfigurationAck = 16
-    case displayCapabilities = 17
-    case displayConfigurationRequest = 18
-    case displayReady = 19
-    case displayConfigurationFailed = 20
-    case clientHello = 21
-    case pairingRequired = 22
-    case trustedDeviceChallenge = 23
-    case trustedDeviceProof = 24
-    case pairingSuccess = 25
-    case trustedAuthResult = 26
-    case sessionResumeResult = 27
-    case settingsGet = 28
-    case settingsState = 29
-    case settingsUpdate = 30
-    case settingsApplied = 31
-    case settingsRejected = 32
-    case forgetDevice = 33
-    case forgetDeviceResult = 34
-    case presentationActivity = 35
-    case pipelineMode = 36
-}
-
-public enum PipelineMode: UInt8 {
-    case office = 0
-    case game = 1
-
-    static func decode(_ payload: Data) -> PipelineMode? {
-        guard payload.count == 1 else { return nil }
-        return PipelineMode(rawValue: payload[0])
-    }
-
-    func encode() -> Data { Data([rawValue]) }
-}
-
-enum WireProtocol {
-    static let magic: UInt32 = 0x54534353
-    static let version: UInt8 = 1
-    static let headerSize = 16
-    static let maxPayloadSize = 8 * 1024 * 1024
-    static let drainChunkSize = 256
-    static let receiveChunkSize = 64 * 1024
-    static let videoFlagIDR: UInt16 = 0x0001
-    static let videoFlagLengthPrefixed: UInt16 = 0x0002
-    static let audioFlagOpus: UInt16 = 0x0001
-    static let maximumOpusPayloadLength = 1_275
-    static let realtimeNegotiationSupportedFlag: UInt16 = 0x8000
-}
-
-struct TrustedHostCredential: Codable, Equatable {
-    let fingerprint: String
-    let hostID: Data
-    let deviceID: Data
-    let secret: Data
-    var sessionID: Data
-}
-
-protocol TrustedHostCredentialBacking {
-    func load(fingerprint: String) -> Data?
-    func save(_ data: Data, fingerprint: String) -> Bool
-    func delete(fingerprint: String)
-}
-
-struct SecurityTrustedHostCredentialBacking: TrustedHostCredentialBacking {
-    private let service = "com.screencasting.trusted-host.v1"
-
-    func load(fingerprint: String) -> Data? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: fingerprint,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data else { return nil }
-        return data
-    }
-
-    func save(_ data: Data, fingerprint: String) -> Bool {
-        let key: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: fingerprint,
-        ]
-        let values: [String: Any] = [
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-        ]
-        let update = SecItemUpdate(key as CFDictionary, values as CFDictionary)
-        if update == errSecSuccess { return true }
-        guard update == errSecItemNotFound else { return false }
-        var add = key
-        values.forEach { add[$0.key] = $0.value }
-        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
-    }
-
-    func delete(fingerprint: String) {
-        SecItemDelete([
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: fingerprint,
-        ] as CFDictionary)
-    }
-}
-
-struct TrustedHostCredentialStore {
-    private let backing: any TrustedHostCredentialBacking
-
-    init(backing: any TrustedHostCredentialBacking = SecurityTrustedHostCredentialBacking()) {
-        self.backing = backing
-    }
-
-    func load(fingerprint: String) -> TrustedHostCredential? {
-        guard !fingerprint.isEmpty,
-              let data = backing.load(fingerprint: fingerprint),
-              let credential = try? JSONDecoder().decode(
-                  TrustedHostCredential.self,
-                  from: data),
-              credential.fingerprint == fingerprint,
-              credential.hostID.count == 16,
-              credential.deviceID.count == 16,
-              credential.secret.count == 32,
-              credential.sessionID.count == 16 else { return nil }
-        return credential
-    }
-
-    func save(_ credential: TrustedHostCredential) -> Bool {
-        guard !credential.fingerprint.isEmpty,
-              credential.hostID.count == 16,
-              credential.deviceID.count == 16,
-              credential.secret.count == 32,
-              credential.sessionID.count == 16,
-              let data = try? JSONEncoder().encode(credential) else { return false }
-        return backing.save(data, fingerprint: credential.fingerprint)
-    }
-
-    func delete(fingerprint: String) {
-        backing.delete(fingerprint: fingerprint)
-    }
-}
-
-struct TrustedHostFingerprintStore {
-    private let service = "com.screencasting.trusted-host-identity.v1"
-    private let account = "selected-host"
-
-    func load() -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data,
-              let fingerprint = String(data: data, encoding: .utf8) else {
-            return nil
-        }
-        return fingerprint
-    }
-
-    func save(_ fingerprint: String) -> Bool {
-        guard !fingerprint.isEmpty,
-              let data = fingerprint.data(using: .utf8) else { return false }
-        let key: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        let values: [String: Any] = [
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-        ]
-        let update = SecItemUpdate(key as CFDictionary, values as CFDictionary)
-        if update == errSecSuccess { return true }
-        guard update == errSecItemNotFound else { return false }
-        var add = key
-        values.forEach { add[$0.key] = $0.value }
-        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
-    }
-
-    func delete() {
-        SecItemDelete([
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ] as CFDictionary)
-    }
-}
-
-enum TrustedReconnectPolicy {
-    private static let delays: [TimeInterval] = [0, 0.25, 1, 2, 5]
-
-    static func delay(forAttempt attempt: Int) -> TimeInterval {
-        delays[min(max(attempt, 0), delays.count - 1)]
-    }
-
-    static func shouldSchedule(
-        isForegroundActive: Bool,
-        reconnectEnabled: Bool,
-        lastKnownHost: String?
-    ) -> Bool {
-        isForegroundActive && reconnectEnabled &&
-            !(lastKnownHost?.isEmpty ?? true)
-    }
-}
-
-enum RecentWifiResumePolicy {
-    static let relaunchWindow: TimeInterval = 30
-
-    static func isValid(
-        resumeUntil: TimeInterval?,
-        now: TimeInterval
-    ) -> Bool {
-        guard let resumeUntil else { return false }
-        return resumeUntil >= now
-    }
-}
-
-enum WifiLifecyclePolicy {
-    static let backgroundGrace: TimeInterval = 5
-
-    static func shouldTearDownAfterGrace(
-        isForegroundActive: Bool,
-        isUSB: Bool,
-        scheduledGeneration: UInt64,
-        currentGeneration: UInt64,
-        hasSameConnection: Bool
-    ) -> Bool {
-        !isForegroundActive && !isUSB &&
-            scheduledGeneration == currentGeneration && hasSameConnection
-    }
-}
-
-enum RecentWifiResumeStore {
-    private static let key = "ScreenCasting.wifi.relaunchResumeUntil"
-
-    static func mark(
-        now: TimeInterval = Date().timeIntervalSince1970,
-        defaults: UserDefaults = .standard
-    ) {
-        defaults.set(
-            now + RecentWifiResumePolicy.relaunchWindow,
-            forKey: key)
-    }
-
-    static func consumeIfValid(
-        now: TimeInterval = Date().timeIntervalSince1970,
-        defaults: UserDefaults = .standard
-    ) -> Bool {
-        let value = defaults.object(forKey: key) as? NSNumber
-        let resumeUntil = value?.doubleValue
-        defaults.removeObject(forKey: key)
-        return RecentWifiResumePolicy.isValid(
-            resumeUntil: resumeUntil,
-            now: now)
-    }
-
-    static func clear(defaults: UserDefaults = .standard) {
-        defaults.removeObject(forKey: key)
-    }
-}
-
-struct WifiReconnectTarget: Codable, Equatable {
-    enum Kind: String, Codable {
-        case hostPort
-        case service
-    }
-
-    let kind: Kind
-    let host: String?
-    let port: UInt16?
-    let serviceName: String?
-    let serviceType: String?
-    let serviceDomain: String?
-
-    static func hostPort(host: String, port: UInt16) -> Self {
-        Self(
-            kind: .hostPort,
-            host: host,
-            port: port,
-            serviceName: nil,
-            serviceType: nil,
-            serviceDomain: nil)
-    }
-
-    static func service(name: String, type: String, domain: String) -> Self {
-        Self(
-            kind: .service,
-            host: nil,
-            port: nil,
-            serviceName: name,
-            serviceType: type,
-            serviceDomain: domain)
-    }
-
-    var endpoint: NWEndpoint? {
-        switch kind {
-        case .hostPort:
-            guard let host, !host.isEmpty,
-                  let port,
-                  let nwPort = NWEndpoint.Port(rawValue: port) else { return nil }
-            return .hostPort(host: NWEndpoint.Host(host), port: nwPort)
-        case .service:
-            guard let serviceName, !serviceName.isEmpty,
-                  let serviceType, !serviceType.isEmpty,
-                  let serviceDomain, !serviceDomain.isEmpty else { return nil }
-            return .service(
-                name: serviceName,
-                type: serviceType,
-                domain: serviceDomain,
-                interface: nil)
-        }
-    }
-}
-
-enum WifiReconnectTargetPolicy {
-    static func target(from endpoint: NWEndpoint) -> WifiReconnectTarget? {
-        switch endpoint {
-        case .hostPort(let host, let port):
-            return .hostPort(host: String(describing: host), port: port.rawValue)
-        case .service(let name, let type, let domain, _):
-            return .service(name: name, type: type, domain: domain)
-        default:
-            return nil
-        }
-    }
-}
-
-enum WifiReconnectTargetSelection {
-    static func preferred(
-        structured: WifiReconnectTarget?,
-        legacyHost: String?
-    ) -> WifiReconnectTarget? {
-        if let structured { return structured }
-        guard let legacyHost, !legacyHost.isEmpty else { return nil }
-        return .hostPort(host: legacyHost, port: 27015)
-    }
-}
-
-enum WifiReconnectTargetStore {
-    private static let key = "ScreenCasting.wifi.reconnectTarget.v1"
-
-    static func save(
-        _ target: WifiReconnectTarget,
-        defaults: UserDefaults = .standard
-    ) {
-        guard let data = try? JSONEncoder().encode(target) else { return }
-        defaults.set(data, forKey: key)
-    }
-
-    static func load(
-        defaults: UserDefaults = .standard
-    ) -> WifiReconnectTarget? {
-        guard let data = defaults.data(forKey: key) else { return nil }
-        return try? JSONDecoder().decode(WifiReconnectTarget.self, from: data)
-    }
-
-    static func clear(defaults: UserDefaults = .standard) {
-        defaults.removeObject(forKey: key)
-    }
-}
-
-struct ClientStreamSettingsPreference: Equatable {
-    static let minimumBitrateMbps: Double = 3
-    static let maximumBitrateMbps: Double = 50
-    static let defaultBitrateMbps: Double = 20
-    static let defaultAudioEnabled = true
-
-    let bitrateMbps: Double
-    let audioEnabled: Bool
-
-    static func normalized(
-        bitrateMbps: Double,
-        audioEnabled: Bool
-    ) -> ClientStreamSettingsPreference {
-        let rounded = round(bitrateMbps)
-        return ClientStreamSettingsPreference(
-            bitrateMbps: min(
-                maximumBitrateMbps,
-                max(minimumBitrateMbps, rounded)),
-            audioEnabled: audioEnabled)
-    }
-}
-
-enum ClientStreamSettingsStore {
-    private static let bitrateKey =
-        "ScreenCasting.client.desiredBitrateMbps.v1"
-    private static let audioKey =
-        "ScreenCasting.client.desiredAudioEnabled.v1"
-
-    static func load(
-        defaults: UserDefaults = .standard
-    ) -> ClientStreamSettingsPreference {
-        let bitrate =
-            (defaults.object(forKey: bitrateKey) as? NSNumber)?.doubleValue
-            ?? ClientStreamSettingsPreference.defaultBitrateMbps
-        let audioEnabled =
-            (defaults.object(forKey: audioKey) as? NSNumber)?.boolValue
-            ?? ClientStreamSettingsPreference.defaultAudioEnabled
-        return .normalized(
-            bitrateMbps: bitrate,
-            audioEnabled: audioEnabled)
-    }
-
-    static func save(
-        _ preference: ClientStreamSettingsPreference,
-        defaults: UserDefaults = .standard
-    ) {
-        let normalized = ClientStreamSettingsPreference.normalized(
-            bitrateMbps: preference.bitrateMbps,
-            audioEnabled: preference.audioEnabled)
-        defaults.set(normalized.bitrateMbps, forKey: bitrateKey)
-        defaults.set(normalized.audioEnabled, forKey: audioKey)
-    }
-}
-
-enum TrustedSettingsRejectReason: UInt8, Equatable {
-    case none = 0
-    case invalidBitrate = 1
-    case staleGeneration = 2
-    case runtimeApplyFailed = 3
-    case invalidRequest = 4
-}
-
-enum ClientSettingsApplyOutcome: Equatable {
-    case state
-    case applied
-    case rejected(TrustedSettingsRejectReason)
-}
-
-enum ClientSettingsReconciliationDecision: Equatable {
-    case inSync
-    case send
-    case suppressHardRejection
-    case suppressAlreadyAttempted
-}
-
-struct ClientSettingsReconciliationGate {
-    private(set) var lastAutomaticAttemptGeneration: UInt64?
-    private(set) var lastStaleRetryGeneration: UInt64?
-    private(set) var hardRejectedGeneration: UInt64?
-    private(set) var runtimeApplyFailedGeneration: UInt64?
-    private(set) var runtimeReadyRetryGeneration: UInt64?
-
-    mutating func decision(
-        hostGeneration: UInt64,
-        desired: ClientStreamSettingsPreference,
-        effective: ClientStreamSettingsPreference,
-        outcome: ClientSettingsApplyOutcome
-    ) -> ClientSettingsReconciliationDecision {
-        guard desired != effective else {
-            runtimeApplyFailedGeneration = nil
-            runtimeReadyRetryGeneration = nil
-            if hardRejectedGeneration == hostGeneration {
-                hardRejectedGeneration = nil
-            }
-            return .inSync
-        }
-        if case .rejected(let reason) = outcome {
-            if reason == .staleGeneration {
-                guard lastAutomaticAttemptGeneration != hostGeneration else {
-                    return .suppressAlreadyAttempted
-                }
-                guard lastStaleRetryGeneration != hostGeneration else {
-                    return .suppressAlreadyAttempted
-                }
-                lastStaleRetryGeneration = hostGeneration
-                lastAutomaticAttemptGeneration = hostGeneration
-                return .send
-            }
-            if reason == .runtimeApplyFailed {
-                if runtimeReadyRetryGeneration == hostGeneration {
-                    runtimeApplyFailedGeneration = hostGeneration
-                } else if runtimeApplyFailedGeneration != hostGeneration {
-                    runtimeApplyFailedGeneration = hostGeneration
-                    runtimeReadyRetryGeneration = nil
-                }
-                hardRejectedGeneration = hostGeneration
-                lastAutomaticAttemptGeneration = hostGeneration
-                return .suppressHardRejection
-            }
-            runtimeApplyFailedGeneration = nil
-            runtimeReadyRetryGeneration = nil
-            hardRejectedGeneration = hostGeneration
-            lastAutomaticAttemptGeneration = hostGeneration
-            return .suppressHardRejection
-        }
-        if case .state = outcome,
-           runtimeApplyFailedGeneration != nil {
-            if let retryGeneration = runtimeReadyRetryGeneration {
-                if retryGeneration == hostGeneration {
-                    return .suppressHardRejection
-                }
-                runtimeApplyFailedGeneration = nil
-                runtimeReadyRetryGeneration = nil
-                if hardRejectedGeneration == retryGeneration {
-                    hardRejectedGeneration = nil
-                }
-            } else {
-                runtimeReadyRetryGeneration = hostGeneration
-                hardRejectedGeneration = nil
-                lastAutomaticAttemptGeneration = hostGeneration
-                return .send
-            }
-        }
-        if hardRejectedGeneration == hostGeneration {
-            return .suppressHardRejection
-        }
-        guard lastAutomaticAttemptGeneration != hostGeneration else {
-            return .suppressAlreadyAttempted
-        }
-        lastAutomaticAttemptGeneration = hostGeneration
-        return .send
-    }
-
-    mutating func reset() {
-        lastAutomaticAttemptGeneration = nil
-        lastStaleRetryGeneration = nil
-        hardRejectedGeneration = nil
-        runtimeApplyFailedGeneration = nil
-        runtimeReadyRetryGeneration = nil
-    }
-}
-
-struct ClientSettingsStateModel {
-    private(set) var desired: ClientStreamSettingsPreference
-    private(set) var effective: ClientStreamSettingsPreference
-    private(set) var generation: UInt64 = 0
-
-    init(desired: ClientStreamSettingsPreference) {
-        self.desired = desired
-        self.effective = .normalized(
-            bitrateMbps: ClientStreamSettingsPreference.defaultBitrateMbps,
-            audioEnabled: ClientStreamSettingsPreference.defaultAudioEnabled)
-    }
-
-    mutating func receiveHostState(
-        _ effective: ClientStreamSettingsPreference,
-        generation: UInt64
-    ) {
-        self.effective = effective
-        self.generation = generation
-    }
-
-    mutating func setDesired(_ desired: ClientStreamSettingsPreference) {
-        self.desired = desired
-    }
-
-    mutating func resetHostGeneration() {
-        generation = 0
-    }
-}
-
-struct ClientSettingsSyncPolicy {
-    private(set) var lastUsbSettingsGetGeneration: UInt64?
-
-    mutating func shouldRequestUsbSettings(
-        committedGeneration: UInt64
-    ) -> Bool {
-        guard lastUsbSettingsGetGeneration != committedGeneration else {
-            return false
-        }
-        lastUsbSettingsGetGeneration = committedGeneration
-        return true
-    }
-
-    mutating func reset() {
-        lastUsbSettingsGetGeneration = nil
-    }
-}
-
-enum DesiredSettingsSendResult: Equatable {
-    case sent(requestID: UInt32)
-    case waitingForHost
-}
-
-enum DesiredSettingsSendDecision: Equatable {
-    case send
-    case waitingForHost
-}
-
-enum DesiredSettingsSendPolicy {
-    static func decision(canSend: Bool) -> DesiredSettingsSendDecision {
-        canSend ? .send : .waitingForHost
-    }
-
-    static func status(for result: DesiredSettingsSendResult) -> String {
-        switch result {
-        case .sent: return "Applying…"
-        case .waitingForHost: return "Waiting for Host"
-        }
-    }
-}
-
-struct TrustedSettingsState: Equatable {
-    let generation: UInt64
-    let bitrateBps: UInt32
-    let audioEnabled: Bool
-    let rejectionReason: TrustedSettingsRejectReason
-
-    static func decode(_ payload: Data) -> TrustedSettingsState? {
-        guard payload.count == 24, payload[0] == 1, payload[1] <= 1,
-              let rejectionReason = TrustedSettingsRejectReason(rawValue: payload[2]),
-              payload[3] == 0,
-              payload[20] == 0, payload[21] == 0,
-              payload[22] == 0, payload[23] == 0 else { return nil }
-        let generation = payload.withUnsafeBytes {
-            $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self).littleEndian
-        }
-        let bitrateBps = payload.withUnsafeBytes {
-            $0.loadUnaligned(fromByteOffset: 16, as: UInt32.self).littleEndian
-        }
-        guard bitrateBps >= 3_000_000, bitrateBps <= 50_000_000,
-              bitrateBps.isMultiple(of: 1_000_000) else { return nil }
-        return TrustedSettingsState(
-            generation: generation,
-            bitrateBps: bitrateBps,
-            audioEnabled: payload[1] == 1,
-            rejectionReason: rejectionReason)
-    }
-}
+// [split: WireCommands.swift]
+// [split: TrustedHostSettings.swift]
 
 private enum TrustedDeviceIdentity {
     private static let defaultsKey = "trustedDeviceId.v1"
@@ -698,343 +58,7 @@ private enum TrustedDeviceIdentity {
         return data
     }
 }
-
-enum ClientDisplayOrientation: UInt8, Equatable {
-    case landscape = 0
-    case portrait = 1
-}
-
-enum DisplayOrientationMode: String, CaseIterable, Hashable {
-    case automatic
-    case landscape
-    case portrait
-
-    var title: String {
-        switch self {
-        case .automatic: return "Automatic"
-        case .landscape: return "Landscape"
-        case .portrait: return "Portrait"
-        }
-    }
-
-    func resolved(using interfaceOrientation: ClientDisplayOrientation) -> ClientDisplayOrientation {
-        switch self {
-        case .automatic: return interfaceOrientation
-        case .landscape: return .landscape
-        case .portrait: return .portrait
-        }
-    }
-}
-
-struct DisplayResolution: Hashable, Identifiable {
-    let width: UInt32
-    let height: UInt32
-
-    var id: String { "\(width)x\(height)" }
-    var title: String { "\(width) × \(height)" }
-}
-
-struct DisplayMode: Hashable {
-    let width: UInt32
-    let height: UInt32
-    let refreshHz: UInt32
-    let isExperimental: Bool
-
-    var resolution: DisplayResolution {
-        DisplayResolution(width: width, height: height)
-    }
-}
-
-struct DisplayCapabilities: Equatable {
-    static let encodedSize = 52
-
-    let modes: [DisplayMode]
-    let preferred: DisplayMode
-
-    var resolutions: [DisplayResolution] {
-        var seen = Set<DisplayResolution>()
-        return modes.compactMap { mode in
-            let resolution = mode.resolution
-            return seen.insert(resolution).inserted ? resolution : nil
-        }
-    }
-
-    func refreshRates(for resolution: DisplayResolution) -> [UInt32] {
-        modes.compactMap { mode in
-            mode.resolution == resolution ? mode.refreshHz : nil
-        }
-    }
-
-    func supports(_ preference: DisplayPreference) -> Bool {
-        modes.contains {
-            $0.width == preference.width &&
-            $0.height == preference.height &&
-            $0.refreshHz == preference.refreshHz
-        }
-    }
-
-    static func decode(_ data: Data) -> DisplayCapabilities? {
-        guard data.count == encodedSize,
-              data[0] == 1,
-              (1...4).contains(Int(data[1])) else {
-            return nil
-        }
-
-        let modeCount = Int(data[1])
-        var decodedModes: [DisplayMode] = []
-        decodedModes.reserveCapacity(modeCount)
-        for index in 0..<modeCount {
-            let offset = 4 + (index * 12)
-            let width = data.loadLittleEndian(UInt32.self, at: offset)
-            let height = data.loadLittleEndian(UInt32.self, at: offset + 4)
-            let refreshHz = UInt32(data.loadLittleEndian(UInt16.self, at: offset + 8))
-            let flags = data.loadLittleEndian(UInt16.self, at: offset + 10)
-            guard width > 0,
-                  height > 0,
-                  refreshHz > 0,
-                  (flags & ~UInt16(1)) == 0 else {
-                return nil
-            }
-            decodedModes.append(DisplayMode(
-                width: width,
-                height: height,
-                refreshHz: refreshHz,
-                isExperimental: (flags & 1) != 0))
-        }
-        let nativeModes = decodedModes.filter {
-            $0.width == 2388 &&
-            $0.height == 1668 &&
-            ($0.refreshHz == 120 || $0.refreshHz == 60) &&
-            !$0.isExperimental
-        }
-        guard !nativeModes.isEmpty,
-              nativeModes.count == decodedModes.count,
-              let preferred = nativeModes.first(where: { $0.refreshHz == 120 })
-                ?? nativeModes.first else { return nil }
-        return DisplayCapabilities(modes: nativeModes, preferred: preferred)
-    }
-}
-
-struct DisplayConfigurationRequest: Equatable {
-    let width: UInt32
-    let height: UInt32
-    let refreshHz: UInt32
-    let orientation: ClientDisplayOrientation
-    let requestId: UInt32
-
-    func encode() -> Data {
-        var data = Data(count: 20)
-        data[0] = 1
-        data[1] = orientation.rawValue
-        data.storeLittleEndian(width, at: 4)
-        data.storeLittleEndian(height, at: 8)
-        data.storeLittleEndian(refreshHz, at: 12)
-        data.storeLittleEndian(requestId, at: 16)
-        return data
-    }
-}
-
-struct DisplayReady: Equatable {
-    let width: UInt32
-    let height: UInt32
-    let refreshHz: UInt32
-    let orientation: ClientDisplayOrientation
-    let requestId: UInt32
-    let generation: UInt32
-
-    static func decode(_ data: Data) -> DisplayReady? {
-        guard data.count == 24,
-              data[0] == 1,
-              let orientation = ClientDisplayOrientation(rawValue: data[1]) else {
-            return nil
-        }
-        let width = data.loadLittleEndian(UInt32.self, at: 4)
-        let height = data.loadLittleEndian(UInt32.self, at: 8)
-        let refreshHz = data.loadLittleEndian(UInt32.self, at: 12)
-        guard width > 0, height > 0, refreshHz > 0 else { return nil }
-        return DisplayReady(
-            width: width,
-            height: height,
-            refreshHz: refreshHz,
-            orientation: orientation,
-            requestId: data.loadLittleEndian(UInt32.self, at: 16),
-            generation: data.loadLittleEndian(UInt32.self, at: 20))
-    }
-}
-
-enum DisplayConfigurationFailureReason: UInt8, Equatable {
-    case unsupportedMode = 1
-    case applyFailed = 2
-}
-
-struct DisplayConfigurationFailed: Equatable {
-    let requestId: UInt32
-    let reason: DisplayConfigurationFailureReason
-
-    static func decode(_ data: Data) -> DisplayConfigurationFailed? {
-        guard data.count == 8,
-              data[0] == 1,
-              let reason = DisplayConfigurationFailureReason(rawValue: data[1]) else {
-            return nil
-        }
-        return DisplayConfigurationFailed(
-            requestId: data.loadLittleEndian(UInt32.self, at: 4),
-            reason: reason)
-    }
-}
-
-struct DisplayPreference: Equatable {
-    static let nativeLandscapeWidth: UInt32 = 2388
-    static let nativeLandscapeHeight: UInt32 = 1668
-    static let nativeRefreshHz: UInt32 = 120
-    static let defaultValue = DisplayPreference(
-        width: nativeLandscapeWidth,
-        height: nativeLandscapeHeight,
-        refreshHz: nativeRefreshHz,
-        orientationMode: .automatic)
-
-    let width: UInt32
-    let height: UInt32
-    let refreshHz: UInt32
-    let orientationMode: DisplayOrientationMode
-
-    var resolution: DisplayResolution {
-        DisplayResolution(width: width, height: height)
-    }
-
-    func makeRequest(
-        interfaceOrientation: ClientDisplayOrientation,
-        requestId: UInt32
-    ) -> DisplayConfigurationRequest {
-        let orientation = orientationMode.resolved(using: interfaceOrientation)
-        return DisplayConfigurationRequest(
-            width: orientation == .portrait
-                ? Self.nativeLandscapeHeight
-                : Self.nativeLandscapeWidth,
-            height: orientation == .portrait
-                ? Self.nativeLandscapeWidth
-                : Self.nativeLandscapeHeight,
-            refreshHz: Self.nativeRefreshHz,
-            orientation: orientation,
-            requestId: requestId)
-    }
-
-    func reconciled(with capabilities: DisplayCapabilities) -> DisplayPreference {
-        let canonical = DisplayPreference(
-            width: Self.nativeLandscapeWidth,
-            height: Self.nativeLandscapeHeight,
-            refreshHz: Self.nativeRefreshHz,
-            orientationMode: orientationMode)
-        guard capabilities.supports(canonical) else {
-            return DisplayPreference(
-                width: capabilities.preferred.width,
-                height: capabilities.preferred.height,
-                refreshHz: capabilities.preferred.refreshHz,
-                orientationMode: orientationMode)
-        }
-        return canonical
-    }
-}
-
-enum DisplayOrientationResolver {
-    static func resolve(width: CGFloat, height: CGFloat) -> ClientDisplayOrientation? {
-        guard width > 0, height > 0, width != height else { return nil }
-        return height > width ? .portrait : .landscape
-    }
-}
-
-struct DisplayRequestGate {
-    private var nextRequestId: UInt32 = 0
-    private(set) var pending: DisplayConfigurationRequest?
-    private(set) var effective: DisplayReady?
-    private(set) var latestDesired: DisplayConfigurationRequest?
-
-    var isInputSuppressed: Bool { pending != nil }
-
-    mutating func begin(_ requested: DisplayConfigurationRequest) -> DisplayConfigurationRequest? {
-        let candidate = DisplayConfigurationRequest(
-            width: requested.width,
-            height: requested.height,
-            refreshHz: requested.refreshHz,
-            orientation: requested.orientation,
-            requestId: 0)
-        latestDesired = candidate
-        guard pending == nil else { return nil }
-        guard effective == nil || !sameConfiguration(candidate, effective!) else {
-            latestDesired = nil
-            return nil
-        }
-        return issue(candidate)
-    }
-
-    mutating func accept(_ ready: DisplayReady) -> DisplayConfigurationRequest? {
-        guard let pending,
-              pending.requestId == ready.requestId,
-              sameConfiguration(pending, ready) else {
-            return nil
-        }
-        effective = ready
-        self.pending = nil
-        guard let latestDesired,
-              !sameConfiguration(latestDesired, ready) else {
-            self.latestDesired = nil
-            return nil
-        }
-        return issue(latestDesired)
-    }
-
-    mutating func reject(_ failed: DisplayConfigurationFailed) -> DisplayConfigurationRequest? {
-        guard let pending, pending.requestId == failed.requestId else { return nil }
-        self.pending = nil
-        // Retry only a newer desired mode, never the rejected request itself.
-        guard let latestDesired, !sameConfiguration(latestDesired, pending) else {
-            self.latestDesired = nil
-            return nil
-        }
-        return issue(latestDesired)
-    }
-
-    mutating func reset() {
-        pending = nil
-        effective = nil
-        latestDesired = nil
-    }
-
-    private func sameConfiguration(
-        _ request: DisplayConfigurationRequest,
-        _ candidate: DisplayConfigurationRequest
-    ) -> Bool {
-        request.width == candidate.width &&
-        request.height == candidate.height &&
-        request.refreshHz == candidate.refreshHz &&
-        request.orientation == candidate.orientation
-    }
-
-    private func sameConfiguration(
-        _ request: DisplayConfigurationRequest,
-        _ ready: DisplayReady
-    ) -> Bool {
-        request.width == ready.width &&
-        request.height == ready.height &&
-        request.refreshHz == ready.refreshHz &&
-        request.orientation == ready.orientation
-    }
-
-    private mutating func issue(
-        _ candidate: DisplayConfigurationRequest
-    ) -> DisplayConfigurationRequest {
-        nextRequestId &+= 1
-        if nextRequestId == 0 { nextRequestId = 1 }
-        let issued = DisplayConfigurationRequest(
-            width: candidate.width,
-            height: candidate.height,
-            refreshHz: candidate.refreshHz,
-            orientation: candidate.orientation,
-            requestId: nextRequestId)
-        pending = issued
-        return issued
-    }
-}
+// [split: DisplayConfiguration.swift]
 
 private enum DisplayPreferenceStore {
     private static let widthKey = "ScreenCasting.display.preferredWidth"
@@ -1068,373 +92,7 @@ private enum DisplayPreferenceStore {
         defaults.set(preference.orientationMode.rawValue, forKey: orientationKey)
     }
 }
-
-enum RealtimeAudioNegotiationPolicy {
-    static func advertisedCodecs(modes: UInt8) -> UInt8 {
-        let realtimeModes = RealtimeTransportMode.wifiRTP |
-            RealtimeTransportMode.usbSplitTLS
-        return (modes & realtimeModes) == 0
-            ? AudioCodecCapabilities.pcm
-            : AudioCodecCapabilities.pcm | AudioCodecCapabilities.opus
-    }
-
-    static func isOfferCompatible(
-        mode: UInt8,
-        audioCodec: UInt8,
-        advertisedModes: UInt8,
-        advertisedCodecs: UInt8
-    ) -> Bool {
-        let exactPair =
-            (mode == RealtimeTransportMode.legacyTLS &&
-             audioCodec == AudioCodecCapabilities.pcm) ||
-            (mode == RealtimeTransportMode.wifiRTP &&
-             (audioCodec == AudioCodecCapabilities.opus ||
-              audioCodec == AudioCodecCapabilities.none)) ||
-            (mode == RealtimeTransportMode.usbSplitTLS &&
-             audioCodec == AudioCodecCapabilities.opus)
-        return exactPair &&
-            (advertisedModes & mode) != 0 &&
-            (advertisedCodecs & audioCodec) != 0
-    }
-}
-
-enum ScstAudioPayloadKind: Equatable {
-    case legacyPCM
-    case opus
-    case reject
-}
-
-enum ScstAudioPolicy {
-    static func classify(
-        mode: UInt8?,
-        flags: UInt16,
-        payloadLength: Int
-    ) -> ScstAudioPayloadKind {
-        guard payloadLength > 0 else { return .reject }
-        if mode == RealtimeTransportMode.legacyTLS {
-            return flags == 0 ? .legacyPCM : .reject
-        }
-        if mode == RealtimeTransportMode.usbSplitTLS {
-            return flags == WireProtocol.audioFlagOpus &&
-                payloadLength <= WireProtocol.maximumOpusPayloadLength
-                ? .opus
-                : .reject
-        }
-        return .reject
-    }
-}
-
-struct WireHeader {
-    let type: WireMessageType
-    let flags: UInt16
-    let payloadLength: Int
-    let sequence: UInt32
-}
-
-struct WireMessage {
-    let header: WireHeader
-    let payload: Data
-    let firstByteAt: TimeInterval
-}
-
-enum WireParserError: Error, Equatable {
-    case invalidHeader
-    case oversizedPayload(Int)
-}
-
-enum WireParserEvent {
-    case message(WireMessage)
-    case discardedFixedControl(WireHeader)
-    case failure(WireParserError)
-}
-
-/// Incremental SCST parser with one fixed header buffer and one exactly-sized
-/// payload allocation. Each receive chunk is consumed by cursor, so bytes
-/// coalesced after a message remain available for the next header.
-final class WireStreamParser {
-    private enum State {
-        case header
-        case payload(WireHeader)
-        case draining(WireHeader, remaining: Int)
-        case failed
-    }
-
-    private var generation: UInt64
-    private var state: State = .header
-    private var headerBytes = Data(count: WireProtocol.headerSize)
-    private var headerOffset = 0
-    private var payload = Data()
-    private var payloadOffset = 0
-    private var messageFirstByteAt: TimeInterval = 0
-    private(set) var maximumDrainChunkObserved = 0
-
-    init(generation: UInt64) {
-        self.generation = generation
-    }
-
-    var allocatedPayloadBytes: Int { payload.count }
-
-    var suggestedReceiveLength: Int {
-        switch state {
-        case .header:
-            return WireProtocol.receiveChunkSize
-        case .payload(let header):
-            return max(1, min(
-                WireProtocol.receiveChunkSize,
-                header.payloadLength - payloadOffset))
-        case .draining(_, let remaining):
-            return max(1, min(WireProtocol.drainChunkSize, remaining))
-        case .failed:
-            return 1
-        }
-    }
-
-    func reset(generation: UInt64) {
-        self.generation = generation
-        state = .header
-        headerOffset = 0
-        payload = Data()
-        payloadOffset = 0
-        messageFirstByteAt = 0
-        maximumDrainChunkObserved = 0
-    }
-
-    func consume(
-        _ data: Data,
-        generation: UInt64,
-        receivedAt: TimeInterval = ProcessInfo.processInfo.systemUptime,
-        onEvent: (WireParserEvent) -> Void
-    ) {
-        guard generation == self.generation, !data.isEmpty else { return }
-
-        data.withUnsafeBytes { source in
-            guard let sourceBase = source.baseAddress else { return }
-            var sourceOffset = 0
-
-            while sourceOffset < source.count {
-                guard generation == self.generation else { break }
-                switch state {
-                case .header:
-                    if headerOffset == 0 { messageFirstByteAt = receivedAt }
-                    let copied = min(
-                        WireProtocol.headerSize - headerOffset,
-                        source.count - sourceOffset)
-                    headerBytes.withUnsafeMutableBytes { destination in
-                        destination.baseAddress!
-                            .advanced(by: headerOffset)
-                            .copyMemory(
-                                from: sourceBase.advanced(by: sourceOffset),
-                                byteCount: copied)
-                    }
-                    headerOffset += copied
-                    sourceOffset += copied
-                    if headerOffset == WireProtocol.headerSize {
-                        preparePayload(onEvent: onEvent)
-                    }
-
-                case .payload(let header):
-                    let copied = min(
-                        header.payloadLength - payloadOffset,
-                        source.count - sourceOffset)
-                    payload.withUnsafeMutableBytes { destination in
-                        destination.baseAddress!
-                            .advanced(by: payloadOffset)
-                            .copyMemory(
-                                from: sourceBase.advanced(by: sourceOffset),
-                                byteCount: copied)
-                    }
-                    payloadOffset += copied
-                    sourceOffset += copied
-                    if payloadOffset == header.payloadLength {
-                        let completedPayload = payload
-                        let firstByteAt = messageFirstByteAt
-                        resetForNextHeader()
-                        onEvent(.message(WireMessage(
-                            header: header,
-                            payload: completedPayload,
-                            firstByteAt: firstByteAt)))
-                    }
-
-                case .draining(let header, let remaining):
-                    let consumed = min(
-                        WireProtocol.drainChunkSize,
-                        remaining,
-                        source.count - sourceOffset)
-                    maximumDrainChunkObserved = max(maximumDrainChunkObserved, consumed)
-                    sourceOffset += consumed
-                    let nextRemaining = remaining - consumed
-                    if nextRemaining == 0 {
-                        resetForNextHeader()
-                        onEvent(.discardedFixedControl(header))
-                    } else {
-                        state = .draining(header, remaining: nextRemaining)
-                    }
-
-                case .failed:
-                    sourceOffset = source.count
-                }
-            }
-        }
-    }
-
-    private func preparePayload(onEvent: (WireParserEvent) -> Void) {
-        let magic = headerBytes.withUnsafeBytes {
-            $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self).littleEndian
-        }
-        let version = headerBytes[4]
-        guard magic == WireProtocol.magic,
-              version == WireProtocol.version,
-              let type = WireMessageType(rawValue: headerBytes[5]) else {
-            state = .failed
-            payload = Data()
-            onEvent(.failure(.invalidHeader))
-            return
-        }
-
-        let flags = headerBytes.withUnsafeBytes {
-            $0.loadUnaligned(fromByteOffset: 6, as: UInt16.self).littleEndian
-        }
-        let payloadLength = Int(headerBytes.withUnsafeBytes {
-            $0.loadUnaligned(fromByteOffset: 8, as: UInt32.self).littleEndian
-        })
-        let sequence = headerBytes.withUnsafeBytes {
-            $0.loadUnaligned(fromByteOffset: 12, as: UInt32.self).littleEndian
-        }
-        guard payloadLength <= WireProtocol.maxPayloadSize else {
-            state = .failed
-            payload = Data()
-            onEvent(.failure(.oversizedPayload(payloadLength)))
-            return
-        }
-
-        let header = WireHeader(
-            type: type,
-            flags: flags,
-            payloadLength: payloadLength,
-            sequence: sequence)
-        let fixedLength: Int?
-        switch type {
-        case .ping, .pong, .videoFeedback:
-            fixedLength = 16
-        case .displayCapabilities:
-            fixedLength = DisplayCapabilities.encodedSize
-        case .displayConfigurationRequest:
-            fixedLength = 20
-        case .displayReady:
-            fixedLength = 24
-        case .displayConfigurationFailed:
-            fixedLength = 8
-        case .trustedDeviceChallenge:
-            fixedLength = 112
-        case .trustedDeviceProof:
-            fixedLength = 48
-        case .pairingSuccess:
-            fixedLength = 80
-        case .sessionResumeResult:
-            fixedLength = 17
-        case .settingsGet, .settingsState, .settingsUpdate,
-             .settingsApplied, .settingsRejected:
-            fixedLength = 24
-        case .forgetDevice:
-            fixedLength = 17
-        case .forgetDeviceResult:
-            fixedLength = 2
-        case .presentationActivity, .pipelineMode:
-            fixedLength = 1
-        case .clientCapabilities:
-            fixedLength = ClientCapabilities.encodedSize
-        case .transportOffer:
-            fixedLength = TransportOffer.encodedSize
-        case .transportReady:
-            fixedLength = TransportReady.encodedSize
-        case .transportCommit:
-            fixedLength = TransportCommit.encodedSize
-        case .usbLaneBind:
-            fixedLength = 60
-        case .usbLaneBindResult:
-            fixedLength = 28
-        default:
-            fixedLength = nil
-        }
-
-        if let fixedLength, payloadLength != fixedLength {
-            payload = Data()
-            payloadOffset = 0
-            if payloadLength == 0 {
-                resetForNextHeader()
-                onEvent(.discardedFixedControl(header))
-            } else {
-                state = .draining(header, remaining: payloadLength)
-            }
-            return
-        }
-
-        if payloadLength == 0 {
-            let firstByteAt = messageFirstByteAt
-            resetForNextHeader()
-            onEvent(.message(WireMessage(
-                header: header,
-                payload: Data(),
-                firstByteAt: firstByteAt)))
-            return
-        }
-
-        payload = Data(count: payloadLength)
-        payloadOffset = 0
-        state = .payload(header)
-    }
-
-    private func resetForNextHeader() {
-        state = .header
-        headerOffset = 0
-        payload = Data()
-        payloadOffset = 0
-        messageFirstByteAt = 0
-    }
-}
-
-/// Enforces the single executor used by production receive/reset operations.
-/// Tests use the same seam to race caller threads while parser mutation remains
-/// serialized on the supplied network queue.
-final class WireParserQueueDomain {
-    private let queue: DispatchQueue
-    private let parser: WireStreamParser
-
-    init(generation: UInt64, queue: DispatchQueue) {
-        self.queue = queue
-        parser = WireStreamParser(generation: generation)
-    }
-
-    var suggestedReceiveLength: Int {
-        dispatchPrecondition(condition: .onQueue(queue))
-        return parser.suggestedReceiveLength
-    }
-
-    var allocatedPayloadBytes: Int {
-        dispatchPrecondition(condition: .onQueue(queue))
-        return parser.allocatedPayloadBytes
-    }
-
-    var maximumDrainChunkObserved: Int {
-        dispatchPrecondition(condition: .onQueue(queue))
-        return parser.maximumDrainChunkObserved
-    }
-
-    func reset(generation: UInt64) {
-        dispatchPrecondition(condition: .onQueue(queue))
-        parser.reset(generation: generation)
-    }
-
-    func consume(
-        _ data: Data,
-        generation: UInt64,
-        receivedAt: TimeInterval = ProcessInfo.processInfo.systemUptime,
-        onEvent: (WireParserEvent) -> Void
-    ) {
-        dispatchPrecondition(condition: .onQueue(queue))
-        parser.consume(data, generation: generation, receivedAt: receivedAt, onEvent: onEvent)
-    }
-}
+// [split: WireStreamParser.swift]
 
 private final class ConnectionGenerationClock {
     private let lock = NSLock()
@@ -1543,6 +201,8 @@ public class NetworkManager: ObservableObject {
 
     // MARK: Published State
     @Published public var connectionState: ConnectionState = .idle
+    /// Automatic reconnect try number while one is running; 0 otherwise.
+    @Published public private(set) var autoReconnectAttempt = 0
     public private(set) var bytesReceived: UInt64 = 0
     @Published public private(set) var hostFingerprint: String?
     @Published public private(set) var hostIdentityCode: String?
@@ -1550,6 +210,7 @@ public class NetworkManager: ObservableObject {
 
     // The Host is the authority for selectable modes. These values only mirror
     // authenticated control responses for the connected settings surface.
+    @Published private(set) var cursorOwnershipState: CursorOwnershipState?
     @Published private(set) var displayCapabilities: DisplayCapabilities?
     @Published private(set) var displayPreference = DisplayPreference.defaultValue
     @Published private(set) var effectiveDisplayState: DisplayReady?
@@ -1562,6 +223,7 @@ public class NetworkManager: ObservableObject {
     @Published public var isAdaptiveBitrate: Bool   = false
     @Published public private(set) var desiredBitrateMbps: Double = 20
     @Published public private(set) var desiredAudioEnabled: Bool = true
+    @Published public private(set) var desiredAdaptiveBitrateEnabled: Bool = false
     @Published public private(set) var effectiveBitrateMbps: Double = 20
     @Published public private(set) var effectiveAudioEnabled: Bool = true
     @Published public private(set) var settingsApplyStatus: String = ""
@@ -1577,7 +239,9 @@ public class NetworkManager: ObservableObject {
     public var isListening:  Bool { connectionState == .listening }
 
     // MARK: Private
-    private var connection: NWConnection?
+    private var connection: NWConnection? {
+        didSet { if oldValue !== connection { refreshAutoAcceptPolicyOnQueue() } }
+    }
     private var transportState: ConnectionState = .idle
     private var verifiedHostFingerprint: String?
     private var verifiedHostIdentityCode: String?
@@ -1592,15 +256,118 @@ public class NetworkManager: ObservableObject {
     private var reconnectAttempt = 0
     private var reconnectWorkItem: DispatchWorkItem?
     private var wifiBackgroundDisconnectWorkItem: DispatchWorkItem?
+    private var wifiLifecycleTransitionGeneration: UInt64?
+    private struct WifiWaitingOwner {
+        let generation: UInt64
+        let connectionID: ObjectIdentifier
+
+        func owns(_ connection: NWConnection, generation: UInt64) -> Bool {
+            self.generation == generation &&
+                connectionID == ObjectIdentifier(connection)
+        }
+    }
+    private var wifiWaitingOwner: WifiWaitingOwner?
     private var connectionTimeoutWorkItem: DispatchWorkItem?
     private var usbListener: NWListener?
-    private var usbListenerExplicitlyStarted = false
+    private var usbListenerExplicitlyStarted = false {
+        didSet { if oldValue != usbListenerExplicitlyStarted { refreshAutoAcceptPolicyOnQueue() } }
+    }
     private var usbScdpConnection: NWConnection?
+    private var activeDirectTouchCommand: DirectTouchContactCommand?
+    @Published private(set) var transferSnapshot = DataTransferManager.Snapshot()
+    private var dataTransfers: DataTransferManager?
+    private let retainedTransferRoot: URL
+    private let receivedFilesQueue = DispatchQueue(label: "ScreenCasting.ReceivedFiles.IO", qos: .utility)
+    private var receivedStorage: ReceivedFileLibrary? // receivedFilesQueue only.
+    private var pendingStorageClear: (id: UUID, token: ReceivedFileLibrary.Confirmation, fingerprint: Data, storageRevision: UInt64)?
+    private let receivedActionClock = ConnectionGenerationClock() // Separate lock-backed storage/UI epoch, not a transport clock.
+    private var receivedUIRevision: UInt64 = 0 // Main queue only.
+    private var pendingReceivedClearID: UUID? // networkQueue only.
+    private var receivedRefreshInFlight = false, receivedRefreshRequested = false
+    private var receivedTransferEvent = ""
+    struct ReceivedFilesViewState {
+        var files: [URL] = [], eligibleNames: Set<String> = [], fileBytes: [URL: UInt64] = [:]
+        var retainedCount = 0, eligibleCount = 0
+        var retainedBytes: UInt64 = 0, eligibleBytes: UInt64 = 0
+        var busy = false, loaded = false
+        var storageWarning: String?
+        var legacyCount: Int { max(0, retainedCount - eligibleCount) }
+        var legacyBytes: UInt64 { retainedBytes >= eligibleBytes ? retainedBytes - eligibleBytes : 0 }
+        init() {}
+        init(_ data: ReceivedFileLibrary.Inventory) {
+            files=data.files;eligibleNames=data.eligibleNames;fileBytes=data.fileBytes
+            retainedCount=data.retainedCount;eligibleCount=data.eligibleCount
+            retainedBytes=data.retainedBytes;eligibleBytes=data.eligibleBytes;busy=data.busy;loaded=true
+        }
+    }
+    struct ReceivedClearPrompt: Identifiable {
+        let id: UUID, count: Int, bytes: UInt64, legacyCount: Int, legacyBytes: UInt64
+    }
+    @Published private(set) var receivedFilesViewState = ReceivedFilesViewState()
+    @Published private(set) var receivedClearPrompt: ReceivedClearPrompt?
+    @Published private(set) var receivedClearMessage: String?
+    private var retainedFileLibrary: ReceivedFileLibrary? // Strong across retired transport generations; networkQueue owned.
+    private var transferReceivePending = 0
+    private struct TransferReceiveSuffix {
+        let data: Data
+        let receivedAt: TimeInterval
+        let generation: UInt64
+        let connection: NWConnection
+        let isComplete: Bool
+    }
+    private var transferReceiveSuffix: TransferReceiveSuffix?
+    private var wireReceiveOutstanding: (generation: UInt64, connection: ObjectIdentifier)?
     private let connectionGenerationClock = ConnectionGenerationClock()
     private var connectionGeneration: UInt64 {
         connectionGenerationClock.current
     }
+    var remoteKeyboardGeneration: UInt64 { connectionGenerationClock.current }
     private var listenerGeneration: UInt64 = 0
+    private struct PendingUsbCandidate {
+        let id: UInt64
+        let candidate: NWConnection
+        let candidateID: ObjectIdentifier
+        let listenerGeneration: UInt64
+        let incumbent: NWConnection
+        let incumbentGeneration: UInt64
+        let deadline: TimeInterval
+        var livenessNonce: UInt64?
+    }
+    private var pendingUsbCandidate: PendingUsbCandidate?
+    private var usbCandidateDeadlineWork: DispatchWorkItem?
+    private var nextUsbCandidateID: UInt64 = 1
+    private static let usbCandidateArbitrationTimeout: TimeInterval = 0.75
+    #if targetEnvironment(simulator)
+    var manualUsbCandidateDeadlineForTesting = false
+    var usbCandidateInstalledForTesting: ((NWConnection) -> Void)?
+    #endif
+    private let mirrorControl = MirrorClientControl()
+    @Published public private(set) var mirrorControlState: MirrorControlState?
+    @Published public private(set) var mirrorMonitorCatalogue: MirrorMonitorCatalogue?
+    @Published public private(set) var mirrorMonitorSwitchPending=false
+    @Published public private(set) var mirrorScreenPickerSupported=false
+    private var currentMirrorCatalogue: MirrorMonitorCatalogue?
+    private var mirrorCatalogueSource: (epoch:UInt64,source:UInt64)?
+    private var lastMirrorCatalogueRevision:UInt64=0
+    private var mirrorSwitchPending=false
+    private var mirrorSwitchAttempt: UUID?
+    private var mirrorSwitchDeadlineToken:UUID?
+    private var mirrorSwitchAdvertised=false
+    private struct MirrorTerminalSend {
+        let attempt:UUID, nonce:UInt64, generation:UInt64, connection:NWConnection, payload:Data
+        let catalogueReceivedAt:TimeInterval
+        var written=false
+    }
+    private var mirrorTerminalSend:MirrorTerminalSend?
+    private var nextMirrorTerminalNonce:UInt64=0
+    private var mirrorCatalogueReceivedAt:TimeInterval=0
+    @Published public private(set) var mirrorInputRevision: UInt64 = 0
+    private struct MirrorDecoderOwner: Equatable {
+        let connection: UInt64, decoder: UInt64, epoch: UInt64, source: UInt64
+    }
+    private let mirrorDecoderLock = NSLock()
+    private var mirrorDecoderOwner: MirrorDecoderOwner?
+    private var nextMirrorDecoder: UInt64 = 0x8000_0000_0000_0000
     private let networkQueueKey = DispatchSpecificKey<Bool>()
     private let networkQueue = DispatchQueue(label: "com.iPadCasting.network", qos: .userInteractive)
     private lazy var controlChannelWriter = ControlChannelWriter(
@@ -1610,6 +377,12 @@ public class NetworkManager: ObservableObject {
                 completion(.posix(.ECANCELED))
                 return
             }
+            #if targetEnvironment(simulator)
+            if let controlSendForAudioTesting = self.controlSendForAudioTesting {
+                controlSendForAudioTesting(data, completion)
+                return
+            }
+            #endif
             let connection = self.activeControlConnection
             if let diagnostic {
                 self.recordUsbTouchSendDiagnostic(
@@ -1648,8 +421,30 @@ public class NetworkManager: ObservableObject {
         generation: connectionGeneration,
         queue: networkQueue)
     private var wireReceiveActiveGeneration: UInt64?
-    private var wireAuthenticatedGeneration: UInt64?
-    private var committedTransportGeneration: UInt64?
+    #if targetEnvironment(simulator)
+    private var testingSimulatedWifiSession = false
+    private var testingInitialReceiveStarts = 0
+    private var testingWriterBegins = 0
+    private var testingClientHelloCount = 0
+    private var testingPingAttempts = 0
+    #endif
+    private var wireAuthenticatedGeneration: UInt64? {
+        didSet { if oldValue != wireAuthenticatedGeneration {
+            refreshAutoAcceptPolicyOnQueue()
+            mirrorControl.beginSession(wireAuthenticatedGeneration ?? 0)
+            currentMirrorCatalogue=nil;mirrorCatalogueSource=nil;lastMirrorCatalogueRevision=0
+            mirrorSwitchAdvertised=false;mirrorSwitchPending=false
+            mirrorSwitchAttempt=nil;mirrorSwitchDeadlineToken=nil
+            mirrorTerminalSend=nil;mirrorCatalogueReceivedAt=0
+            mirrorDecoderLock.lock(); mirrorDecoderOwner = nil; mirrorDecoderLock.unlock()
+            publishMirrorStateOnQueue()
+        } }
+    }
+    private var committedTransportGeneration: UInt64? {
+        didSet { if oldValue != committedTransportGeneration { refreshAutoAcceptPolicyOnQueue() } }
+    }
+    private var audioDiagnosticGeneration: UInt64?
+    private var audioDiagnosticPublishedAt: TimeInterval = 0
     private var pendingTransportOffer: TransportOffer?
     private var activeVideoCodec: VideoDecoderCodec = .hevc
     private var wifiCommitGate = WifiCommitGate()
@@ -1659,7 +454,12 @@ public class NetworkManager: ObservableObject {
     private lazy var wifiMediaReceiver = WifiMediaReceiver(
         networkQueue: networkQueue,
         decoder: { [weak self] data, sequence, isIDR, receivedAt in
-            self?.decoder.processInputData(
+            guard let self,
+                  self.committedTransportGeneration == self.connectionGeneration,
+                  self.committedRealtimeMode == RealtimeTransportMode.wifiRTP else { return }
+            guard self.mirrorControl.permitsVideoSequence(sequence) else { return }
+            self.recordVideoPayloadReceived(data.count, sequence: sequence)
+            self.decoder.processInputData(
                 data,
                 sequence: sequence,
                 isIDR: isIDR,
@@ -1705,8 +505,13 @@ public class NetworkManager: ObservableObject {
         securityDropObserver: { [weak self] counters in
             self?.transportTelemetry.recordWifiSecurityDrops(counters)
         },
+        rttObserver: { [weak self] durationMs in
+            self?.transportTelemetry.recordRtt(durationMs: durationMs)
+        },
         telemetryProvider: { [weak self] in
             guard let self else { return .zero }
+            self.publishHudSnapshotIfDue()
+            self.publishAudioDiagnosticsIfDue()
             let feedback = self.transportTelemetry.makeFeedback()
             return WifiFeedbackTelemetry(
                 lastDecoded: feedback.1,
@@ -1723,14 +528,12 @@ public class NetworkManager: ObservableObject {
             guard let self else { throw USBListenerError.identityUnavailable }
             return try self.buildUSBListenerParameters()
         },
-        onBound: { [weak self] lane, _, connection in
+        onBound: { [weak self] token, _, connection in
             guard let self else {
                 connection.cancel()
                 return
             }
-            self.usbLaneConnections[lane]?.cancel()
-            self.usbLaneConnections[lane] = connection
-            self.startUsbLaneReceiveLoop(connection, lane: lane)
+            self.adoptUsbLane(token, connection: connection)
         },
         onFailure: { [weak self] error in
             self?.handleStreamError(
@@ -1739,18 +542,39 @@ public class NetworkManager: ObservableObject {
 
     // Telemetry timer: fires 2× per second while streaming.
     private var telemetryTimer: DispatchSourceTimer?
+    private var performanceFeedbackTimer: DispatchSourceTimer?
+    private var performanceFeedbackSequence: UInt32 = 0
     private var adaptiveTelemetryTimer: DispatchSourceTimer?
-    private var committedRealtimeMode: UInt8?
+    private var committedRealtimeMode: UInt8? {
+        didSet { if oldValue != committedRealtimeMode { _ = realtimeModeClock.advance() } }
+    }
+    // Lock-protected epoch of committedRealtimeMode so main-thread closures never read the queue-owned value.
+    private let realtimeModeClock = ConnectionGenerationClock()
+    private var committedTransportAudioAvailable = false
     private var committedRealtimeSessionID: SessionID?
     private var wifiLegacyFallbackGeneration: UInt64?
     private var wifiLegacyFallbackRequestGeneration: UInt64?
     private let transportTelemetry = TransportTelemetry()
+    private var videoPayloadCounter = VideoPayloadCounter()
+    private var videoRxSampler = VideoPayloadRateSampler()
+    private var clientDebugLoggingEnabled = false
     private var lastHudSnapshotPublishedAt: TimeInterval = 0
     private var lastClientPingSentAt: TimeInterval = 0
     private var nextClientPingNonce: UInt64 = 1
-    private var pendingClientPings: [UInt64: TimeInterval] = [:]
+    private enum ClientPingPurpose { case telemetry, usbLegacyPcmFreshFence, usbCandidateLiveness }
+    private struct PendingClientPing {
+        let sentAt: TimeInterval
+        let purpose: ClientPingPurpose
+        let generation: UInt64
+        let connectionID: ObjectIdentifier
+    }
+    private var pendingClientPings: [UInt64: PendingClientPing] = [:]
+    private var usbLegacyPcmFreshFenceNonce: UInt64?
+    private var usbLegacyPcmFreshFenceGeneration: UInt64?
+    private var legacyUsbPlaybackEnabledGeneration: UInt64?
     private var activeDisplayCapabilities: DisplayCapabilities?
     private var desiredPipelineMode: PipelineMode = .office
+    private var committedPipelineMode = CommittedPipelineModeState()
     private var activeDisplayPreference = DisplayPreference.defaultValue
     private var displayRequestGate = DisplayRequestGate()
     private var pendingDisplayPreference: DisplayPreference?
@@ -1769,12 +593,17 @@ public class NetworkManager: ObservableObject {
     var videoFeedbackCountForTesting: Int { testingVideoFeedbackCount }
     #endif
 
-    public init() {
+    public init(userDefaults: UserDefaults = .standard, receivedFilesDirectory: URL? = nil) {
+        retainedTransferRoot = receivedFilesDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ScreenCasting Transfers")
         networkQueue.setSpecific(key: networkQueueKey, value: true)
-        let desired = ClientStreamSettingsStore.load()
+        clientDebugLoggingEnabled = ClientDebugLoggingPreference.load(
+            defaults: userDefaults)
+        let desired = ClientStreamSettingsStore.load(defaults: userDefaults)
         clientSettingsState = ClientSettingsStateModel(desired: desired)
         desiredBitrateMbps = desired.bitrateMbps
         desiredAudioEnabled = desired.audioEnabled
+        desiredAdaptiveBitrateEnabled = desired.adaptiveBitrateEnabled
         reconnectEnabled = RecentWifiResumeStore.consumeIfValid()
         print(
             "[IPAD][APP_LIFECYCLE] state=relaunch_resume " +
@@ -1797,9 +626,13 @@ public class NetworkManager: ObservableObject {
             [weak self] sequence, generation, succeeded in
             guard let self else { return }
             self.networkQueue.async {
+                let networkGeneration: UInt64
+                if let owner = self.currentMirrorDecoderOwner, owner.decoder == generation { networkGeneration = owner.connection }
+                else if generation & 0x8000_0000_0000_0000 == 0 { networkGeneration = generation }
+                else { return }
                 self.wifiMediaReceiver.decoderDidComplete(
                     sequence: sequence,
-                    generation: generation,
+                    generation: networkGeneration,
                     succeeded: succeeded)
             }
         }
@@ -1823,6 +656,7 @@ public class NetworkManager: ObservableObject {
                 }
             }
         }
+        refreshReceivedFiles()
     }
 
     // MARK: - Public API
@@ -1831,6 +665,7 @@ public class NetworkManager: ObservableObject {
         networkQueue.async { [weak self] in
             guard let self else { return }
             self.desiredPipelineMode = mode
+            self.committedPipelineMode.request(mode)
             guard self.wireAuthenticatedGeneration ==
                     self.connectionGeneration else { return }
             self.sendDesiredPipelineMode(reason: "user_preference")
@@ -1845,8 +680,29 @@ public class NetworkManager: ObservableObject {
             if let target = WifiReconnectTargetPolicy.target(from: endpoint) {
                 WifiReconnectTargetStore.save(target)
             }
+            self.publishAutoReconnectAttempt(0)
             self.connectOnQueue(to: endpoint)
         }
+    }
+
+    /// The last Wi-Fi PC (saved target, or the legacy typed host) can be reconnected to.
+    public var hasReconnectTarget: Bool {
+        WifiReconnectTargetSelection.preferred(
+            structured: WifiReconnectTargetStore.load(),
+            legacyHost: UserDefaults.standard.string(forKey: Self.lastKnownHostKey))?.endpoint != nil
+    }
+
+    /// One-tap Reconnect on the connect screen: the same endpoint automatic reconnects use.
+    public func reconnectLastPC() {
+        networkQueue.async { [weak self] in
+            guard let self, let endpoint = self.loadWifiReconnectEndpoint() else { return }
+            self.publishAutoReconnectAttempt(0)
+            self.connectOnQueue(to: endpoint)
+        }
+    }
+
+    private func publishAutoReconnectAttempt(_ attempt: Int) {
+        DispatchQueue.main.async { self.autoReconnectAttempt = attempt }
     }
 
     private func connectOnQueue(to endpoint: NWEndpoint) {
@@ -1854,7 +710,15 @@ public class NetworkManager: ObservableObject {
         reconnectEnabled = true
         guard transportState == .idle || isDisconnectedOnQueue else { return }
 
+        wifiLifecycleTransitionGeneration = nil
+        wifiWaitingOwner = nil
         _ = connectionGenerationClock.advance()
+        resetAutoAcceptOnQueue()
+        advanceReceivedRevisionOnQueue()
+        resetDirectTouchSessionOnQueue()
+        #if targetEnvironment(simulator)
+        testingSimulatedWifiSession = false
+        #endif
         // Settings generations are scoped to the Host credential/session.
         // After Forget Host (or a fresh pairing), the Host may legitimately
         // start again at generation zero; retaining the old value would cause
@@ -1906,10 +770,47 @@ public class NetworkManager: ObservableObject {
     }
 
     public func applicationDidBecomeActive() {
+        setMirrorInputForeground(true)
         networkQueue.async { [weak self] in
             guard let self else { return }
+            let diagnosticForegroundBefore = self.isForegroundActive
+            self.recordAppAudioLifecycleDiagnostic(event: "did_become_active", phase: "received", foregroundBefore: diagnosticForegroundBefore)
+            defer { self.recordAppAudioLifecycleDiagnostic(event: "did_become_active", phase: "applied", foregroundBefore: diagnosticForegroundBefore) }
             let wasForegroundActive = self.isForegroundActive
             self.isForegroundActive = true
+            if !wasForegroundActive,
+               self.connection != nil,
+               self.transportState == .streaming,
+               self.wireAuthenticatedGeneration == self.connectionGeneration,
+               self.committedTransportGeneration == self.connectionGeneration {
+                self.transportTelemetry.beginFreshFrameRate(
+                    generation: self.connectionGeneration, at: self.performanceFeedbackTime())
+            }
+            let inactiveGeneration = self.wifiLifecycleTransitionGeneration
+            self.wifiLifecycleTransitionGeneration = nil
+            if inactiveGeneration == self.connectionGeneration,
+               self.wifiBackgroundDisconnectWorkItem == nil,
+               self.isCurrentCommittedWifiRtpStreamingSessionOnQueue(),
+               let currentConnection = self.connection,
+               !self.isWifiConnectionReadyOnQueue(
+                   currentConnection, generation: self.connectionGeneration) {
+                self.recordWifiLifecycleDiagnostic(
+                    "generation=\(self.connectionGeneration) event=foreground " +
+                    "action=terminal_fallback reason=inactive_without_grace")
+                self.handleStreamError(
+                    "Wi-Fi connection remained unavailable after inactive transition.")
+                return
+            }
+            if self.isCurrentCommittedWifiRtpStreamingSessionOnQueue(),
+               self.wifiBackgroundDisconnectWorkItem != nil,
+               let currentConnection = self.connection,
+               !self.isWifiConnectionReadyOnQueue(
+                   currentConnection, generation: self.connectionGeneration) {
+                self.recordWifiLifecycleDiagnostic(
+                    "generation=\(self.connectionGeneration) event=foreground " +
+                    "nw_state=waiting action=defer_same_session_resume")
+                return
+            }
             self.wifiBackgroundDisconnectWorkItem?.cancel()
             self.wifiBackgroundDisconnectWorkItem = nil
             RecentWifiResumeStore.clear()
@@ -1918,7 +819,7 @@ public class NetworkManager: ObservableObject {
                 self.recordUsbLifecycleDiagnostic(
                     "[USB_MEDIA_RECOVERY] generation=\(generation) " +
                     "action=decoder_invalidate_begin")
-                self.decoder.invalidate(waitForCompletion: true)
+                self.decoder.invalidate(waitForCompletion: false)
                 guard self.isCurrentCommittedUsbStreamingSessionOnQueue(
                     generation: generation) else {
                     self.recordUsbLifecycleDiagnostic(
@@ -1926,7 +827,8 @@ public class NetworkManager: ObservableObject {
                         "current_generation=\(self.connectionGeneration) action=skip_stale")
                     return
                 }
-                self.decoder.beginSession(generation: generation)
+                self.armLegacyUsbPcmFreshFence(generation: generation)
+                self.beginOwnedDecoderSession(networkGeneration: generation)
                 self.sendVideoFeedback()
                 self.recordUsbLifecycleDiagnostic(
                     "[USB_MEDIA_RECOVERY] generation=\(generation) " +
@@ -1935,29 +837,19 @@ public class NetworkManager: ObservableObject {
             }
 
             if !wasForegroundActive,
-               self.isCurrentCommittedWifiRtpStreamingSessionOnQueue() {
-                let generation = self.connectionGeneration
-                let begin = "[WIFI_MEDIA_RECOVERY] generation=\(generation) " +
-                    "action=decoder_invalidate_begin"
-                print(begin)
-                self.recordDiagnosticLine(begin)
-                self.decoder.invalidate(waitForCompletion: true)
-                if self.isCurrentCommittedWifiRtpStreamingSessionOnQueue(
-                    generation: generation) {
-                    self.decoder.beginSession(generation: generation)
-                    self.wifiMediaReceiver.requestImmediateRecoveryFeedback(
-                        generation: generation)
-                    self.sendClientPingIfDue()
-                    let complete = "[WIFI_MEDIA_RECOVERY] generation=\(generation) " +
-                        "action=decoder_rearmed recovery_requested=true"
-                    print(complete)
-                    self.recordDiagnosticLine(complete)
+               self.usbLegacyPcmFreshFenceGeneration == self.connectionGeneration,
+               self.isCurrentCommittedUsbStreamingSessionOnQueue() {
+                self.armLegacyUsbPcmFreshFence(generation: self.connectionGeneration)
+            }
+
+            if !wasForegroundActive,
+               self.isCurrentCommittedWifiRtpStreamingSessionOnQueue(),
+               let currentConnection = self.connection {
+                if self.resumeCommittedWifiSessionOnQueue(
+                    connection: currentConnection,
+                    generation: self.connectionGeneration) {
                     return
                 }
-                let stale = "[WIFI_MEDIA_RECOVERY] scheduled_generation=\(generation) " +
-                    "current_generation=\(self.connectionGeneration) action=skip_stale"
-                print(stale)
-                self.recordDiagnosticLine(stale)
             }
 
             if !self.usbListenerExplicitlyStarted,
@@ -1984,26 +876,57 @@ public class NetworkManager: ObservableObject {
     }
 
     public func applicationWillResignActive() {
+        setMirrorInputForeground(false)
         networkQueue.async { [weak self] in
             guard let self else { return }
+            let diagnosticForegroundBefore = self.isForegroundActive
+            self.recordAppAudioLifecycleDiagnostic(event: "will_resign_active", phase: "received", foregroundBefore: diagnosticForegroundBefore)
+            defer { self.recordAppAudioLifecycleDiagnostic(event: "will_resign_active", phase: "applied", foregroundBefore: diagnosticForegroundBefore) }
+            self.cancelActiveDirectTouchOnQueue()
             self.isForegroundActive = false
+            // Foreground eligibility is closed first; discard its old sample window.
+            self.transportTelemetry.beginFreshFrameRate(
+                generation: self.connectionGeneration, at: self.performanceFeedbackTime())
             self.reconnectWorkItem?.cancel()
             self.reconnectWorkItem = nil
+            if self.isCurrentCommittedWifiRtpStreamingSessionOnQueue() {
+                self.wifiLifecycleTransitionGeneration = self.connectionGeneration
+                self.recordWifiLifecycleDiagnostic(
+                    "generation=\(self.connectionGeneration) event=inactive " +
+                    "action=arm_transition_preservation")
+            } else {
+                self.wifiLifecycleTransitionGeneration = nil
+            }
             print("[IPAD][APP_LIFECYCLE] state=inactive action=preserve_session")
         }
     }
 
     public func applicationDidEnterBackground() {
+        setMirrorInputForeground(false)
         networkQueue.async { [weak self] in
             guard let self else { return }
+            let diagnosticForegroundBefore = self.isForegroundActive
+            self.recordAppAudioLifecycleDiagnostic(event: "did_enter_background", phase: "received", foregroundBefore: diagnosticForegroundBefore)
+            defer { self.recordAppAudioLifecycleDiagnostic(event: "did_enter_background", phase: "applied", foregroundBefore: diagnosticForegroundBefore) }
             self.isForegroundActive = false
+            // Foreground eligibility is closed first; discard its old sample window.
+            self.transportTelemetry.beginFreshFrameRate(
+                generation: self.connectionGeneration, at: self.performanceFeedbackTime())
             self.reconnectWorkItem?.cancel()
             self.reconnectWorkItem = nil
             self.wifiBackgroundDisconnectWorkItem?.cancel()
             self.wifiBackgroundDisconnectWorkItem = nil
 
             guard !self.usbListenerExplicitlyStarted else {
+                self.wifiLifecycleTransitionGeneration = nil
                 if self.isCurrentCommittedUsbStreamingSessionOnQueue() {
+                    if self.legacyUsbPlaybackEnabledGeneration == self.connectionGeneration {
+                        self.cancelLegacyUsbPcmFreshFence()
+                        self.usbLegacyPcmFreshFenceGeneration = self.connectionGeneration
+                        AudioManager.shared.suspendLegacySessionForLifecycle(
+                            generation: self.connectionGeneration,
+                            newBackgroundCycle: self.pendingUsbForegroundDecoderRearmGeneration != self.connectionGeneration)
+                    }
                     self.pendingUsbForegroundDecoderRearmGeneration =
                         self.connectionGeneration
                     print(
@@ -2019,6 +942,7 @@ public class NetworkManager: ObservableObject {
             }
 
             guard let currentConnection = self.connection else {
+                self.wifiLifecycleTransitionGeneration = nil
                 print("[IPAD][APP_LIFECYCLE] state=background transport=wifi connection=none")
                 return
             }
@@ -2033,12 +957,16 @@ public class NetworkManager: ObservableObject {
                         isUSB: self.usbListenerExplicitlyStarted,
                         scheduledGeneration: generation,
                         currentGeneration: self.connectionGeneration,
-                        hasSameConnection: self.connection === currentConnection) else {
+                        hasSameConnection: self.connection === currentConnection,
+                        isWaiting: !self.isWifiConnectionReadyOnQueue(
+                            currentConnection, generation: generation)) else {
                     return
                 }
-                print(
-                    "[IPAD][APP_LIFECYCLE] state=background action=teardown_after_grace " +
-                    "generation=\(generation)")
+                self.recordWifiLifecycleDiagnostic(
+                    "generation=\(generation) event=grace_expired " +
+                    "foreground=\(self.isForegroundActive) " +
+                    "waiting=\(self.wifiWaitingOwner?.owns(currentConnection, generation: generation) == true) " +
+                    "action=terminal_fallback")
                 self.handleStreamError(
                     "Application remained backgrounded; reconnecting on resume.")
             }
@@ -2046,6 +974,12 @@ public class NetworkManager: ObservableObject {
             self.networkQueue.asyncAfter(
                 deadline: .now() + Self.wifiBackgroundDisconnectGrace,
                 execute: work)
+            if self.wifiLifecycleTransitionGeneration == generation {
+                self.wifiLifecycleTransitionGeneration = nil
+                self.recordWifiLifecycleDiagnostic(
+                    "generation=\(generation) event=background " +
+                    "action=handoff_to_grace")
+            }
             print(
                 "[IPAD][APP_LIFECYCLE] state=background transport=wifi " +
                 "action=graceful_preserve grace_s=\(Self.wifiBackgroundDisconnectGrace)")
@@ -2142,6 +1076,8 @@ public class NetworkManager: ObservableObject {
     ///   - y:        Vertical position in logical pixels (0–65535 for normalised use).
     ///   - pressure: Normalised pressure mapped to 0–255 byte range.
     public func sendTouchEvent(type: TouchEventType, x: UInt16, y: UInt16, pressure: UInt8) {
+        guard mirrorControl.allowsLegacyVirtualInput else { return }
+        let requestedGeneration = connectionGenerationClock.current
         // Build the 8-byte packet inline — stack allocation, no heap alloc.
         var packet = Data(count: TouchWireProtocol.packetSize)
         packet.withUnsafeMutableBytes { buf in
@@ -2163,8 +1099,8 @@ public class NetworkManager: ObservableObject {
         }
 
         networkQueue.async { [weak self] in
-            guard let self else { return }
-            let generation = self.connectionGeneration
+            guard let self, requestedGeneration == self.connectionGeneration, self.mirrorControl.allowsLegacyVirtualInput else { return }
+            let generation = requestedGeneration
             let isUsb = self.activeTransportKind == .usb
             let diagnostic = isUsb
                 ? self.nextUsbTouchDiagnostic(type: type)
@@ -2244,6 +1180,139 @@ public class NetworkManager: ObservableObject {
         sendTouchEvent(type: type, x: x, y: y, pressure: pressure)
     }
 
+    public func sendTextCommit(_ text: String) {
+        guard mirrorControl.allowsLegacyVirtualInput else { return }
+        let requestedGeneration = connectionGenerationClock.current
+        networkQueue.async { [weak self] in
+            guard let self, requestedGeneration == self.connectionGeneration, self.mirrorControl.allowsLegacyVirtualInput else { return }
+            let generation = requestedGeneration
+            guard self.transportState == .streaming,
+                  self.committedTransportGeneration == generation,
+                  TextCommitDeliveryPolicy.maySend(inputSuppressed: self.displayRequestGate.isInputSuppressed) else { return }
+            for command in TextCommitCommand.chunks(text) {
+                guard let payload = command.encode() else { return }
+                self.sendWireMessage(type: .textCommit, payload: payload, sequence: 0, movement: false)
+            }
+        }
+    }
+
+    public func sendKeyboardInput(_ command: KeyboardInputCommand) {
+        guard mirrorControl.allowsLegacyVirtualInput else { return }
+        let requestedGeneration = connectionGenerationClock.current
+        networkQueue.async { [weak self] in
+            guard let self, requestedGeneration == self.connectionGeneration, self.mirrorControl.allowsLegacyVirtualInput else { return }
+            let generation = requestedGeneration
+            guard self.transportState == .streaming,
+                  self.committedTransportGeneration == generation,
+                  command.virtualKey != 0,
+                  KeyboardInputDeliveryPolicy.maySend(
+                    action: command.action,
+                    inputSuppressed: self.displayRequestGate.isInputSuppressed) else { return }
+            self.sendWireMessage(
+                type: .keyboardInput,
+                payload: command.encode(),
+                sequence: 0,
+                movement: false)
+        }
+    }
+
+    private func resetDirectTouchSessionOnQueue() {
+        activeDirectTouchCommand = nil
+        let generation = connectionGenerationClock.current
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.connectionGenerationClock.current == generation else { return }
+            self.cursorOwnershipState = nil
+        }
+    }
+
+    private func cancelActiveDirectTouchOnQueue() {
+        guard let command = activeDirectTouchCommand else { return }
+        activeDirectTouchCommand = nil
+        guard transportState == .streaming, committedTransportGeneration == connectionGeneration else { return }
+        let cancel = DirectTouchContactCommand(phase: .cancel, pressure: command.pressure,
+            contactID: command.contactID, x: command.x, y: command.y)
+        sendWireMessage(type: .directTouchContact, payload: cancel.encode(), sequence: 0)
+    }
+
+    public func sendDirectTouchContact(_ command: DirectTouchContactCommand) {
+        guard mirrorControl.allowsLegacyVirtualInput else { return }
+        let requestedGeneration = connectionGenerationClock.current
+        networkQueue.async { [weak self] in
+            guard let self, requestedGeneration == self.connectionGeneration, self.mirrorControl.allowsLegacyVirtualInput,
+                  self.transportState == .streaming,
+                  self.committedTransportGeneration == requestedGeneration,
+                  command.contactID != 0,
+                  DirectTouchDeliveryPolicy.maySend(phase: command.phase,
+                    inputSuppressed: self.displayRequestGate.isInputSuppressed) else { return }
+            if command.phase == .down {
+                guard self.activeDirectTouchCommand == nil else { return }
+                self.activeDirectTouchCommand = command
+            } else {
+                guard self.activeDirectTouchCommand?.contactID == command.contactID else { return }
+                self.activeDirectTouchCommand = command.phase == .up || command.phase == .cancel ? nil : command
+            }
+            self.sendWireMessage(type: .directTouchContact, payload: command.encode(), sequence: 0,
+                movement: command.phase == .update)
+        }
+    }
+
+    public func sendPointerInput(_ command: PointerInputCommand) {
+        guard mirrorControl.allowsLegacyVirtualInput else { return }
+        let requestedGeneration = connectionGenerationClock.current
+        networkQueue.async { [weak self] in
+            guard let self, requestedGeneration == self.connectionGeneration, self.mirrorControl.allowsLegacyVirtualInput else { return }
+            let generation = requestedGeneration
+            guard self.transportState == .streaming,
+                  self.committedTransportGeneration == generation,
+                  PointerInputDeliveryPolicy.maySend(
+                    action: command.action,
+                    inputSuppressed: self.displayRequestGate.isInputSuppressed) else {
+                return
+            }
+            self.sendWireMessage(
+                type: .pointerInput,
+                payload: command.encode(),
+                sequence: 0,
+                movement: command.action == .move)
+        }
+    }
+
+    public func setClientDebugLoggingEnabled(_ enabled: Bool) {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.clientDebugLoggingEnabled = enabled
+            if enabled {
+                guard self.transportState == .streaming else { return }
+                self.startPersistentTelemetryLoggingIfEnabled()
+            } else {
+                self.transportTelemetry.stopLogging()
+            }
+        }
+    }
+
+    public func deleteClientDebugLogs(
+        completion: @escaping (Result<Int, Error>) -> Void
+    ) {
+        transportTelemetry.deleteStoredLogs { result in
+            DispatchQueue.main.async {
+                completion(result)
+            }
+        }
+    }
+
+    private func startPersistentTelemetryLoggingIfEnabled(
+        directoryURL: URL? = nil,
+        completion: ((URL?) -> Void)? = nil
+    ) {
+        guard clientDebugLoggingEnabled else {
+            completion?(nil)
+            return
+        }
+        _ = transportTelemetry.startLogging(
+            directoryURL: directoryURL,
+            completion: completion)
+    }
+
     // MARK: - Public API: Bitrate Control Sender
 
     /// Sends a legacy 8-byte frame-stage packet to the host.
@@ -2266,22 +1335,25 @@ public class NetworkManager: ObservableObject {
 
     public func setDesiredStreamSettings(
         bitrateMbps: Double,
-        audioEnabled: Bool
+        audioEnabled: Bool,
+        adaptiveBitrateEnabled: Bool
     ) {
         let desired = ClientStreamSettingsPreference.normalized(
             bitrateMbps: bitrateMbps,
-            audioEnabled: audioEnabled)
+            audioEnabled: audioEnabled,
+            adaptiveBitrateEnabled: adaptiveBitrateEnabled)
         ClientStreamSettingsStore.save(desired)
         DispatchQueue.main.async {
             self.desiredBitrateMbps = desired.bitrateMbps
             self.desiredAudioEnabled = desired.audioEnabled
+            self.desiredAdaptiveBitrateEnabled = desired.adaptiveBitrateEnabled
         }
         networkQueue.async { [weak self] in
             guard let self else { return }
             self.clientSettingsState.setDesired(desired)
             print(
                 "[IPAD][SETTINGS_DESIRED] bitrate_mbps=\(Int(desired.bitrateMbps)) " +
-                "audio=\(desired.audioEnabled) source=user")
+                "audio=\(desired.audioEnabled) adaptive=\(desired.adaptiveBitrateEnabled) source=user")
             _ = self.sendDesiredSettingsIfPossible(reason: "user_change")
         }
     }
@@ -2289,7 +1361,8 @@ public class NetworkManager: ObservableObject {
     public func sendSettingsUpdate(bitrateMbps: Double, audioEnabled: Bool) {
         setDesiredStreamSettings(
             bitrateMbps: bitrateMbps,
-            audioEnabled: audioEnabled)
+            audioEnabled: audioEnabled,
+            adaptiveBitrateEnabled: ClientStreamSettingsStore.load().adaptiveBitrateEnabled)
     }
 
     @discardableResult
@@ -2320,6 +1393,10 @@ public class NetworkManager: ObservableObject {
                 as: UInt8.self)
             bytes.storeBytes(of: UInt8(0), toByteOffset: 2, as: UInt8.self)
             bytes.storeBytes(
+                of: desired.adaptiveBitrateEnabled ? UInt8(1) : UInt8(0),
+                toByteOffset: 3,
+                as: UInt8.self)
+            bytes.storeBytes(
                 of: requestID.littleEndian,
                 toByteOffset: 4,
                 as: UInt32.self)
@@ -2340,7 +1417,7 @@ public class NetworkManager: ObservableObject {
             "[IPAD][SETTINGS_UPDATE] request=\(requestID) " +
             "expected_generation=\(generation) " +
             "bitrate_bps=\(UInt32(desired.bitrateMbps * 1_000_000)) " +
-            "audio=\(desired.audioEnabled) reason=\(reason)")
+            "audio=\(desired.audioEnabled) adaptive=\(desired.adaptiveBitrateEnabled) reason=\(reason)")
         sendWireMessage(
             type: .settingsUpdate,
             payload: payload,
@@ -2391,17 +1468,30 @@ public class NetworkManager: ObservableObject {
     }
 
     private func stopOnQueue() {
+        cancelUsbCandidateArbitration(reason: "explicit_stop")
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        cancelLegacyUsbPcmFreshFence()
+        legacyUsbPlaybackEnabledGeneration = nil
+        pendingClientPings.removeAll(keepingCapacity: true)
         let wasUSB = usbListenerExplicitlyStarted
         usbListenerExplicitlyStarted = false
         reconnectEnabled = false
+        publishAutoReconnectAttempt(0)
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
         wifiBackgroundDisconnectWorkItem?.cancel()
         wifiBackgroundDisconnectWorkItem = nil
+        wifiLifecycleTransitionGeneration = nil
+        wifiWaitingOwner = nil
         pendingUsbForegroundDecoderRearmGeneration = nil
+        #if targetEnvironment(simulator)
+        testingSimulatedWifiSession = false
+        #endif
         RecentWifiResumeStore.clear()
         let stoppedGeneration = connectionGenerationClock.advance()
+        resetAutoAcceptOnQueue()
+        advanceReceivedRevisionOnQueue()
+        resetDirectTouchSessionOnQueue()
         listenerGeneration &+= 1
         decoder.invalidate()
         AudioManager.shared.reset()
@@ -2415,17 +1505,26 @@ public class NetworkManager: ObservableObject {
         usbLaneConnections.values.forEach { $0.cancel() }
         usbLaneConnections.removeAll()
         wireReceiveActiveGeneration = nil
+        wireReceiveOutstanding = nil
+        transferReceiveSuffix = nil
         wireAuthenticatedGeneration = nil
         committedTransportGeneration = nil
         committedRealtimeMode = nil
+        committedTransportAudioAvailable = false
         committedRealtimeSessionID = nil
+        // Mirror teardownCurrentSession: Stop must also retire the Wi-Fi media path.
+        connectionTimeoutWorkItem?.cancel()
+        connectionTimeoutWorkItem = nil
+        wifiLegacyFallbackGeneration = nil
+        wifiLegacyFallbackRequestGeneration = nil
+        wifiMediaReceiver.cancel()
         advertisedClientCapabilities = nil
         settingsSyncPolicy.reset()
         resetDisplaySession()
         clearPendingTransportOffer()
         wireParser.reset(generation: stoppedGeneration)
-        controlChannelWriter.cancel()
-        if wasUSB { controlChannelWriter.abandonConnection() }
+        dataTransfers?.retire(); dataTransfers = nil; transferReceivePending = 0
+        controlChannelWriter.abandonConnection()
         stopTelemetryTimer()
         if wasUSB {
             recordUsbLifecycleDiagnostic("[USB_LISTENER_STATE] state=cancelled reason=explicit_stop")
@@ -2559,6 +1658,11 @@ public class NetworkManager: ObservableObject {
                     newConnection.cancel()
                     return
                 }
+                if self.pendingUsbCandidate != nil {
+                    self.recordUsbLifecycleDiagnostic("[USB_CANDIDATE_ARBITRATION] action=reject_extra_pending candidate=\(ObjectIdentifier(newConnection))")
+                    newConnection.cancel()
+                    return
+                }
                 let currentConnectionId = self.usbScdpConnection.map {
                     String(describing: ObjectIdentifier($0))
                 } ?? "none"
@@ -2580,9 +1684,7 @@ public class NetworkManager: ObservableObject {
                     let isHealthy = isCommitted && (current.state == .ready || current.state == .setup)
                     let isConnecting = (self.transportState == .connecting && self.committedTransportGeneration == nil && (current.state == .setup || current.state == .preparing || current.state == .ready))
                     if isHealthy || isConnecting {
-                        self.recordUsbLifecycleDiagnostic(
-                            "[USB_RECOVERY_CANDIDATE] attempt=\(self.connectionGeneration &+ 1) generation=\(self.connectionGeneration) state=rejected_stale")
-                        newConnection.cancel()
+                        self.holdUsbCandidate(newConnection, incumbent: current)
                         return
                     }
                     self.teardownUsbSession(
@@ -2590,18 +1692,7 @@ public class NetworkManager: ObservableObject {
                         generation: self.connectionGeneration,
                         reason: "replacement_candidate_accepted")
                 }
-                _ = self.connectionGenerationClock.advance()
-                self.clientSettingsState.resetHostGeneration()
-                self.settingsReconciliationGate.reset()
-                self.usbScdpConnection = newConnection
-                self.connection = newConnection
-                self.recordUsbLifecycleDiagnostic(
-                    "[USB_RECOVERY_CANDIDATE] attempt=\(self.connectionGeneration) generation=\(self.connectionGeneration) state=start")
-                self.recordUsbLifecycleDiagnostic(
-                    "[USB_SESSION_ACCEPT] generation=\(self.connectionGeneration) connectionId=\(ObjectIdentifier(newConnection))")
-                self.setupStateHandler(for: newConnection)
-                self.setState(.connecting)
-                newConnection.start(queue: self.networkQueue)
+                self.installUsbCandidate(newConnection)
             }
             listener.start(queue: networkQueue)
         } catch {
@@ -2610,6 +1701,86 @@ public class NetworkManager: ObservableObject {
             setState(.disconnected(
                 reason: "Unable to start USB listener: \(error.localizedDescription)"))
         }
+    }
+
+    private func installUsbCandidate(_ candidate: NWConnection) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        _ = connectionGenerationClock.advance()
+        resetAutoAcceptOnQueue()
+        advanceReceivedRevisionOnQueue()
+        resetDirectTouchSessionOnQueue()
+        clientSettingsState.resetHostGeneration()
+        settingsReconciliationGate.reset()
+        usbScdpConnection = candidate
+        connection = candidate
+        recordUsbLifecycleDiagnostic("[USB_RECOVERY_CANDIDATE] attempt=\(connectionGeneration) generation=\(connectionGeneration) state=start")
+        recordUsbLifecycleDiagnostic("[USB_SESSION_ACCEPT] generation=\(connectionGeneration) connectionId=\(ObjectIdentifier(candidate))")
+        setupStateHandler(for: candidate)
+        setState(.connecting)
+        #if targetEnvironment(simulator)
+        usbCandidateInstalledForTesting?(candidate)
+        #endif
+        candidate.start(queue: networkQueue)
+    }
+
+    private func ownsUsbCandidate(_ pending: PendingUsbCandidate) -> Bool {
+        usbListenerExplicitlyStarted && usbListener != nil &&
+        listenerGeneration == pending.listenerGeneration &&
+        connectionGeneration == pending.incumbentGeneration &&
+        usbScdpConnection === pending.incumbent && connection === pending.incumbent &&
+        ObjectIdentifier(pending.candidate) == pending.candidateID
+    }
+
+    private func holdUsbCandidate(_ candidate: NWConnection, incumbent: NWConnection) {
+        let id = nextUsbCandidateID
+        nextUsbCandidateID &+= 1
+        pendingUsbCandidate = PendingUsbCandidate(id: id, candidate: candidate,
+            candidateID: ObjectIdentifier(candidate), listenerGeneration: listenerGeneration,
+            incumbent: incumbent, incumbentGeneration: connectionGeneration,
+            deadline: ProcessInfo.processInfo.systemUptime + Self.usbCandidateArbitrationTimeout)
+        let work = DispatchWorkItem { [weak self] in self?.expireUsbCandidate(id: id) }
+        usbCandidateDeadlineWork = work
+        recordUsbLifecycleDiagnostic("[USB_CANDIDATE_ARBITRATION] arbitration=\(id) action=hold generation=\(connectionGeneration) committed=\(committedTransportGeneration == connectionGeneration) candidate=\(ObjectIdentifier(candidate))")
+        #if targetEnvironment(simulator)
+        if !manualUsbCandidateDeadlineForTesting {
+            networkQueue.asyncAfter(deadline: .now() + Self.usbCandidateArbitrationTimeout, execute: work)
+        }
+        #else
+        networkQueue.asyncAfter(deadline: .now() + Self.usbCandidateArbitrationTimeout, execute: work)
+        #endif
+        challengeUsbCandidateIfCommitted()
+    }
+
+    private func challengeUsbCandidateIfCommitted() {
+        guard var pending = pendingUsbCandidate, ownsUsbCandidate(pending),
+              pending.livenessNonce == nil,
+              committedTransportGeneration == pending.incumbentGeneration,
+              wireAuthenticatedGeneration == pending.incumbentGeneration else { return }
+        pending.livenessNonce = sendClientPing(force: true, purpose: .usbCandidateLiveness)
+        pendingUsbCandidate = pending
+        recordUsbLifecycleDiagnostic("[USB_CANDIDATE_ARBITRATION] arbitration=\(pending.id) action=challenge nonce=\(pending.livenessNonce.map { String($0) } ?? "none")")
+    }
+
+    @discardableResult
+    private func takeUsbCandidate() -> PendingUsbCandidate? {
+        let pending = pendingUsbCandidate
+        pendingUsbCandidate = nil
+        usbCandidateDeadlineWork?.cancel()
+        usbCandidateDeadlineWork = nil
+        if let nonce = pending?.livenessNonce { pendingClientPings.removeValue(forKey: nonce) }
+        return pending
+    }
+
+    private func cancelUsbCandidateArbitration(reason: String) {
+        guard let pending = takeUsbCandidate() else { return }
+        pending.candidate.cancel()
+        recordUsbLifecycleDiagnostic("[USB_CANDIDATE_ARBITRATION] arbitration=\(pending.id) action=reject_candidate reason=\(reason)")
+    }
+
+    private func expireUsbCandidate(id: UInt64) {
+        guard let pending = pendingUsbCandidate, pending.id == id, ownsUsbCandidate(pending) else { return }
+        teardownUsbSession(connection: pending.incumbent, generation: pending.incumbentGeneration,
+                           reason: "candidate_arbitration_deadline")
     }
 
     private func nextUsbTouchDiagnostic(
@@ -2827,14 +1998,42 @@ public class NetworkManager: ObservableObject {
                 print("[IPAD][NW_STATE] preparing")
             case .waiting(let error):
                 print("[IPAD][NW_STATE] waiting error=\(error)")
-                // NWConnection remains non-nil while it is waiting. Route the
-                // transition through the normal generation-safe teardown so
-                // the bounded reconnect attempt can create a fresh socket.
+                if self.shouldPreserveTransientWifiControlError(
+                    error, generation: generation, connection: connection) {
+                    if case .ready = connection.state {
+                        self.recordWifiLifecycleDiagnostic(
+                            "generation=\(generation) event=waiting " +
+                            "action=ignore_stale_ready_callback")
+                        return
+                    }
+                    self.wifiWaitingOwner = WifiWaitingOwner(
+                        generation: generation,
+                        connectionID: ObjectIdentifier(connection))
+                    self.recordWifiLifecycleDiagnostic(
+                        "generation=\(generation) event=waiting " +
+                        "action=preserve_same_session " +
+                        "grace_active=\(self.wifiBackgroundDisconnectWorkItem != nil)")
+                    return
+                }
                 self.handleStreamError(
                     "Waiting for Windows host: \(error.localizedDescription)")
             case .ready:
                 self.connectionTimeoutWorkItem?.cancel()
                 print("[IPAD][NW_STATE] ready TLS_VERIFY_COMPLETE accepted")
+                if self.isCurrentCommittedWifiRtpStreamingSessionOnQueue(
+                    generation: generation) {
+                    let wasWaiting = self.wifiWaitingOwner?.owns(
+                        connection, generation: generation) == true
+                    if wasWaiting {
+                        self.wifiWaitingOwner = nil
+                    }
+                    if self.isForegroundActive,
+                       (wasWaiting || self.wifiBackgroundDisconnectWorkItem != nil) {
+                        _ = self.resumeCommittedWifiSessionOnQueue(
+                            connection: connection, generation: generation)
+                    }
+                    return
+                }
                 let telemetryKind: StreamingTransportKind =
                     self.activeTransportKind == .usb ? .usbTypeC : .wifi
                 self.transportTelemetry.setSessionContext(TransportTelemetryContext(
@@ -2843,6 +2042,9 @@ public class NetworkManager: ObservableObject {
                         ? "localhost_scdp"
                         : "network_framework",
                     connectionGeneration: generation))
+                #if targetEnvironment(simulator)
+                self.testingWriterBegins += 1
+                #endif
                 self.controlChannelWriter.begin(generation: generation)
                 if self.activeTransportKind == .wifi {
                     self.startWireReceiveLoop(generation: generation)
@@ -2903,6 +2105,9 @@ public class NetworkManager: ObservableObject {
 
     private func sendTrustedClientHello(generation: UInt64) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        #if targetEnvironment(simulator)
+        testingClientHelloCount += 1
+        #endif
         guard generation == connectionGeneration,
               let fingerprint = verifiedHostFingerprint else {
             handleStreamError("TLS host identity was unavailable after verification.")
@@ -2958,11 +2163,15 @@ public class NetworkManager: ObservableObject {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard isForegroundActive,
               reconnectEnabled,
-              let endpoint = loadWifiReconnectEndpoint() else { return }
+              let endpoint = loadWifiReconnectEndpoint() else {
+            publishAutoReconnectAttempt(0) // Nothing is scheduled, so the screen must not say "Reconnecting".
+            return
+        }
         if reset { reconnectAttempt = 0 }
         reconnectWorkItem?.cancel()
         let delay = TrustedReconnectPolicy.delay(forAttempt: reconnectAttempt)
         reconnectAttempt += 1
+        publishAutoReconnectAttempt(reconnectAttempt)
         print("[IPAD][AUTO_RECONNECT_ATTEMPT] attempt=\(reconnectAttempt) delay=\(delay)")
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.isForegroundActive, self.reconnectEnabled else { return }
@@ -3033,19 +2242,29 @@ public class NetworkManager: ObservableObject {
         }
     }
 
-    private func receiveSettingsState(
+    func receiveSettingsState(
         _ payload: Data,
         outcome: ClientSettingsApplyOutcome
     ) {
         guard let state = TrustedSettingsState.decode(payload),
               state.generation >= clientSettingsState.generation else { return }
+        let previousAudioEnabled = clientSettingsState.effective.audioEnabled
         let bitrateMbps = Double(state.bitrateBps) / 1_000_000
         let effective = ClientStreamSettingsPreference.normalized(
             bitrateMbps: bitrateMbps,
-            audioEnabled: state.audioEnabled)
+            audioEnabled: state.audioEnabled,
+            adaptiveBitrateEnabled: state.adaptiveBitrateEnabled)
         clientSettingsState.receiveHostState(
             effective,
             generation: state.generation)
+        if previousAudioEnabled != state.audioEnabled,
+           let committedGeneration = committedTransportGeneration,
+           let committedMode = committedRealtimeMode {
+            reconcileRealtimeAudioPlayback(
+                generation: committedGeneration,
+                mode: committedMode,
+                audioEnabled: state.audioEnabled)
+        }
         let resolvedOutcome: ClientSettingsApplyOutcome
         if case .rejected = outcome {
             resolvedOutcome = .rejected(state.rejectionReason)
@@ -3078,13 +2297,17 @@ public class NetworkManager: ObservableObject {
         }
         DispatchQueue.main.async {
             self.settingsGeneration = state.generation
-            self.effectiveBitrateMbps = bitrateMbps
+            // Settings carries the saved manual fallback. Existing .bitrate
+            // packets remain authoritative for the live target while Auto runs.
+            if !state.adaptiveBitrateEnabled || !self.isAdaptiveBitrate {
+                self.effectiveBitrateMbps = bitrateMbps
+            }
             self.effectiveAudioEnabled = state.audioEnabled
-            self.isAdaptiveBitrate = false
+            self.isAdaptiveBitrate = state.adaptiveBitrateEnabled
+            self.transportTelemetry.recordBitrateMbps(self.effectiveBitrateMbps)
             self.settingsApplyStatus = status
         }
-        transportTelemetry.recordBitrateMbps(bitrateMbps)
-        print("[IPAD][SETTINGS_RESULT] generation=\(state.generation) bitrate_bps=\(state.bitrateBps) audio=\(state.audioEnabled) rejected=\(rejected) reason=\(state.rejectionReason)")
+        print("[IPAD][SETTINGS_RESULT] generation=\(state.generation) bitrate_bps=\(state.bitrateBps) audio=\(state.audioEnabled) adaptive=\(state.adaptiveBitrateEnabled) rejected=\(rejected) reason=\(state.rejectionReason)")
         if decision == .send {
             let isRuntimeRecovery = resolvedOutcome == .state &&
                 settingsReconciliationGate.runtimeReadyRetryGeneration ==
@@ -3133,62 +2356,96 @@ public class NetworkManager: ObservableObject {
         startTelemetryTimer()
     }
 
+    private func retireUsbAudioLane(_ connection: NWConnection, generation: UInt64, reason: String) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard generation == connectionGeneration,
+              committedTransportGeneration == generation,
+              committedRealtimeMode == RealtimeTransportMode.usbSplitTLS,
+              usbLaneConnections[.audio] === connection else { return }
+        usbLaneConnections.removeValue(forKey: .audio)
+        connection.cancel()
+        committedTransportAudioAvailable = false
+        reconcileRealtimeAudioPlayback(generation: generation,
+            mode: RealtimeTransportMode.usbSplitTLS,
+            audioEnabled: clientSettingsState.effective.audioEnabled)
+        recordDiagnosticLine("[USB_AUDIO_RUNTIME] generation=\(generation) available=0 reason=\(reason)")
+    }
+
+    private func adoptUsbLane(_ token: UsbLaneBindToken, connection: NWConnection) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard usbLaneServer.owns(token, connection: connection),
+              token.connectionGeneration == connectionGeneration,
+              pendingTransportOffer?.sessionID == token.sessionID,
+              pendingTransportOffer?.mode == RealtimeTransportMode.usbSplitTLS else {
+            connection.cancel()
+            return
+        }
+        let lane = token.lane
+        usbLaneConnections[lane]?.cancel()
+        usbLaneConnections[lane] = connection
+        startUsbLaneReceiveLoop(connection, lane: lane, generation: token.connectionGeneration)
+    }
+
     private func startUsbLaneReceiveLoop(
         _ connection: NWConnection,
-        lane: UsbLaneKind)
+        lane: UsbLaneKind, generation: UInt64)
     {
         dispatchPrecondition(condition: .onQueue(networkQueue))
-        let generation = connectionGeneration
         let parser = WireStreamParser(generation: generation)
+        var terminated = false
 
         func receiveNext() {
+            guard !terminated else { return }
             connection.receive(
                 minimumIncompleteLength: 1,
                 maximumLength: parser.suggestedReceiveLength)
             { [weak self] data, _, isComplete, error in
-                guard let self,
+                guard !terminated, let self,
                       generation == self.connectionGeneration,
-                      self.usbLaneConnections[lane] === connection
-                else { return }
-                if let error {
-                    if lane == .video {
-                        self.handleStreamError(
-                            "USB video lane failed: \(error.localizedDescription)")
+                      self.usbLaneConnections[lane] === connection else { return }
+                func terminate(_ reason: String) {
+                    guard !terminated else { return }
+                    terminated = true
+                    if lane == .audio,
+                       self.committedTransportGeneration == generation,
+                       self.committedRealtimeMode == RealtimeTransportMode.usbSplitTLS {
+                        self.retireUsbAudioLane(connection, generation: generation, reason: reason)
+                    } else {
+                        connection.cancel()
+                        self.handleStreamError("USB media lane terminal: \(reason)")
                     }
-                    return
                 }
+                if error != nil { terminate("receive_error"); return }
                 if let data, !data.isEmpty {
                     parser.consume(
-                        data,
-                        generation: generation,
+                        data, generation: generation,
                         receivedAt: CACurrentMediaTime())
                     { event in
-                        guard case .message(let message) = event else { return }
-                        let expected: WireMessageType =
-                            lane == .video ? .video : .audio
-                        guard message.header.type == expected else {
-                            connection.cancel()
-                            if lane == .video {
-                                self.handleStreamError(
-                                    "Unexpected message on USB video lane.")
+                        guard !terminated,
+                              generation == self.connectionGeneration,
+                              self.usbLaneConnections[lane] === connection else { return }
+                        switch event {
+                        case .failure:
+                            terminate("wire_parser_failure")
+                        case .discardedFixedControl:
+                            // Only video/audio messages are legal on bound data lanes.
+                            terminate("discarded_fixed_control_on_data_lane")
+                        case .message(let message):
+                            let expected: WireMessageType = lane == .video ? .video : .audio
+                            guard message.header.type == expected else {
+                                terminate("unexpected_type"); return
                             }
-                            return
+                            self.handleWireMessage(message, generation: generation)
                         }
-                        self.handleWireMessage(
-                            message,
-                            generation: generation)
                     }
                 }
-                if isComplete {
-                    if lane == .video {
-                        self.handleStreamError("USB video lane closed.")
-                    }
-                    return
-                }
+                guard !terminated,
+                      generation == self.connectionGeneration,
+                      self.usbLaneConnections[lane] === connection else { return }
+                if isComplete { terminate("eof"); return }
                 receiveNext()
             }
         }
-
         receiveNext()
     }
 
@@ -3196,12 +2453,32 @@ public class NetworkManager: ObservableObject {
 
     private func startTelemetryTimer() {
         stopTelemetryTimer()
-        pendingClientPings.removeAll(keepingCapacity: true)
+        pendingClientPings = pendingClientPings.filter { $0.value.purpose != .telemetry }
         lastClientPingSentAt = 0
-        _ = transportTelemetry.startLogging()
+        videoPayloadCounter.begin(generation: connectionGeneration)
+        videoRxSampler.reset()
+        lastHudSnapshotPublishedAt = 0
+        transportTelemetry.beginRuntimeSession()
+        if committedPipelineMode.active != nil {
+            transportTelemetry.beginFreshFrameRate(generation: connectionGeneration)
+        }
+        let generation = connectionGeneration
+        let performanceTimer = DispatchSource.makeTimerSource(queue: networkQueue)
+        performanceTimer.schedule(deadline: .now() + 1, repeating: 1)
+        performanceTimer.setEventHandler { [weak self] in
+            guard let self, self.connectionGeneration == generation else { return }
+            self.sendPerformanceFeedback()
+        }
+        performanceTimer.resume()
+        performanceFeedbackTimer = performanceTimer
+        startPersistentTelemetryLoggingIfEnabled()
         if committedRealtimeMode == RealtimeTransportMode.wifiRTP {
             return
         }
+        startLegacyTelemetryTimers()
+    }
+
+    private func startLegacyTelemetryTimers() {
         let timer = DispatchSource.makeTimerSource(queue: networkQueue)
         timer.schedule(deadline: .now() + 0.5, repeating: 0.5)   // 2× per second
         timer.setEventHandler { [weak self] in
@@ -3226,16 +2503,52 @@ public class NetworkManager: ObservableObject {
     }
 
     private func stopTelemetryTimer() {
+        videoPayloadCounter.reset()
+        videoRxSampler.reset()
+        let generation = connectionGeneration
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.connectionGeneration == generation,
+                  self.committedTransportGeneration == nil else { return }
+            self.hudTelemetry = TransportHudSnapshot(
+                frameReceiveMs: self.hudTelemetry.frameReceiveMs,
+                decodeMs: self.hudTelemetry.decodeMs)
+        }
+
         telemetryTimer?.cancel()
+        performanceFeedbackTimer?.cancel()
+        performanceFeedbackTimer = nil
         telemetryTimer = nil
         adaptiveTelemetryTimer?.cancel()
         adaptiveTelemetryTimer = nil
-        pendingClientPings.removeAll(keepingCapacity: true)
+        pendingClientPings = pendingClientPings.filter { $0.value.purpose != .telemetry }
         transportTelemetry.stopLogging()
+    }
+
+    private func publishAudioDiagnosticsIfDue() {
+        let generation = connectionGeneration
+        guard wireAuthenticatedGeneration == generation,
+              committedTransportGeneration == generation else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard audioDiagnosticGeneration != generation || now - audioDiagnosticPublishedAt >= 1 else { return }
+        audioDiagnosticGeneration = generation
+        audioDiagnosticPublishedAt = now
+        let opus = committedRealtimeMode == RealtimeTransportMode.wifiRTP ||
+            committedRealtimeMode == RealtimeTransportMode.usbSplitTLS
+        let profile = usbListenerExplicitlyStarted ? "usb" : "wifi"
+        let rejects = "parse_reject=\(wifiMediaReceiver.audioParseRejects) crypto_reject=\(wifiMediaReceiver.audioCryptoRejects)"
+        AudioManager.shared.publishDiagnostics(generation: generation, profile: profile,
+            opus: opus, receiveRejects: rejects) { [weak self] line in
+                self?.networkQueue.async { [weak self] in
+                    guard let self, self.connectionGeneration == generation,
+                          self.committedTransportGeneration == generation else { return }
+                    self.recordDiagnosticLine(line)
+                }
+            }
     }
 
     private func sendVideoFeedback() {
         guard wireAuthenticatedGeneration == connectionGeneration else { return }
+        publishAudioDiagnosticsIfDue()
         #if targetEnvironment(simulator)
         testingVideoFeedbackCount += 1
         #endif
@@ -3265,21 +2578,63 @@ public class NetworkManager: ObservableObject {
         publishHudSnapshotIfDue()
     }
 
+    // The simulator seam supplies a deterministic clock; device timing is unchanged.
+    private func performanceFeedbackTime() -> TimeInterval {
+        #if targetEnvironment(simulator)
+        if let testingPerformanceFeedbackNow { return testingPerformanceFeedbackNow }
+        #endif
+        return CACurrentMediaTime()
+    }
+
+    private func sendPerformanceFeedback() {
+        guard isForegroundActive,
+              wireAuthenticatedGeneration == connectionGeneration,
+              committedTransportGeneration == connectionGeneration,
+              let mode = committedPipelineMode.active,
+              mode == desiredPipelineMode,
+              let sample = transportTelemetry.freshFrameRateSample(generation: connectionGeneration, at: performanceFeedbackTime()),
+              sample.sampleWindowMs <= 2500,
+              committedPipelineMode.readyForFeedback(at: performanceFeedbackTime()) else { return }
+        func encoded(_ fps: Double) -> UInt16 {
+            UInt16(clamping: Int(min(2400, max(0, fps * 10)).rounded()))
+        }
+        performanceFeedbackSequence &+= 1
+        let feedback = ClientPerformanceFeedback(mode: mode, flags: sample.valid ? 3 : 0,
+            generation: connectionGeneration, targetFps: mode.targetFps,
+            decodedFpsX10: encoded(sample.decodedFps), freshPresentedFpsX10: encoded(sample.freshPresentedFps),
+            windowMs: sample.sampleWindowMs, droppedFrames: sample.droppedFrames)
+        sendWireMessage(type: .clientPerformanceFeedback, payload: feedback.encode(), sequence: performanceFeedbackSequence)
+        recordDiagnosticLine("[IPAD][FPS_FEEDBACK] generation=\(connectionGeneration) mode=\(mode) target_fps=\(mode.targetFps) decode_fps=\(sample.decodedFps) fresh_present_fps=\(sample.freshPresentedFps) window_ms=\(sample.sampleWindowMs)")
+    }
+
     /// Measures a true local RTT for the CSV without comparing clocks. The
     /// Windows host echoes this exact 16-byte payload as a Pong.
     private func sendClientPingIfDue() {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        #if targetEnvironment(simulator)
+        testingPingAttempts += 1
+        #endif
+        sendClientPing(force: false, purpose: .telemetry)
+    }
+
+    @discardableResult
+    private func sendClientPing(force: Bool, purpose: ClientPingPurpose) -> UInt64? {
+        guard let owner = activeControlConnection else { return nil }
         let now = ProcessInfo.processInfo.systemUptime
-        guard now - lastClientPingSentAt >= 1 else { return }
+        guard force || now - lastClientPingSentAt >= 1 else { return nil }
         lastClientPingSentAt = now
 
         let nonce = nextClientPingNonce
         nextClientPingNonce &+= 1
         if pendingClientPings.count >= 16,
-           let oldest = pendingClientPings.min(by: { $0.value < $1.value })?.key {
+           let oldest = pendingClientPings.filter({ $0.value.purpose == .telemetry })
+            .min(by: { $0.value.sentAt < $1.value.sentAt })?.key {
             pendingClientPings.removeValue(forKey: oldest)
         }
-        pendingClientPings[nonce] = now
+        pendingClientPings[nonce] = PendingClientPing(
+            sentAt: now, purpose: purpose, generation: connectionGeneration,
+            connectionID: ObjectIdentifier(owner))
+        if purpose == .usbLegacyPcmFreshFence { usbLegacyPcmFreshFenceNonce = nonce }
 
         let sentNanoseconds = UInt64(max(0, now) * 1_000_000_000.0)
         var payload = Data(count: 16)
@@ -3297,29 +2652,346 @@ public class NetworkManager: ObservableObject {
             type: .ping,
             payload: payload,
             sequence: UInt32(truncatingIfNeeded: nonce))
+        return nonce
     }
 
+    private func cancelLegacyUsbPcmFreshFence() {
+        if let nonce = usbLegacyPcmFreshFenceNonce {
+            pendingClientPings.removeValue(forKey: nonce)
+        }
+        usbLegacyPcmFreshFenceNonce = nil
+        usbLegacyPcmFreshFenceGeneration = nil
+    }
+
+    private func armLegacyUsbPcmFreshFence(generation: UInt64) {
+        guard generation == connectionGeneration,
+              legacyUsbPlaybackEnabledGeneration == generation,
+              committedRealtimeMode == RealtimeTransportMode.legacyTLS,
+              committedTransportGeneration == generation,
+              wireAuthenticatedGeneration == generation,
+              activeTransportKind == .usb,
+              let owner = usbScdpConnection, connection === owner else { return }
+        cancelLegacyUsbPcmFreshFence()
+        usbLegacyPcmFreshFenceGeneration = generation
+        AudioManager.shared.suspendLegacySessionForLifecycle(generation: generation)
+        guard isForegroundActive else { return }
+        sendClientPing(force: true, purpose: .usbLegacyPcmFreshFence)
+        recordUsbLifecycleDiagnostic(
+            "[USB_PCM_RESUME_FENCE] generation=\(generation) action=armed nonce=\(usbLegacyPcmFreshFenceNonce.map { String($0) } ?? "none")")
+    }
+
+    private func recordVideoPayloadReceived(_ byteCount: Int, sequence: UInt32) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        let generation = connectionGeneration
+        guard committedTransportGeneration == generation,
+              wireAuthenticatedGeneration == generation else { return }
+        videoPayloadCounter.record(byteCount: byteCount, sequence: sequence, generation: generation)
+    }
     private func publishHudSnapshotIfDue() {
         let now = ProcessInfo.processInfo.systemUptime
         guard now - lastHudSnapshotPublishedAt >= 0.5 else { return }
         lastHudSnapshotPublishedAt = now
-        let snapshot = transportTelemetry.hudSnapshot()
+        let stages = transportTelemetry.hudSnapshot()
+        publishHudSnapshot(TransportHudSnapshot(frameReceiveMs: stages.frameReceiveMs,
+            decodeMs: stages.decodeMs,
+            videoRxMbps: videoRxSampler.sample(totalBytes: videoPayloadCounter.totalBytes, at: now)))
+    }
+    private func publishHudSnapshot(_ snapshot: TransportHudSnapshot) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        let generation = connectionGeneration
+        let modeEpoch = realtimeModeClock.current
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            guard self.connectionGeneration == generation,
+                  self.realtimeModeClock.current == modeEpoch else { return }
             self.hudTelemetry = snapshot
             self.lastFrameReceiveDurationMs = snapshot.frameReceiveMs
             self.lastDecodeLatencyMs = snapshot.decodeMs
         }
     }
 
+
+    private func receivedLibraryOnWorker() throws -> ReceivedFileLibrary {
+        dispatchPrecondition(condition: .onQueue(receivedFilesQueue))
+        if let receivedStorage { return receivedStorage }
+        let library = try ReceivedFileLibrary(directory: retainedTransferRoot)
+        receivedStorage = library
+        networkQueue.async { [weak self] in self?.retainedFileLibrary = library }
+        return library
+    }
+    private func publishReceivedUI(revision: UInt64, _ update: @escaping (NetworkManager) -> Void) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, revision >= self.receivedUIRevision else { return }
+            self.receivedUIRevision = revision; update(self)
+        }
+    }
+    private func advanceReceivedRevisionOnQueue() {
+        let revision = receivedActionClock.advance()
+        pendingReceivedClearID = nil
+        publishReceivedUI(revision: revision) { $0.receivedClearPrompt = nil }
+        refreshReceivedFilesOnQueue()
+    }
+    func refreshReceivedFiles() { networkQueue.async { [weak self] in self?.refreshReceivedFilesOnQueue() } }
+    private func refreshReceivedFilesOnQueue() {
+        if receivedRefreshInFlight { receivedRefreshRequested = true; return }
+        receivedRefreshInFlight = true
+        let revision = receivedActionClock.current
+        receivedFilesQueue.async { [weak self] in
+            guard let self else { return }
+            let result = Result { try self.receivedLibraryOnWorker().snapshot() }
+            self.networkQueue.async {
+                self.receivedRefreshInFlight = false
+                if revision == self.receivedActionClock.current {
+                    self.publishReceivedUI(revision: revision) { owner in
+                        switch result {
+                        case .success(let data): owner.receivedFilesViewState = ReceivedFilesViewState(data)
+                        case .failure:
+                            owner.receivedFilesViewState.loaded = false
+                            owner.receivedFilesViewState.storageWarning = "Stored files cannot be inspected safely. Try again."
+                        }
+                    }
+                } else { self.receivedRefreshRequested = true }
+                if self.receivedRefreshRequested { self.receivedRefreshRequested = false; self.refreshReceivedFilesOnQueue() }
+            }
+        }
+    }
+    private func receivedMessage(_ text: String, revision: UInt64) {
+        publishReceivedUI(revision: revision) { $0.receivedClearMessage = text }
+    }
+    func requestClearReceivedFiles() {
+        networkQueue.async { [weak self] in
+            guard let self, self.pendingReceivedClearID == nil else { return }
+            let id = UUID(), revision = self.receivedActionClock.current, session = self.connectionGeneration
+            self.pendingReceivedClearID = id
+            self.receivedFilesQueue.async {
+                do {
+                    let library = try self.receivedLibraryOnWorker(), inventory = try library.snapshot()
+                    guard !inventory.busy else { throw CocoaError(.fileLocking) }
+                    guard inventory.retainedCount > 0 else {
+                        self.networkQueue.async {
+                            if self.pendingReceivedClearID == id { self.pendingReceivedClearID = nil }
+                            self.receivedMessage("No received files are available to delete.", revision: revision)
+                        }; return
+                    }
+                    let token = try library.confirmClear(), current = try library.snapshot()
+                    guard current.fingerprint == inventory.fingerprint, current.revision == inventory.revision,
+                          self.receivedActionClock.current == revision else { throw CocoaError(.fileReadUnknown) }
+                    self.pendingStorageClear = (id, token, inventory.fingerprint, inventory.revision)
+                    let prompt = ReceivedClearPrompt(id: id, count: token.count, bytes: token.bytes,
+                                                     legacyCount: inventory.retainedCount - inventory.eligibleCount,
+                                                     legacyBytes: inventory.retainedBytes - inventory.eligibleBytes)
+                    self.networkQueue.async {
+                        guard self.pendingReceivedClearID == id, self.receivedActionClock.current == revision,
+                              self.connectionGeneration == session else { return }
+                        self.publishReceivedUI(revision: revision) { $0.receivedClearMessage = nil; $0.receivedClearPrompt = prompt }
+                    }
+                } catch {
+                    self.networkQueue.async {
+                        if self.pendingReceivedClearID == id { self.pendingReceivedClearID = nil }
+                        self.receivedMessage("Cannot clear while a transfer or Save to Files is active, or storage is unavailable.", revision: revision)
+                    }
+                }
+            }
+        }
+    }
+    func cancelClearReceivedFiles(id: UUID) {
+        networkQueue.async { [weak self] in
+            guard let self, self.pendingReceivedClearID == id else { return }
+            self.pendingReceivedClearID = nil
+            self.publishReceivedUI(revision: self.receivedActionClock.current) { $0.receivedClearPrompt = nil }
+            self.receivedFilesQueue.async { if self.pendingStorageClear?.id == id { self.pendingStorageClear = nil } }
+        }
+    }
+    func confirmClearReceivedFiles(id: UUID) {
+        networkQueue.async { [weak self] in
+            guard let self, self.pendingReceivedClearID == id else { return }
+            self.pendingReceivedClearID = nil // Consume before dispatch: double taps cannot enqueue a second delete.
+            let revision = self.receivedActionClock.current, generation = self.connectionGeneration
+            self.publishReceivedUI(revision: revision) { $0.receivedClearPrompt = nil }
+            self.receivedFilesQueue.async {
+                var result: ReceivedFileLibrary.ClearResult?, inventory: ReceivedFileLibrary.Inventory?
+                var message = "Received files changed. Review and confirm again."
+                do {
+                    guard let pending = self.pendingStorageClear, pending.id == id else { throw CocoaError(.fileReadUnknown) }
+                    self.pendingStorageClear = nil
+                    let library = try self.receivedLibraryOnWorker(), current = try library.snapshot()
+                    guard self.receivedActionClock.current == revision,
+                          current.fingerprint == pending.fingerprint, current.revision == pending.storageRevision else { throw CocoaError(.fileReadUnknown) }
+                    guard !current.busy else { throw CocoaError(.fileLocking) }
+                    result = try library.clear(pending.token, expectedFingerprint: pending.fingerprint,
+                                               expectedRevision: pending.storageRevision, authorize: {
+                        self.receivedActionClock.current == revision && self.connectionGenerationClock.current == generation
+                    })
+                    inventory = try library.snapshot()
+                    message = TransferPresentation.clearResult(result!, legacyCount: inventory!.retainedCount - inventory!.eligibleCount)
+                } catch { /* A fresh snapshot below reports surviving bytes; no inferred reclamation. */ }
+                self.networkQueue.async {
+                    if self.receivedActionClock.current == revision {
+                        self.receivedMessage(message, revision: revision)
+                        if let data = inventory {
+                            self.publishReceivedUI(revision: revision) { owner in
+                                owner.receivedFilesViewState = ReceivedFilesViewState(data)
+                                if (result?.deletedCount ?? 0) > 0, !owner.transferSnapshot.outgoing,
+                                   owner.transferSnapshot.phase == .completed {
+                                    owner.transferSnapshot.count = 0 // Preserve failure/stage/direction diagnostics.
+                                    owner.transferSnapshot.received = data.files
+                                    owner.transferSnapshot.retainedCount = data.retainedCount
+                                    owner.transferSnapshot.retainedBytes = data.retainedBytes
+                                }
+                            }
+                        }
+                    }
+                    self.advanceReceivedRevisionOnQueue()
+                }
+            }
+        }
+    }
+    func requestReceivedFileExport(_ url: URL, completion: @escaping (UUID?) -> Void) {
+        networkQueue.async { [weak self] in
+            guard let self else { DispatchQueue.main.async { completion(nil) }; return }
+            self.advanceReceivedRevisionOnQueue()
+            self.receivedFilesQueue.async {
+                let token = try? self.receivedLibraryOnWorker().beginExport(url)
+                self.networkQueue.async {
+                    if token == nil { self.receivedMessage("Cannot export while a transfer is active or this file is unavailable.", revision: self.receivedActionClock.current) }
+                    self.advanceReceivedRevisionOnQueue()
+                    DispatchQueue.main.async { completion(token) }
+                }
+            }
+        }
+    }
+    func releaseReceivedFileExport(_ token: UUID) {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.receivedFilesQueue.async {
+                self.receivedStorage?.endExport(token) // App-storage lease survives network teardown; foreign token is inert.
+                self.networkQueue.async { self.advanceReceivedRevisionOnQueue() }
+            }
+        }
+    }
+
+    private struct AutoAcceptScope: Equatable {
+        let generation: UInt64
+        let usb: Bool
+        let connectionID: ObjectIdentifier
+    }
+    private var autoAcceptScope: AutoAcceptScope?
+    private var autoAcceptObservedScope: AutoAcceptScope?
+    private let autoAcceptSessionClock = ConnectionGenerationClock()
+    private var autoAcceptPolicyRevision: UInt64 = 0
+    private var autoAcceptUIRevision: UInt64 = 0 // Main queue only.
+    @Published private(set) var autoAcceptIncomingFiles = false
+    @Published private(set) var canEnableAutoAccept = false
+    private func currentAutoAcceptScopeOnQueue() -> AutoAcceptScope? {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard let connection, wireAuthenticatedGeneration == connectionGeneration,
+              committedTransportGeneration == connectionGeneration else { return nil }
+        if case .authFailed = transportState { return nil }
+        return AutoAcceptScope(generation: connectionGeneration, usb: activeTransportKind == .usb,
+                               connectionID: ObjectIdentifier(connection))
+    }
+    private func publishAutoAcceptOnQueue() {
+        autoAcceptPolicyRevision &+= 1
+        let revision = autoAcceptPolicyRevision
+        let scope = currentAutoAcceptScopeOnQueue()
+        let enabled = scope != nil && autoAcceptScope == scope
+        let available = scope != nil
+        DispatchQueue.main.async { [weak self] in
+            guard let self, revision >= self.autoAcceptUIRevision else { return }
+            self.autoAcceptUIRevision = revision
+            self.autoAcceptIncomingFiles = enabled; self.canEnableAutoAccept = available
+        }
+    }
+    private func resetAutoAcceptOnQueue() {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        autoAcceptScope = nil; autoAcceptObservedScope = nil
+        _ = autoAcceptSessionClock.advance()
+        dataTransfers?.setAutoAccept(false, localGeneration: connectionGeneration)
+        publishAutoAcceptOnQueue()
+    }
+    private func refreshAutoAcceptPolicyOnQueue() {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        let scope = currentAutoAcceptScopeOnQueue()
+        let changed = scope != autoAcceptObservedScope
+        if changed {
+            autoAcceptObservedScope = scope; autoAcceptScope = nil
+            _ = autoAcceptSessionClock.advance()
+        }
+        dataTransfers?.setAutoAccept(scope != nil && autoAcceptScope == scope,
+                                    localGeneration: connectionGeneration)
+        // Packet admission rechecks scope without publishing UI work per chunk.
+        if changed { publishAutoAcceptOnQueue() }
+    }
+    func setAutoAcceptIncomingFiles(_ requested: Bool) {
+        // Lock-backed clocks fence commands queued before retirement/handover.
+        let generation = connectionGenerationClock.current
+        let epoch = autoAcceptSessionClock.current
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            let scope = self.currentAutoAcceptScopeOnQueue()
+            let allowed = requested && generation == self.connectionGeneration &&
+                epoch == self.autoAcceptSessionClock.current && scope != nil
+            self.autoAcceptScope = allowed ? scope : nil
+            self.dataTransfers?.setAutoAccept(allowed, localGeneration: self.connectionGeneration)
+            self.publishAutoAcceptOnQueue()
+        }
+    }
+
+    func sendTransferFiles(_ urls: [URL]) { networkQueue.async { [weak self] in self?.dataTransfers?.sendFiles(urls) } }
+    func decideTransfer(_ accepted: Bool) { networkQueue.async { [weak self] in self?.dataTransfers?.decide(accepted) } }
+    func cancelTransfer() { networkQueue.async { [weak self] in self?.controlChannelWriter.cancelBulk(); self?.dataTransfers?.cancel() } }
+    private func beginDataTransfer(generation: UInt64) {
+        guard generation == connectionGeneration, dataTransfers == nil else { return }
+        let manager = DataTransferManager(generation: generation, directory: retainedTransferRoot,
+                                          transport: activeTransportKind == .usb ? "USB-C" : "Wi-Fi",
+                                          receivedLibrary: retainedFileLibrary,
+                                          onLibraryReady: { [weak self] library in
+            // Authority opens on the transfer IO worker, not the latency-sensitive network queue.
+            self?.networkQueue.async { [weak self] in self?.retainedFileLibrary = library }
+        }) { [weak self] packet, completion in
+            guard let self else { completion(false); return }
+            self.networkQueue.async {
+                guard generation == self.connectionGeneration, self.wireAuthenticatedGeneration == generation,
+                      self.committedTransportGeneration == generation, let kind = WireMessageType(rawValue: packet.kind.rawValue),
+                      let payload = try? TransferProtocol.encode(packet) else { completion(false); return }
+                self.sendWireMessage(type: kind, payload: payload, sequence: 0, bulk: true) { completion($0 == nil) }
+            }
+        }
+        let transferTransport = activeTransportKind == .usb ? "USBC" : "WiFi"
+        manager.diagnostic = { [weak self] line in
+            self?.recordDiagnosticLine(line + " transport=\(transferTransport)")
+        }
+        manager.changed = { [weak self, weak manager] snapshot in
+            guard let self else { return }
+            self.networkQueue.async {
+                guard let manager, self.dataTransfers === manager,
+                      self.connectionGeneration == generation else { return }
+                let event = "\(generation)|\(snapshot.phase.rawValue)|\(snapshot.published)|\(snapshot.count)|\(snapshot.outgoing)"
+                if self.receivedTransferEvent != event {
+                    self.receivedTransferEvent = event; self.advanceReceivedRevisionOnQueue()
+                }
+                DispatchQueue.main.async {
+                    guard self.connectionGenerationClock.current == generation else { return }
+                    self.transferSnapshot = snapshot
+                }
+            }
+        }
+        dataTransfers = manager
+        refreshAutoAcceptPolicyOnQueue()
+    }
     private func sendWireMessage(
         type: WireMessageType,
         payload: Data,
         sequence: UInt32,
         flags: UInt16 = 0,
+        movement: Bool = false,
+        bulk: Bool = false,
         completion: @escaping (NWError?) -> Void = { _ in }
     ) {
         guard payload.count <= WireProtocol.maxPayloadSize else { return }
+        let sendGeneration = connectionGeneration
+        let sendConnection = connection
+        let sendTransport = activeTransportKind
         var message = Data(count: WireProtocol.headerSize)
         message.withUnsafeMutableBytes { bytes in
             bytes.storeBytes(of: WireProtocol.magic.littleEndian, toByteOffset: 0, as: UInt32.self)
@@ -3333,22 +3005,60 @@ public class NetworkManager: ObservableObject {
         enqueueControlData(
             message,
             telemetry: type == .videoFeedback,
+            movement: movement,
+            bulk: bulk,
             completion: { [weak self] error in
-                if let error { self?.handleStreamError("Control send error: \(error)") }
+                // Queued bulk cancellation is terminal for its transfer owner,
+                // not a transport send failure. Preserve the authenticated session.
+                if bulk, case .posix(.ECANCELED)? = error {
+                    completion(error)
+                    return
+                }
+                if let error {
+                    self?.handleControlSendError(
+                        error, generation: sendGeneration,
+                        connection: sendConnection,
+                        transport: sendTransport)
+                }
                 completion(error)
             })
+    }
+
+    private func handleControlSendError(
+        _ error: NWError,
+        generation: UInt64,
+        connection sentConnection: NWConnection?,
+        transport: ActiveTransportKind
+    ) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        if transport == .wifi {
+            guard generation == connectionGeneration,
+                  connection === sentConnection else { return }
+            if let sentConnection,
+               shouldPreserveTransientWifiControlError(
+                   error, generation: generation, connection: sentConnection) {
+                recordWifiLifecycleDiagnostic(
+                    "generation=\(generation) event=control_send_error " +
+                    "action=preserve_transient")
+                return
+            }
+        }
+        handleStreamError("Control send error: \(error)")
     }
 
     private func enqueueControlData(
         _ data: Data,
         telemetry: Bool = false,
         movement: Bool = false,
+        bulk: Bool = false,
         completion: @escaping (NWError?) -> Void = { _ in }
     ) {
         let generation = connectionGeneration
         networkQueue.async { [weak self] in
             guard let self, generation == self.connectionGeneration else { return }
-            if telemetry {
+            if bulk {
+                if !self.controlChannelWriter.enqueueBulk(data, completion: completion) { completion(.posix(.ENOBUFS)) }
+            } else if telemetry {
                 self.controlChannelWriter.enqueueTelemetry(data, completion: completion)
             } else if movement {
                 self.controlChannelWriter.enqueueMovement(data, completion: completion)
@@ -3364,13 +3074,21 @@ public class NetworkManager: ObservableObject {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard generation == connectionGeneration, connection != nil else { return }
         guard wireReceiveActiveGeneration != generation else { return }
+        #if targetEnvironment(simulator)
+        testingInitialReceiveStarts += 1
+        #endif
         wireReceiveActiveGeneration = generation
         wireAuthenticatedGeneration = nil
         committedTransportGeneration = nil
+        committedTransportAudioAvailable = false
         advertisedClientCapabilities = nil
         clearPendingTransportOffer()
         wireParser.reset(generation: generation)
         receiveWireChunk(generation: generation)
+    }
+
+    private var transferReceiveHasCapacity: Bool {
+        transferReceivePending < DataTransferManager.maxPendingPackets
     }
 
     private func receiveWireChunk(generation: UInt64) {
@@ -3379,37 +3097,92 @@ public class NetworkManager: ObservableObject {
               wireReceiveActiveGeneration == generation,
               let connection else { return }
 
+        if let outstanding = wireReceiveOutstanding,
+           outstanding.generation == generation,
+           outstanding.connection == ObjectIdentifier(connection) { return }
+        if let suffix = transferReceiveSuffix {
+            guard suffix.generation == generation, suffix.connection === connection else {
+                transferReceiveSuffix = nil
+                return
+            }
+            guard transferReceiveHasCapacity else { return }
+            transferReceiveSuffix = nil
+            consumeWireReceive(suffix.data, generation: generation, connection: connection,
+                               receivedAt: suffix.receivedAt, isComplete: suffix.isComplete)
+            return
+        }
+        guard transferReceiveHasCapacity else { return }
+        wireReceiveOutstanding = (generation, ObjectIdentifier(connection))
+
         let maximumLength = wireParser.suggestedReceiveLength
-        connection.receive(
-            minimumIncompleteLength: 1,
-            maximumLength: maximumLength
-        ) { [weak self] data, _, isComplete, error in
+        let completion: (Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void = { [weak self] data, _, isComplete, error in
             guard let self,
                   generation == self.connectionGeneration,
                   self.connection === connection,
                   self.wireReceiveActiveGeneration == generation else { return }
+            self.wireReceiveOutstanding = nil
             if let error {
-                self.handleStreamError("SCST receive error: \(error.localizedDescription)")
+                self.handleWireReceiveError(
+                    error, generation: generation, connection: connection)
                 return
             }
 
-            if let data, !data.isEmpty {
-                self.wireParser.consume(
-                    data,
-                    generation: generation,
-                    receivedAt: CACurrentMediaTime()) { event in
-                    self.handleWireParserEvent(event, generation: generation)
-                }
-            }
-
-            guard generation == self.connectionGeneration,
-                  self.wireReceiveActiveGeneration == generation else { return }
-            if isComplete {
-                self.handleStreamError("Server closed the stream.")
-                return
-            }
-            self.receiveWireChunk(generation: generation)
+            self.consumeWireReceive(data ?? Data(), generation: generation, connection: connection,
+                                    receivedAt: CACurrentMediaTime(), isComplete: isComplete)
         }
+        #if targetEnvironment(simulator)
+        if let transferReceiveForTesting {
+            transferReceiveForTesting(maximumLength, completion)
+            return
+        }
+        #endif
+        connection.receive(minimumIncompleteLength: 1, maximumLength: maximumLength, completion: completion)
+    }
+
+    private func consumeWireReceive(_ data: Data, generation: UInt64, connection: NWConnection,
+                                    receivedAt: TimeInterval, isComplete: Bool) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard data.count <= WireProtocol.receiveChunkSize else {
+            handleStreamError("Receive buffer exceeded its bound.")
+            return
+        }
+        let consumed = wireParser.consume(data, generation: generation, receivedAt: receivedAt,
+            shouldContinue: { self.transferReceiveHasCapacity }) { event in
+                self.handleWireParserEvent(event, generation: generation)
+            }
+        guard generation == connectionGeneration, self.connection === connection,
+              wireReceiveActiveGeneration == generation else { return }
+        if consumed < data.count {
+            // One bounded socket buffer owns the FIFO suffix; no new read may bypass it.
+            transferReceiveSuffix = TransferReceiveSuffix(data: Data(data.dropFirst(consumed)),
+                receivedAt: receivedAt, generation: generation, connection: connection, isComplete: isComplete)
+            return
+        }
+        if isComplete {
+            handleStreamError("Server closed the stream.")
+            return
+        }
+        if transferReceiveHasCapacity { receiveWireChunk(generation: generation) }
+    }
+
+    private func handleWireReceiveError(
+        _ error: NWError,
+        generation: UInt64,
+        connection receivedConnection: NWConnection
+    ) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard generation == connectionGeneration,
+              connection === receivedConnection,
+              wireReceiveActiveGeneration == generation else { return }
+        if shouldPreserveTransientWifiControlError(
+            error, generation: generation, connection: receivedConnection) {
+            wireReceiveActiveGeneration = nil
+            recordWifiLifecycleDiagnostic(
+                "generation=\(generation) event=control_receive_error " +
+                "action=preserve_transient_receive_stopped")
+            return
+        }
+        handleStreamError("SCST receive error: \(error.localizedDescription)")
     }
 
     private func handleWireParserEvent(_ event: WireParserEvent, generation: UInt64) {
@@ -3485,6 +3258,7 @@ public class NetworkManager: ObservableObject {
                 print("[IPAD][AUTO_RECONNECT_SUCCESS] generation=\(generation)")
                 wireAuthenticatedGeneration = generation
                 committedTransportGeneration = nil
+                committedTransportAudioAvailable = false
                 committedRealtimeSessionID = nil
                 wifiLegacyFallbackRequestGeneration = nil
                 clearPendingTransportOffer()
@@ -3505,6 +3279,33 @@ public class NetworkManager: ObservableObject {
         }
 
         switch header.type {
+        case .transferOffer, .transferResponse, .transferChunk, .transferFileEnd, .transferFileAck, .transferCancel, .transferEnd, .transferAck:
+            guard wireAuthenticatedGeneration == generation, committedTransportGeneration == generation,
+                  let kind = TransferKind(rawValue: header.type.rawValue) else { return }
+            do {
+                let packet = try TransferProtocol.decode(kind,payload)
+                if let manager = dataTransfers {
+                    refreshAutoAcceptPolicyOnQueue()
+                    if kind == .cancel && manager.owns(packet) { controlChannelWriter.cancelBulk() }
+                    transferReceivePending += 1
+                    let post: (TransferPacket, @escaping () -> Void) -> Bool
+                    #if targetEnvironment(simulator)
+                    post = transferPostForTesting ?? { manager.post($0, completion: $1) }
+                    #else
+                    post = { manager.post($0, completion: $1) }
+                    #endif
+                    if !post(packet, { [weak self] in
+                        guard let self else {return}
+                        self.networkQueue.async {
+                            guard generation == self.connectionGeneration, self.dataTransfers === manager else {return}
+                            self.transferReceivePending = max(0,self.transferReceivePending-1)
+                            if self.transferReceiveHasCapacity { self.receiveWireChunk(generation:generation) }
+                        }
+                    }) { transferReceivePending -= 1 }
+                }
+            }
+            catch { dataTransfers?.cancel(failed: true) }
+            return
         case .pairingSuccess:
             storePairingCredential(payload)
 
@@ -3552,6 +3353,10 @@ public class NetworkManager: ObservableObject {
                 handleStreamError("Malformed display capabilities.")
                 return
             }
+            if let hello = mirrorControl.helloIfAdvertised(session: generation, flags: header.flags) {
+                mirrorSwitchAdvertised=header.flags & 0x2000 != 0
+                sendWireMessage(type: .mirrorHello, payload: hello, sequence: 0)
+            }
             receiveDisplayCapabilities(capabilities)
 
         case .displayReady:
@@ -3572,6 +3377,84 @@ public class NetworkManager: ObservableObject {
             return
 
         case .pipelineMode:
+            guard wireAuthenticatedGeneration == generation,
+                  committedTransportGeneration == generation,
+                  let mode = PipelineMode.decode(payload),
+                  committedPipelineMode.acknowledge(mode) else { return }
+            transportTelemetry.beginFreshFrameRate(generation: generation)
+            return
+
+        case .clientPerformanceFeedback:
+            return
+
+        case .cursorOwnership:
+            guard generation == connectionGeneration,
+                  committedTransportGeneration == generation,
+                  transportState == .streaming,
+                  let command = CursorOwnershipCommand.decode(payload) else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.connectionGenerationClock.current == generation else { return }
+                self.cursorOwnershipState = command.state
+            }
+            return
+
+        case .mirrorState:
+            guard committedTransportGeneration == generation, header.flags == 0 else { return }
+            do {
+                let oldState = mirrorControl.currentState
+                if let transition = try mirrorControl.receiveState(session: generation, data: payload) {
+                    if oldState?.epoch != transition.state.epoch {
+                        currentMirrorCatalogue=nil;mirrorCatalogueSource=nil
+                        decoder.invalidate(waitForCompletion: false)
+                        beginOwnedDecoderSession(networkGeneration: generation)
+                    }
+                    // The first anchor is reported after its completed write. That IDR may
+                    // already have been discarded while metadata was pending; request a fresh
+                    // dependency root using the existing recovery owner, not a media retry lane.
+                    if oldState?.firstFrame == nil, transition.state.firstFrame != nil {
+                        if committedRealtimeMode == RealtimeTransportMode.wifiRTP {
+                            wifiMediaReceiver.requestImmediateRecoveryFeedback(generation: generation)
+                        } else if let recovery=mirrorControl.presentationRecoveryRequest() {
+                            sendWireMessage(type:.mirrorAction,payload:recovery,sequence:0)
+                        }
+                    }
+                    if let ack = transition.acknowledgement { sendWireMessage(type: .mirrorAction, payload: ack, sequence: 0) }
+                    advanceMirrorTerminalSwitchOnQueue()
+                    publishMirrorStateOnQueue()
+                }
+            } catch { handleStreamError("Invalid physical-source control state.") }
+            return
+        case .mirrorCatalogue:
+            guard committedTransportGeneration==generation,mirrorSwitchAdvertised,header.flags==0 else {return}
+            do {
+                let catalogue=try MirrorMonitorCatalogue.decode(payload)
+                guard catalogue.revision>lastMirrorCatalogueRevision,
+                      let source=mirrorControl.currentState,source.geometry != nil else {return}
+                lastMirrorCatalogueRevision=catalogue.revision
+                mirrorCatalogueReceivedAt=ProcessInfo.processInfo.systemUptime
+                currentMirrorCatalogue=catalogue
+                mirrorCatalogueSource=(source.epoch,source.source)
+                publishMirrorStateOnQueue()
+            } catch {handleStreamError("Invalid physical monitor list.")}
+            return
+        case .mirrorAction:
+            guard committedTransportGeneration==generation,header.flags==0,
+                  mirrorControl.supportsTerminalSwitch else {
+                handleStreamError("Invalid physical-source control direction.");return
+            }
+            guard mirrorTerminalSend != nil else {return}
+            do {
+                try mirrorControl.receiveTerminalAcknowledgement(session:generation,data:payload)
+                advanceMirrorTerminalSwitchOnQueue()
+            } catch {
+                // An unmatched terminal response is never switch or input authority.
+                mirrorControl.cancelTerminalSwitch();mirrorTerminalSend=nil
+            }
+            publishMirrorStateOnQueue();return
+        case .mirrorHello, .mirrorInput, .mirrorSwitchRequest:
+            handleStreamError("Invalid physical-source control direction.")
+            return
+        case .directTouchContact, .pointerInput, .keyboardInput, .textCommit:
             return
 
         case .video:
@@ -3581,8 +3464,10 @@ public class NetworkManager: ObservableObject {
                 // exact host commit must arrive first on authenticated TLS.
                 return
             }
+            guard mirrorControl.permitsVideoSequence(header.sequence) else { return }
             let receivedAt = CACurrentMediaTime()
             let receiveDurationMs = max(0, (receivedAt - message.firstByteAt) * 1_000.0)
+            recordVideoPayloadReceived(payload.count, sequence: header.sequence)
             bytesReceived &+= UInt64(payload.count)
             transportTelemetry.recordPayloadReceived(
                 sequence: header.sequence,
@@ -3644,11 +3529,33 @@ public class NetworkManager: ObservableObject {
             let nonce = payload.withUnsafeBytes {
                 $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self).littleEndian
             }
-            if let sentAt = pendingClientPings.removeValue(forKey: nonce) {
+            if let pending = pendingClientPings[nonce],
+               pending.generation == generation,
+               generation == connectionGeneration,
+               let owner = activeControlConnection,
+               pending.connectionID == ObjectIdentifier(owner) {
+                pendingClientPings.removeValue(forKey: nonce)
                 let rttMs = max(
                     0,
-                    (ProcessInfo.processInfo.systemUptime - sentAt) * 1_000.0)
+                    (ProcessInfo.processInfo.systemUptime - pending.sentAt) * 1_000.0)
                 transportTelemetry.recordRtt(durationMs: rttMs)
+                if pending.purpose == .usbCandidateLiveness,
+                   let candidate = pendingUsbCandidate, ownsUsbCandidate(candidate),
+                   candidate.livenessNonce == nonce {
+                    cancelUsbCandidateArbitration(reason: "incumbent_liveness_pong")
+                }
+                if pending.purpose == .usbLegacyPcmFreshFence,
+                   usbLegacyPcmFreshFenceNonce == nonce,
+                   legacyUsbPlaybackEnabledGeneration == generation,
+                   isForegroundActive,
+                   isCurrentCommittedUsbStreamingSessionOnQueue(generation: generation),
+                   committedRealtimeMode == RealtimeTransportMode.legacyTLS {
+                    usbLegacyPcmFreshFenceNonce = nil
+                    usbLegacyPcmFreshFenceGeneration = nil
+                    AudioManager.shared.resumeLegacySessionAfterFreshFence(generation: generation)
+                    recordUsbLifecycleDiagnostic(
+                        "[USB_PCM_RESUME_FENCE] generation=\(generation) action=released nonce=\(nonce)")
+                }
             }
 
         case .videoFeedback:
@@ -3670,7 +3577,13 @@ public class NetworkManager: ObservableObject {
                     timestamp: audioTimestamp,
                     generation: generation)
             case .legacyPCM:
-                AudioManager.shared.playPCMData(payload)
+                if activeTransportKind == .usb,
+                   isForegroundActive,
+                   usbLegacyPcmFreshFenceGeneration == generation {
+                    AudioManager.shared.recordLegacyResumeFenceDrop(generation: generation)
+                    return
+                }
+                AudioManager.shared.playPCMData(payload, generation: generation)
             case .reject:
                 return
             }
@@ -3740,7 +3653,8 @@ public class NetworkManager: ObservableObject {
                     usbSplitCommitGate.begin(sessionID: offer.sessionID)
                     usbLaneServer.start(
                         sessionID: offer.sessionID,
-                        secret: offer.usbBindingSecret)
+                        secret: offer.usbBindingSecret,
+                        connectionGeneration: generation)
                 }
             } else {
                 offer.zeroSecrets()
@@ -3915,6 +3829,123 @@ public class NetworkManager: ObservableObject {
         return true
     }
 
+    private func recordWifiLifecycleDiagnostic(_ details: String) {
+        let line = "[IPAD][WIFI_LIFECYCLE] " + details
+        print(line)
+        recordDiagnosticLine(line)
+    }
+
+    private func shouldPreserveTransientWifiControlError(
+        _ error: NWError,
+        generation: UInt64,
+        connection expectedConnection: NWConnection
+    ) -> Bool {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        return WifiNetworkErrorPolicy.disposition(for: error) == .transient &&
+            (wifiBackgroundDisconnectWorkItem != nil ||
+                wifiLifecycleTransitionGeneration == generation) &&
+            connection === expectedConnection &&
+            isCurrentCommittedWifiRtpStreamingSessionOnQueue(
+                generation: generation)
+    }
+
+    private func isWifiConnectionReadyOnQueue(
+        _ expectedConnection: NWConnection,
+        generation: UInt64
+    ) -> Bool {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard connection === expectedConnection,
+              generation == connectionGeneration else { return false }
+        let actualReady: Bool
+        if case .ready = expectedConnection.state {
+            actualReady = true
+        } else {
+            actualReady = false
+        }
+        let waitingOwned = wifiWaitingOwner?.owns(
+            expectedConnection, generation: generation) == true
+        #if targetEnvironment(simulator)
+        return WifiConnectionReadinessPolicy.isReady(
+            actualReady: actualReady,
+            waitingOwned: waitingOwned,
+            simulatedReady: testingSimulatedWifiSession)
+        #else
+        return WifiConnectionReadinessPolicy.isReady(
+            actualReady: actualReady,
+            waitingOwned: waitingOwned)
+        #endif
+    }
+
+    private func resumeCommittedWireReceiveLoopIfNeeded(
+        connection expectedConnection: NWConnection,
+        generation: UInt64
+    ) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard wifiWaitingOwner?.owns(
+                  expectedConnection, generation: generation) != true,
+              connection === expectedConnection,
+              isCurrentCommittedWifiRtpStreamingSessionOnQueue(
+                generation: generation),
+              wireReceiveActiveGeneration != generation else { return }
+        wireReceiveActiveGeneration = generation
+        #if targetEnvironment(simulator)
+        if testingSimulatedWifiSession { return }
+        #endif
+        receiveWireChunk(generation: generation)
+    }
+
+    @discardableResult
+    private func resumeCommittedWifiSessionOnQueue(
+        connection expectedConnection: NWConnection,
+        generation: UInt64
+    ) -> Bool {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard isForegroundActive,
+              connection === expectedConnection,
+              isWifiConnectionReadyOnQueue(
+                  expectedConnection, generation: generation),
+              isCurrentCommittedWifiRtpStreamingSessionOnQueue(
+                generation: generation) else { return false }
+        wifiBackgroundDisconnectWorkItem?.cancel()
+        wifiBackgroundDisconnectWorkItem = nil
+        resumeCommittedWireReceiveLoopIfNeeded(
+            connection: expectedConnection, generation: generation)
+        if wifiMediaReceiver.isPreservedSessionRecoveryPending(
+            generation: generation) {
+            sendClientPingIfDue()
+            recordWifiLifecycleDiagnostic(
+                "generation=\(generation) event=ready " +
+                "action=coalesce_existing_recovery client_hello_sent=false")
+            return true
+        }
+        let begin = "[WIFI_MEDIA_RECOVERY] generation=\(generation) " +
+            "action=decoder_invalidate_begin"
+        print(begin)
+        recordDiagnosticLine(begin)
+        decoder.invalidate(waitForCompletion: false)
+        guard connection === expectedConnection,
+              isCurrentCommittedWifiRtpStreamingSessionOnQueue(
+                generation: generation) else {
+            let stale = "[WIFI_MEDIA_RECOVERY] scheduled_generation=\(generation) " +
+                "current_generation=\(connectionGeneration) action=skip_stale"
+            print(stale)
+            recordDiagnosticLine(stale)
+            return false
+        }
+        beginOwnedDecoderSession(networkGeneration: generation)
+        wifiMediaReceiver.reanchorForPreservedSessionRecovery(generation: generation)
+        AudioManager.shared.resumeCurrentRealtimeSession(generation: generation, profile: .wifi)
+        sendClientPingIfDue()
+        let complete = "[WIFI_MEDIA_RECOVERY] generation=\(generation) " +
+            "action=decoder_rearmed recovery_requested=true"
+        print(complete)
+        recordDiagnosticLine(complete)
+        recordWifiLifecycleDiagnostic(
+            "generation=\(generation) event=ready " +
+            "action=resume_committed_same_session client_hello_sent=false")
+        return true
+    }
+
     private func consumeUsbForegroundDecoderRearmIfEligibleOnQueue()
         -> UInt64? {
         dispatchPrecondition(condition: .onQueue(networkQueue))
@@ -3938,8 +3969,7 @@ public class NetworkManager: ObservableObject {
     private func sendClientCapabilities(for kind: ActiveTransportKind) {
         if case .usb = kind {
             publishClientCapabilities(
-                modes: RealtimeTransportMode.legacyTLS |
-                    RealtimeTransportMode.usbSplitTLS,
+                modes: RealtimeTransportMode.legacyTLS,
                 udpPort: 0)
             return
         }
@@ -3998,6 +4028,7 @@ public class NetworkManager: ObservableObject {
     private func sendDesiredPipelineMode(reason: String) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard wireAuthenticatedGeneration == connectionGeneration else { return }
+        committedPipelineMode.request(desiredPipelineMode)
         sendWireMessage(
             type: .pipelineMode,
             payload: desiredPipelineMode.encode(),
@@ -4056,6 +4087,7 @@ public class NetworkManager: ObservableObject {
               let appliedPreference = pendingDisplayPreference else {
             return
         }
+        decoder.configureRefreshRate(ready.refreshHz)
         pendingDisplayPreference = nil
         latestDisplayPreference = nil
         activeDisplayPreference = appliedPreference
@@ -4097,6 +4129,7 @@ public class NetworkManager: ObservableObject {
 
     private func resetDisplaySession() {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        committedPipelineMode.reset()
         orientationDebounceWorkItem?.cancel()
         orientationDebounceWorkItem = nil
         activeDisplayCapabilities = nil
@@ -4136,19 +4169,15 @@ public class NetworkManager: ObservableObject {
               committedTransportGeneration != generation else { return }
         committedTransportGeneration = generation
         committedRealtimeMode = mode
+        beginDataTransfer(generation: generation)
+        committedTransportAudioAvailable = audioEnabled
         wifiLegacyFallbackGeneration = nil
         wifiLegacyFallbackRequestGeneration = nil
-        decoder.beginSession(generation: generation)
-        if mode == RealtimeTransportMode.wifiRTP {
-            AudioManager.shared.beginRealtimeSession(
-                generation: generation,
-                profile: .wifi)
-        } else if mode == RealtimeTransportMode.usbSplitTLS &&
-                    audioEnabled {
-            AudioManager.shared.beginRealtimeSession(
-                generation: generation,
-                profile: .usb)
-        }
+        beginOwnedDecoderSession(networkGeneration: generation)
+        reconcileRealtimeAudioPlayback(
+            generation: generation,
+            mode: mode,
+            audioEnabled: audioEnabled)
         setState(.streaming)
         startVideoReceiveLoop(generation: generation)
         if activeTransportKind == .usb {
@@ -4156,6 +4185,7 @@ public class NetworkManager: ObservableObject {
             recordUsbLifecycleDiagnostic(
                 "[USB_RECOVERY_CANDIDATE] attempt=\(generation) generation=\(generation) state=committed")
             recordUsbLifecycleDiagnostic("[USB_SESSION_COMMIT] generation=\(generation)")
+            challengeUsbCandidateIfCommitted()
         }
     }
 
@@ -4340,22 +4370,42 @@ public class NetworkManager: ObservableObject {
     }
 
     @discardableResult
-    private func fallbackCommittedWifiToLegacy(
+    func fallbackCommittedWifiToLegacy(
         generation: UInt64
     ) -> Bool {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard generation == connectionGeneration,
+              wireAuthenticatedGeneration == generation,
               committedTransportGeneration == generation,
               committedRealtimeMode == RealtimeTransportMode.wifiRTP,
               wifiLegacyFallbackGeneration != generation,
-              connection != nil else {
+              let expectedConnection = connection else {
             return false
         }
         wifiLegacyFallbackGeneration = generation
         wifiLegacyFallbackRequestGeneration = nil
+        mirrorControl.retireTransportPresentation()
+        mirrorTerminalSend=nil
+        publishMirrorStateOnQueue()
         committedRealtimeMode = RealtimeTransportMode.legacyTLS
+        committedTransportAudioAvailable = true
         wifiMediaReceiver.clearOffer()
+        decoder.invalidate(waitForCompletion: true)
+        guard connection === expectedConnection,
+              generation == connectionGeneration,
+              wireAuthenticatedGeneration == generation,
+              committedTransportGeneration == generation,
+              committedRealtimeMode == RealtimeTransportMode.legacyTLS,
+              wifiLegacyFallbackGeneration == generation else { return false }
+        beginOwnedDecoderSession(networkGeneration: generation)
+        videoPayloadCounter.begin(generation: generation)
+        videoRxSampler.reset()
+        lastHudSnapshotPublishedAt = 0
+        startLegacyTelemetryTimers()
         AudioManager.shared.reset()
+        reconcileRealtimeAudioPlayback(
+            generation: generation, mode: RealtimeTransportMode.legacyTLS,
+            audioEnabled: clientSettingsState.effective.audioEnabled)
         return true
     }
 
@@ -4399,27 +4449,51 @@ public class NetworkManager: ObservableObject {
             "[USB_SESSION_LOST] generation=\(generation) connectionId=\(ObjectIdentifier(connection)) listenerStillReady=\(listenerStillReady) reason=\(reason)")
         recordUsbLifecycleDiagnostic(
             "[USB_RECOVERY_CANDIDATE] attempt=\(generation) generation=\(generation) state=failed")
+        let replacement: PendingUsbCandidate?
+        if let pending = pendingUsbCandidate, ownsUsbCandidate(pending) {
+            replacement = takeUsbCandidate()
+        } else {
+            replacement = nil
+        }
         teardownCurrentSession()
-        // Sends are serialized per socket. A retired socket must not hold the
-        // replacement socket behind a completion that may never arrive.
-        controlChannelWriter.abandonConnection()
         recordUsbLifecycleDiagnostic(
             "[USB_LISTENER_REUSE] oldGeneration=\(generation) acceptingNext=\(listenerStillReady)")
         recordUsbLifecycleDiagnostic(
             "[USB_RECOVERY_CANDIDATE] attempt=\(generation) generation=\(generation) state=retired")
         setState(.listening)
+        if let replacement, usbListenerExplicitlyStarted,
+           listenerGeneration == replacement.listenerGeneration, usbListener != nil {
+            recordUsbLifecycleDiagnostic("[USB_CANDIDATE_ARBITRATION] arbitration=\(replacement.id) action=promote_candidate reason=\(reason)")
+            installUsbCandidate(replacement.candidate)
+        } else {
+            replacement?.candidate.cancel()
+        }
     }
 
     private func teardownCurrentSession() {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        cancelUsbCandidateArbitration(reason: "session_teardown")
+        cancelLegacyUsbPcmFreshFence()
+        legacyUsbPlaybackEnabledGeneration = nil
+        pendingClientPings.removeAll(keepingCapacity: true)
+        wifiBackgroundDisconnectWorkItem?.cancel()
+        wifiBackgroundDisconnectWorkItem = nil
+        wifiLifecycleTransitionGeneration = nil
+        wifiWaitingOwner = nil
         pendingUsbForegroundDecoderRearmGeneration = nil
         connectionTimeoutWorkItem?.cancel()
         connectionTimeoutWorkItem = nil
         let failedGeneration = connectionGenerationClock.advance()
+        resetAutoAcceptOnQueue()
+        advanceReceivedRevisionOnQueue()
+        resetDirectTouchSessionOnQueue()
         wireReceiveActiveGeneration = nil
+        wireReceiveOutstanding = nil
+        transferReceiveSuffix = nil
         wireAuthenticatedGeneration = nil
         committedTransportGeneration = nil
         committedRealtimeMode = nil
+        committedTransportAudioAvailable = false
         committedRealtimeSessionID = nil
         wifiLegacyFallbackGeneration = nil
         wifiLegacyFallbackRequestGeneration = nil
@@ -4427,11 +4501,13 @@ public class NetworkManager: ObservableObject {
         resetDisplaySession()
         clearPendingTransportOffer()
         wireParser.reset(generation: failedGeneration)
-        controlChannelWriter.cancel()
+        dataTransfers?.retire(); dataTransfers = nil; transferReceivePending = 0
         decoder.invalidate(waitForCompletion: !usbListenerExplicitlyStarted)
         AudioManager.shared.reset()
         connection?.cancel()
         connection = nil
+        // The socket is retired; late completion IDs must not gate its successor.
+        controlChannelWriter.abandonConnection()
         usbScdpConnection = nil
         usbLaneServer.abort()
         usbLaneConnections.values.forEach { $0.cancel() }
@@ -4440,17 +4516,226 @@ public class NetworkManager: ObservableObject {
         stopTelemetryTimer()
     }
 
+    private func reconcileRealtimeAudioPlayback(
+        generation: UInt64,
+        mode: UInt8,
+        audioEnabled: Bool
+    ) {
+        guard generation == connectionGeneration,
+              committedTransportGeneration == generation,
+              committedRealtimeMode == mode else { return }
+        let playbackEnabled = audioEnabled && clientSettingsState.desired.audioEnabled &&
+            committedTransportAudioAvailable
+        if activeTransportKind == .usb, mode == RealtimeTransportMode.legacyTLS {
+            if !playbackEnabled {
+                cancelLegacyUsbPcmFreshFence()
+                legacyUsbPlaybackEnabledGeneration = nil
+            } else if legacyUsbPlaybackEnabledGeneration != generation {
+                legacyUsbPlaybackEnabledGeneration = generation
+                AudioManager.shared.beginLegacySession(generation: generation)
+                armLegacyUsbPcmFreshFence(generation: generation)
+            }
+        }
+        if mode == RealtimeTransportMode.legacyTLS, playbackEnabled,
+           activeTransportKind != .usb {
+            AudioManager.shared.beginLegacySession(generation: generation)
+        }
+        guard RealtimeAudioTimerPolicy.shouldRun(
+            mode: mode,
+            audioEnabled: playbackEnabled) else {
+            if !playbackEnabled {
+                #if targetEnvironment(simulator)
+                if let realtimeAudioPlaybackForTesting {
+                    realtimeAudioPlaybackForTesting(false)
+                    return
+                }
+                #endif
+                AudioManager.shared.reset()
+            }
+            return
+        }
+        #if targetEnvironment(simulator)
+        if let realtimeAudioPlaybackForTesting {
+            realtimeAudioPlaybackForTesting(true)
+            return
+        }
+        #endif
+        AudioManager.shared.beginRealtimeSession(
+            generation: generation,
+            profile: mode == RealtimeTransportMode.wifiRTP ? .wifi : .usb)
+    }
+
     // MARK: - Private: Thread-Safe State Transition
 
     private func recordUsbLifecycleDiagnostic(_ line: String) {
-        let timed = "\(line) uptime=\(ProcessInfo.processInfo.systemUptime)"
+        let uptime = ProcessInfo.processInfo.systemUptime
+        let timed = "\(line) uptime=\(uptime) uptime_ms=\(Int64(uptime * 1000))"
         // The listener also exists between telemetry files; keep these sparse
         // events visible in the device console throughout that interval.
         print(timed)
         recordDiagnosticLine(timed)
     }
 
+    private func recordAppAudioLifecycleDiagnostic(event: String, phase: String, foregroundBefore: Bool) {
+        recordUsbLifecycleDiagnostic("[APP_AUDIO_LIFECYCLE] event=\(event) phase=\(phase) isForegroundActive_before=\(foregroundBefore ? 1 : 0) isForegroundActive_after=\(isForegroundActive ? 1 : 0) connectionGeneration=\(connectionGeneration) committedTransportGeneration=\(committedTransportGeneration.map { String($0) } ?? "none") wireAuthenticatedGeneration=\(wireAuthenticatedGeneration.map { String($0) } ?? "none") activeTransportKind=\(activeTransportKind == .usb ? "usb" : "wifi") committedRealtimeMode=\(committedRealtimeMode.map { String($0) } ?? "none") legacyUsbPlaybackEnabledGeneration=\(legacyUsbPlaybackEnabledGeneration.map { String($0) } ?? "none") usbLegacyPcmFreshFenceGeneration=\(usbLegacyPcmFreshFenceGeneration.map { String($0) } ?? "none") usbLegacyPcmFreshFenceNonce_present=\(usbLegacyPcmFreshFenceNonce != nil ? 1 : 0) \(AudioManager.audioSessionDiagnosticFields)")
+    }
+
     #if targetEnvironment(simulator)
+    // Captures the real pending-switch completion without wall-clock sleeps in XCTest.
+    var mirrorSwitchDeadlineForTesting: ((TimeInterval, @escaping () -> Void) -> Void)?
+    func beginMirrorControlForTesting(generation:UInt64, monitorSelection:Bool=false, terminal:Bool=false) {
+        mirrorControl.beginSession(generation)
+        _=mirrorControl.helloIfAdvertised(session:generation,flags:terminal ? 0x7000:(monitorSelection ? 0x6000:0x4000))
+        mirrorSwitchAdvertised=monitorSelection
+    }
+    var mirrorDecoderGenerationForTesting:UInt64? {currentMirrorDecoderOwner?.decoder}
+    func receiveMirrorWireForTesting(type:WireMessageType,payload:Data,generation:UInt64,connection owner:NWConnection) {
+        networkQueue.sync {
+            guard generation==connectionGeneration,connection===owner,wireAuthenticatedGeneration==generation else {return}
+            handleWireMessage(WireMessage(header:WireHeader(type:type,flags:0,payloadLength:payload.count,sequence:0),
+                payload:payload,firstByteAt:ProcessInfo.processInfo.systemUptime),generation:generation)
+        }
+    }
+    func transferObserverForTesting() -> (DataTransferManager, (DataTransferManager.Snapshot) -> Void) {
+        networkQueue.sync {
+            beginDataTransfer(generation: connectionGeneration)
+            return (dataTransfers!, dataTransfers!.changed!)
+        }
+    }
+    var receivedRevisionForTesting: UInt64 { receivedActionClock.current }
+    // Deterministic admission/receive boundary only; absent from device builds.
+    var transferReceiveForTesting: ((Int, @escaping (Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void) -> Void)?
+    var transferPostForTesting: ((TransferPacket, @escaping () -> Void) -> Bool)?
+    func startTransferReceiveForTesting(manager: DataTransferManager?, authenticated: Bool = true) {
+        networkQueue.sync {
+            dataTransfers = manager
+            transferReceivePending = 0
+            transferReceiveSuffix = nil
+            wireReceiveOutstanding = nil
+            wireParser.reset(generation: connectionGeneration)
+            wireAuthenticatedGeneration = authenticated ? connectionGeneration : nil
+            receiveWireChunk(generation: connectionGeneration)
+        }
+    }
+    // Simulator-only authorization fixture. Uses the real session/manager boundary.
+    func configureTransferAuthorizationForTesting(manager: DataTransferManager?, authenticated: Bool,
+                                                   committed: Bool, usb: Bool = false) {
+        networkQueue.sync {
+            dataTransfers = manager
+            usbListenerExplicitlyStarted = usb
+            wireAuthenticatedGeneration = authenticated ? connectionGeneration : nil
+            committedTransportGeneration = committed ? connectionGeneration : nil
+            refreshAutoAcceptPolicyOnQueue()
+        }
+    }
+    var transferPendingForTesting: Int { networkQueue.sync { transferReceivePending } }
+    func beginTransferWriterForTesting() {
+        networkQueue.sync { controlChannelWriter.begin(generation: connectionGeneration) }
+    }
+    func enqueueTransferWireForTesting(bulk: Bool, completion: @escaping (NWError?) -> Void) {
+        networkQueue.async {
+            self.sendWireMessage(type: bulk ? .transferEnd : .ping, payload: Data(count: bulk ? 25 : 16), sequence: 0, bulk: bulk, completion: completion)
+        }
+    }
+
+    var realtimeAudioPlaybackForTesting: ((Bool) -> Void)?
+    var controlSendForAudioTesting: ((Data, @escaping (NWError?) -> Void) -> Void)?
+
+    func isLegacyPcmFreshFencePingForTesting(_ data: Data) -> Bool {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard data.count == WireProtocol.headerSize + 16,
+              data[5] == WireMessageType.ping.rawValue else { return false }
+        let nonce = data.withUnsafeBytes {
+            $0.loadUnaligned(fromByteOffset: WireProtocol.headerSize + 8, as: UInt64.self).littleEndian
+        }
+        return usbLegacyPcmFreshFenceNonce == nonce
+    }
+
+    func receiveUsbWireForTesting(type: WireMessageType, payload: Data,
+                                  generation: UInt64, connection owner: NWConnection) {
+        networkQueue.sync {
+            guard generation == connectionGeneration, connection === owner,
+                  usbScdpConnection === owner else { return }
+            handleWireMessage(WireMessage(header: WireHeader(type: type, flags: 0,
+                payloadLength: payload.count, sequence: 0), payload: payload,
+                firstByteAt: ProcessInfo.processInfo.systemUptime), generation: generation)
+        }
+    }
+
+    var usbCandidateArbitrationForTesting: (id: UInt64, candidate: NWConnection, generation: UInt64, nonce: UInt64?, deadline: TimeInterval)? {
+        networkQueue.sync {
+            pendingUsbCandidate.map { ($0.id, $0.candidate, $0.incumbentGeneration, $0.livenessNonce, $0.deadline) }
+        }
+    }
+
+    func expireUsbCandidateForTesting(id: UInt64) {
+        networkQueue.sync { expireUsbCandidate(id: id) }
+    }
+
+    private var testingPerformanceFeedbackNow: TimeInterval?
+    func seedPerformanceWindowForTesting(mode: PipelineMode = .office, at now: TimeInterval) {
+        networkQueue.sync {
+            testingPerformanceFeedbackNow = now
+            desiredPipelineMode = mode
+            committedPipelineMode.request(mode)
+            _ = committedPipelineMode.acknowledge(mode, at: now - 3)
+            transportTelemetry.beginFreshFrameRate(generation: connectionGeneration, at: now - 1.1)
+        }
+    }
+    func advancePerformanceFeedbackClockForTesting(to now: TimeInterval) {
+        networkQueue.sync { testingPerformanceFeedbackNow = now }
+    }
+    func sendPerformanceFeedbackForTesting() -> UInt32 {
+        networkQueue.sync { sendPerformanceFeedback(); return performanceFeedbackSequence }
+    }
+    func performanceSampleForTesting(at now: TimeInterval) -> ClientFreshFrameRateSample? {
+        networkQueue.sync {
+            transportTelemetry.freshFrameRateSample(generation: connectionGeneration, at: now)
+        }
+    }
+
+    func installUsbLaneForParserTesting(_ lane: UsbLaneKind, connection: NWConnection) {
+        networkQueue.sync {
+            usbLaneConnections[lane]?.cancel()
+            usbLaneConnections[lane] = connection
+            connection.start(queue: networkQueue)
+            startUsbLaneReceiveLoop(connection, lane: lane, generation: connectionGeneration)
+        }
+    }
+
+    func installUsbAudioLaneForTesting() -> NWConnection {
+        networkQueue.sync {
+            let lane = NWConnection(host: "127.0.0.1", port: 27015, using: .tcp)
+            usbLaneConnections[.audio]?.cancel()
+            usbLaneConnections[.audio] = lane
+            return lane
+        }
+    }
+
+    func failUsbAudioLaneForTesting(_ connection: NWConnection, generation: UInt64, reason: String) {
+        networkQueue.sync { retireUsbAudioLane(connection, generation: generation, reason: reason) }
+    }
+
+    func commitAudioTransportForTesting(mode: UInt8, audioAvailable: Bool) {
+        networkQueue.sync {
+            wireAuthenticatedGeneration = connectionGeneration
+            commitRealtimeTransport(
+                generation: connectionGeneration, mode: mode,
+                audioEnabled: audioAvailable)
+        }
+    }
+
+    func reconcileAudioForTesting(generation: UInt64, mode: UInt8, audioEnabled: Bool) {
+        networkQueue.sync {
+            reconcileRealtimeAudioPlayback(
+                generation: generation, mode: mode, audioEnabled: audioEnabled)
+        }
+    }
+
+    var clientDebugLoggingEnabledForTesting: Bool {
+        networkQueue.sync { clientDebugLoggingEnabled }
+    }
+
     // Read-only ownership snapshot for real Network.framework regression tests.
     struct USBSessionSnapshot {
         let listener: NWListener?
@@ -4466,6 +4751,7 @@ public class NetworkManager: ObservableObject {
     var networkQueueForTesting: DispatchQueue { networkQueue }
     var networkQueueKeyForTesting: DispatchSpecificKey<Bool> { networkQueueKey }
     var decoderForTesting: DecoderManager { decoder }
+    var wifiMediaReceiverForTesting: WifiMediaReceiver { wifiMediaReceiver }
 
     func wifiSessionSnapshotForTesting() -> (
         connection: NWConnection?, generation: UInt64,
@@ -4476,20 +4762,97 @@ public class NetworkManager: ObservableObject {
         }
     }
 
+    func wifiLifecycleSnapshotForTesting() -> (
+        connection: NWConnection?, generation: UInt64,
+        authenticatedGeneration: UInt64?, committedGeneration: UInt64?,
+        realtimeMode: UInt8?, waitingGeneration: UInt64?,
+        inactiveTransitionGeneration: UInt64?,
+        graceActive: Bool, receiveActiveGeneration: UInt64?,
+        initialReceiveStarts: Int, writerBegins: Int,
+        clientHelloCount: Int, pingAttempts: Int
+    ) {
+        networkQueue.sync {
+            (connection, connectionGeneration, wireAuthenticatedGeneration,
+             committedTransportGeneration, committedRealtimeMode,
+             wifiWaitingOwner?.generation, wifiLifecycleTransitionGeneration,
+             wifiBackgroundDisconnectWorkItem != nil,
+             wireReceiveActiveGeneration, testingInitialReceiveStarts,
+             testingWriterBegins, testingClientHelloCount, testingPingAttempts)
+        }
+    }
+
+    func simulateWifiControlSendErrorForTesting(
+        _ error: NWError = .posix(.ENETDOWN),
+        generation: UInt64, connection expectedConnection: NWConnection
+    ) {
+        networkQueue.sync {
+            handleControlSendError(
+                error, generation: generation,
+                connection: expectedConnection, transport: .wifi)
+        }
+    }
+
+    func simulateWifiControlReceiveErrorForTesting(
+        _ error: NWError = .posix(.ENETDOWN),
+        generation: UInt64, connection expectedConnection: NWConnection
+    ) {
+        networkQueue.sync {
+            handleWireReceiveError(
+                error, generation: generation,
+                connection: expectedConnection)
+        }
+    }
+
+    func setWifiWaitingOwnerForTesting(
+        generation: UInt64, connection expectedConnection: NWConnection
+    ) {
+        networkQueue.sync {
+            wifiWaitingOwner = WifiWaitingOwner(
+                generation: generation,
+                connectionID: ObjectIdentifier(expectedConnection))
+        }
+    }
+
+    func isWifiConnectionReadyForTesting(
+        connection expectedConnection: NWConnection,
+        generation: UInt64
+    ) -> Bool {
+        networkQueue.sync {
+            isWifiConnectionReadyOnQueue(
+                expectedConnection, generation: generation)
+        }
+    }
+
+    func expireWifiBackgroundGraceForTesting() {
+        networkQueue.sync {
+            wifiBackgroundDisconnectWorkItem?.perform()
+        }
+    }
+
     func simulateCommittedWifiSessionForTesting(
         mode: UInt8 = RealtimeTransportMode.wifiRTP
     ) -> (connection: NWConnection, generation: UInt64) {
         networkQueue.sync {
             let peer = NWConnection(host: "127.0.0.1", port: 27015, using: .tcp)
             let generation = connectionGenerationClock.advance()
+            resetAutoAcceptOnQueue()
+            advanceReceivedRevisionOnQueue()
+            resetDirectTouchSessionOnQueue()
             connection?.cancel()
+            wifiBackgroundDisconnectWorkItem?.cancel()
+            wifiBackgroundDisconnectWorkItem = nil
+            wifiLifecycleTransitionGeneration = nil
+            wifiWaitingOwner = nil
             connection = peer
             setupStateHandler(for: peer)
+            testingSimulatedWifiSession = true
+            wireReceiveActiveGeneration = generation
             wireAuthenticatedGeneration = generation
             committedTransportGeneration = generation
             committedRealtimeMode = mode
+            committedTransportAudioAvailable = true
             lastClientPingSentAt = .greatestFiniteMagnitude
-            decoder.beginSession(generation: generation)
+            beginOwnedDecoderSession(networkGeneration: generation)
             setState(.streaming)
             return (peer, generation)
         }
@@ -4497,6 +4860,14 @@ public class NetworkManager: ObservableObject {
 
     func stopForTesting() {
         networkQueue.sync { self.stopOnQueue() }
+    }
+
+    func publishHudSnapshotForTesting(_ snapshot: TransportHudSnapshot) {
+        networkQueue.sync { publishHudSnapshot(snapshot) }
+    }
+
+    func setCommittedRealtimeModeForTesting(_ mode: UInt8?) {
+        networkQueue.sync { committedRealtimeMode = mode }
     }
 
     func enqueueControlForTesting(
@@ -4545,6 +4916,8 @@ public class NetworkManager: ObservableObject {
     private func setState(_ newState: ConnectionState) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         transportState = newState
+        if case .authFailed = newState { resetAutoAcceptOnQueue() }
+        if newState == .streaming { publishAutoReconnectAttempt(0) }
         DispatchQueue.main.async {
             self.connectionState = newState
         }
@@ -4565,14 +4938,218 @@ public class NetworkManager: ObservableObject {
         frameReceiveMs: 0,
         decodeMs: 0)
 
+    private var currentMirrorDecoderOwner: MirrorDecoderOwner? {
+        mirrorDecoderLock.lock(); defer { mirrorDecoderLock.unlock() }; return mirrorDecoderOwner
+    }
+    private func beginOwnedDecoderSession(networkGeneration generation: UInt64) {
+        guard let state = mirrorControl.currentState else { decoder.beginSession(generation: generation); return }
+        guard generation & 0x8000_0000_0000_0000 == 0, nextMirrorDecoder != UInt64.max else {
+            handleStreamError("Physical-source decoder identity exhausted."); return
+        }
+        nextMirrorDecoder += 1
+        let owner = MirrorDecoderOwner(connection: generation, decoder: nextMirrorDecoder, epoch: state.epoch, source: state.source)
+        mirrorDecoderLock.lock(); mirrorDecoderOwner = owner; mirrorDecoderLock.unlock()
+        decoder.beginSession(generation: owner.decoder)
+    }
+    private func publishMirrorStateOnQueue() {
+        let generation = connectionGenerationClock.current
+        let state = mirrorControl.currentState
+        let revision = mirrorControl.gestureRevision
+        let catalogue:MirrorMonitorCatalogue?
+        if let state,mirrorCatalogueSource?.epoch==state.epoch,
+           mirrorCatalogueSource?.source==state.source,mirrorControl.hasPresentedCurrentSource {
+            catalogue=currentMirrorCatalogue
+            if catalogue != nil {mirrorSwitchPending=false;mirrorSwitchAttempt=nil;mirrorSwitchDeadlineToken=nil}
+        } else {catalogue=nil}
+        let pending=mirrorSwitchPending
+        let picker=mirrorControl.supportsScreenPicker
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.connectionGenerationClock.current == generation else { return }
+            self.mirrorControlState = state; self.mirrorInputRevision = revision
+            self.mirrorMonitorCatalogue=catalogue;self.mirrorMonitorSwitchPending=pending
+            self.mirrorScreenPickerSupported=picker
+        }
+    }
+    /// Screen picker opened: ask the Host for a fresh list (the stored one goes stale after 30 s).
+    public func refreshMirrorScreens() { sendScreenPickerAction { $0.screenListRequest() } }
+    /// Ask the attended Host to allow monitor switching. The Host shows a notice; nothing is granted here.
+    public func requestMirrorSwitchPermission() { sendScreenPickerAction { $0.switchPermissionRequest() } }
+    private func sendScreenPickerAction(_ make: @escaping (MirrorClientControl) -> Data?) {
+        let generation = connectionGenerationClock.current
+        networkQueue.async { [weak self] in
+            guard let self, generation == self.connectionGeneration,
+                  self.wireAuthenticatedGeneration == generation,
+                  let action = make(self.mirrorControl) else { return }
+            self.sendWireMessage(type: .mirrorAction, payload: action, sequence: 0)
+        }
+    }
+    public var mirrorTicketAtRegistration: MirrorInputTicket? { mirrorControl.captureTicket() }
+    public var permitsLegacyVirtualInput: Bool { mirrorControl.allowsLegacyVirtualInput }
+    /// Settings over the stream pauses local input only; the Host keeps its attended grant.
+    public func setMirrorInputSettingsPresented(_ open: Bool) {
+        let generation = connectionGenerationClock.current
+        mirrorControl.setSettingsPresented(open)
+        networkQueue.async { [weak self] in
+            guard let self, generation == self.connectionGeneration else { return }
+            self.publishMirrorStateOnQueue()
+        }
+    }
+    /// Explicit Release control: revokes the Host grant.
+    public func releaseMirrorControl() {
+        let generation = connectionGenerationClock.current
+        let action = mirrorControl.suspendInput()
+        networkQueue.async { [weak self] in
+            guard let self, generation == self.connectionGeneration else { return }
+            self.mirrorTerminalSend=nil
+            if let action, self.wireAuthenticatedGeneration == generation {
+                self.sendWireMessage(type: .mirrorAction, payload: action, sequence: 0)
+            }
+            self.publishMirrorStateOnQueue()
+        }
+    }
+    public func requestMirrorControl() {
+        let generation = connectionGenerationClock.current
+        networkQueue.async { [weak self] in
+            guard let self, generation == self.connectionGeneration,
+                  let action = self.mirrorControl.requestControl() else { return }
+            self.sendWireMessage(type: .mirrorAction, payload: action, sequence: 0)
+        }
+    }
+    public func requestMirrorMonitor(_ id:UInt64, catalogue:MirrorMonitorCatalogue) {
+        let generation=connectionGenerationClock.current
+        networkQueue.async { [weak self] in
+            guard let self,generation==self.connectionGeneration,
+                  self.wireAuthenticatedGeneration==generation,self.committedTransportGeneration==generation,
+                  !self.mirrorSwitchPending,let connection=self.activeControlConnection,
+                  self.currentMirrorCatalogue==catalogue,
+                  self.mirrorControl.hasPresentedCurrentSource,
+                  ProcessInfo.processInfo.systemUptime-self.mirrorCatalogueReceivedAt<30,
+                  let payload=try? catalogue.switchRequest(id) else {return}
+            // A consumed catalogue cannot submit another switch while its transaction is pending.
+            self.currentMirrorCatalogue=nil
+            self.mirrorCatalogueSource=nil;self.mirrorSwitchPending=true
+            let attempt=UUID()
+            self.mirrorSwitchAttempt=attempt
+            if self.mirrorControl.supportsTerminalSwitch {
+                guard self.nextMirrorTerminalNonce != UInt64.max else {
+                    self.mirrorControl.cancelTerminalSwitch();self.mirrorSwitchPending=false
+                    self.mirrorSwitchAttempt=nil;self.publishMirrorStateOnQueue();return
+                }
+                self.nextMirrorTerminalNonce+=1
+                let nonce=self.nextMirrorTerminalNonce
+                guard let retirement=self.mirrorControl.beginTerminalSwitch(nonce:nonce) else {
+                    self.mirrorSwitchPending=false;self.mirrorSwitchAttempt=nil
+                    self.publishMirrorStateOnQueue();return
+                }
+                self.mirrorTerminalSend=MirrorTerminalSend(attempt:attempt,nonce:nonce,generation:generation,
+                    connection:connection,payload:payload,catalogueReceivedAt:self.mirrorCatalogueReceivedAt)
+                self.sendWireMessage(type:.mirrorAction,payload:retirement,sequence:0) { [weak self] error in
+                    guard let self,var pending=self.mirrorTerminalSend,pending.attempt==attempt,
+                          self.connectionGeneration==generation,self.activeControlConnection === connection else {return}
+                    guard error == nil else {
+                        self.mirrorControl.cancelTerminalSwitch();self.mirrorTerminalSend=nil;return
+                    }
+                    pending.written=true;self.mirrorTerminalSend=pending
+                    self.advanceMirrorTerminalSwitchOnQueue()
+                }
+            } else {
+                if let retirement=self.mirrorControl.suspendInput() {
+                    self.sendWireMessage(type:.mirrorAction,payload:retirement,sequence:0)
+                }
+                self.sendWireMessage(type:.mirrorSwitchRequest,payload:payload,sequence:0)
+            }
+            self.publishMirrorStateOnQueue()
+            self.scheduleMirrorSwitchDeadlineOnQueue(attempt:attempt,generation:generation,connection:connection)
+        }
+    }
+    private func scheduleMirrorSwitchDeadlineOnQueue(attempt:UUID,generation:UInt64,connection:NWConnection) {
+            let deadlineToken=UUID();mirrorSwitchDeadlineToken=deadlineToken
+            let completion: () -> Void = { [weak self, weak connection] in
+                guard let self,let connection,self.mirrorSwitchAttempt==attempt,
+                      self.mirrorSwitchDeadlineToken==deadlineToken,
+                      self.connectionGeneration==generation,self.wireAuthenticatedGeneration==generation,
+                      self.committedTransportGeneration==generation,
+                      self.activeControlConnection === connection else {return}
+                // No response means unknown, never a selected monitor or renewed input grant.
+                self.mirrorSwitchAttempt=nil;self.mirrorSwitchPending=false
+                self.mirrorSwitchDeadlineToken=nil
+                if self.mirrorControl.supportsTerminalSwitch {self.mirrorControl.cancelTerminalSwitch()}
+                self.mirrorTerminalSend=nil
+                self.currentMirrorCatalogue=nil;self.mirrorCatalogueSource=nil
+                self.publishMirrorStateOnQueue()
+            }
+            #if targetEnvironment(simulator)
+            if let schedule=mirrorSwitchDeadlineForTesting {schedule(5,completion);return}
+            #endif
+            networkQueue.asyncAfter(deadline:.now()+5,execute:completion)
+    }
+    private func advanceMirrorTerminalSwitchOnQueue() {
+        dispatchPrecondition(condition:.onQueue(networkQueue))
+        guard let pending=mirrorTerminalSend,pending.written,
+              mirrorSwitchAttempt==pending.attempt,mirrorSwitchPending,
+              connectionGeneration==pending.generation,wireAuthenticatedGeneration==pending.generation,
+              committedTransportGeneration==pending.generation,
+              activeControlConnection === pending.connection else {return}
+        guard ProcessInfo.processInfo.systemUptime-pending.catalogueReceivedAt<30 else {
+            mirrorControl.cancelTerminalSwitch();mirrorTerminalSend=nil;return
+        }
+        guard mirrorControl.takeTerminalSwitch(nonce:pending.nonce) else {return}
+        mirrorTerminalSend=nil
+        sendWireMessage(type:.mirrorSwitchRequest,payload:pending.payload,sequence:0)
+        // Terminal retirement and the D03-P response are distinct bounded phases.
+        scheduleMirrorSwitchDeadlineOnQueue(attempt:pending.attempt,generation:pending.generation,connection:pending.connection)
+    }
+    public func setMirrorInputForeground(_ active: Bool) {
+        let generation = connectionGenerationClock.current
+        let action = mirrorControl.setForeground(active)
+        networkQueue.async { [weak self] in
+            guard let self, generation == self.connectionGeneration else { return }
+            if !active {self.mirrorTerminalSend=nil}
+            if let action, self.wireAuthenticatedGeneration == generation {
+                self.sendWireMessage(type: .mirrorAction, payload: action, sequence: 0)
+            }
+            self.publishMirrorStateOnQueue()
+        }
+    }
+    public func sendMirrorInput(ticket: MirrorInputTicket, kind: MirrorInputKind, payload: Data) {
+        networkQueue.async { [weak self] in
+            guard let self, ticket.session == self.connectionGeneration,
+                  self.wireAuthenticatedGeneration == ticket.session,
+                  self.committedTransportGeneration == ticket.session,
+                  self.transportState == .streaming,
+                  let envelope = try? self.mirrorControl.encodeInput(ticket: ticket, kind: kind, payload: payload) else { return }
+            // Existing bounded reliable lane. No UDP/raw fallback, no terminal coalescing.
+            self.sendWireMessage(type: .mirrorInput, payload: envelope, sequence: 0, movement: false)
+        }
+    }
+    public static func mirrorPencilPayload(type: TouchEventType, x: UInt16, y: UInt16, pressure: UInt8) -> Data {
+        var bytes = [UInt8](repeating: 0, count: 8)
+        bytes[0] = 0x49; bytes[1] = 0x54; bytes[2] = type.rawValue; bytes[3] = pressure
+        bytes[4] = UInt8(truncatingIfNeeded: x); bytes[5] = UInt8(truncatingIfNeeded: x >> 8)
+        bytes[6] = UInt8(truncatingIfNeeded: y); bytes[7] = UInt8(truncatingIfNeeded: y >> 8)
+        return Data(bytes)
+    }
+
     /// Records completion of the Metal command buffer as a distinct presentation stage.
-    public func recordRenderCompletion(
-        sequence: UInt32,
-        generation: UInt64
-    ) {
-        transportTelemetry.recordRenderCompletion(
-            sequence: sequence,
-            generation: generation)
+    public func recordRenderCompletion(sequence: UInt32, generation: UInt64) {
+        mirrorDecoderLock.lock()
+        let captured = mirrorDecoderOwner
+        mirrorDecoderLock.unlock()
+        if let captured, captured.decoder == generation {
+            transportTelemetry.recordRenderCompletion(sequence: sequence, generation: captured.connection)
+            networkQueue.async { [weak self] in
+                guard let self, captured.connection == self.connectionGeneration,
+                      self.currentMirrorDecoderOwner == captured,
+                      self.mirrorControl.currentState?.epoch == captured.epoch,
+                      self.mirrorControl.currentState?.source == captured.source else { return }
+                if let ack=self.mirrorControl.observeRendered(session: captured.connection, sequence: sequence) {
+                    self.sendWireMessage(type: .mirrorAction, payload: ack, sequence: 0)
+                    self.publishMirrorStateOnQueue()
+                }
+            }
+        } else if generation & 0x8000_0000_0000_0000 == 0 {
+            transportTelemetry.recordRenderCompletion(sequence: sequence, generation: generation)
+        }
     }
 
     public func recordDrawableCommitted(
@@ -4603,5 +5180,34 @@ public class NetworkManager: ObservableObject {
 private extension Float {
     func clamped(_ lo: Float, _ hi: Float) -> Float {
         Swift.min(Swift.max(self, lo), hi)
+    }
+}
+enum WifiConnectionReadinessPolicy {
+    static func isReady(
+        actualReady: Bool,
+        waitingOwned: Bool,
+        simulatedReady: Bool = false
+    ) -> Bool {
+        if actualReady { return true }
+        if waitingOwned { return false }
+        return simulatedReady
+    }
+}
+
+enum KeyboardInputDeliveryPolicy {
+    static func maySend(action: KeyboardInputAction, inputSuppressed: Bool) -> Bool {
+        !inputSuppressed || action == .keyUp
+    }
+}
+
+enum PointerInputDeliveryPolicy {
+    static func maySend(action: PointerInputAction, inputSuppressed: Bool) -> Bool {
+        !inputSuppressed || action == .leftUp
+    }
+}
+
+enum DirectTouchDeliveryPolicy {
+    static func maySend(phase: DirectTouchPhase, inputSuppressed: Bool) -> Bool {
+        !inputSuppressed || phase == .up || phase == .cancel
     }
 }
