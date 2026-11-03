@@ -41,6 +41,8 @@ private extension Color {
     static let inkSecondary = Color(uiColor: SessionInk.secondary)
     static let inkWarning = Color(uiColor: SessionInk.warning)
     static let inkDanger = Color(uiColor: SessionInk.danger)
+    static let inkAccent = Color(uiColor: SessionInk.accent)
+    static let inkOnAccent = Color(uiColor: SessionInk.onAccent)
 }
 
 struct PINEntryView: View {
@@ -78,11 +80,11 @@ struct PINEntryView: View {
                     ForEach(0..<4, id: \.self) { index in
                         ZStack {
                             Circle()
-                                .stroke(index < pin.count ? Color.inkText : Color.inkHairline, lineWidth: 2)
+                                .stroke(index < pin.count ? Color.inkAccent : Color.inkHairline, lineWidth: 2)
                                 .frame(width: 22, height: 22)
                             if index < pin.count {
                                 Circle()
-                                    .fill(Color.inkText)
+                                    .fill(Color.inkAccent)
                                     .frame(width: 12, height: 12)
                                     .transition(.scale.combined(with: .opacity))
                             }
@@ -214,9 +216,9 @@ struct HostIdentityConfirmationView: View {
                     Button(action: onConfirm) {
                         Text("The codes match")
                             .font(.headline)
-                            .foregroundStyle(Color.inkSurface)
+                            .foregroundStyle(Color.inkOnAccent)
                             .frame(maxWidth: .infinity, minHeight: 50)
-                            .background(Color.inkText, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .background(Color.inkAccent, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
                     Button(action: onCancel) {
                         Text("Cancel")
@@ -612,7 +614,8 @@ public struct ContentView: View {
                 streamingHUD
                 SessionPanelOverlay(
                     networkManager: networkManager,
-                    hostLabel: lastHostLabel,
+                    hostLabel: SessionPanelSnapshot.sessionHost(current: lastHostLabel, lastWifi: lastWifiHostLabel,
+                                                                usb: usbChosen),
                     isOpen: $isSessionPanelOpen,
                     onFiles: { isTransferPresented = true },
                     onSettings: { isSettingsPresented = true },
@@ -694,13 +697,18 @@ public struct ContentView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 rowLayout {
-                    Text("ScreenCasting").font(.headline)
+                    Label {
+                        Text("ScreenCasting").font(.headline)
+                    } icon: {
+                        Image(systemName: "rectangle.on.rectangle").foregroundStyle(Color.inkAccent)
+                    }
                     if !typeSize.isAccessibilitySize { Spacer() }
                     iPadAddressChip
                 }
                 VStack(alignment: .leading, spacing: 16) {
                     statusLine
-                    if networkManager.hasReconnectTarget { reconnectButton }
+                    // Hidden, not faded, while a connect or USB wait runs: a faded card read as broken.
+                    if networkManager.hasReconnectTarget && !isConnectBusy { reconnectButton }
                     discoveredPCs
                     usbCard
                     ipEntry
@@ -764,7 +772,8 @@ public struct ContentView: View {
                 .accessibilityElement(children: .combine)
             }
             if !typeSize.isAccessibilitySize { Spacer(minLength: 8) }
-            if status.action != .none {
+            // A USB wait is stopped from the USB-C card, so the status line does not repeat its Stop.
+            if status.action != .none && !(status.action == .stop && networkManager.connectionState == .listening) {
                 Button(status.action == .retry ? "Retry" : status.action == .restartUSB ? "Start again"
                        : status.action == .stop ? "Stop" : "Cancel") {
                     switch status.action {
@@ -783,7 +792,7 @@ public struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.large)
-                .tint(Color.inkText)
+                .tint(Color.inkAccent)
             }
         }
     }
@@ -799,16 +808,15 @@ public struct ContentView: View {
                 Image(systemName: "arrow.clockwise").font(.title3).accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Reconnect to \(lastWifiName)").font(.headline).lineLimit(2)
-                    Text("Wi-Fi · last used").font(.caption).foregroundStyle(Color.inkSurface.opacity(0.7))
+                    Text("Wi-Fi · last used").font(.caption)
                 }
                 Spacer(minLength: 8)
                 Image(systemName: "chevron.right").accessibilityHidden(true)
             }
-            .foregroundStyle(Color.inkSurface)
+            .foregroundStyle(Color.inkOnAccent)
             .padding(.horizontal, 16)
             .frame(minHeight: 64)
-            .background(Color.inkText, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .opacity(isConnectBusy ? 0.5 : 1)
+            .background(Color.inkAccent, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
         .buttonStyle(.plain)
         .disabled(isConnectBusy)
@@ -825,7 +833,7 @@ public struct ContentView: View {
                     .foregroundStyle(Color.inkSecondary)
                     .padding(14)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.inkHairline, lineWidth: 0.5))
+                    .background(Color.inkSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             } else {
                 VStack(spacing: 0) {
                     ForEach(Array(hosts.enumerated()), id: \.element.id) { index, host in
@@ -837,7 +845,8 @@ public struct ContentView: View {
                             networkManager.connect(to: host.endpoint)
                         } label: {
                             HStack(spacing: 12) {
-                                Image(systemName: "desktopcomputer").font(.title3).accessibilityHidden(true)
+                                Image(systemName: "desktopcomputer").font(.title3).foregroundStyle(Color.inkAccent)
+                                    .accessibilityHidden(true)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(host.name).font(.subheadline.weight(.semibold)).lineLimit(2)
                                     if host.name == lastWifiHostLabel {
@@ -859,7 +868,7 @@ public struct ContentView: View {
                         }
                     }
                 }
-                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.inkHairline, lineWidth: 0.5))
+                .background(Color.inkSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             }
         }
     }
@@ -867,7 +876,7 @@ public struct ContentView: View {
     private var usbCard: some View {
         let listening = networkManager.connectionState == .listening
         return rowLayout {
-            Image(systemName: "cable.connector").font(.title3).accessibilityHidden(true)
+            Image(systemName: "cable.connector").font(.title3).foregroundStyle(Color.inkAccent).accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 Text("USB-C cable").font(.subheadline.weight(.semibold))
                 Text(listening ? "Waiting. On the PC, pick USB-C Direct. This iPad shows as \(UIDevice.current.name)."
@@ -881,11 +890,11 @@ public struct ContentView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.large)
-            .tint(Color.inkText)
+            .tint(listening ? Color.inkText : Color.inkAccent)
             .disabled(isConnectBusy && !listening)
         }
         .padding(14)
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.inkHairline, lineWidth: 0.5))
+        .background(Color.inkSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
     private var ipEntry: some View {
@@ -911,7 +920,7 @@ public struct ContentView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.large)
-                    .tint(Color.inkText)
+                    .tint(Color.inkAccent)
                     .disabled(!isValidManualIPv4 || isConnectBusy)
                 }
                 if !hostIP.isEmpty && !isValidManualIPv4 {

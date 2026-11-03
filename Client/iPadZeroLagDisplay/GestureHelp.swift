@@ -108,19 +108,20 @@ struct GestureGuideCard: View {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? 220 : 140), spacing: 8)], spacing: 8) {
                 ForEach(gestures, id: \.gesture) { item in
                     VStack(alignment: .leading, spacing: 4) {
-                        Image(systemName: item.symbol).font(.title2).accessibilityHidden(true)
+                        Image(systemName: item.symbol).font(.title2).foregroundStyle(Color(uiColor: SessionInk.accent))
+                            .accessibilityHidden(true)
                         Text(item.gesture).font(.subheadline.weight(.semibold))
                         Text(item.result).font(.caption).foregroundStyle(Color(uiColor: SessionInk.secondary))
                     }
                     .frame(maxWidth: .infinity, minHeight: 88, alignment: .topLeading)
                     .padding(10)
-                    .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .stroke(Color(uiColor: SessionInk.hairline), lineWidth: 0.5))
+                    .background(Color(uiColor: SessionInk.raised), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     .accessibilityElement(children: .combine)
                 }
             }
             HStack(alignment: .top, spacing: 10) {
-                Image(systemName: "applepencil").font(.title3).accessibilityHidden(true)
+                Image(systemName: "applepencil").font(.title3).foregroundStyle(Color(uiColor: SessionInk.accent))
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Apple Pencil").font(.subheadline.weight(.semibold))
                     Text("Writes and clicks with pressure. Fingers are ignored while the Pencil touches the screen. " +
@@ -130,8 +131,7 @@ struct GestureGuideCard: View {
             }
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color(uiColor: SessionInk.hairline), lineWidth: 0.5))
+            .background(Color(uiColor: SessionInk.raised), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             .accessibilityElement(children: .combine)
             footer
         }
@@ -139,6 +139,7 @@ struct GestureGuideCard: View {
         .padding(20)
         .background(Color(uiColor: SessionInk.surface), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(Color(uiColor: SessionInk.hairline), lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.45), radius: 24, y: 12)
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(.isModal)
         .accessibilityAction(.escape) { onDone() }
@@ -150,10 +151,10 @@ struct GestureGuideCard: View {
         let done = Button(action: onDone) {
             Text("Got it")
                 .font(.headline)
-                .foregroundStyle(Color(uiColor: SessionInk.surface))
+                .foregroundStyle(Color(uiColor: SessionInk.onAccent))
                 .padding(.horizontal, 22)
                 .frame(minHeight: 44)
-                .background(Color(uiColor: SessionInk.text), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .background(Color(uiColor: SessionInk.accent), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         .buttonStyle(.plain)
         return Group {
