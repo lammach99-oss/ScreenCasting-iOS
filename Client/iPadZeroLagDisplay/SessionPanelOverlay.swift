@@ -32,6 +32,7 @@ struct SessionPanelOverlay: View {
     @Binding var isOpen: Bool
     let onFiles: () -> Void
     let onSettings: () -> Void
+    let onGestures: () -> Void
 
     @State private var switchingTo: UInt64?
     @State private var failedFrom: String?
@@ -311,9 +312,21 @@ struct SessionPanelOverlay: View {
 
     private func footer(_ s: SessionPanelSnapshot) -> some View {
         let armed = disconnectTick >= 0 && disconnectArming.isArmed(at: Date())
-        let tip = Text(armed ? "Disconnect from \(s.hostLabel)?" : "3-finger tap opens this panel")
-            .font(.caption)
-            .foregroundStyle(Color(ink: armed ? SessionInk.danger : SessionInk.secondary))
+        let tip = Group {
+            if armed {
+                Text("Disconnect from \(s.hostLabel)?").font(.caption).foregroundStyle(Color(ink: SessionInk.danger))
+            } else {
+                Button { close(); onGestures() } label: {
+                    Label("Gestures", systemImage: "questionmark.circle")
+                        .font(.subheadline)
+                        .foregroundStyle(Color(ink: SessionInk.secondary))
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("Shows the touch and Pencil gestures")
+            }
+        }
         let button = Button {
             lastInteraction = Date()
             if disconnectArming.tap(at: Date()) {

@@ -274,6 +274,10 @@ public struct ContentView: View {
     @State private var isSettingsPresented = false
     @State private var isTransferPresented = false
     @State private var isSessionPanelOpen = false
+    @State private var showGestureGuide = false
+    @State private var gestureToast: GestureToast?
+    @AppStorage("ScreenCasting.client.gestureGuideSeen.v1") private var gestureGuideSeen = false
+    private let gestureToasts = GestureToastLedger()
     /// What the session pill calls the PC: the discovered name or typed address of the last connect.
     @AppStorage("ScreenCasting.client.lastHostLabel") private var lastHostLabel = ""
     @State private var rootSurfaceSize: CGSize = .zero
@@ -385,8 +389,10 @@ public struct ContentView: View {
             networkManager.setMirrorInputSettingsPresented(open)
         }
         .onChange(of: streamManager.isConnected) { _, connected in
-            if !connected { isSessionPanelOpen = false }
+            if !connected { isSessionPanelOpen = false; showGestureGuide = false; gestureToast = nil }
+            offerGestureGuideIfNew()
         }
+        .onChange(of: networkManager.mirrorControlState?.mode) { _, _ in offerGestureGuideIfNew() }
         .sheet(isPresented: $isSettingsPresented) {
             SettingsView(networkManager: networkManager)
         }
@@ -475,7 +481,7 @@ public struct ContentView: View {
             ConnectedPresentationSurface(
                 networkManager: networkManager,
                 gameModeEnabled: gameModeEnabled,
-                remoteKeyboardActive: streamManager.isConnected && scenePhase == .active && !isSheetPresented,
+                remoteKeyboardActive: streamManager.isConnected && scenePhase == .active && !isSheetPresented && !showGestureGuide,
                 onKeyboardInput: { command in
                     networkManager.sendKeyboardInput(command)
                 },
@@ -519,6 +525,7 @@ public struct ContentView: View {
                     // The 3-finger tap opens the session panel; Settings is one tap inside it.
                     isSessionPanelOpen = true
                 })
+                .gestureHints { hint in showGestureToast(hint) }
                 .frame(width: frame.width, height: frame.height)
                 .offset(x: frame.minX, y: frame.minY)
                 .allowsHitTesting(true)
@@ -534,6 +541,30 @@ public struct ContentView: View {
                 }
         }
         .ignoresSafeArea(.container, edges: .all)
+    }
+
+    /// Touches reach the PC: an extended display, or a mirrored screen under granted control.
+    private var touchReachesPC: Bool {
+        let state = networkManager.mirrorControlState
+        return state?.geometry == nil || state?.mode == .active
+    }
+
+    /// The gesture card greets the first session in which its gestures actually work, once.
+    private func offerGestureGuideIfNew() {
+        guard streamManager.isConnected, !gestureGuideSeen, !showGestureGuide,
+              !isSheetPresented, touchReachesPC else { return }
+        showGestureGuide = true
+    }
+
+    /// Toasts only while the gesture is new, and never when touches cannot reach the PC (view-only mirror).
+    private func showGestureToast(_ hint: GestureHint) {
+        guard touchReachesPC, !isSessionPanelOpen, !showGestureGuide,
+              let text = gestureToasts.toast(for: hint) else { return }
+        let toast = GestureToast(hint: hint, text: text)
+        gestureToast = toast
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+            if gestureToast == toast { gestureToast = nil }
+        }
     }
 
     private func emitGeometrySnapshot(
@@ -584,8 +615,27 @@ public struct ContentView: View {
                     hostLabel: lastHostLabel,
                     isOpen: $isSessionPanelOpen,
                     onFiles: { isTransferPresented = true },
-                    onSettings: { isSettingsPresented = true })
+                    onSettings: { isSettingsPresented = true },
+                    onGestures: { showGestureGuide = true })
+                VStack {
+                    Spacer()
+                    if let toast = gestureToast {
+                        GestureToastView(hint: toast.hint, text: toast.text)
+                            .padding(.bottom, 28)
+                            .transition(.opacity)
+                    }
+                }
+                .allowsHitTesting(false)
+                .animation(.easeOut(duration: 0.2), value: gestureToast)
+                if showGestureGuide {
+                    GestureGuideCard(onDone: {
+                        gestureGuideSeen = true
+                        showGestureGuide = false
+                    })
+                    .transition(.opacity)
+                }
             }
+            .animation(.easeOut(duration: 0.2), value: showGestureGuide)
         } else {
             disconnectedDashboard
         }

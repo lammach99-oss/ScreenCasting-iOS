@@ -700,6 +700,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     var onDirectTouchContact: ((DirectTouchContactCommand) -> Void)?
     var onPointerInput: ((PointerInputCommand) -> Void)?
     var onOpenSettings: (() -> Void)?
+    var onGestureHint: ((GestureHint) -> Void)?
 
     public init(
         networkManager: NetworkManager,
@@ -733,6 +734,13 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         self.onDirectTouchContact = onDirectTouchContact
         self.onPointerInput = onPointerInput
         self.onOpenSettings = onOpenSettings
+    }
+
+    /// Reports recognised finger gestures for the first-use toasts.
+    func gestureHints(_ handler: @escaping (GestureHint) -> Void) -> Self {
+        var copy = self
+        copy.onGestureHint = handler
+        return copy
     }
 
     public static func dismantleUIView(_ uiView: ConnectedPresentationContainer, coordinator: Coordinator) {
@@ -855,6 +863,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             openSettings?()
         }
         touchView.inputGeometryContext = coordinator.inputGeometryContext
+        touchView.onGestureHint = onGestureHint
         touchView.diagnosticSink = { [weak networkManager] line in
             networkManager?.recordDiagnosticLine(line)
         }

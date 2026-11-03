@@ -964,6 +964,8 @@ public class PencilUIKitView: UIView {
     public var onDirectTouchContact: ((DirectTouchContactCommand) -> Void)?
     public var onPointerInput: ((PointerInputCommand) -> Void)?
     public var onOpenSettings: (() -> Void)?
+    /// A right-click, drag, pinch or scroll was recognised; drives the first-use toasts.
+    var onGestureHint: ((GestureHint) -> Void)?
     public var contentViewport: VideoContentViewport? {
         willSet { if newValue != contentViewport { retireDirectTouch(); retireExternalPointer() } }
     }
@@ -1256,17 +1258,23 @@ public class PencilUIKitView: UIView {
     }
 
     private var diagnosedScrollContact: UInt64?
+    /// A swipe was classified as scroll; its first delivered wheel step reports the hint.
+    private var scrollHintPending = false
     private var lastWheelDiagnosticAt: TimeInterval = -.infinity
 
     private func emit(_ outputs: [DirectTouchGestureOutput]) {
         if let axis = directGesture.scrollClassification, axis.contact != diagnosedScrollContact {
             diagnosedScrollContact = axis.contact
+            scrollHintPending = true
             diagnosticSink?("[TOUCH_GESTURE] kind=scroll_axis axis=\(axis.horizontal ? "horizontal" : "vertical") dx=\(axis.dx) dy=\(axis.dy) contact=\(axis.contact) generation=\(directTouchGeneration)")
         }
         emitDirectOutputs(outputs)
     }
 
     func emitDirectOutputs(_ outputs: [DirectTouchGestureOutput]) {
+        // Hints count only what was actually sent, so a dropped gesture never spends a toast.
+        var delivered: [DirectTouchGestureOutput] = []
+        defer { if let hint = GestureHint.from(delivered) { onGestureHint?(hint) } }
         for output in outputs {
             switch output {
             case .directTouch(let phase, let id, let point, let pressure):
@@ -1284,6 +1292,7 @@ public class PencilUIKitView: UIView {
                 onDirectTouchContact?(DirectTouchContactCommand(phase: phase, pressure: pressure, contactID: id,
                     x: UInt16(clamping: Int((normalized.x * 65_535).rounded())),
                     y: UInt16(clamping: Int((normalized.y * 65_535).rounded()))))
+                delivered.append(output)
             case .openSettings:
                 onOpenSettings?()
             case .pointer(let action, let point, let value):
@@ -1308,6 +1317,11 @@ public class PencilUIKitView: UIView {
                     y: y,
                     value: value))
                 pointerCoordinateState.clearAfterRelease(action)
+                delivered.append(output)
+                if scrollHintPending, action == .horizontalWheel || action == .verticalWheel {
+                    scrollHintPending = false
+                    onGestureHint?(.scroll)
+                }
             }
         }
     }
