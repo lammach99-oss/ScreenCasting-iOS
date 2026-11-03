@@ -1,28 +1,38 @@
 import SwiftUI
 import UIKit
 
-/// Neutral ink shared with the Host Control Panel; one accent per meaning (control, problem, disconnect).
+/// Midnight ink: blue-black surfaces, one signal-blue accent for main actions, and one colour per meaning
+/// (control on, problem, disconnect).
 enum SessionInk {
     private static func rgb(_ hex: UInt32) -> UIColor {
         UIColor(red: CGFloat((hex >> 16) & 0xFF) / 255, green: CGFloat((hex >> 8) & 0xFF) / 255,
                 blue: CGFloat(hex & 0xFF) / 255, alpha: 1)
     }
-    static let canvas = rgb(0x0F0F0F)
-    static let surface = rgb(0x171717)
-    static let raised = rgb(0x262625)
-    static let hairline = rgb(0x3A3A38)
-    static let text = rgb(0xEDEDED)
-    static let secondary = rgb(0xA3A3A0)
-    static let positive = rgb(0x97C459)
-    static let warning = rgb(0xFAC775)
-    static let danger = rgb(0xF09595)
-    static let dangerFill = rgb(0xE24B4A)
+    static let canvas = rgb(0x0B1020)
+    static let surface = rgb(0x121A2E)
+    static let raised = rgb(0x1C2640)
+    static let hairline = rgb(0x2C3858)
+    static let text = rgb(0xEEF2FF)
+    static let secondary = rgb(0xA7B1CF)
+    static let accent = rgb(0x7B93FF)
+    static let onAccent = rgb(0x0B1020)
+    static let positive = rgb(0x6EE7A8)
+    static let warning = rgb(0xFFC870)
+    static let danger = rgb(0xFF8F8F)
+    static let dangerFill = rgb(0xF25C5C)
     static let onDanger = rgb(0x1F0A0A)
-    static let accent = rgb(0x262625)
-    static let onAccent = rgb(0x262625)
 
-    /// WCAG contrast ratio. RED stub.
-    static func contrast(_ a: UIColor, _ b: UIColor) -> CGFloat { 1 }
+    /// WCAG 2 contrast ratio between two opaque colours.
+    static func contrast(_ a: UIColor, _ b: UIColor) -> CGFloat {
+        func luminance(_ c: UIColor) -> CGFloat {
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, alpha: CGFloat = 0
+            c.getRed(&r, green: &g, blue: &b, alpha: &alpha)
+            let linear = [r, g, b].map { $0 <= 0.03928 ? $0 / 12.92 : pow(($0 + 0.055) / 1.055, 2.4) }
+            return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+        }
+        let (x, y) = (luminance(a), luminance(b))
+        return (max(x, y) + 0.05) / (min(x, y) + 0.05)
+    }
 }
 
 private extension Color {
@@ -68,16 +78,23 @@ struct SessionPanelOverlay: View {
                     Color.black.opacity(0.001).contentShape(Rectangle()).onTapGesture { close() }
                 }
                 VStack(spacing: 10) {
-                    // Dims after a few idle seconds so it stays out of the way of the PC picture.
+                    // After a few idle seconds the pill shrinks to a slim handle so the top of the PC stays visible.
                     TimelineView(.periodic(from: .now, by: 1)) { context in
-                        let recent = context.date.timeIntervalSince(lastInteraction) < 3
-                        // Control on keeps the pill legible: it says touches now drive the PC.
-                        pill(maxX: proxy.size.width)
-                            .opacity(isOpen || recent || session.reconnecting ? 1 : session.control == .on ? 0.75 : 0.45)
-                            .animation(.easeOut(duration: 0.4), value: recent)
+                        let mode = SessionPillPresentation.make(isOpen: isOpen,
+                                                                idleFor: context.date.timeIntervalSince(lastInteraction),
+                                                                reconnecting: session.reconnecting)
+                        ZStack(alignment: .top) {
+                            if mode == .full {
+                                pill(maxX: proxy.size.width).transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .top)))
+                            } else {
+                                handle(maxX: proxy.size.width).transition(.opacity)
+                            }
+                        }
+                        .animation(.easeOut(duration: 0.3), value: mode)
                     }
                     if isOpen {
-                        panel(width: min(440, proxy.size.width - 24), maxHeight: max(160, proxy.size.height - 102))
+                        // Sized to its content; only very large text or many screens reach the cap and scroll.
+                        panel(width: min(420, proxy.size.width - 24), maxHeight: max(160, proxy.size.height - 102))
                             .transition(.opacity.combined(with: .move(edge: .top)))
                     }
                 }
@@ -86,6 +103,7 @@ struct SessionPanelOverlay: View {
             }
             .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
         }
+        .environment(\.colorScheme, .dark)
         .onChange(of: isOpen) { _, open in
             lastInteraction = Date()
             disconnectArming.reset()
@@ -108,7 +126,7 @@ struct SessionPanelOverlay: View {
                     Image(systemName: "arrow.triangle.2.circlepath")
                     Text(s.reconnectingText).lineLimit(1)
                 } else {
-                    Image(systemName: icon(s.icon))
+                    Image(systemName: icon(s.icon)).foregroundStyle(Color(ink: SessionInk.accent))
                     Text(s.title).fontWeight(.semibold).lineLimit(1).frame(maxWidth: 220)
                     if let transport = s.transport {
                         Text("· \(transport)").foregroundStyle(Color(ink: SessionInk.secondary))
@@ -126,22 +144,51 @@ struct SessionPanelOverlay: View {
             .foregroundStyle(Color(ink: s.reconnecting ? SessionInk.warning : SessionInk.text))
             .padding(.horizontal, 14).padding(.vertical, 10)
             .frame(minHeight: 44)
-            .background(Color(ink: SessionInk.surface).opacity(0.94), in: Capsule())
+            .background(Color(ink: SessionInk.surface).opacity(0.82), in: Capsule())
+            .background(.ultraThinMaterial, in: Capsule())
             .overlay(Capsule().stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
+            .shadow(color: .black.opacity(0.35), radius: 10, y: 4)
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
-        .gesture(DragGesture(minimumDistance: 8)
+        .gesture(moveAlongTop(maxX: maxX))
+        .accessibilityLabel(pillLabel(s))
+        .accessibilityValue(isOpen ? "Expanded" : "Collapsed")
+        .accessibilityHint("Opens screens, keyboard, files, settings and disconnect")
+    }
+
+    /// The idle pill: a slim bar at the top edge, green while touches drive the PC. Tapping it opens the panel.
+    private func handle(maxX: CGFloat) -> some View {
+        let s = session
+        return Button { open() } label: {
+            Capsule()
+                .fill(Color(ink: s.control == .on ? SessionInk.positive : SessionInk.text).opacity(0.75))
+                .frame(width: 56, height: 5)
+                .shadow(color: .black.opacity(0.6), radius: 2, y: 1)
+                .frame(width: 96, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .offset(y: -8)
+        .gesture(moveAlongTop(maxX: maxX))
+        .accessibilityLabel(pillLabel(s))
+        .accessibilityValue("Collapsed")
+        .accessibilityHint("Opens screens, keyboard, files, settings and disconnect")
+    }
+
+    private func moveAlongTop(maxX: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 8)
             .onChanged { dragOffset = $0.translation.width; lastInteraction = Date() }
             .onEnded { value in
                 storedOffset = Double(clamp(CGFloat(storedOffset) + value.translation.width, width: maxX))
                 dragOffset = 0
-            })
-        .accessibilityLabel(s.reconnecting ? s.reconnectingText
-            : "\(s.title)\(s.transport.map { ", \($0)" } ?? "")\(s.isMirror ? ". \(controlText(s.control))" : "")")
-        .accessibilityValue(isOpen ? "Expanded" : "Collapsed")
-        .accessibilityHint("Opens screens, keyboard, files, settings and disconnect")
+            }
+    }
+
+    private func pillLabel(_ s: SessionPanelSnapshot) -> String {
+        s.reconnecting ? s.reconnectingText
+            : "\(s.title)\(s.transport.map { ", \($0)" } ?? "")\(s.isMirror ? ". \(controlText(s.control))" : "")"
     }
 
     // MARK: Panel
@@ -155,10 +202,11 @@ struct SessionPanelOverlay: View {
         }
         return VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
-                Text(s.hostLabel).font(.headline)
+                Text(s.hostLabel).font(.headline).lineLimit(1)
                 Spacer()
                 if let transport = s.transport {
-                    Text(transport).font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
+                    Label(transport, systemImage: transport == "USB-C" ? "cable.connector" : "wifi")
+                        .font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
                 }
             }
             if s.reconnecting {
@@ -175,11 +223,14 @@ struct SessionPanelOverlay: View {
         .foregroundStyle(Color(ink: SessionInk.text))
         .padding(16)
         .frame(width: width)
-        .frame(maxHeight: maxHeight)
-        .background(Color(ink: SessionInk.surface).opacity(0.97), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
-        .contentShape(Rectangle())
+        .background(Color(ink: SessionInk.surface).opacity(0.9), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.45), radius: 24, y: 12)
+        .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
         .onTapGesture { lastInteraction = Date() }
+        // The cap goes outside the background: a capped frame takes the whole cap, which left a tall empty panel.
+        .frame(maxHeight: maxHeight, alignment: .top)
         .accessibilityAddTraits(.isModal)
         .accessibilityAction(.escape) { close() }
     }
@@ -203,7 +254,7 @@ struct SessionPanelOverlay: View {
                 .font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
         } else if p.phase == .loading {
             HStack(spacing: 10) {
-                ProgressView().tint(Color(ink: SessionInk.text))
+                ProgressView().tint(Color(ink: SessionInk.accent))
                 Text(p.isSwitching || switchingTo != nil ? "Switching…" : "Screens appear once the picture is showing.")
                     .font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
             }
@@ -245,19 +296,20 @@ struct SessionPanelOverlay: View {
         } label: {
             VStack(alignment: .leading, spacing: 6) {
                 Image(systemName: tile.isBuiltIn ? "laptopcomputer" : "display").font(.title2)
+                    .foregroundStyle(Color(ink: selected ? SessionInk.accent : SessionInk.secondary))
                 Text(tile.label).font(.subheadline.weight(.semibold)).lineLimit(2).multilineTextAlignment(.leading)
                 HStack(spacing: 6) {
-                    if tile.status == .switching { ProgressView().controlSize(.mini).tint(Color(ink: SessionInk.text)) }
+                    if tile.status == .switching { ProgressView().controlSize(.mini).tint(Color(ink: SessionInk.accent)) }
                     Text(statusText(tile.status)).font(.caption)
                         .foregroundStyle(Color(ink: selected ? SessionInk.text : SessionInk.secondary))
                 }
             }
             .frame(maxWidth: .infinity, minHeight: 88, alignment: .topLeading)
             .padding(12)
-            .background(Color(ink: selected ? SessionInk.raised : SessionInk.surface),
+            .background(selected ? Color(ink: SessionInk.accent).opacity(0.16) : Color(ink: SessionInk.raised),
                         in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color(ink: selected ? SessionInk.text : SessionInk.hairline), lineWidth: selected ? 1.5 : 0.5))
+                .stroke(Color(ink: selected ? SessionInk.accent : SessionInk.hairline), lineWidth: selected ? 1.5 : 0.5))
             .opacity(tile.status == .locked ? 0.45 : 1)
         }
         .buttonStyle(.plain)
@@ -292,21 +344,19 @@ struct SessionPanelOverlay: View {
                 HStack(spacing: 8) { buttons }
             }
         }
-        .padding(.top, 12)
-        .overlay(alignment: .top) { Rectangle().fill(Color(ink: SessionInk.hairline)).frame(height: 0.5) }
     }
 
     private func actionButton(_ title: String, icon: String, enabled: Bool = true, hint: String? = nil,
                               action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            VStack(spacing: 4) {
-                Image(systemName: icon).font(.title3)
-                Text(title).font(.footnote).lineLimit(typeSize.isAccessibilitySize ? 2 : 1).minimumScaleFactor(0.8)
+            VStack(spacing: 6) {
+                Image(systemName: icon).font(.title3).foregroundStyle(Color(ink: SessionInk.accent))
+                Text(title).font(.footnote.weight(.medium)).lineLimit(typeSize.isAccessibilitySize ? 2 : 1).minimumScaleFactor(0.8)
                     .multilineTextAlignment(.center)
             }
-            .frame(maxWidth: .infinity, minHeight: 64)
-            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
-            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .frame(maxWidth: .infinity, minHeight: 60)
+            .background(Color(ink: SessionInk.raised), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .opacity(enabled ? 1 : 0.45)
         }
         .buttonStyle(.plain)
