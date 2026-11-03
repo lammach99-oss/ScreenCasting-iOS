@@ -1,6 +1,153 @@
 import XCTest
 import Network
+import Metal
 @testable import iPadCasting
+
+final class UsbBindCompletionOwnershipTests: XCTestCase {
+    func testEveryBindIdentityComponentIsRequired() throws {
+        let queue = DispatchQueue(label: "UsbBindCompletionOwnershipTests.identity")
+        let session = try XCTUnwrap(SessionID(bytes: Data(repeating: 9, count: 16)))
+        let other = try XCTUnwrap(SessionID(bytes: Data(repeating: 10, count: 16)))
+        let connection = NWConnection(host: "127.0.0.1", port: 1, using: .tcp)
+        var token: UsbLaneBindToken?
+        let server = UsbLaneServer(networkQueue: queue, parametersProvider: { .tcp },
+            onBound: { value, _, _ in token = value }, onFailure: { _ in XCTFail() })
+        queue.sync {
+            server.bindingResultSenderForTesting = { _, done in done(nil) }
+            server.prepareBoundForTesting(connection, sessionID: session,
+                connectionGeneration: 7, lane: .video, generation: 3)
+        }
+        queue.sync { }
+        let current = try XCTUnwrap(token)
+        queue.sync {
+            XCTAssertTrue(server.owns(current, connection: connection))
+            for invalid in [
+                UsbLaneBindToken(serverEpoch: UUID(), sessionID: session, connectionGeneration: 7, lane: .video, bindGeneration: 3, connectionID: current.connectionID),
+                UsbLaneBindToken(serverEpoch: current.serverEpoch, sessionID: other, connectionGeneration: 7, lane: .video, bindGeneration: 3, connectionID: current.connectionID),
+                UsbLaneBindToken(serverEpoch: current.serverEpoch, sessionID: session, connectionGeneration: 6, lane: .video, bindGeneration: 3, connectionID: current.connectionID),
+                UsbLaneBindToken(serverEpoch: current.serverEpoch, sessionID: session, connectionGeneration: 7, lane: .audio, bindGeneration: 3, connectionID: current.connectionID),
+                UsbLaneBindToken(serverEpoch: current.serverEpoch, sessionID: session, connectionGeneration: 7, lane: .video, bindGeneration: 2, connectionID: current.connectionID)
+            ] { XCTAssertFalse(server.owns(invalid, connection: connection)) }
+            XCTAssertFalse(server.owns(current, connection:
+                NWConnection(host: "127.0.0.1", port: 2, using: .tcp)))
+        }
+        server.abort()
+        queue.sync { }
+    }
+
+    func testCurrentSendErrorDoesNotAdopt() throws {
+        let queue = DispatchQueue(label: "UsbBindCompletionOwnershipTests.error")
+        let session = try XCTUnwrap(SessionID(bytes: Data(repeating: 11, count: 16)))
+        let server = UsbLaneServer(networkQueue: queue, parametersProvider: { .tcp },
+            onBound: { _, _, _ in XCTFail("failed send adopted") }, onFailure: { _ in XCTFail() })
+        queue.sync {
+            server.bindingResultSenderForTesting = { _, done in done(.posix(.ECONNRESET)) }
+            server.prepareBoundForTesting(NWConnection(host: "127.0.0.1", port: 1, using: .tcp),
+                sessionID: session, connectionGeneration: 1, lane: .video, generation: 1)
+        }
+        queue.sync { }
+        server.abort()
+        queue.sync { }
+    }
+
+    func testRetiredSendCompletionCannotAdoptOrReplaceNewLane() throws {
+        let queue = DispatchQueue(label: "UsbBindCompletionOwnershipTests")
+        let session = try XCTUnwrap(SessionID(bytes: Data(repeating: 7, count: 16)))
+        var completions: [(NWError?) -> Void] = []
+        var adopted: [NWConnection] = []
+        let server = UsbLaneServer(networkQueue: queue, parametersProvider: { .tcp },
+            onBound: { _, _, connection in adopted.append(connection) }, onFailure: { _ in XCTFail() })
+        let old = NWConnection(host: "127.0.0.1", port: 1, using: .tcp)
+        let replacement = NWConnection(host: "127.0.0.1", port: 2, using: .tcp)
+        queue.sync {
+            server.bindingResultSenderForTesting = { _, completion in completions.append(completion) }
+            server.prepareBoundForTesting(old, sessionID: session, connectionGeneration: 1, lane: .video, generation: 1)
+            server.prepareBoundForTesting(replacement, sessionID: session, connectionGeneration: 2, lane: .video, generation: 1)
+            completions[1](nil)
+        }
+        queue.sync { }
+        queue.sync { completions[0](nil); completions[1](nil) }
+        queue.sync { }
+        queue.sync {
+            XCTAssertEqual(adopted.count, 1)
+            XCTAssertTrue(adopted.first === replacement)
+        }
+        server.abort()
+        queue.sync { }
+    }
+
+    func testFinalizeAndErrorCompletionNeverAdopt() throws {
+        let queue = DispatchQueue(label: "UsbBindCompletionOwnershipTests.finalize")
+        let session = try XCTUnwrap(SessionID(bytes: Data(repeating: 8, count: 16)))
+        var completion: ((NWError?) -> Void)?
+        let server = UsbLaneServer(networkQueue: queue, parametersProvider: { .tcp },
+            onBound: { _, _, _ in XCTFail("retired lane adopted") }, onFailure: { _ in XCTFail() })
+        queue.sync {
+            server.bindingResultSenderForTesting = { _, callback in completion = callback }
+            server.prepareBoundForTesting(NWConnection(host: "127.0.0.1", port: 1, using: .tcp),
+                sessionID: session, connectionGeneration: 1, lane: .audio, generation: 1)
+        }
+        server.finalize()
+        queue.sync { }
+        completion?(nil)
+        queue.sync { }
+        completion?(.posix(.ECONNRESET))
+        queue.sync { }
+    }
+}
+
+final class RendererConstantOwnershipTests: XCTestCase {
+    func testTransientConstantsKeepTwoEncodedDrawsIndependent() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        let library = try device.makeLibrary(source: """
+            #include <metal_stdlib>
+            using namespace metal;
+            struct Out { float4 position [[position]]; float2 scale; };
+            vertex Out v(uint i [[vertex_id]], constant float2& s [[buffer(0)]]) {
+                float2 p[3] = {float2(-1,-1),float2(3,-1),float2(-1,3)};
+                return {float4(p[i],0,1),s};
+            }
+            fragment float4 f(Out x [[stage_in]]) { return float4(x.scale,0,1); }
+            """, options: nil)
+        let descriptor = MTLRenderPipelineDescriptor()
+        descriptor.vertexFunction = library.makeFunction(name: "v")
+        descriptor.fragmentFunction = library.makeFunction(name: "f")
+        descriptor.colorAttachments[0].pixelFormat = .rgba32Float
+        let pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
+        let command = try XCTUnwrap(queue.makeCommandBuffer())
+        var targets: [MTLTexture] = []
+        for expected in [SIMD2<Float>(0.25, 0.5), SIMD2<Float>(0.75, 1)] {
+            let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba32Float, width: 1, height: 1, mipmapped: false)
+            textureDescriptor.storageMode = .shared
+            textureDescriptor.usage = .renderTarget
+            let texture = try XCTUnwrap(device.makeTexture(descriptor: textureDescriptor))
+            targets.append(texture)
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture = texture
+            pass.colorAttachments[0].loadAction = .clear
+            pass.colorAttachments[0].storeAction = .store
+            let encoder = try XCTUnwrap(command.makeRenderCommandEncoder(descriptor: pass))
+            encoder.setRenderPipelineState(pipeline)
+            var scale = expected
+            encoder.setVertexBytes(&scale, length: MemoryLayout<SIMD2<Float>>.size, index: 0)
+            scale = .zero // caller storage is deliberately reused before GPU submission
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            encoder.endEncoding()
+        }
+        command.commit()
+        command.waitUntilCompleted()
+        XCTAssertEqual(command.status, .completed)
+        for (texture, expected) in zip(targets, [SIMD2<Float>(0.25, 0.5), SIMD2<Float>(0.75, 1)]) {
+            var pixel = SIMD4<Float>.zero
+            texture.getBytes(&pixel, bytesPerRow: MemoryLayout<SIMD4<Float>>.size,
+                from: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0)
+            XCTAssertEqual(pixel.x, expected.x)
+            XCTAssertEqual(pixel.y, expected.y)
+        }
+    }
+}
 
 final class Display120HzSourceTests: XCTestCase {
     func testCapabilitiesDecodeCanonical120HzNativeModes() throws {
@@ -61,6 +208,29 @@ final class Display120HzSourceTests: XCTestCase {
         XCTAssertEqual(DisplayPreference.defaultValue.makeRequest(
             interfaceOrientation: .landscape,
             requestId: 2).refreshHz, 120)
+    }
+}
+
+final class RealtimeAudioTimerPolicyTests: XCTestCase {
+    func testAudioDisabledNeverOwnsRealtimePlayoutTimer() {
+        XCTAssertFalse(RealtimeAudioTimerPolicy.shouldRun(
+            mode: RealtimeTransportMode.wifiRTP,
+            audioEnabled: false))
+        XCTAssertFalse(RealtimeAudioTimerPolicy.shouldRun(
+            mode: RealtimeTransportMode.usbSplitTLS,
+            audioEnabled: false))
+    }
+
+    func testAudioEnabledRunsOnlyForRealtimeAudioTransports() {
+        XCTAssertTrue(RealtimeAudioTimerPolicy.shouldRun(
+            mode: RealtimeTransportMode.wifiRTP,
+            audioEnabled: true))
+        XCTAssertTrue(RealtimeAudioTimerPolicy.shouldRun(
+            mode: RealtimeTransportMode.usbSplitTLS,
+            audioEnabled: true))
+        XCTAssertFalse(RealtimeAudioTimerPolicy.shouldRun(
+            mode: RealtimeTransportMode.legacyTLS,
+            audioEnabled: true))
     }
 }
 
@@ -194,6 +364,170 @@ final class WifiTransportNegotiationTests: XCTestCase {
         XCTAssertEqual(gate.authenticate(2), [])
         XCTAssertEqual(gate.committed, 2)
         XCTAssertFalse(gate.register(3).accepted)
+    }
+
+    func testFeedbackFailureRetainsEvidenceAndAdvancesSequence() {
+        var ledger = WifiFeedbackSendLedger()
+        ledger.recordExpiredFrame()
+        ledger.recordExpiredFrame()
+        ledger.markRecoveryCompleted()
+
+        let failed = ledger.prepare(sentNanoseconds: 10)
+        XCTAssertEqual(failed.sequence, 1)
+        XCTAssertEqual(failed.expiredFrames, 2)
+        XCTAssertTrue(failed.recoveryCompleted)
+        ledger.didProtect(failed)
+        ledger.complete(failed, succeeded: false)
+
+        XCTAssertEqual(ledger.pendingExpiredFrames, 2)
+        XCTAssertTrue(ledger.recoveryCompletedPending)
+        XCTAssertEqual(ledger.pendingRttCount, 0)
+        XCTAssertEqual(ledger.prepare(sentNanoseconds: 20).sequence, 2)
+    }
+
+    func testFeedbackSuccessClearsOnlyItsExpirySnapshot() {
+        var ledger = WifiFeedbackSendLedger()
+        ledger.recordExpiredFrame()
+        ledger.recordExpiredFrame()
+        let sent = ledger.prepare(sentNanoseconds: 10)
+        ledger.didProtect(sent)
+        ledger.recordExpiredFrame()
+
+        ledger.complete(sent, succeeded: true)
+
+        XCTAssertEqual(ledger.pendingExpiredFrames, 1)
+        XCTAssertEqual(ledger.pendingRttCount, 1)
+    }
+
+    func testEarlyRttEchoDoesNotPreventSuccessfulAccounting() {
+        var ledger = WifiFeedbackSendLedger()
+        ledger.recordExpiredFrame()
+        let sent = ledger.prepare(sentNanoseconds: 10)
+        ledger.didProtect(sent)
+        XCTAssertEqual(
+            ledger.consumeRtt(token: sent.token, sentNanoseconds: 10),
+            10)
+
+        ledger.complete(sent, succeeded: true)
+
+        XCTAssertEqual(ledger.pendingExpiredFrames, 0)
+    }
+
+    func testRecoveryCompletionClearsOnlyAfterSuccessfulFeedback() {
+        var ledger = WifiFeedbackSendLedger()
+        ledger.markRecoveryCompleted()
+        let failed = ledger.prepare(sentNanoseconds: 10)
+        ledger.didProtect(failed)
+        ledger.complete(failed, succeeded: false)
+        XCTAssertTrue(ledger.recoveryCompletedPending)
+
+        let sent = ledger.prepare(sentNanoseconds: 20)
+        ledger.didProtect(sent)
+        ledger.complete(sent, succeeded: true)
+        XCTAssertFalse(ledger.recoveryCompletedPending)
+    }
+
+    func testAbandonedFeedbackSendRetiresBookkeepingWithoutAcknowledgingEvidence() {
+        var ledger = WifiFeedbackSendLedger()
+        ledger.recordExpiredFrame()
+        ledger.recordExpiredFrame()
+        ledger.markRecoveryCompleted()
+
+        let stale = ledger.prepare(sentNanoseconds: 10)
+        XCTAssertEqual(stale.expiredFrames, 2)
+        XCTAssertTrue(stale.recoveryCompleted)
+        ledger.didProtect(stale)
+        XCTAssertEqual(ledger.pendingRttCount, 1)
+
+        ledger.abandon(stale)
+
+        XCTAssertEqual(ledger.pendingRttCount, 0)
+        XCTAssertEqual(ledger.pendingExpiredFrames, 2)
+        XCTAssertTrue(ledger.recoveryCompletedPending)
+    }
+
+    func testAbandonedFeedbackSendIsIdempotentAndReplacementRereportsEvidence() {
+        var ledger = WifiFeedbackSendLedger()
+        ledger.recordExpiredFrame()
+        ledger.recordExpiredFrame()
+        ledger.markRecoveryCompleted()
+
+        let stale = ledger.prepare(sentNanoseconds: 10)
+        ledger.didProtect(stale)
+        ledger.abandon(stale)
+        ledger.complete(stale, succeeded: true)
+
+        XCTAssertEqual(ledger.pendingExpiredFrames, 2)
+        XCTAssertTrue(ledger.recoveryCompletedPending)
+        let replacement = ledger.prepare(sentNanoseconds: 20)
+        XCTAssertEqual(replacement.sequence, stale.sequence + 1)
+        XCTAssertEqual(replacement.token, stale.token + 1)
+        XCTAssertEqual(replacement.expiredFrames, 2)
+        XCTAssertTrue(replacement.recoveryCompleted)
+
+        ledger.didProtect(replacement)
+        ledger.complete(replacement, succeeded: true)
+        XCTAssertEqual(ledger.pendingExpiredFrames, 0)
+        XCTAssertFalse(ledger.recoveryCompletedPending)
+    }
+
+    func testWifiNetworkErrorPolicyIsFailClosed() {
+        for code: POSIXErrorCode in [
+            .ENETDOWN, .ENETUNREACH, .EHOSTUNREACH,
+            .EAGAIN, .ENOBUFS, .EADDRNOTAVAIL
+        ] {
+            XCTAssertEqual(
+                WifiNetworkErrorPolicy.disposition(for: .posix(code)),
+                .transient)
+        }
+        for code: POSIXErrorCode in [
+            .ECONNRESET, .ECONNABORTED, .ENOTCONN,
+            .EPIPE, .ECONNREFUSED, .ETIMEDOUT
+        ] {
+            XCTAssertEqual(
+                WifiNetworkErrorPolicy.disposition(for: .posix(code)),
+                .terminal)
+        }
+        XCTAssertEqual(
+            WifiNetworkErrorPolicy.disposition(for: .tls(-9806)),
+            .terminal)
+    }
+
+    func testHealthyCommittedLaneRejectsReplacementCandidate() {
+        var gate = WifiProbeCandidateGate<Int>(limit: 2)
+        XCTAssertTrue(gate.register(1).accepted)
+        XCTAssertNotNil(gate.authenticate(1))
+        XCTAssertTrue(gate.committedHealthy)
+        XCTAssertFalse(gate.register(2).accepted)
+    }
+
+    func testWaitingCommittedLaneRequiresAuthenticatedReplacement() {
+        var gate = WifiProbeCandidateGate<Int>(limit: 2)
+        XCTAssertTrue(gate.register(1).accepted)
+        XCTAssertNotNil(gate.authenticate(1))
+        XCTAssertTrue(gate.markCommittedWaiting(1))
+        XCTAssertFalse(gate.committedHealthy)
+        XCTAssertTrue(gate.register(2).accepted)
+        XCTAssertEqual(gate.committed, 1)
+
+        XCTAssertNotNil(gate.authenticate(2))
+        XCTAssertEqual(gate.committed, 2)
+        XCTAssertTrue(gate.committedHealthy)
+        XCTAssertFalse(gate.retireCommitted(1))
+        XCTAssertEqual(gate.committed, 2)
+    }
+
+    func testCommittedRecoveryClosesReplacementWindow() {
+        var gate = WifiProbeCandidateGate<Int>(limit: 2)
+        XCTAssertTrue(gate.register(1).accepted)
+        XCTAssertNotNil(gate.authenticate(1))
+        XCTAssertTrue(gate.markCommittedWaiting(1))
+        XCTAssertTrue(gate.register(2).accepted)
+
+        XCTAssertEqual(gate.committedRecovered(1), [2])
+        XCTAssertTrue(gate.committedHealthy)
+        XCTAssertFalse(gate.register(3).accepted)
+        XCTAssertNil(gate.authenticate(2))
     }
 
     func testProbeAcceptanceReplacesLegacyTimerWithCommitDeadline() throws {
@@ -364,6 +698,71 @@ final class WifiTransportNegotiationTests: XCTestCase {
         XCTAssertTrue(outcomes.contains(.expired(frameSequence: 1)))
     }
 
+    func testRecoveredSixFrameBurstReachesDecoderInOrder() {
+        var decoded: [UInt32] = []
+        let processor = WifiAuthenticatedMediaProcessor(
+            mtu: 1_200,
+            initialSequence: 10,
+            unprotect: { _ in true },
+            decoder: { _, sequence, _, _ in decoded.append(sequence) },
+            rttP95Provider: { 20 })
+        let payload = Data([0x02, 0x01])
+        for sequence in [10, 12] {
+            processor.consume(
+                makeMediaPacket(
+                    sequence: UInt16(sequence), timestamp: 1,
+                    frameSequence: 1, marker: sequence == 12,
+                    payload: payload),
+                arrivalTime: 0)
+        }
+        for frame in 2...6 {
+            processor.consume(
+                makeMediaPacket(
+                    sequence: UInt16(frame + 11),
+                    timestamp: UInt32(frame),
+                    frameSequence: UInt32(frame), marker: true,
+                    payload: payload),
+                arrivalTime: Double(frame) * 0.001)
+        }
+        processor.consume(
+            makeMediaPacket(
+                sequence: 11, timestamp: 1, frameSequence: 1,
+                marker: false, payload: payload),
+            arrivalTime: 0.010)
+        XCTAssertEqual(decoded, [1, 2, 3, 4, 5, 6])
+    }
+
+    func testFreshRecoveryProcessorDeliversConfigurationAndIDR() {
+        var decoded: [Data] = []
+        let processor = WifiAuthenticatedMediaProcessor(
+            mtu: 1_200,
+            initialSequence: 1,
+            unprotect: { _ in true },
+            decoder: { data, _, _, _ in decoded.append(data) })
+        processor.prepareForFreshIDRAnchor()
+        let vps = Data([32 << 1, 1])
+        let sps = Data([33 << 1, 1])
+        let pps = Data([34 << 1, 1])
+        let idr = Data([19 << 1, 1])
+        for (sequence, payload, marker) in [
+            (101, sps, false), (102, pps, false),
+            (103, idr, true)
+        ] {
+            processor.consume(
+                makeMediaPacket(
+                    sequence: UInt16(sequence), timestamp: 10,
+                    frameSequence: 10, marker: marker, payload: payload),
+                arrivalTime: Double(sequence - 100) * 0.001)
+        }
+        XCTAssertTrue(decoded.isEmpty)
+        processor.consume(
+            makeMediaPacket(
+                sequence: 100, timestamp: 10,
+                frameSequence: 10, marker: false, payload: vps),
+            arrivalTime: 0.004)
+        XCTAssertEqual(decoded, [canonical(vps, sps, pps, idr)])
+    }
+
     private func makeSingleNalPacket(sequence: UInt16) -> Data {
         makeMediaPacket(
             sequence: sequence,
@@ -395,6 +794,19 @@ final class WifiTransportNegotiationTests: XCTestCase {
             RtpPacketView.headerLength..<packet.count,
             with: payload)
         return packet
+    }
+
+    private func canonical(_ nals: Data...) -> Data {
+        var result = Data()
+        for nal in nals {
+            let count = UInt32(nal.count)
+            result.append(UInt8(truncatingIfNeeded: count >> 24))
+            result.append(UInt8(truncatingIfNeeded: count >> 16))
+            result.append(UInt8(truncatingIfNeeded: count >> 8))
+            result.append(UInt8(truncatingIfNeeded: count))
+            result.append(nal)
+        }
+        return result
     }
 
     private func storeBE16(_ value: UInt16, in data: inout Data, at offset: Int) {
@@ -534,6 +946,33 @@ final class ClientPreferenceTests: XCTestCase {
         XCTAssertTrue(defaults.bool(forKey: ClientPreferenceKeys.showPerformanceHUD))
         defaults.removePersistentDomain(forName: suiteName)
     }
+
+    func testClientDebugLoggingPreferenceDefaultsOffAndPersists() throws {
+        let suiteName = "ScreenCasting.ClientDebugLoggingPreferenceTests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertFalse(ClientDebugLoggingPreference.load(defaults: defaults))
+        defaults.set(true, forKey: ClientPreferenceKeys.clientDebugLoggingEnabled)
+        XCTAssertTrue(ClientDebugLoggingPreference.load(defaults: defaults))
+        defaults.set(false, forKey: ClientPreferenceKeys.clientDebugLoggingEnabled)
+        XCTAssertFalse(ClientDebugLoggingPreference.load(defaults: defaults))
+    }
+
+    func testNetworkManagerRestoresSessionLoggingPreference() throws {
+        let suiteName = "ScreenCasting.ClientDebugLoggingSessionStartTests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let disabledManager = NetworkManager(userDefaults: defaults)
+        XCTAssertFalse(disabledManager.clientDebugLoggingEnabledForTesting)
+
+        defaults.set(true, forKey: ClientPreferenceKeys.clientDebugLoggingEnabled)
+        let enabledManager = NetworkManager(userDefaults: defaults)
+        XCTAssertTrue(enabledManager.clientDebugLoggingEnabledForTesting)
+    }
 }
 
 final class WifiReconnectTargetTests: XCTestCase {
@@ -642,6 +1081,25 @@ final class WifiReconnectTargetTests: XCTestCase {
 }
 
 final class ClientStreamSettingsPreferenceTests: XCTestCase {
+    func testBitrateV1CeilingAndHostState() {
+        XCTAssertEqual(ClientStreamSettingsPreference.defaultBitrateMbps, 20)
+        for value in [3.0, 20, 50, 75, 100] {
+            XCTAssertEqual(ClientStreamSettingsPreference.normalized(bitrateMbps: value, audioEnabled: true).bitrateMbps, value)
+        }
+        XCTAssertEqual(ClientStreamSettingsPreference.normalized(bitrateMbps: 101, audioEnabled: true).bitrateMbps, 100)
+        XCTAssertEqual(ClientStreamSettingsPreference.normalized(bitrateMbps: 2, audioEnabled: true).bitrateMbps, 3)
+        func decode(_ bitrate: UInt32) -> TrustedSettingsState? {
+            var data = Data(count: 24)
+            data[0] = 1
+            var little = bitrate.littleEndian
+            withUnsafeBytes(of: &little) { data.replaceSubrange(16..<20, with: $0) }
+            return TrustedSettingsState.decode(data)
+        }
+        XCTAssertEqual(decode(100_000_000)?.bitrateBps, 100_000_000)
+        XCTAssertNil(decode(101_000_000))
+        XCTAssertNil(decode(99_500_000))
+    }
+
     func testClientStreamSettingsDefaultTo20MbpsAndAudioOn() throws {
         let suite = "ScreenCasting.ClientStreamSettingsDefaultsTests"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -675,9 +1133,9 @@ final class ClientStreamSettingsPreferenceTests: XCTestCase {
             3)
         XCTAssertEqual(
             ClientStreamSettingsPreference.normalized(
-                bitrateMbps: 80,
+                bitrateMbps: 101,
                 audioEnabled: false).bitrateMbps,
-            50)
+            100)
         XCTAssertEqual(
             ClientStreamSettingsPreference.normalized(
                 bitrateMbps: 12.6,
@@ -1247,5 +1705,218 @@ final class ClientStreamSettingsPreferenceTests: XCTestCase {
             desired: model.desired,
             effective: model.effective,
             outcome: .state), .send)
+    }
+}
+
+final class VideoThroughputV1Tests: XCTestCase {
+    func testVideoPayloadRateUsesMonotonicDeltasAndResets() {
+        var meter = VideoPayloadRateSampler()
+        XCTAssertEqual(meter.sample(totalBytes: 9_000_000, at: 10), 0)
+        XCTAssertEqual(meter.sample(totalBytes: 10_000_000, at: 10.5), 16)
+        XCTAssertEqual(meter.sample(totalBytes: 10_000_000, at: 11), 0)
+        XCTAssertEqual(meter.sample(totalBytes: 0, at: 11.5), 0)
+        XCTAssertEqual(meter.sample(totalBytes: 1_000_000, at: 12), 16)
+        XCTAssertEqual(meter.sample(totalBytes: 2_000_000, at: 12), 0)
+        meter.reset()
+        XCTAssertEqual(meter.sample(totalBytes: 100_000_000, at: 13), 0)
+    }
+
+    func testUniqueVideoPayloadCounterRejectsDuplicatesAndStaleSessions() {
+        var counter = VideoPayloadCounter()
+        XCTAssertFalse(counter.record(byteCount: 100, sequence: 1, generation: 1))
+        counter.begin(generation: 1)
+        XCTAssertTrue(counter.record(byteCount: 1_000_000, sequence: UInt32.max, generation: 1))
+        XCTAssertFalse(counter.record(byteCount: 1_000_000, sequence: UInt32.max, generation: 1))
+        XCTAssertTrue(counter.record(byteCount: 500_000, sequence: 0, generation: 1))
+        XCTAssertFalse(counter.record(byteCount: 500_000, sequence: UInt32.max, generation: 1))
+        XCTAssertFalse(counter.record(byteCount: 0, sequence: 1, generation: 1))
+        XCTAssertEqual(counter.totalBytes, 1_500_000)
+        counter.begin(generation: 2)
+        XCTAssertFalse(counter.record(byteCount: 100, sequence: 1, generation: 1))
+        XCTAssertTrue(counter.record(byteCount: 100, sequence: 1, generation: 2))
+        XCTAssertEqual(counter.totalBytes, 100)
+        counter.reset()
+        XCTAssertFalse(counter.record(byteCount: 100, sequence: 2, generation: 2))
+        XCTAssertEqual(counter.totalBytes, 0)
+        XCTAssertEqual(TransportHudSnapshot(frameReceiveMs: 2, decodeMs: 3, videoRxMbps: 16).videoRxMbps, 16)
+    }
+    func testFallbackKeepsExistingTelemetryCadence() {
+        let manager = NetworkManager()
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        defer { manager.stopForTesting() }
+        XCTAssertTrue(manager.networkQueueForTesting.sync {
+            manager.fallbackCommittedWifiToLegacy(generation: session.generation)
+        })
+        let sampled = expectation(description: "existing feedback cadence resumes")
+        manager.networkQueueForTesting.asyncAfter(deadline: .now() + 0.6) {
+            XCTAssertGreaterThan(manager.videoFeedbackCountForTesting, 0)
+            sampled.fulfill()
+        }
+        wait(for: [sampled], timeout: 2)
+    }
+
+    func testExplicitStopCancelsWifiMediaReceiver() {
+        let manager = NetworkManager()
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        let receiver = manager.wifiMediaReceiverForTesting
+        manager.networkQueueForTesting.sync {
+            receiver.start(generation: session.generation) { _ in }
+        }
+        XCTAssertTrue(manager.networkQueueForTesting.sync { receiver.isListeningForTesting })
+        manager.stopForTesting()
+        XCTAssertFalse(manager.networkQueueForTesting.sync { receiver.isListeningForTesting },
+            "explicit Stop must not leave the Wi-Fi media listener, feedback timer or keys alive")
+    }
+
+    func testHudSnapshotFromRetiredModeIsNotPublishedAfterModeReturns() {
+        let manager = NetworkManager()
+        _ = manager.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.wifiRTP)
+        defer { manager.stopForTesting() }
+        let stale = TransportHudSnapshot(frameReceiveMs: 41, decodeMs: 42, videoRxMbps: 43)
+        // The main-thread apply is queued behind this test, so the mode can change A -> B -> A first.
+        manager.publishHudSnapshotForTesting(stale)
+        manager.setCommittedRealtimeModeForTesting(RealtimeTransportMode.legacyTLS)
+        manager.setCommittedRealtimeModeForTesting(RealtimeTransportMode.wifiRTP)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        XCTAssertNotEqual(manager.hudTelemetry, stale, "a snapshot from a retired mode epoch was applied")
+    }
+
+    func testCommittedFallbackRearmsDecoderOnceWithoutReplacingSession() {
+        let manager = NetworkManager()
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        defer { manager.stopForTesting() }
+        let decoder = manager.decoderForTesting
+        let invalidates = decoder.invalidateCountForTesting
+        let begins = decoder.sessionBeganCountForTesting
+        XCTAssertTrue(manager.networkQueueForTesting.sync {
+            manager.fallbackCommittedWifiToLegacy(generation: session.generation)
+        })
+        let after = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(after.connection === session.connection)
+        XCTAssertEqual(after.generation, session.generation)
+        XCTAssertEqual(after.authenticatedGeneration, session.generation)
+        XCTAssertEqual(after.committedGeneration, session.generation)
+        XCTAssertEqual(after.realtimeMode, RealtimeTransportMode.legacyTLS)
+        XCTAssertEqual(decoder.invalidateCountForTesting, invalidates + 1)
+        XCTAssertEqual(decoder.sessionBeganCountForTesting, begins + 1)
+        XCTAssertEqual(Array(decoder.lifecycleEventsForTesting.suffix(3)), [
+            "invalidate-begin", "invalidate-end", "begin-\(session.generation)"])
+        XCTAssertFalse(manager.networkQueueForTesting.sync {
+            manager.fallbackCommittedWifiToLegacy(generation: session.generation)
+        })
+        XCTAssertEqual(decoder.invalidateCountForTesting, invalidates + 1)
+        XCTAssertEqual(decoder.sessionBeganCountForTesting, begins + 1)
+    }
+
+    func testStaleFallbackCannotRearmReplacementWifiDecoder() {
+        let manager = NetworkManager()
+        let old = manager.simulateCommittedWifiSessionForTesting()
+        let current = manager.simulateCommittedWifiSessionForTesting()
+        defer { manager.stopForTesting() }
+        let decoder = manager.decoderForTesting
+        let invalidates = decoder.invalidateCountForTesting
+        let begins = decoder.sessionBeganCountForTesting
+        XCTAssertFalse(manager.networkQueueForTesting.sync {
+            manager.fallbackCommittedWifiToLegacy(generation: old.generation)
+        })
+        let after = manager.wifiLifecycleSnapshotForTesting()
+        XCTAssertTrue(after.connection === current.connection)
+        XCTAssertEqual(after.authenticatedGeneration, current.generation)
+        XCTAssertEqual(after.committedGeneration, current.generation)
+        XCTAssertEqual(after.realtimeMode, RealtimeTransportMode.wifiRTP)
+        XCTAssertEqual(decoder.invalidateCountForTesting, invalidates)
+        XCTAssertEqual(decoder.sessionBeganCountForTesting, begins)
+    }
+}
+
+final class AutoBitrateWireV1Tests: XCTestCase {
+    func testAutoPreferencePersistsWithoutChangingManual75() throws {
+        let suite = "ScreenCasting.AutoBitrateV1Tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertFalse(ClientStreamSettingsStore.load(defaults: defaults).adaptiveBitrateEnabled)
+        defaults.set(75, forKey: "ScreenCasting.client.desiredBitrateMbps.v1")
+        defaults.set(true, forKey: "ScreenCasting.client.desiredAudioEnabled.v1")
+        let oldManual = ClientStreamSettingsStore.load(defaults: defaults)
+        XCTAssertEqual(oldManual.bitrateMbps, 75)
+        XCTAssertFalse(oldManual.adaptiveBitrateEnabled)
+        let auto = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: oldManual.bitrateMbps, audioEnabled: false, adaptiveBitrateEnabled: true)
+        ClientStreamSettingsStore.save(auto, defaults: defaults)
+        XCTAssertEqual(ClientStreamSettingsStore.load(defaults: defaults), auto)
+        let manual = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: auto.bitrateMbps, audioEnabled: auto.audioEnabled, adaptiveBitrateEnabled: false)
+        ClientStreamSettingsStore.save(manual, defaults: defaults)
+        XCTAssertEqual(ClientStreamSettingsStore.load(defaults: defaults).bitrateMbps, 75)
+        XCTAssertFalse(ClientStreamSettingsStore.load(defaults: defaults).adaptiveBitrateEnabled)
+    }
+
+    func testModeMismatchReconcilesEvenWhenBitrateAndAudioMatch() {
+        let desired = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 75, audioEnabled: true, adaptiveBitrateEnabled: true)
+        let manual = ClientStreamSettingsPreference.normalized(
+            bitrateMbps: 75, audioEnabled: true, adaptiveBitrateEnabled: false)
+        var model = ClientSettingsStateModel(desired: desired)
+        model.receiveHostState(manual, generation: 9)
+        var gate = ClientSettingsReconciliationGate()
+        XCTAssertEqual(gate.decision(hostGeneration: 9, desired: model.desired,
+            effective: model.effective, outcome: .state), .send)
+        model.receiveHostState(desired, generation: 10)
+        XCTAssertEqual(model.desired.bitrateMbps, 75)
+        XCTAssertEqual(gate.decision(hostGeneration: 10, desired: model.desired,
+            effective: model.effective, outcome: .applied), .inSync)
+    }
+
+    @MainActor func testAutoSnapshotPreservesLiveTargetAndManualReportsSavedTarget() async {
+        let manager = NetworkManager()
+        let desired = manager.desiredBitrateMbps
+        var payload = Data(count: 24)
+        payload[0] = 1
+        payload[1] = 1
+        payload[2] = TrustedSettingsRejectReason.invalidRequest.rawValue
+        payload[3] = 1
+        var bitrate = UInt32(60_000_000).littleEndian
+        withUnsafeBytes(of: &bitrate) { payload.replaceSubrange(16..<20, with: $0) }
+        manager.receiveSettingsState(payload, outcome: .rejected(.invalidRequest))
+        let seed = expectation(description: "Auto seed published")
+        DispatchQueue.main.async { seed.fulfill() }
+        await fulfillment(of: [seed], timeout: 2)
+        XCTAssertTrue(manager.isAdaptiveBitrate)
+        XCTAssertEqual(manager.effectiveBitrateMbps, 60)
+        bitrate = UInt32(75_000_000).littleEndian
+        withUnsafeBytes(of: &bitrate) { payload.replaceSubrange(16..<20, with: $0) }
+        manager.receiveSettingsState(payload, outcome: .rejected(.invalidRequest))
+        let auto = expectation(description: "Auto state published")
+        DispatchQueue.main.async { auto.fulfill() }
+        await fulfillment(of: [auto], timeout: 2)
+        XCTAssertTrue(manager.isAdaptiveBitrate)
+        XCTAssertEqual(manager.effectiveBitrateMbps, 60)
+        XCTAssertEqual(manager.desiredBitrateMbps, desired)
+        payload[3] = 0
+        manager.receiveSettingsState(payload, outcome: .rejected(.invalidRequest))
+        let manual = expectation(description: "Manual state published")
+        DispatchQueue.main.async { manual.fulfill() }
+        await fulfillment(of: [manual], timeout: 2)
+        XCTAssertFalse(manager.isAdaptiveBitrate)
+        XCTAssertEqual(manager.effectiveBitrateMbps, 75)
+        XCTAssertEqual(manager.desiredBitrateMbps, desired)
+    }
+
+    func testSettingsByte3AcceptsAutoAndKeeps24ByteLayout() {
+        var payload = Data(count: 24)
+        payload[0] = 1
+        payload[1] = 1
+        payload[3] = 1
+        var bitrate = UInt32(75_000_000).littleEndian
+        withUnsafeBytes(of: &bitrate) { payload.replaceSubrange(16..<20, with: $0) }
+        XCTAssertEqual(payload.count, 24)
+        XCTAssertEqual(TrustedSettingsState.decode(payload)?.bitrateBps, 75_000_000)
+        payload[3] = 0
+        XCTAssertNotNil(TrustedSettingsState.decode(payload))
+        for byte in UInt8(2)...UInt8(255) {
+            payload[3] = byte
+            XCTAssertNil(TrustedSettingsState.decode(payload))
+        }
     }
 }

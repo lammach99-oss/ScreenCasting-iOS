@@ -1,9 +1,10 @@
 import Foundation
 
-enum RealtimeAudioTransportProfile {
+enum RealtimeAudioTransportProfile: Equatable {
     case wifi
     case usb
 
+    // Startup/prebuffer depth only; retained capacity is the separate hard bound.
     var targetPacketCount: Int {
         switch self {
         case .wifi: return 3
@@ -23,6 +24,85 @@ enum AudioJitterAction: Equatable {
     case plc(sequence: UInt16, timestamp: UInt32)
 }
 
+struct AudioJitterDiagnostics {
+    var insertedPackets = 0
+    var duplicateRejects = 0
+    var staleRejects = 0
+    var maximumDepth = 0
+    var decodeActions = 0
+    var plcActions = 0
+    var nilPlayoutActions = 0
+    var targetPolicyDrops = 0
+    var overflowDrops = 0
+    var startupWaitTicks = 0
+    var shortStarvationEntries = 0
+    var boundedPlcActions = 0
+    var rebufferEntries = 0
+    var rebufferWaitTicks = 0
+    var rebufferResumes = 0
+    var freshReanchorSkipUnits = 0
+    private var depthSamples = [Double]()
+    private var depthIndex = 0
+    var depthPercentiles: LatencyPercentiles { LatencyPercentiles.calculate(depthSamples) }
+    mutating func observeDepth(_ depth: Int) {
+        if depthSamples.count < 256 { depthSamples.append(Double(depth)) }
+        else { depthSamples[depthIndex] = Double(depth); depthIndex = (depthIndex + 1) % 256 }
+    }
+}
+
+/// Observation only: never participates in packet admission or playout.
+struct AudioReceiveDiagnostics {
+    private var highest: UInt16?
+    private var history: UInt64 = 0
+    private var lastArrival: TimeInterval?
+    private var lastTimestamp: UInt32 = 0
+    private var intervals: [Double] = []
+    private var intervalIndex = 0
+    private(set) var packets = 0
+    private(set) var forwardGaps = 0
+    private(set) var missingPacketUnits = 0
+    private(set) var reorderedPackets = 0
+    private(set) var repairedPacketUnits = 0
+    private(set) var duplicateOrStalePackets = 0
+    private(set) var jitterMs = 0.0
+    var interarrivalP95Ms: Double { LatencyPercentiles.calculate(intervals).p95 }
+    var interarrivalMaxMs: Double { intervals.max() ?? 0 }
+
+    mutating func record(sequence: UInt16, timestamp: UInt32, arrivedAt: TimeInterval) {
+        packets += 1
+        guard let highest else {
+            self.highest = sequence
+            history = 1
+            lastArrival = arrivedAt
+            lastTimestamp = timestamp
+            return
+        }
+        let forward = sequence &- highest
+        if forward > 0 && forward < 0x8000 {
+            if forward > 1 { forwardGaps += 1; missingPacketUnits += Int(forward) - 1 }
+            history = forward >= 64 ? 1 : (history << Int(forward)) | 1
+            self.highest = sequence
+        } else {
+            let behind = highest &- sequence
+            if behind < 64 && history & (UInt64(1) << Int(behind)) == 0 {
+                history |= UInt64(1) << Int(behind)
+                reorderedPackets += 1
+                repairedPacketUnits += 1
+            } else { duplicateOrStalePackets += 1 }
+            return
+        }
+        if let lastArrival {
+            let elapsedMs = max(0, arrivedAt - lastArrival) * 1000
+            if intervals.count < 256 { intervals.append(elapsedMs) }
+            else { intervals[intervalIndex] = elapsedMs; intervalIndex = (intervalIndex + 1) % 256 }
+            let mediaMs = Double(Int32(bitPattern: timestamp &- lastTimestamp)) / 48
+            jitterMs += (abs(elapsedMs - mediaMs) - jitterMs) / 16
+        }
+        lastArrival = arrivedAt
+        lastTimestamp = timestamp
+    }
+}
+
 /// Serial-executor state for fixed 10 ms Opus packets.
 final class AudioJitterBuffer {
     static let packetDurationSamples: UInt32 = 480
@@ -33,8 +113,13 @@ final class AudioJitterBuffer {
     private var expectedSequence: UInt16?
     private var expectedTimestamp: UInt32 = 0
     private var startupAnchorSequence: UInt16?
-    private var started = false
+    private enum PlayoutState: Equatable { case prebuffering, playing, shortStarvation, rebuffering }
+    // Provisional 20-ms cap; physical tuning remains pending. Startup targets stay unchanged.
+    private static let starvationPlcBudget = 2
+    private var playoutState: PlayoutState = .prebuffering
+    private var starvationPlcRemaining = 0
     private(set) var droppedPacketCount = 0
+    private(set) var diagnostics = AudioJitterDiagnostics()
 
     init(profile: RealtimeAudioTransportProfile) {
         self.profile = profile
@@ -52,20 +137,23 @@ final class AudioJitterBuffer {
         expectedSequence = nil
         expectedTimestamp = 0
         startupAnchorSequence = nil
-        started = false
+        playoutState = .prebuffering
+        starvationPlcRemaining = 0
         droppedPacketCount = 0
+        diagnostics = AudioJitterDiagnostics()
     }
 
     func insert(_ packet: AudioJitterPacket) {
-        guard packets[packet.sequence] == nil else { return }
+        guard packets[packet.sequence] == nil else { diagnostics.duplicateRejects += 1; return }
         if let expectedSequence {
             let delta = packet.sequence &- expectedSequence
             if delta >= 0x8000 {
-                guard let startupAnchorSequence else { return }
+                guard let startupAnchorSequence else { diagnostics.staleRejects += 1; return }
                 let backwardDistance =
                     startupAnchorSequence &- packet.sequence
-                guard !started,
+                guard playoutState == .prebuffering,
                       backwardDistance <= UInt16(Self.maximumPacketCount) else {
+                    diagnostics.staleRejects += 1
                     return
                 }
                 self.expectedSequence = packet.sequence
@@ -77,46 +165,89 @@ final class AudioJitterBuffer {
             startupAnchorSequence = packet.sequence
         }
         packets[packet.sequence] = packet
+        diagnostics.insertedPackets += 1
         if packets.count > Self.maximumPacketCount {
-            dropOldest()
+            dropOldest(overflow: true)
         }
+        diagnostics.maximumDepth = max(diagnostics.maximumDepth, packets.count)
     }
 
     func dequeue() -> AudioJitterAction? {
-        guard let expectedSequence else { return nil }
-        if !started {
-            guard packets.count >= profile.targetPacketCount else { return nil }
-            started = true
+        diagnostics.observeDepth(packets.count)
+        guard let expectedSequence else { return noPlayout() }
+        if playoutState == .prebuffering {
+            guard packets.count >= profile.targetPacketCount else {
+                diagnostics.startupWaitTicks += 1
+                return noPlayout()
+            }
+            playoutState = .playing
+            starvationPlcRemaining = Self.starvationPlcBudget
             startupAnchorSequence = nil
+        } else if playoutState == .rebuffering {
+            guard packets.count >= profile.targetPacketCount,
+                  let anchor = packets.values.min(by: {
+                      ($0.sequence &- expectedSequence) < ($1.sequence &- expectedSequence)
+                  }) else {
+                diagnostics.rebufferWaitTicks += 1
+                return noPlayout()
+            }
+            diagnostics.freshReanchorSkipUnits += Int(anchor.sequence &- expectedSequence)
+            self.expectedSequence = anchor.sequence
+            expectedTimestamp = anchor.timestamp
+            diagnostics.rebufferResumes += 1
+            playoutState = .playing
+            starvationPlcRemaining = Self.starvationPlcBudget
         }
 
-        if packets.count >= profile.targetPacketCount + 1 {
-            dropOldest()
-        }
-
-        guard let currentExpected = self.expectedSequence else { return nil }
+        guard let currentExpected = self.expectedSequence else { return noPlayout() }
         if let packet = packets.removeValue(forKey: currentExpected) {
             advance(after: packet)
+            playoutState = .playing
+            starvationPlcRemaining = Self.starvationPlcBudget
+            diagnostics.decodeActions += 1
             return .decode(packet)
         }
-
-        if !packets.isEmpty &&
-            packets.count <= max(0, profile.targetPacketCount - 1) {
-            let timestamp = expectedTimestamp
-            self.expectedSequence = currentExpected &+ 1
-            expectedTimestamp &+= Self.packetDurationSamples
-            return .plc(sequence: currentExpected, timestamp: timestamp)
+        if playoutState == .playing {
+            playoutState = .shortStarvation
+            diagnostics.shortStarvationEntries += 1
         }
+        guard playoutState == .shortStarvation, starvationPlcRemaining > 0 else {
+            return noPlayout()
+        }
+        starvationPlcRemaining -= 1
+        let action = conceal(currentExpected, bounded: true)
+        if starvationPlcRemaining == 0,
+           let nextExpected = self.expectedSequence,
+           packets[nextExpected] == nil {
+            playoutState = .rebuffering
+            diagnostics.rebufferEntries += 1
+        }
+        return action
+    }
+
+    private func conceal(_ sequence: UInt16, bounded: Bool) -> AudioJitterAction {
+        let timestamp = expectedTimestamp
+        expectedSequence = sequence &+ 1
+        expectedTimestamp &+= Self.packetDurationSamples
+        diagnostics.plcActions += 1
+        if bounded { diagnostics.boundedPlcActions += 1 }
+        return .plc(sequence: sequence, timestamp: timestamp)
+    }
+
+    private func noPlayout() -> AudioJitterAction? {
+        diagnostics.nilPlayoutActions += 1
         return nil
     }
 
-    private func dropOldest() {
+    private func dropOldest(overflow: Bool = false) {
         guard let expectedSequence,
               let oldest = packets.keys.min(by: {
                   ($0 &- expectedSequence) < ($1 &- expectedSequence)
               }),
               let dropped = packets.removeValue(forKey: oldest) else { return }
         droppedPacketCount += 1
+        if overflow { diagnostics.overflowDrops += 1 }
+        else { diagnostics.targetPolicyDrops += 1 }
         if let next = packets.values.min(by: {
             ($0.sequence &- expectedSequence) <
                 ($1.sequence &- expectedSequence)

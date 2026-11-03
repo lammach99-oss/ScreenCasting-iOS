@@ -1,6 +1,64 @@
 import Foundation
 import QuartzCore
 
+struct ClientFreshFrameRateSample {
+    let generation: UInt64
+    let sampleWindowMs: UInt16
+    let decodedFps: Double
+    let freshPresentedFps: Double
+    let droppedFrames: UInt32
+    let valid: Bool
+}
+
+struct FreshFrameRateWindow {
+    private var generation: UInt64?
+    private var startedAt: TimeInterval?
+    private var lastDecoded: UInt32?
+    private var lastPresented: UInt32?
+    private var decoded: UInt32 = 0
+    private var presented: UInt32 = 0
+    private var dropped: UInt32 = 0
+
+    mutating func begin(generation: UInt64, at now: TimeInterval) {
+        self = FreshFrameRateWindow()
+        self.generation = generation
+        startedAt = now
+    }
+
+    mutating func recordDecode(sequence: UInt32, generation: UInt64) {
+        guard self.generation == generation else { return }
+        if let previous = lastDecoded, Int32(bitPattern: sequence &- previous) <= 0 { return }
+        lastDecoded = sequence
+        decoded = decoded == .max ? .max : decoded + 1
+    }
+
+    mutating func recordPresentation(sequence: UInt32, generation: UInt64) {
+        guard self.generation == generation else { return }
+        if let previous = lastPresented, Int32(bitPattern: sequence &- previous) <= 0 { return }
+        lastPresented = sequence
+        presented = presented == .max ? .max : presented + 1
+    }
+
+    mutating func recordDrop(generation: UInt64) {
+        guard self.generation == generation else { return }
+        dropped = dropped == .max ? .max : dropped + 1
+    }
+
+    mutating func sample(generation: UInt64, at now: TimeInterval) -> ClientFreshFrameRateSample? {
+        guard self.generation == generation, now.isFinite,
+              let start = startedAt, now - start >= 1 else { return nil }
+        let elapsed = now - start
+        let sample = ClientFreshFrameRateSample(generation: generation,
+            sampleWindowMs: UInt16(clamping: Int(min(65535, elapsed * 1000).rounded())),
+            decodedFps: Double(decoded) / elapsed,
+            freshPresentedFps: Double(presented) / elapsed,
+            droppedFrames: dropped, valid: elapsed <= 2.5)
+        startedAt = now
+        decoded = 0; presented = 0; dropped = 0
+        return sample
+    }
+}
+
 /// SCST VideoFeedback header flags.  The 16-byte v1 payload is unchanged so
 /// old hosts continue to parse it; new hosts use these flags to distinguish an
 /// unavailable stage from a valid zero-millisecond observation.
@@ -14,8 +72,67 @@ enum VideoFeedbackValidityFlags {
 public struct TransportHudSnapshot: Equatable {
     public let frameReceiveMs: Double
     public let decodeMs: Double
+    public let videoRxMbps: Double
+
+    init(frameReceiveMs: Double, decodeMs: Double, videoRxMbps: Double = 0) {
+        self.frameReceiveMs = frameReceiveMs
+        self.decodeMs = decodeMs
+        self.videoRxMbps = videoRxMbps
+    }
 }
 
+// Video Throughput V1 measures unique encoded payload bytes accepted by the
+// Client video path per unit monotonic time. Audio, control, framing and
+// retransmission duplicates are excluded; this is not NIC/USB link utilization.
+// NetworkManager owns these values exclusively on its existing networkQueue.
+struct VideoPayloadCounter {
+    private(set) var totalBytes: UInt64 = 0
+    private var generation: UInt64?
+    private var lastSequence: UInt32?
+
+    mutating func begin(generation: UInt64) {
+        reset()
+        self.generation = generation
+    }
+
+    mutating func reset() {
+        totalBytes = 0
+        generation = nil
+        lastSequence = nil
+    }
+
+    @discardableResult
+    mutating func record(byteCount: Int, sequence: UInt32, generation: UInt64) -> Bool {
+        guard self.generation == generation, byteCount > 0 else { return false }
+        if let previous = lastSequence, Int32(bitPattern: sequence &- previous) <= 0 {
+            return false
+        }
+        lastSequence = sequence
+        totalBytes &+= UInt64(byteCount)
+        return true
+    }
+}
+
+struct VideoPayloadRateSampler {
+    private var lastBytes: UInt64 = 0
+    private var lastTime: TimeInterval?
+
+    mutating func reset() { lastTime = nil }
+
+    mutating func sample(totalBytes: UInt64, at now: TimeInterval) -> Double {
+        guard now.isFinite else { return 0 }
+        guard let previousTime = lastTime, totalBytes >= lastBytes, now >= previousTime else {
+            lastBytes = totalBytes
+            lastTime = now
+            return 0
+        }
+        guard now > previousTime else { return 0 }
+        let rate = Double(totalBytes - lastBytes) * 8 / (now - previousTime) / 1_000_000
+        lastBytes = totalBytes
+        lastTime = now
+        return rate
+    }
+}
 enum StreamingTransportKind: String, Equatable {
     case wifi
     case usbTypeC = "usb_type_c"
@@ -317,6 +434,10 @@ final class SequenceLatencyReporter {
 }
 
 final class TransportTelemetry {
+    private enum PersistentLogError: Error {
+        case documentsDirectoryUnavailable
+    }
+
     struct SecurityDropSnapshot: Equatable {
         let authentication: UInt64
         let replay: UInt64
@@ -402,10 +523,25 @@ final class TransportTelemetry {
 
     private let lock = NSLock()
     private var receive = RollingHistogram()
+    private var freshRateWindow = FreshFrameRateWindow()
+
+    func beginFreshFrameRate(generation: UInt64, at now: TimeInterval = CACurrentMediaTime()) {
+        lock.lock()
+        freshRateWindow.begin(generation: generation, at: now)
+        lock.unlock()
+    }
+
+    func freshFrameRateSample(generation: UInt64, at now: TimeInterval = CACurrentMediaTime()) -> ClientFreshFrameRateSample? {
+        lock.lock()
+        defer { lock.unlock() }
+        return freshRateWindow.sample(generation: generation, at: now)
+    }
     private var decode = RollingHistogram()
     private var mailboxAge = RollingHistogram()
     private var presentation = RollingHistogram()
     private var rtt = RollingHistogram()
+    // Dimensions are built per packet; rtt only changes when a probe sample lands.
+    private var rttP95Cached: UInt16 = 0
     private var exportRtt = RollingHistogram(capacity: 4_096)
     private var exportReceive = RollingHistogram(capacity: 4_096)
     private var exportDecode = RollingHistogram(capacity: 4_096)
@@ -627,6 +763,14 @@ final class TransportTelemetry {
             sequence: sequence)
         lock.lock()
         let state = packetStages.removeValue(forKey: key)
+        if stage == .reassemblyCompleted, let state {
+            let receiveDurationMs = max(
+                0,
+                (state.lastArrival - state.firstArrival) * 1_000.0)
+            receive.add(receiveDurationMs)
+            exportReceive.add(receiveDurationMs)
+            sessionReceive.add(receiveDurationMs)
+        }
         let dimensions = frameDimensions[key] ?? makeDimensionsLocked(
             sequence: sequence,
             isIDR: state?.isIDR ?? false,
@@ -691,6 +835,7 @@ final class TransportTelemetry {
     ) {
         let dimensions: FrameTelemetryDimensions?
         lock.lock()
+        freshRateWindow.recordDrop(generation: generation ?? sessionContext.connectionGeneration)
         droppedSinceFeedback = droppedSinceFeedback == .max
             ? .max
             : droppedSinceFeedback + 1
@@ -727,6 +872,7 @@ final class TransportTelemetry {
             sequence: sequence)
         lock.lock()
         decode.add(durationMs)
+        freshRateWindow.recordDecode(sequence: sequence, generation: generation)
         exportDecode.add(durationMs)
         sessionDecode.add(durationMs)
         receiveTicks.removeValue(forKey: key)
@@ -787,6 +933,9 @@ final class TransportTelemetry {
     }
 
     func recordDrawableCommitted(sequence: UInt32, generation: UInt64) {
+        lock.lock()
+        freshRateWindow.recordPresentation(sequence: sequence, generation: generation)
+        lock.unlock()
         guard let dimensions = dimensions(
             for: sequence,
             generation: generation) else { return }
@@ -802,6 +951,14 @@ final class TransportTelemetry {
         recordRttLocked(durationMs: durationMs)
         lock.unlock()
     }
+
+    #if targetEnvironment(simulator)
+    func summaryCountsForTesting() -> (rtt: Int, receive: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (sessionRtt.count, sessionReceive.count)
+    }
+    #endif
 
     func recordAuthenticatedRtt(
         durationMs: Double,
@@ -825,6 +982,7 @@ final class TransportTelemetry {
 
     private func recordRttLocked(durationMs: Double) {
         rtt.add(durationMs)
+        rttP95Cached = rtt.p95()
         exportRtt.add(durationMs)
         sessionRtt.add(durationMs)
     }
@@ -836,7 +994,12 @@ final class TransportTelemetry {
         lock.unlock()
     }
 
-    /// Enqueues a logging restart and returns its planned URL immediately.
+    func beginRuntimeSession() {
+        resetSessionMetrics()
+    }
+
+    /// Enqueues logging startup and returns its planned URL immediately.
+    /// Repeated startup while a sink is active reuses that sink.
     /// `completion` runs on the utility queue after both headers are created,
     /// or with `nil` after setup fails.
     /// FileHandle writes are synchronous on that queue and are not cancellable;
@@ -866,8 +1029,10 @@ final class TransportTelemetry {
                 completion?(nil)
                 return
             }
-            self.finishLogging(reason: "restart")
-            self.resetSessionMetrics()
+            if let activeURL = self.exportFileURL {
+                completion?(activeURL)
+                return
+            }
             do {
                 try FileManager.default.createDirectory(
                     at: directory,
@@ -923,6 +1088,56 @@ final class TransportTelemetry {
             }
             finishLogging(reason: "final", snapshot: snapshot)
             completion?()
+        }
+    }
+
+    func deleteStoredLogs(
+        directoryURL: URL? = nil,
+        completion: @escaping (Result<Int, Error>) -> Void
+    ) {
+        let directory = directoryURL ?? FileManager.default.urls(
+            for: .documentDirectory,
+            in: .userDomainMask).first
+        fileQueue.async { [weak self] in
+            guard let self else {
+                completion(.success(0))
+                return
+            }
+            guard let directory else {
+                completion(.failure(
+                    PersistentLogError.documentsDirectoryUnavailable))
+                return
+            }
+            guard FileManager.default.fileExists(atPath: directory.path) else {
+                completion(.success(0))
+                return
+            }
+
+            let activeURLs = Set([
+                self.exportFileURL,
+                self.frameExportFileURL,
+                self.diagnosticExportFileURL
+            ].compactMap { $0?.standardizedFileURL })
+            do {
+                let urls = try FileManager.default.contentsOfDirectory(
+                    at: directory,
+                    includingPropertiesForKeys: [.isRegularFileKey],
+                    options: [.skipsHiddenFiles])
+                var deletedCount = 0
+                for url in urls where Self.isManagedPersistentLog(url) {
+                    let standardizedURL = url.standardizedFileURL
+                    guard !activeURLs.contains(standardizedURL),
+                          try standardizedURL.resourceValues(
+                            forKeys: [.isRegularFileKey]).isRegularFile == true else {
+                        continue
+                    }
+                    try FileManager.default.removeItem(at: standardizedURL)
+                    deletedCount += 1
+                }
+                completion(.success(deletedCount))
+            } catch {
+                completion(.failure(error))
+            }
         }
     }
 
@@ -1012,11 +1227,13 @@ final class TransportTelemetry {
     private func resetSessionMetrics() {
         sequenceReporter.reset()
         lock.lock()
+        freshRateWindow = FreshFrameRateWindow()
         receive.removeAll()
         decode.removeAll()
         mailboxAge.removeAll()
         presentation.removeAll()
         rtt.removeAll()
+        rttP95Cached = 0
         exportRtt.removeAll()
         exportReceive.removeAll()
         exportDecode.removeAll()
@@ -1081,6 +1298,16 @@ final class TransportTelemetry {
         frameExportFileURL = nil
         diagnosticExportFileURL = nil
         exportStartedAt = 0
+    }
+
+    private static func isManagedPersistentLog(_ url: URL) -> Bool {
+        let name = url.lastPathComponent
+        return (name.hasPrefix("ScreenCasting-Telemetry-") &&
+                url.pathExtension == "csv") ||
+               (name.hasPrefix("ScreenCasting-Frame-Telemetry-") &&
+                url.pathExtension == "csv") ||
+               (name.hasPrefix("ScreenCasting-Diagnostics-") &&
+                url.pathExtension == "log")
     }
 
     private func appendDiagnosticLine(_ line: String) {
@@ -1205,7 +1432,7 @@ final class TransportTelemetry {
             packetCount: packetCount,
             bytes: bytes,
             lossCount: Int(clamping: totalDropped),
-            rttMilliseconds: Double(rtt.p95()),
+            rttMilliseconds: Double(rttP95Cached),
             routeKind: routeKind)
     }
 

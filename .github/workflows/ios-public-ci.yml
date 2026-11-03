@@ -7,11 +7,76 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      p1_production_ipa:
+        description: Package qualified production app with retained G02 dependencies; no dependency rebuild
+        required: false
+        default: false
+        type: boolean
+      p1_client_qualification:
+        description: P1 native tests using retained qualified dependencies; no dependency build or IPA
+        required: false
+        default: false
+        type: boolean
+      g02_consumer_provenance_only:
+        description: Inspect immutable G02 producer provenance only; no builds/tests/IPA
+        required: false
+        default: false
+        type: boolean
+      g02_dependencies_only:
+        description: Qualify pinned native dependencies only; no Client tests or IPA
+        required: false
+        default: false
+        type: boolean
+      c1_final_qualification:
+        description: Two full suites only on immutable corrected C1 source
+        required: false
+        default: false
+        type: boolean
+      c1_native_stability:
+        description: Run only the matched C1 native stability diagnostics; no IPA
+        required: false
+        default: false
+        type: boolean
+      c1_focused_lifecycle:
+        description: Focused baseline/candidate lifecycle instrumentation RED or GREEN only
+        required: false
+        default: false
+        type: boolean
+      c1_extract_reports:
+        description: Extract only the retained completed C1 diagnostic reports; no tests or IPA
+        required: false
+        default: false
+        type: boolean
+      c1_extract_source_run:
+        description: Completed diagnostic run on the validation branch to extract
+        required: false
+        default: '37881608414'
+        type: string
+      c1_baseline_ref:
+        description: Exact public object with canonical a48980f AudioManager and NetworkManager bytes
+        required: false
+        default: ''
+        type: string
       build_unsigned_ipa:
         description: Build and upload unsigned iPad IPA
         required: true
         default: true
         type: boolean
+      xctest_filter:
+        description: Optional comma-separated xcodebuild -only-testing selectors
+        required: false
+        default: ''
+        type: string
+      run_xctest:
+        description: Run native simulator XCTest before packaging
+        required: false
+        default: true
+        type: boolean
+      repeat_count:
+        description: Focused XCTest repetitions (1-20)
+        required: false
+        default: '1'
+        type: string
 
 permissions:
   contents: read
@@ -22,7 +87,7 @@ concurrency:
 
 env:
   NATIVE_CACHE_SCHEMA: v1
-  OPENSSL_PIN: openssl-3.3.2-98b3bf1433f8f4a29e64ca8b9bd42c58d3d1b98a
+  OPENSSL_PIN: openssl-3.5.7-8cf17aaeb4599f8af87fefd810b5b5fee90fe69e
   LIBSRTP_PIN: 24b3bf8f19b6f5ab4cd2bcceb4f4064efca86fd5
   OPUS_PIN: ddbe48383984d56acd9e1ab6a090c54ca6b735a6
   IOS_DEPLOYMENT_TARGET: '17.0'
@@ -31,6 +96,7 @@ env:
 
 jobs:
   prepare-native-deps:
+    if: ${{ !inputs.p1_client_qualification && !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (!inputs.c1_native_stability)) }}
     name: Prepare verified native dependencies
     runs-on: macos-15-intel
     timeout-minutes: 45
@@ -182,6 +248,7 @@ jobs:
           retention-days: 3
 
   build-and-test:
+    if: ${{ !inputs.p1_client_qualification && !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (!inputs.c1_native_stability)) }}
     name: Build and XCTest
     needs: prepare-native-deps
     runs-on: macos-15-intel
@@ -230,6 +297,7 @@ jobs:
           echo "NATIVE_DEPENDENCY_ARTIFACT_VERIFY_SECONDS=$(( $(date +%s) - started_epoch ))"
           echo 'NATIVE_DEPENDENCY_CONSUMER_VERIFY=PASS'
       - name: Build unsigned iOS Simulator app
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_xctest != false }}
         run: |
           set -euo pipefail
           started_epoch=$(date +%s)
@@ -239,21 +307,45 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
           echo "SIMULATOR_BUILD_SECONDS=$(( $(date +%s) - started_epoch ))"
       - name: Run XCTest
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_xctest != false }}
+        env:
+          XCTEST_FILTER: ${{ inputs.xctest_filter }}
+          REPEAT_COUNT: ${{ inputs.repeat_count || '1' }}
         run: |
           set -euo pipefail
           started_epoch=$(date +%s)
           destination=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(("platform=iOS Simulator,id="+device["udid"]+",arch=x86_64" for devices in data.get("devices", {}).values() for device in devices if device.get("isAvailable") and "iPad" in device.get("name", "")), ""))')
           test -n "$destination"
-          xcodebuild test -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj \
-            -scheme iPadCasting -destination "$destination" \
-            ARCHS=x86_64 ONLY_ACTIVE_ARCH=YES \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          [[ "$REPEAT_COUNT" =~ ^([1-9]|1[0-9]|20)$ ]]
+          test_args=()
+          if [[ -n "$XCTEST_FILTER" ]]; then
+            IFS=',' read -r -a selectors <<< "$XCTEST_FILTER"
+            for selector in "${selectors[@]}"; do
+              [[ -n "$selector" ]]
+              test_args+=("-only-testing:$selector")
+            done
+          else
+            [[ "$REPEAT_COUNT" == 1 ]]
+          fi
+          failed=0
+          for ((iteration=1; iteration<=REPEAT_COUNT; iteration++)); do
+            if xcodebuild test -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj \
+              -scheme iPadCasting -destination "$destination" \
+              ARCHS=x86_64 ONLY_ACTIVE_ARCH=YES \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO ${test_args[@]+"${test_args[@]}"}; then
+              echo "XCTEST_ITERATION=$iteration RESULT=PASS"
+            else
+              echo "XCTEST_ITERATION=$iteration RESULT=FAIL"
+              failed=1
+            fi
+          done
           echo "XCTEST_SECONDS=$(( $(date +%s) - started_epoch ))"
+          exit "$failed"
 
   build-unsigned-ipad-app:
     name: Build unsigned iPad app
     needs: [prepare-native-deps, build-and-test]
-    if: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.build_unsigned_ipa == true)) && needs.prepare-native-deps.result == 'success' && needs.build-and-test.result == 'success' }}
+    if: ${{ !inputs.p1_client_qualification && !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.build_unsigned_ipa == true)) && needs.prepare-native-deps.result == 'success' && needs.build-and-test.result == 'success')) }}
     runs-on: macos-15-intel
     timeout-minutes: 45
     outputs:
@@ -373,7 +465,7 @@ jobs:
   package-unsigned-ipa:
     name: Package unsigned iPad IPA
     needs: build-unsigned-ipad-app
-    if: ${{ needs.build-unsigned-ipad-app.result == 'success' }}
+    if: ${{ !inputs.p1_client_qualification && !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (needs.build-unsigned-ipad-app.result == 'success')) }}
     runs-on: macos-15-intel
     timeout-minutes: 15
     outputs:
@@ -482,7 +574,7 @@ jobs:
   revalidate-uploaded-ipa:
     name: Revalidate uploaded unsigned IPA
     needs: package-unsigned-ipa
-    if: ${{ needs.package-unsigned-ipa.result == 'success' }}
+    if: ${{ !inputs.p1_client_qualification && !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (needs.package-unsigned-ipa.result == 'success')) }}
     runs-on: macos-15-intel
     timeout-minutes: 15
     permissions:
@@ -526,3 +618,367 @@ jobs:
           echo "DOWNLOADED_IPA_SHA256=$actual_sha256"
           echo "DOWNLOADED_ARTIFACT_REVALIDATION_SECONDS=$(( $(date +%s) - started_epoch ))"
           echo 'DOWNLOADED_ARTIFACT_REVALIDATION=PASS'
+
+  c1-native-stability:
+    if: ${{ !inputs.p1_client_qualification && !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (github.event_name == 'workflow_dispatch' && inputs.c1_native_stability && !inputs.c1_extract_reports)) }}
+    permissions:
+      contents: read
+      actions: read
+    runs-on: macos-15-intel
+    timeout-minutes: 360
+    env:
+      C1_BASELINE_REF: ${{ inputs.c1_baseline_ref }}
+      C1_FOCUSED_LIFECYCLE: ${{ inputs.c1_focused_lifecycle }}
+      C1_FINAL_QUALIFICATION: ${{ inputs.c1_final_qualification }}
+      C1_QUALIFICATION_SELECTORS: ${{ inputs.xctest_filter }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Pin and record Xcode 16.4 and simulator runtime 18.5
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${{ inputs.build_unsigned_ipa }}" == false ]]
+          [[ "${{ inputs.run_xctest }}" == false ]]
+          export C1_EVIDENCE_ROOT="$RUNNER_TEMP/c1-native-stability-evidence"
+          echo "C1_EVIDENCE_ROOT=$C1_EVIDENCE_ROOT" >> "$GITHUB_ENV"
+          mkdir -p "$C1_EVIDENCE_ROOT/entry"
+          sudo xcode-select -s /Applications/Xcode_16.4.app
+          xcodebuild -version | tee "$C1_EVIDENCE_ROOT/entry/xcode-version.txt"
+          grep -qx 'Xcode 16.4' "$C1_EVIDENCE_ROOT/entry/xcode-version.txt"
+          xcrun --sdk iphonesimulator --show-sdk-version | tee "$C1_EVIDENCE_ROOT/entry/simulator-sdk-version.txt"
+          grep -qx '18.5' "$C1_EVIDENCE_ROOT/entry/simulator-sdk-version.txt"
+          swift --version > "$C1_EVIDENCE_ROOT/entry/swift-version.txt"
+          xcrun simctl list runtimes -j > "$C1_EVIDENCE_ROOT/entry/runtimes.json"
+          xcrun simctl list devices available -j > "$C1_EVIDENCE_ROOT/entry/devices.json"
+          python3 - <<'PY'
+          import json, os, pathlib
+          entry=pathlib.Path(os.environ['C1_EVIDENCE_ROOT'])/'entry'
+          runtimes=json.loads((entry/'runtimes.json').read_text())['runtimes']
+          runtime=next(x for x in runtimes if x['version']=='18.5' and x.get('isAvailable') and 'iOS' in x['name'])
+          devices=json.loads((entry/'devices.json').read_text())['devices'][runtime['identifier']]
+          device=sorted((x for x in devices if x.get('isAvailable') and 'iPad' in x['name']), key=lambda x:(x['name'],x['udid']))[0]
+          (entry/'selected-simulator.json').write_text(json.dumps({'runtime':runtime,'device':device,'policy':'one UDID; no erase/reboot between variants or repetitions; single test worker'},indent=2))
+          with open(os.environ['GITHUB_ENV'],'a') as env:env.write('C1_SIMULATOR_UDID='+device['udid']+'\n')
+          PY
+      - name: Download and verify the exact retained dependency archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/11758497205" > "$C1_EVIDENCE_ROOT/entry/dependency-artifact.json"
+          python3 - <<'PY'
+          import json, os, pathlib
+          x=json.loads((pathlib.Path(os.environ['C1_EVIDENCE_ROOT'])/'entry/dependency-artifact.json').read_text())
+          assert x['id']==11758497205 and not x['expired']
+          assert x['workflow_run']['id']==38272065310
+          assert x['workflow_run']['head_sha']=='5888a66060b3b272ba84b54e38e6eb9ee27e2be3'
+          assert x['digest']=='sha256:b9378493af7dc1e88a255aabb9fb8bc10a402bf92834139327e389a6a425b054'
+          PY
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/11758497205/zip" > "$RUNNER_TEMP/c1-native-deps.zip"
+          printf '%s  %s\n' b9378493af7dc1e88a255aabb9fb8bc10a402bf92834139327e389a6a425b054 "$RUNNER_TEMP/c1-native-deps.zip" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/c1-native-deps"
+          unzip -q "$RUNNER_TEMP/c1-native-deps.zip" -d "$RUNNER_TEMP/c1-native-deps"
+          manifest=$(find "$RUNNER_TEMP/c1-native-deps" -name native-deps.manifest.txt -type f)
+          test "$(printf '%s\n' "$manifest" | wc -l | tr -d ' ')" = 1
+          cp "$manifest" "$C1_EVIDENCE_ROOT/entry/native-deps.manifest.txt"
+          grep -qx 'Native Output Tree SHA-256: 6030659b9b2824340d07692e6b9a4fad68070bb8538bf9e2c36f587763cb11c5' "$manifest"
+          export EXPECTED_PUBLIC_SHA=5888a66060b3b272ba84b54e38e6eb9ee27e2be3
+          export EXPECTED_CACHE_KEY=$(sed -n 's/^Cache Key: //p' "$manifest")
+          export EXPECTED_MANIFEST_SHA256=$(shasum -a 256 "$manifest" | awk '{print $1}')
+          bash Client/scripts/verify_native_dependency_artifact.sh "$RUNNER_TEMP/c1-native-deps" "$GITHUB_WORKSPACE/Client/ThirdPartyBuild" 2>&1 | tee "$C1_EVIDENCE_ROOT/entry/dependency-verification.log"
+          bash Client/scripts/verify_ios_dependency_artifacts.sh "$GITHUB_WORKSPACE/Client/ThirdPartyBuild/xcframeworks" "$GITHUB_WORKSPACE/Client/ThirdPartyBuild/build" 2>&1 | tee "$C1_EVIDENCE_ROOT/entry/dependency-strict-validation.log"
+      - name: Boot the single matched simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          state=$(xcrun simctl list devices -j | python3 -c 'import json,os,sys; d=json.load(sys.stdin); print(next(x["state"] for group in d["devices"].values() for x in group if x["udid"]==os.environ["C1_SIMULATOR_UDID"]))')
+          if [[ "$state" != Booted ]]; then xcrun simctl boot "$C1_SIMULATOR_UDID"; fi
+          xcrun simctl bootstatus "$C1_SIMULATOR_UDID" -b > "$C1_EVIDENCE_ROOT/entry/simulator-boot.log" 2>&1
+      - name: Matched N0 N1 S1 S2 and ordered-pair diagnostics
+        shell: bash
+        timeout-minutes: 300
+        run: |
+          set -euo pipefail
+          if [[ "$C1_FINAL_QUALIFICATION" == true ]]; then
+            python3 Client/scripts/run_c1_final_qualification.py 2>&1 | tee "$C1_EVIDENCE_ROOT/campaign.stdout-stderr.log"
+          else
+            python3 Client/scripts/run_c1_heap_classification.py 2>&1 | tee "$C1_EVIDENCE_ROOT/campaign.stdout-stderr.log"
+          fi
+      - name: Retain final crash and simulator diagnostics even after failure
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          C1_EVIDENCE_ROOT="${C1_EVIDENCE_ROOT:-$RUNNER_TEMP/c1-native-stability-evidence}"
+          mkdir -p "$C1_EVIDENCE_ROOT/final-diagnostics"
+          if [[ -n "${C1_SIMULATOR_UDID:-}" ]]; then
+            xcrun simctl spawn "$C1_SIMULATOR_UDID" log show --last 10m --style compact > "$C1_EVIDENCE_ROOT/final-diagnostics/simulator-unified.log" 2>&1 || true
+            source="$HOME/Library/Developer/CoreSimulator/Devices/$C1_SIMULATOR_UDID/data/Library/Logs"
+            if [[ -d "$source" ]]; then cp -R "$source" "$C1_EVIDENCE_ROOT/final-diagnostics/simulator-logs"; fi
+          fi
+          if [[ -d "$HOME/Library/Logs/DiagnosticReports" ]]; then cp -R "$HOME/Library/Logs/DiagnosticReports" "$C1_EVIDENCE_ROOT/final-diagnostics/host-crash-reports"; fi
+      - name: Always upload native XCTest stability evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: C1-native-stability-${{ github.run_id }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/c1-native-stability-evidence/entry
+            ${{ runner.temp }}/c1-native-stability-evidence/N0
+            ${{ runner.temp }}/c1-native-stability-evidence/N1
+            ${{ runner.temp }}/c1-native-stability-evidence/S1
+            ${{ runner.temp }}/c1-native-stability-evidence/S2
+            ${{ runner.temp }}/c1-native-stability-evidence/sequences
+            ${{ runner.temp }}/c1-native-stability-evidence/full
+            ${{ runner.temp }}/c1-native-stability-evidence/sources/*-source-manifest.json
+            ${{ runner.temp }}/c1-native-stability-evidence/sources/*-test-input-manifest.json
+            ${{ runner.temp }}/c1-native-stability-evidence/final-diagnostics
+            ${{ runner.temp }}/c1-native-stability-evidence/*.json
+            ${{ runner.temp }}/c1-native-stability-evidence/*.txt
+            ${{ runner.temp }}/c1-native-stability-evidence/*.log
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+  c1-extract-reports:
+    if: ${{ !inputs.p1_client_qualification && !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (github.event_name == 'workflow_dispatch' && inputs.c1_native_stability && inputs.c1_extract_reports)) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Require diagnostic-only extraction
+        env:
+          BUILD_IPA: ${{ inputs.build_unsigned_ipa }}
+          RUN_TESTS: ${{ inputs.run_xctest }}
+        run: test "$BUILD_IPA" = false && test "$RUN_TESTS" = false
+      - name: Verify completed diagnostic run identity
+        id: source
+        env:
+          SOURCE_RUN: ${{ inputs.c1_extract_source_run }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$SOURCE_RUN" =~ ^[0-9]+$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" > /tmp/c1-source-run.json
+          python3 - <<'PY'
+          import json, os
+          run=json.load(open('/tmp/c1-source-run.json'))
+          assert str(run['id'])==os.environ['SOURCE_RUN']
+          assert run['status']=='completed' and run['event']=='workflow_dispatch'
+          assert run['head_branch']=='codex/keyboard-v1-validation'
+          assert run['path']=='.github/workflows/ios-public-ci.yml'
+          with open(os.environ['GITHUB_OUTPUT'],'a') as output: output.write('sha='+run['head_sha']+'\n')
+          PY
+      - name: Download the exact retained completed native evidence
+        uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.c1_extract_source_run }}
+          name: C1-native-stability-${{ inputs.c1_extract_source_run }}-${{ steps.source.outputs.sha }}
+          path: /tmp/c1-retained
+      - name: Extract exact diagnostic reports and preserve source hashes
+        run: |
+          python3 - <<'PY'
+          import pathlib, hashlib, json, shutil
+          root=pathlib.Path('/tmp/c1-retained'); out=pathlib.Path('/tmp/c1-reports'); out.mkdir()
+          manifest=[]; observed=set()
+          for file in sorted(root.rglob('*')):
+              if not file.is_file() or 'symbols' in file.relative_to(root).parts: continue
+              relative=file.relative_to(root)
+              if file.suffix not in ['.json','.log','.txt','.ips','.crash']: continue
+              if file.stat().st_size > 8_000_000: continue
+              data=file.read_bytes(); sha=hashlib.sha256(data).hexdigest()
+              if file.suffix in ['.ips','.crash']:
+                  destination=out/'crashes'/(sha+file.suffix)
+              else: destination=out/relative
+              destination.parent.mkdir(parents=True,exist_ok=True)
+              if not destination.exists(): destination.write_bytes(data)
+              manifest.append({'source':str(relative),'retained':str(destination.relative_to(out)),'sourceSha256':sha,'bytes':len(data)})
+              if file.name in ['classification.json','xcresult-summary.json.log']:
+                  print('=== REPORT '+str(relative)+' ===',flush=True)
+                  print(data.decode('utf-8',errors='replace')[:24000],flush=True)
+              if file.suffix in ['.ips','.crash'] and sha not in observed:
+                  observed.add(sha)
+                  text=data.decode('utf-8',errors='replace')
+                  if 'iPadCasting' in text:
+                      print('=== CRASH '+str(relative)+' SHA256 '+sha+' ===',flush=True)
+                      print(text[:50000],flush=True)
+          (out/'retained-source-manifest.json').write_text(json.dumps(manifest,indent=2))
+          print('Retained',len(manifest),'reports;',len(observed),'unique crash reports',flush=True)
+          PY
+      - name: Retain the small exact diagnostic report bundle
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: C1-extracted-reports-${{ inputs.c1_extract_source_run }}-${{ github.run_id }}
+          path: /tmp/c1-reports
+          if-no-files-found: error
+          retention-days: 14
+
+  g02-native-dependencies-only:
+    if: ${{ !inputs.p1_client_qualification && !inputs.g02_consumer_provenance_only && (github.event_name == 'workflow_dispatch' && inputs.g02_dependencies_only) }}
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    env:
+      SCREENCASTING_DEP_CACHE: ${{ github.workspace }}/Client/ThirdPartyBuild
+      IPHONEOS_DEPLOYMENT_TARGET: '17.0'
+      PUBLIC_SHA: ${{ github.sha }}
+      CACHE_SCHEMA: g02-v1
+      OPENSSL_PIN: openssl-3.5.7-8cf17aaeb4599f8af87fefd810b5b5fee90fe69e
+      LIBSRTP_PIN: 24b3bf8f19b6f5ab4cd2bcceb4f4064efca86fd5
+      OPUS_PIN: ddbe48383984d56acd9e1ab6a090c54ca6b735a6
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 4
+      - name: Pin Xcode and retain toolchain identity
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          { xcodebuild -version; xcode-select -p; xcrun --sdk iphoneos --show-sdk-version; xcrun --sdk iphonesimulator --show-sdk-version; xcrun clang --version; cmake --version; uname -a; } | tee evidence/toolchain.txt
+          test "$(xcrun --sdk iphonesimulator --show-sdk-version)" = '18.5'
+          echo "XCODE_FINGERPRINT=$(shasum -a 256 evidence/toolchain.txt | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "CACHE_KEY=g02-${GITHUB_SHA}-openssl-3.5.7" >> "$GITHUB_ENV"
+      - name: Pin contract RED then GREEN
+        run: |
+          set -euo pipefail
+          git show d47f6d976660ffe3944363d50d296d55d763c3a6:Client/scripts/build_ios_dependencies.sh > evidence/builder-before.sh
+          set +e
+          python3 Client/scripts/test_g02_dependency_pin.py evidence/builder-before.sh > evidence/pin-RED.log 2>&1
+          red=$?
+          set -e
+          test "$red" = 1
+          grep -F 'FAILED (failures=1)' evidence/pin-RED.log
+          python3 Client/scripts/test_g02_dependency_pin.py 2>&1 | tee evidence/pin-GREEN.log
+      - name: Build exact pinned native inputs without cache reuse
+        run: |
+          set -euo pipefail
+          test ! -e Client/ThirdPartyBuild
+          bash Client/scripts/build_ios_dependencies.sh 2>&1 | tee evidence/native-build.log
+      - name: Retain source identities and file hashes
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,subprocess
+          root=pathlib.Path('Client/ThirdPartyBuild')
+          pins={'openssl':'8cf17aaeb4599f8af87fefd810b5b5fee90fe69e','libsrtp':'24b3bf8f19b6f5ab4cd2bcceb4f4064efca86fd5','opus':'ddbe48383984d56acd9e1ab6a090c54ca6b735a6'}
+          for name,expected in pins.items():
+              actual=subprocess.check_output(['git','-C',str(root/'src'/name),'rev-parse','HEAD'],text=True).strip()
+              assert actual==expected,(name,actual,expected)
+          scripts=['build_ios_dependencies.sh','test_g02_dependency_pin.py','verify_ios_dependency_artifacts.sh','compute_native_dependency_manifest.sh','native_dependency_helpers.sh']
+          inputs={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in [pathlib.Path('Client/scripts')/s for s in scripts]+[pathlib.Path('.github/workflows/g02-native-dependencies.yml')]}
+          files={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for base in ['build','xcframeworks'] for p in sorted((root/base).rglob('*')) if p.is_file()}
+          data={'publicSha':os.environ['GITHUB_SHA'],'canonicalAuthority':'573b3d7dfd2818c37ac39d10fe03f1c8e3988bbf','pins':pins,'buildInputSha256':inputs,'nativeFileSha256':files,'applicationBuild':'NOT_RUN','ipa':'NOT_CREATED'}
+          pathlib.Path('evidence/provenance.json').write_text(json.dumps(data,indent=2))
+          PY
+      - name: Strict native verification and export artifact
+        run: |
+          set -euo pipefail
+          bash Client/scripts/verify_ios_dependency_artifacts.sh "$SCREENCASTING_DEP_CACHE/xcframeworks" "$SCREENCASTING_DEP_CACHE/build" 2>&1 | tee evidence/native-verify.log
+          rm -rf "$SCREENCASTING_DEP_CACHE/src"
+          bash Client/scripts/compute_native_dependency_manifest.sh "$SCREENCASTING_DEP_CACHE" evidence/native-deps.manifest.txt
+          tar -czf evidence/G02-native-deps-openssl-3.5.7.tar.gz Client/ThirdPartyBuild/build Client/ThirdPartyBuild/xcframeworks
+          shasum -a 256 evidence/G02-native-deps-openssl-3.5.7.tar.gz > evidence/G02-native-deps-openssl-3.5.7.tar.gz.sha256
+      - name: Retain qualification evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: G02-native-dependencies-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30
+
+  g02-consumer-provenance-only:
+    if: ${{ !inputs.p1_client_qualification && github.event_name == 'workflow_dispatch' && inputs.g02_consumer_provenance_only && !inputs.g02_dependencies_only && !inputs.c1_native_stability }}
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Pin diagnostic consumer toolchain
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+      - name: Test isolated diagnostic contract only
+        run: python3 -B Client/scripts/test_g02_native_consumer_attestation.py
+      - name: Acquire exact producer metadata and envelope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: lammach99-oss/ScreenCasting-iOS
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/g02-consumer-diagnostic"
+          test ! -e "$out"
+          mkdir "$out"
+          gh api --method GET repos/lammach99-oss/ScreenCasting-iOS/actions/artifacts/12091540222 > "$out/artifact.json"
+          gh api --method GET repos/lammach99-oss/ScreenCasting-iOS/actions/runs/39005711789 > "$out/run.json"
+          gh api --method GET repos/lammach99-oss/ScreenCasting-iOS/actions/artifacts/12091540222/zip > "$out/artifact.zip"
+      - name: Verify diagnostic evidence without staging or building
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/g02-consumer-diagnostic"
+          python3 -B Client/scripts/verify_g02_native_consumer_attestation.py \
+            --artifact-zip "$out/artifact.zip" --artifact-metadata "$out/artifact.json" \
+            --run-metadata "$out/run.json" --consumer-sha "$GITHUB_SHA" \
+            --consumer-root "$GITHUB_WORKSPACE" --output "$out/consumer-diagnostic.json"
+      - name: Retain diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: G02-consumer-diagnostic-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/g02-consumer-diagnostic/*.json
+          if-no-files-found: error
+          retention-days: 30
+
+  p1-client-qualification:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.p1_client_qualification }}
+    permissions:
+      contents: read
+      actions: read
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+      - name: Acquire exact qualified G02 dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/producer
+          gh api repos/lammach99-oss/ScreenCasting-iOS/actions/artifacts/12091540222 > evidence/producer/artifact.json
+          gh api repos/lammach99-oss/ScreenCasting-iOS/actions/runs/39005711789 > evidence/producer/run.json
+          gh api repos/lammach99-oss/ScreenCasting-iOS/actions/artifacts/12091540222/zip > evidence/producer/artifact.zip
+          python3 Client/scripts/p1_native_qualification.py prepare
+      - name: Build and qualify immutable Client snapshot
+        env:
+          P1_SELECTORS: ${{ inputs.xctest_filter }}
+        run: |
+          if [ "${{ inputs.p1_production_ipa }}" = true ]; then
+            python3 Client/scripts/p1_native_qualification.py package
+          else
+            python3 Client/scripts/p1_native_qualification.py test
+          fi
+      - uses: actions/upload-artifact@v4
+        if: success() && inputs.p1_production_ipa
+        with:
+          name: ScreenCasting-production-unsigned-${{ github.run_id }}
+          path: evidence/production-package
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: P1-Client-native-${{ github.run_id }}
+          path: evidence
+          retention-days: 14
