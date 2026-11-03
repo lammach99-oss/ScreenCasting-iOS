@@ -62,11 +62,19 @@ public struct SessionPanelSnapshot: Equatable {
     public let control: ScreenPickerSnapshot.Control
     public let reconnecting: Bool
     public let icon: Icon
-    public var reconnectingText: String { "" }
+    public var reconnectingText: String { "Reconnecting to \(hostLabel)…" }
 
+    /// `transport` is the transfer snapshot's label; anything but "Wi-Fi" or "USB-C" means not known yet.
     public static func make(hostLabel: String?, transport: String, connection: ConnectionState,
                             control: ScreenPickerSnapshot.Control, mirrorLabel: String?) -> Self {
-        Self(title: "", hostLabel: "", transport: nil, isMirror: false, control: control, reconnecting: false, icon: .extended)
+        let trimmed = hostLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let host = trimmed.isEmpty ? "Your PC" : trimmed
+        let isMirror = control != .unavailable
+        let icon: Icon = !isMirror ? .extended
+            : mirrorLabel.map(ScreenPickerSnapshot.isBuiltIn) == true ? .laptop : .monitor
+        return Self(title: isMirror ? mirrorLabel ?? host : host, hostLabel: host,
+                    transport: ["Wi-Fi", "USB-C"].contains(transport) ? transport : nil,
+                    isMirror: isMirror, control: control, reconnecting: connection != .streaming, icon: icon)
     }
 }
 
@@ -75,7 +83,13 @@ public struct DisconnectArming: Equatable {
     public static let window: TimeInterval = 4
     private var armedAt: Date?
     public init() {}
-    public func isArmed(at now: Date) -> Bool { false }
-    public mutating func tap(at now: Date) -> Bool { false }
-    public mutating func reset() {}
+    public func isArmed(at now: Date) -> Bool {
+        armedAt.map { now.timeIntervalSince($0) <= Self.window } ?? false
+    }
+    public mutating func tap(at now: Date) -> Bool {
+        if isArmed(at: now) { armedAt = nil; return true }
+        armedAt = now
+        return false
+    }
+    public mutating func reset() { armedAt = nil }
 }

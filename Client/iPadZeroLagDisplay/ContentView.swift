@@ -288,6 +288,10 @@ public struct ContentView: View {
     @State private var presentationGeometry: PresentationSurfaceGeometry?
     @State private var lastGeometrySnapshotLine = ""
     @State private var isSettingsPresented = false
+    @State private var isTransferPresented = false
+    @State private var isSessionPanelOpen = false
+    /// What the session pill calls the PC: the discovered name or typed address of the last connect.
+    @AppStorage("ScreenCasting.client.lastHostLabel") private var lastHostLabel = ""
     @State private var rootSurfaceSize: CGSize = .zero
 
     public init() {
@@ -386,15 +390,24 @@ public struct ContentView: View {
                 break
             }
         }
-        .onChange(of: isSettingsPresented) { _, open in
+        .onChange(of: isSheetPresented) { _, open in
             networkManager.setMirrorInputSettingsPresented(open)
+        }
+        .onChange(of: streamManager.isConnected) { _, connected in
+            if !connected { isSessionPanelOpen = false }
         }
         .sheet(isPresented: $isSettingsPresented) {
             SettingsView(networkManager: networkManager)
         }
+        .sheet(isPresented: $isTransferPresented) {
+            TransferCenterSheet(networkManager: networkManager)
+        }
     }
 
     // MARK: - Computed Helpers
+
+    /// Settings and File Transfer both pause local input to the PC while they cover the stream.
+    private var isSheetPresented: Bool { isSettingsPresented || isTransferPresented }
 
     private var isHostIdentityPhase: Bool {
         networkManager.connectionState == .awaitingHostIdentity
@@ -480,7 +493,7 @@ public struct ContentView: View {
             ConnectedPresentationSurface(
                 networkManager: networkManager,
                 gameModeEnabled: gameModeEnabled,
-                remoteKeyboardActive: streamManager.isConnected && scenePhase == .active && !isSettingsPresented,
+                remoteKeyboardActive: streamManager.isConnected && scenePhase == .active && !isSheetPresented,
                 onKeyboardInput: { command in
                     networkManager.sendKeyboardInput(command)
                 },
@@ -521,7 +534,8 @@ public struct ContentView: View {
                     networkManager.sendPointerInput(command)
                 },
                 onOpenSettings: {
-                    isSettingsPresented = true
+                    // The 3-finger tap opens the session panel; Settings is one tap inside it.
+                    isSessionPanelOpen = true
                 })
                 .frame(width: frame.width, height: frame.height)
                 .offset(x: frame.minX, y: frame.minY)
@@ -583,8 +597,12 @@ public struct ContentView: View {
         if streamManager.isConnected {
             ZStack {
                 streamingHUD
-                // Only while mirroring a physical monitor; renders nothing otherwise.
-                ScreenPickerOverlay(networkManager: networkManager)
+                SessionPanelOverlay(
+                    networkManager: networkManager,
+                    hostLabel: lastHostLabel,
+                    isOpen: $isSessionPanelOpen,
+                    onFiles: { isTransferPresented = true },
+                    onSettings: { isSettingsPresented = true })
             }
         } else {
             disconnectedDashboard
@@ -806,8 +824,10 @@ public struct ContentView: View {
 
             Button(action: {
                 if useUSBMode {
+                    lastHostLabel = ""
                     networkManager.startListening(port: 42042)
                 } else {
+                    lastHostLabel = normalizedManualHost
                     networkManager.connect(to: normalizedManualHost)
                 }
             }) {
@@ -863,6 +883,7 @@ public struct ContentView: View {
                         ForEach(discoveryManager.discoveredHosts) { host in
                             Button(action: {
                                 enteredPIN = ""
+                                lastHostLabel = host.name
                                 networkManager.connect(to: host.endpoint)
                             }) {
                                 HStack(spacing: 12) {
@@ -910,38 +931,38 @@ public struct ContentView: View {
                         HStack(spacing: 16) {
                             // FPS Pill
                             HStack(spacing: 6) {
-                                Circle().fill(Color.green).frame(width: 8, height: 8)
-                                    .symbolEffect(.pulse, options: .repeating)
+                                Circle().fill(Color(uiColor: SessionInk.secondary)).frame(width: 6, height: 6)
                                 Text(String(format: "%.1f FPS", streamManager.currentFPS))
                                     .font(.system(size: 13, weight: .bold, design: .monospaced))
                             }
-                            Color.white.opacity(0.2).frame(width: 1, height: 14)
+                            Color(uiColor: SessionInk.hairline).frame(width: 1, height: 14)
                             // This is a local receive-stage measurement, not RTT/ping.
                             HStack(spacing: 6) {
                                 Image(systemName: "gauge.with.needle.fill")
-                                    .foregroundColor(.orange).font(.system(size: 12))
+                                    .foregroundColor(Color(uiColor: SessionInk.secondary)).font(.caption)
                                 VStack(alignment: .leading, spacing: 0) {
                                     Text(String(format: "%.1f ms", streamManager.frameReceiveMs))
                                     Text("Frame receive")
-                                        .font(.system(size: 8, weight: .medium))
-                                        .foregroundColor(.white.opacity(0.65))
+                                        .font(.caption2)
+                                        .foregroundColor(Color(uiColor: SessionInk.secondary))
                                 }
                                     .font(.system(size: 13, weight: .bold, design: .monospaced))
                             }
-                            Color.white.opacity(0.2).frame(width: 1, height: 14)
+                            Color(uiColor: SessionInk.hairline).frame(width: 1, height: 14)
                             VStack(alignment: .leading, spacing: 0) {
                                 Text(String(format: "%.1f Mbps", networkManager.hudTelemetry.videoRxMbps))
                                     .font(.system(size: 13, weight: .bold, design: .monospaced))
                                 Text("Video RX")
-                                    .font(.system(size: 8, weight: .medium))
-                                    .foregroundColor(.white.opacity(0.65))
+                                    .font(.caption2)
+                                    .foregroundColor(Color(uiColor: SessionInk.secondary))
                             }
                         }
-                        .foregroundColor(.white)
+                        .foregroundColor(Color(uiColor: SessionInk.text))
                         .padding(.horizontal, 16).padding(.vertical, 10)
-                        .background(.ultraThinMaterial).cornerRadius(18)
-                        .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.white.opacity(0.12), lineWidth: 1))
-                        .shadow(color: .black.opacity(0.15), radius: 6, x: 0, y: 3)
+                        .background(Color(uiColor: SessionInk.surface).opacity(0.94),
+                                    in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .stroke(Color(uiColor: SessionInk.hairline), lineWidth: 0.5))
                         .padding(.top, 16).padding(.trailing, 16)
                     }
                     Spacer()

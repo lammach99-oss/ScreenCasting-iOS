@@ -203,8 +203,10 @@ final class KeyboardHintLabel: UILabel {
         numberOfLines = 0
         font = .preferredFont(forTextStyle: .footnote)
         adjustsFontForContentSizeCategory = true
-        textColor = .white
-        backgroundColor = UIColor.black.withAlphaComponent(0.78)
+        textColor = SessionInk.text
+        backgroundColor = SessionInk.surface.withAlphaComponent(0.96)
+        layer.borderColor = SessionInk.hairline.cgColor
+        layer.borderWidth = 0.5
         layer.cornerRadius = 12
         clipsToBounds = true
     }
@@ -311,10 +313,12 @@ public final class ConnectedPresentationContainer: UIView {
         softwareTextView.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
         addSubview(softwareTextView)
         keyboardButton.setImage(UIImage(systemName: "keyboard"), for: .normal)
-        keyboardButton.backgroundColor = UIColor.black.withAlphaComponent(0.6)
-        keyboardButton.tintColor = .white
+        keyboardButton.backgroundColor = SessionInk.surface.withAlphaComponent(0.94)
+        keyboardButton.tintColor = SessionInk.text
+        keyboardButton.layer.borderColor = SessionInk.hairline.cgColor
+        keyboardButton.layer.borderWidth = 0.5
         keyboardButton.layer.cornerRadius = 12
-        keyboardButton.accessibilityLabel = "Software keyboard"
+        keyboardButton.accessibilityLabel = "Keyboard"
         keyboardButton.addTarget(self, action: #selector(toggleSoftwareKeyboard(_:forEvent:)), for: .touchUpInside)
         keyboardButton.isHidden = true
         softwareTextView.onEmission = { [weak self] emission in
@@ -350,6 +354,9 @@ public final class ConnectedPresentationContainer: UIView {
                 MainActor.assumeIsolated { self?.handleKeyboardNotification(note) }
             })
         }
+        keyboardObservers.append(NotificationCenter.default.addObserver(forName: .sessionPanelToggleKeyboard, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.toggleSoftwareKeyboard(source: .panel) }
+        })
 
         // The container owns the one runtime rectangle used by both surfaces.
         // Explicit edge constraints prevent UIKit from retaining a provisional
@@ -493,7 +500,10 @@ public final class ConnectedPresentationContainer: UIView {
         touchView.diagnosticSink?(line)
     }
     @objc private func toggleSoftwareKeyboard(_ sender: UIButton, forEvent event: UIEvent?) {
-        lastKeyboardTapSource = KeyboardTapSource(touchType: event?.allTouches?.first?.type)
+        toggleSoftwareKeyboard(source: KeyboardTapSource(touchType: event?.allTouches?.first?.type))
+    }
+    private func toggleSoftwareKeyboard(source: KeyboardTapSource) {
+        lastKeyboardTapSource = source
         guard keyboardMode != .none else {
             recordKeyboardAuthority(reason: "software_toggle_blocked")
             return
