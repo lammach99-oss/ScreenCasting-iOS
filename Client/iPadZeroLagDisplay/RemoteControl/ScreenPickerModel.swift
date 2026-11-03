@@ -78,6 +78,18 @@ public struct SessionPanelSnapshot: Equatable {
     }
 }
 
+public extension SessionPanelSnapshot {
+    /// The PC to name in the pill. RED stub.
+    static func sessionHost(current: String, lastWifi: String, usb: Bool) -> String { current }
+}
+
+/// Full pill, or a slim handle that keeps the top of the PC picture clear. RED stub.
+public enum SessionPillPresentation: Equatable {
+    case full, handle
+    public static let idleDelay: TimeInterval = 3
+    public static func make(isOpen: Bool, idleFor: TimeInterval, reconnecting: Bool) -> Self { .full }
+}
+
 /// Disconnect asks once inline: the first tap arms it, a second tap within the window confirms.
 public struct DisconnectArming: Equatable {
     public static let window: TimeInterval = 4

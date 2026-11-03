@@ -69,4 +69,47 @@ final class SessionPanelTests: XCTestCase {
         if before != .none { XCTAssertEqual(container.keyboardMode, .softwareOpen) }
         container.retireRemoteKeyboard()
     }
+
+    // MARK: Pill clears the PC picture
+
+    func testPillShrinksToAHandleWhenIdle() {
+        XCTAssertEqual(SessionPillPresentation.make(isOpen: false, idleFor: 1, reconnecting: false), .full)
+        XCTAssertEqual(SessionPillPresentation.make(isOpen: false, idleFor: 4, reconnecting: false), .handle,
+                       "an idle pill must stop covering the top of the PC screen")
+        XCTAssertEqual(SessionPillPresentation.make(isOpen: true, idleFor: 60, reconnecting: false), .full)
+        XCTAssertEqual(SessionPillPresentation.make(isOpen: false, idleFor: 60, reconnecting: true), .full,
+                       "reconnecting stays readable")
+    }
+
+    func testSessionNamesTheWifiPCWhenTheLabelWasCleared() {
+        XCTAssertEqual(SessionPanelSnapshot.sessionHost(current: "", lastWifi: "ADMINISTRATOR", usb: false), "ADMINISTRATOR")
+        XCTAssertEqual(SessionPanelSnapshot.sessionHost(current: "Lam-PC", lastWifi: "ADMINISTRATOR", usb: false), "Lam-PC")
+        XCTAssertEqual(SessionPanelSnapshot.sessionHost(current: "", lastWifi: "ADMINISTRATOR", usb: true), "",
+                       "a USB-C PC may not be the Wi-Fi one")
+    }
+
+    // MARK: Theme
+
+    func testThemeIsReadable() {
+        for background in [SessionInk.canvas, SessionInk.surface, SessionInk.raised] {
+            XCTAssertGreaterThanOrEqual(SessionInk.contrast(SessionInk.text, background), 7)
+            XCTAssertGreaterThanOrEqual(SessionInk.contrast(SessionInk.secondary, background), 4.5)
+            XCTAssertGreaterThanOrEqual(SessionInk.contrast(SessionInk.accent, background), 3)
+            for tone in [SessionInk.positive, SessionInk.warning, SessionInk.danger] {
+                XCTAssertGreaterThanOrEqual(SessionInk.contrast(tone, background), 4.5)
+            }
+        }
+        XCTAssertGreaterThanOrEqual(SessionInk.contrast(SessionInk.onAccent, SessionInk.accent), 4.5)
+        XCTAssertGreaterThanOrEqual(SessionInk.contrast(SessionInk.onDanger, SessionInk.dangerFill), 4.5)
+    }
+
+    func testThemeIsNotGreyOnly() {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        for ink in [SessionInk.canvas, SessionInk.surface, SessionInk.raised] {
+            ink.getRed(&r, green: &g, blue: &b, alpha: &a)
+            XCTAssertGreaterThan(b - r, 0.03, "surfaces carry the midnight hue, not neutral grey")
+        }
+        SessionInk.accent.getRed(&r, green: &g, blue: &b, alpha: &a)
+        XCTAssertGreaterThan(b - r, 0.25, "one saturated accent for main actions")
+    }
 }
