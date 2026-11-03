@@ -7,6 +7,7 @@ enum SessionInk {
         UIColor(red: CGFloat((hex >> 16) & 0xFF) / 255, green: CGFloat((hex >> 8) & 0xFF) / 255,
                 blue: CGFloat(hex & 0xFF) / 255, alpha: 1)
     }
+    static let canvas = rgb(0x0F0F0F)
     static let surface = rgb(0x171717)
     static let raised = rgb(0x262625)
     static let hairline = rgb(0x3A3A38)

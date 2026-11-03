@@ -32,6 +32,17 @@ struct ShakeEffect: GeometryEffect {
 
 // MARK: - PIN Entry Overlay
 
+private extension Color {
+    static let inkCanvas = Color(uiColor: SessionInk.canvas)
+    static let inkSurface = Color(uiColor: SessionInk.surface)
+    static let inkRaised = Color(uiColor: SessionInk.raised)
+    static let inkHairline = Color(uiColor: SessionInk.hairline)
+    static let inkText = Color(uiColor: SessionInk.text)
+    static let inkSecondary = Color(uiColor: SessionInk.secondary)
+    static let inkWarning = Color(uiColor: SessionInk.warning)
+    static let inkDanger = Color(uiColor: SessionInk.danger)
+}
+
 struct PINEntryView: View {
     @Binding var pin: String
     let authFailed: Bool
@@ -44,49 +55,34 @@ struct PINEntryView: View {
 
     var body: some View {
         ZStack {
-            // Blurred background
             Color.black.opacity(0.7)
                 .ignoresSafeArea()
                 .onTapGesture { } // Consume taps to block dismissal
 
-            VStack(spacing: 28) {
-
-                // Header
-                VStack(spacing: 10) {
-                    Image(systemName: "lock.shield.fill")
-                        .font(.system(size: 48))
-                        .foregroundStyle(
-                            LinearGradient(colors: [.blue, .purple],
-                                           startPoint: .topLeading,
-                                           endPoint: .bottomTrailing)
-                        )
-
-                    Text("Enter Pairing PIN")
-                        .font(.system(size: 26, weight: .bold, design: .rounded))
-                        .foregroundColor(.white)
-
-                    Text("Enter the 4-digit PIN displayed\non your Windows PC.")
-                        .font(.system(size: 14))
+            VStack(spacing: 24) {
+                VStack(spacing: 8) {
+                    Image(systemName: "lock.shield")
+                        .font(.system(size: 40))
+                        .foregroundStyle(Color.inkText)
+                        .accessibilityHidden(true)
+                    Text("Enter pairing PIN")
+                        .font(.title2.weight(.semibold))
+                        .foregroundStyle(Color.inkText)
+                    Text("Type the 4-digit PIN shown on your Windows PC.")
+                        .font(.subheadline)
                         .multilineTextAlignment(.center)
-                        .foregroundColor(.white.opacity(0.6))
+                        .foregroundStyle(Color.inkSecondary)
                 }
 
-                // PIN Dots Indicator
                 HStack(spacing: 20) {
                     ForEach(0..<4, id: \.self) { index in
                         ZStack {
                             Circle()
-                                .stroke(
-                                    index < pin.count
-                                        ? Color.blue
-                                        : Color.white.opacity(0.25),
-                                    lineWidth: 2
-                                )
+                                .stroke(index < pin.count ? Color.inkText : Color.inkHairline, lineWidth: 2)
                                 .frame(width: 22, height: 22)
-
                             if index < pin.count {
                                 Circle()
-                                    .fill(Color.blue)
+                                    .fill(Color.inkText)
                                     .frame(width: 12, height: 12)
                                     .transition(.scale.combined(with: .opacity))
                             }
@@ -95,6 +91,8 @@ struct PINEntryView: View {
                     }
                 }
                 .modifier(ShakeEffect(animatableData: shakeAttempts))
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(pin.count) of 4 digits entered")
 
                 // Invisible SecureField capturing keyboard input
                 SecureField("", text: $pin)
@@ -102,79 +100,60 @@ struct PINEntryView: View {
                     .focused($isFocused)
                     .frame(width: 1, height: 1)
                     .opacity(0.01)
+                    .accessibilityLabel("PIN")
                     .onChange(of: pin) { _, newValue in
-                        // Clamp to 4 digits only
                         if newValue.count > 4 {
                             pin = String(newValue.prefix(4))
                         }
-                        // Remove non-numeric characters
                         let filtered = newValue.filter(\.isNumber)
                         if filtered != newValue { pin = filtered }
                     }
 
-                // Tap-to-focus hint button (also auto-focuses on appear)
                 Button(action: { isFocused = true }) {
-                    Text("Tap here to type PIN")
-                        .font(.system(size: 13))
-                        .foregroundColor(.white.opacity(0.35))
+                    Text("Show the number pad")
+                        .font(.footnote)
+                        .foregroundStyle(Color.inkSecondary)
+                        .frame(minHeight: 44)
                 }
 
-                // Error message
                 if authFailed {
-                    HStack(spacing: 6) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.red)
-                            .font(.system(size: 13))
-                        Text(failureReason)
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundColor(.red.opacity(0.9))
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .background(Color.red.opacity(0.12))
-                    .cornerRadius(10)
-                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                    Label(failureReason, systemImage: "exclamationmark.triangle")
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(Color.inkDanger)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(Color.inkDanger.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .transition(.opacity.combined(with: .scale(scale: 0.95)))
                 }
 
-                // Action Buttons
-                VStack(spacing: 12) {
+                VStack(spacing: 8) {
                     Button(action: onSubmit) {
                         Text("Confirm PIN")
-                            .font(.system(size: 16, weight: .semibold, design: .rounded))
-                            .foregroundColor(.white)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 14)
-                            .background(
-                                pin.count == 4
-                                    ? LinearGradient(colors: [.blue, .purple],
-                                                     startPoint: .leading,
-                                                     endPoint: .trailing)
-                                    : LinearGradient(colors: [.gray.opacity(0.4), .gray.opacity(0.3)],
-                                                     startPoint: .leading,
-                                                     endPoint: .trailing)
-                            )
-                            .cornerRadius(14)
+                            .font(.headline)
+                            .foregroundStyle(pin.count == 4 ? Color.inkSurface : Color.inkSecondary)
+                            .frame(maxWidth: .infinity, minHeight: 50)
+                            .background(pin.count == 4 ? Color.inkText : Color.inkRaised,
+                                        in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
                     .disabled(pin.count != 4)
                     .animation(.easeInOut(duration: 0.2), value: pin.count)
 
                     Button(action: onCancel) {
                         Text("Cancel")
-                            .font(.system(size: 14))
-                            .foregroundColor(.white.opacity(0.45))
+                            .font(.subheadline)
+                            .foregroundStyle(Color.inkSecondary)
+                            .frame(maxWidth: .infinity, minHeight: 44)
                     }
                 }
             }
-            .padding(32)
-            .frame(maxWidth: 340)
-            .background(.ultraThinMaterial)
-            .cornerRadius(28)
-            .overlay(
-                RoundedRectangle(cornerRadius: 28)
-                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
-            )
+            .padding(28)
+            .frame(maxWidth: 360)
+            .background(Color.inkSurface, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(Color.inkHairline, lineWidth: 0.5))
             .shadow(color: .black.opacity(0.4), radius: 30, x: 0, y: 10)
+            .accessibilityAddTraits(.isModal)
         }
+        .dynamicTypeSize(...DynamicTypeSize.accessibility2)
         .onAppear {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 isFocused = true
@@ -207,56 +186,54 @@ struct HostIdentityConfirmationView: View {
                 .ignoresSafeArea()
                 .onTapGesture { }
 
-            VStack(spacing: 24) {
-                VStack(spacing: 10) {
-                    Image(systemName: "checkmark.shield.fill")
-                        .font(.system(size: 48))
-                        .foregroundStyle(.yellow)
-                    Text("Verify Windows Host")
-                        .font(.system(size: 26, weight: .bold, design: .rounded))
-                        .foregroundColor(.white)
-                    Text("Compare this code with the Host security panel.\nOnly continue when they match.")
-                        .font(.system(size: 14))
+            VStack(spacing: 22) {
+                VStack(spacing: 8) {
+                    Image(systemName: "checkmark.shield")
+                        .font(.system(size: 40))
+                        .foregroundStyle(Color.inkWarning)
+                        .accessibilityHidden(true)
+                    Text("Verify your Windows PC")
+                        .font(.title2.weight(.semibold))
+                        .foregroundStyle(Color.inkText)
+                    Text("Compare this code with the one on the PC. Continue only if they match.")
+                        .font(.subheadline)
                         .multilineTextAlignment(.center)
-                        .foregroundColor(.white.opacity(0.65))
+                        .foregroundStyle(Color.inkSecondary)
                 }
 
                 Text(identityCode)
-                    .font(.system(size: 25, weight: .bold, design: .monospaced))
-                    .foregroundColor(.yellow)
+                    .font(.system(.title2, design: .monospaced).weight(.bold))
+                    .foregroundStyle(Color.inkWarning)
                     .tracking(1.5)
                     .padding(.vertical, 16)
                     .frame(maxWidth: .infinity)
-                    .background(Color.yellow.opacity(0.12))
-                    .cornerRadius(12)
+                    .background(Color.inkWarning.opacity(0.12), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .accessibilityLabel("Identity code \(identityCode)")
 
-                VStack(spacing: 12) {
+                VStack(spacing: 8) {
                     Button(action: onConfirm) {
-                        Text("I Verified the Host")
-                            .font(.system(size: 16, weight: .semibold, design: .rounded))
-                            .foregroundColor(.black)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 14)
-                            .background(Color.yellow)
-                            .cornerRadius(14)
+                        Text("The codes match")
+                            .font(.headline)
+                            .foregroundStyle(Color.inkSurface)
+                            .frame(maxWidth: .infinity, minHeight: 50)
+                            .background(Color.inkText, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
                     Button(action: onCancel) {
                         Text("Cancel")
-                            .font(.system(size: 14))
-                            .foregroundColor(.white.opacity(0.45))
+                            .font(.subheadline)
+                            .foregroundStyle(Color.inkSecondary)
+                            .frame(maxWidth: .infinity, minHeight: 44)
                     }
                 }
             }
-            .padding(32)
-            .frame(maxWidth: 340)
-            .background(.ultraThinMaterial)
-            .cornerRadius(28)
-            .overlay(
-                RoundedRectangle(cornerRadius: 28)
-                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
-            )
+            .padding(28)
+            .frame(maxWidth: 360)
+            .background(Color.inkSurface, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(Color.inkHairline, lineWidth: 0.5))
             .shadow(color: .black.opacity(0.4), radius: 30, x: 0, y: 10)
+            .accessibilityAddTraits(.isModal)
         }
+        .dynamicTypeSize(...DynamicTypeSize.accessibility2)
     }
 }
 
@@ -276,7 +253,14 @@ public struct ContentView: View {
     @State private var enteredPIN: String = ""
     @State private var showConnectSheet: Bool = false
     @State private var hostIP: String = ""
-    @State private var useUSBMode: Bool = false
+    @State private var showIPEntry = false
+    @State private var copiedIP = false
+    /// The current attempt is USB-C, so the status line never borrows the last Wi-Fi PC.
+    @State private var usbChosen = false
+    @State private var isWifiBrowsing = false
+    @Environment(\.dynamicTypeSize) private var typeSize
+    /// The last Wi-Fi PC by name or typed address; Reconnect uses the matching saved target.
+    @AppStorage("ScreenCasting.client.lastWifiHostLabel") private var lastWifiHostLabel = ""
 
     // UI States
     @AppStorage(ClientPreferenceKeys.showPerformanceHUD)
@@ -327,7 +311,7 @@ public struct ContentView: View {
         }
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
-            discoveryManager.startBrowsing()
+            setWifiBrowsing(true)
             networkManager.setDesiredPipelineMode(
                 gameModeEnabled ? .game : .office)
             networkManager.applicationDidBecomeActive()
@@ -338,7 +322,7 @@ public struct ContentView: View {
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
-            discoveryManager.stopBrowsing()
+            setWifiBrowsing(false)
         }
         .animation(.easeInOut(duration: 0.3), value: streamManager.isConnected)
         // PIN entry overlay: shown when awaiting PIN or after auth failure
@@ -350,6 +334,7 @@ public struct ContentView: View {
                         networkManager.confirmHostIdentity()
                     },
                     onCancel: {
+                        enteredPIN = ""
                         networkManager.stop()
                     }
                 )
@@ -364,6 +349,7 @@ public struct ContentView: View {
                         networkManager.sendAuthPIN(enteredPIN)
                     },
                     onCancel: {
+                        enteredPIN = ""
                         networkManager.stop()
                     }
                 )
@@ -376,6 +362,11 @@ public struct ContentView: View {
             if newState == .awaitingPIN, enteredPIN.count == 4 {
                 networkManager.sendAuthPIN(enteredPIN)
             }
+            if newState == .streaming { enteredPIN = "" }
+            updateWifiBrowsing(for: newState)
+        }
+        .onChange(of: connectStatus.text) { _, text in
+            if !streamManager.isConnected { UIAccessibility.post(notification: .announcement, argument: text) }
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -466,17 +457,8 @@ public struct ContentView: View {
         if streamManager.isConnected {
             connectedVideoSurface
         } else {
-            // Premium Disconnected Background
-            RadialGradient(
-                gradient: Gradient(colors: [
-                    Color(red: 0.10, green: 0.15, blue: 0.28),
-                    Color(red: 0.05, green: 0.07, blue: 0.12)
-                ]),
-                center: .center,
-                startRadius: 10,
-                endRadius: 600
-            )
-            .ignoresSafeArea()
+            Color.inkCanvas
+                .ignoresSafeArea()
         }
     }
 
@@ -611,312 +593,290 @@ public struct ContentView: View {
 
     // MARK: - Disconnected Dashboard
 
+    private var connectStatus: ConnectScreenStatus {
+        .make(state: networkManager.connectionState,
+              pcName: lastHostLabel.isEmpty ? lastWifiHostLabel : lastHostLabel,
+              discoveredCount: discoveryManager.discoveredHosts.count,
+              reconnectAttempt: networkManager.autoReconnectAttempt,
+              usb: usbChosen,
+              canRetry: networkManager.hasReconnectTarget)
+    }
+
+    private func setWifiBrowsing(_ on: Bool) {
+        guard on != isWifiBrowsing else { return }
+        isWifiBrowsing = on
+        if on { discoveryManager.startBrowsing() } else { discoveryManager.stopBrowsing() }
+    }
+
+    /// Wi-Fi discovery pauses only while the iPad waits for, or runs, a USB-C session.
+    private func updateWifiBrowsing(for state: ConnectionState) {
+        switch state {
+        case .listening: setWifiBrowsing(false)
+        case .idle, .disconnected: setWifiBrowsing(true)
+        case .connecting, .awaitingHostIdentity, .awaitingPIN, .authFailed, .streaming: setWifiBrowsing(!usbChosen)
+        }
+    }
+
+    private func startUSB() {
+        usbChosen = true
+        enteredPIN = ""
+        lastHostLabel = ""
+        networkManager.startListening(port: 42042)
+    }
+
+    /// Stacks a row vertically at accessibility text sizes so text is not squeezed beside its button.
+    private var rowLayout: AnyLayout {
+        typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 10))
+            : AnyLayout(HStackLayout(alignment: .center, spacing: 12))
+    }
+
+    private var hasIPv4Address: Bool {
+        let parts = streamManager.localIPAddress.split(separator: ".", omittingEmptySubsequences: false)
+        return parts.count == 4 && parts.allSatisfy { !$0.isEmpty && $0.allSatisfy(\.isNumber) }
+    }
+
+    /// A connect, reconnect or USB wait is already running.
+    private var isConnectBusy: Bool { connectStatus.action == .cancel || connectStatus.action == .stop }
+
+    private var lastWifiName: String { lastWifiHostLabel.isEmpty ? "your PC" : lastWifiHostLabel }
+
     private var disconnectedDashboard: some View {
-        VStack(spacing: 24) {
-            Spacer()
-
-            // Hero Header Card
-            VStack(spacing: 16) {
-                Image(systemName: "ipad.and.display.lagfree")
-                    .symbolEffect(.pulse, options: .repeating)
-                    .font(.system(size: 60))
-                    .foregroundStyle(
-                        LinearGradient(colors: [.blue, .purple],
-                                       startPoint: .topLeading,
-                                       endPoint: .bottomTrailing)
-                    )
-                    .padding(.bottom, 8)
-
-                Text("ScreenCasting")
-                    .font(.system(size: 32, weight: .bold, design: .rounded))
-                    .foregroundColor(.white)
-
-                Text("Native 60Hz iPad Receiver")
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundColor(.gray)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                rowLayout {
+                    Text("ScreenCasting").font(.headline)
+                    if !typeSize.isAccessibilitySize { Spacer() }
+                    iPadAddressChip
+                }
+                VStack(alignment: .leading, spacing: 16) {
+                    statusLine
+                    if networkManager.hasReconnectTarget { reconnectButton }
+                    discoveredPCs
+                    usbCard
+                    ipEntry
+                }
+                .frame(maxWidth: 520, alignment: .leading)
+                .frame(maxWidth: .infinity)
             }
-            .padding(32)
-            .background(Color.white.opacity(0.04))
-            .cornerRadius(24)
-            .overlay(RoundedRectangle(cornerRadius: 24).stroke(Color.white.opacity(0.1), lineWidth: 1))
+            .padding(.horizontal, 24)
+            .padding(.vertical, 28)
+        }
+        .foregroundStyle(Color.inkText)
+        .accessibilityHidden(isPINPhase || isHostIdentityPhase)
+        .transition(.opacity)
+    }
 
-            // Connection Info Card
-            VStack(spacing: 20) {
-                connectionStatusRow
-                Divider().background(Color.white.opacity(0.15))
-                connectivityGuide
-                localIPCard
-                connectButton
+    private var iPadAddressChip: some View {
+        Button {
+            UIPasteboard.general.string = streamManager.localIPAddress
+            copiedIP = true
+            UIAccessibility.post(notification: .announcement, argument: "Copied")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copiedIP = false }
+        } label: {
+            Label(copiedIP ? "Copied" : "This iPad \(streamManager.localIPAddress)",
+                  systemImage: copiedIP ? "checkmark" : "doc.on.doc")
+                .font(.caption)
+                .foregroundStyle(Color.inkSecondary)
+                .padding(.horizontal, 12)
+                .frame(minHeight: 32)
+                .overlay(Capsule().stroke(Color.inkHairline, lineWidth: 0.5))
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!hasIPv4Address)
+        .accessibilityLabel(copiedIP ? "Copied" : "This iPad's address \(streamManager.localIPAddress)")
+        .accessibilityHint("Copies the address")
+    }
+
+    private var statusLine: some View {
+        let status = connectStatus
+        let color: Color = status.tone == .warning ? .inkWarning : status.tone == .danger ? .inkDanger : .inkText
+        return rowLayout {
+            HStack(alignment: .center, spacing: 10) {
+                Group {
+                    switch status.tone {
+                    case .busy: ProgressView().tint(Color.inkSecondary)
+                    case .warning: Image(systemName: "arrow.triangle.2.circlepath")
+                    case .danger: Image(systemName: "exclamationmark.triangle")
+                    case .ready: Image(systemName: "checkmark.circle")
+                    case .neutral: Image(systemName: "wifi")
+                    }
+                }
+                .foregroundStyle(color)
+                .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(status.text).font(.subheadline).foregroundStyle(color)
+                    if let detail = status.detail {
+                        Text(detail).font(.caption).foregroundStyle(Color.inkSecondary).lineLimit(2)
+                    }
+                }
+                .accessibilityElement(children: .combine)
             }
-            .padding(28)
-            .frame(maxWidth: 400)
-            .background(Color.white.opacity(0.03))
-            .cornerRadius(20)
-            .overlay(RoundedRectangle(cornerRadius: 20).stroke(Color.white.opacity(0.08), lineWidth: 1))
-
-            Spacer()
-        }
-        .transition(.opacity.combined(with: .scale(scale: 0.95)))
-    }
-
-    private var connectionStatusRow: some View {
-        HStack(spacing: 12) {
-            connectionStatusIcon
-            connectionStatusText
-        }
-    }
-
-    @ViewBuilder
-    private var connectionStatusIcon: some View {
-        switch networkManager.connectionState {
-        case .connecting:
-            ProgressView()
-                .progressViewStyle(CircularProgressViewStyle(tint: .blue))
-                .scaleEffect(1.2)
-        case .disconnected(let reason) where !reason.isEmpty:
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundColor(.orange)
-                .font(.system(size: 18))
-        default:
-            ProgressView()
-                .progressViewStyle(CircularProgressViewStyle(tint: .blue))
-                .scaleEffect(1.2)
+            if !typeSize.isAccessibilitySize { Spacer(minLength: 8) }
+            if status.action != .none {
+                Button(status.action == .retry ? "Retry" : status.action == .restartUSB ? "Start again"
+                       : status.action == .stop ? "Stop" : "Cancel") {
+                    switch status.action {
+                    case .retry:
+                        usbChosen = false
+                        enteredPIN = ""
+                        networkManager.reconnectLastPC()
+                    case .restartUSB:
+                        startUSB()
+                    case .cancel, .stop:
+                        enteredPIN = ""
+                        networkManager.stop()
+                    case .none:
+                        break
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+                .tint(Color.inkText)
+            }
         }
     }
 
-    @ViewBuilder
-    private var connectionStatusText: some View {
-        switch networkManager.connectionState {
-        case .idle:
-            Text("Enter PC IP to connect securely.")
-                .font(.system(size: 15, weight: .semibold, design: .rounded))
-                .foregroundColor(.white)
-        case .listening:
-            Text("USB listener ready on port 42042.")
-                .font(.system(size: 15, weight: .semibold, design: .rounded))
-                .foregroundColor(.green)
-        case .connecting:
-            Text("Connecting & establishing TLS…")
-                .font(.system(size: 15, weight: .semibold, design: .rounded))
-                .foregroundColor(.white)
-        case .awaitingHostIdentity:
-            Text("Verify the Windows Host identity code.")
-                .font(.system(size: 15, weight: .semibold, design: .rounded))
-                .foregroundColor(.yellow)
-        case .disconnected(let reason) where !reason.isEmpty:
-            Text("Disconnected: \(reason)")
-                .font(.system(size: 14, weight: .medium, design: .rounded))
-                .foregroundColor(.orange.opacity(0.9))
-                .lineLimit(2)
-        default:
-            Text("Waiting for PC Connection…")
-                .font(.system(size: 15, weight: .semibold, design: .rounded))
-                .foregroundColor(.white)
+    private var reconnectButton: some View {
+        Button {
+            usbChosen = false
+            enteredPIN = ""
+            lastHostLabel = lastWifiHostLabel
+            networkManager.reconnectLastPC()
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "arrow.clockwise").font(.title3).accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Reconnect to \(lastWifiName)").font(.headline).lineLimit(2)
+                    Text("Wi-Fi · last used").font(.caption).foregroundStyle(Color.inkSurface.opacity(0.7))
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right").accessibilityHidden(true)
+            }
+            .foregroundStyle(Color.inkSurface)
+            .padding(.horizontal, 16)
+            .frame(minHeight: 64)
+            .background(Color.inkText, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .opacity(isConnectBusy ? 0.5 : 1)
         }
+        .buttonStyle(.plain)
+        .disabled(isConnectBusy)
+        .accessibilityHint("Connects to the PC you used last")
     }
 
-    private var connectivityGuide: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if useUSBMode {
-                Label("1. Connect the iPad to the PC via USB-C", systemImage: "cable.connector")
-                Label("2. Start the USB listener below", systemImage: "antenna.radiowaves.left.and.right")
-                Label("3. Select USB-C Direct and Start on the PC", systemImage: "desktopcomputer")
+    private var discoveredPCs: some View {
+        let hosts = discoveryManager.discoveredHosts
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("PCs on this Wi-Fi").font(.footnote).foregroundStyle(Color.inkSecondary)
+            if hosts.isEmpty {
+                Text("None found yet. Open ScreenCasting on the PC and make sure both are on the same Wi-Fi.")
+                    .font(.footnote)
+                    .foregroundStyle(Color.inkSecondary)
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.inkHairline, lineWidth: 0.5))
             } else {
-                Label("1. Open Host App on your Windows PC", systemImage: "desktopcomputer")
-                Label("2. Compare the Host identity code before entering the PIN", systemImage: "checkmark.shield")
-                Label("3. Enter PC IP below and tap Connect", systemImage: "network")
-            }
-        }
-        .font(.system(size: 14))
-        .foregroundColor(.white.opacity(0.8))
-    }
-
-    private var localIPCard: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("This iPad's IP Address")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.gray)
-                Text(streamManager.localIPAddress)
-                    .font(.system(size: 16, weight: .bold, design: .monospaced))
-                    .foregroundColor(.blue)
-            }
-            Spacer()
-            Button(action: { UIPasteboard.general.string = streamManager.localIPAddress }) {
-                Image(systemName: "doc.on.doc.fill")
-                    .font(.system(size: 14))
-                    .foregroundColor(.gray)
-                    .padding(8)
-                    .background(Color.white.opacity(0.08))
-                    .clipShape(Circle())
-            }
-        }
-        .padding(14)
-        .background(Color.black.opacity(0.2))
-        .cornerRadius(12)
-    }
-
-    private var connectButton: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Connection Transport")
-                .font(.system(size: 12, weight: .bold))
-                .foregroundColor(.gray)
-
-            Picker("Connection Transport", selection: $useUSBMode) {
-                Text("Wi-Fi").tag(false)
-                Text("USB-C Direct").tag(true)
-            }
-            .pickerStyle(.segmented)
-            .onChange(of: useUSBMode) { _, usbSelected in
-                networkManager.stop()
-                if usbSelected {
-                    discoveryManager.stopBrowsing()
-                } else {
-                    discoveryManager.startBrowsing()
-                }
-            }
-
-            if useUSBMode {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("USB-C Direct | Port 42042")
-                    Text("USB identity: \(UIDevice.current.name)")
-                }
-                .font(.system(size: 12))
-                .foregroundColor(.blue.opacity(0.9))
-            }
-
-            if !useUSBMode {
-                TextField("PC IP Address", text: $hostIP)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .keyboardType(.numbersAndPunctuation)
-                    .textContentType(.URL)
-                    .padding(12)
-                    .foregroundColor(.white)
-                    .background(Color.white.opacity(0.08))
-                    .cornerRadius(10)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10)
-                            .stroke(Color.white.opacity(0.12), lineWidth: 1)
-                    )
-
-                if !hostIP.isEmpty && !isValidManualIPv4 {
-                    Text("Enter a valid IPv4 address, for example 172.20.10.2.")
-                        .font(.system(size: 11))
-                        .foregroundColor(.orange)
-                }
-
-                SecureField("4-digit PIN Code", text: $enteredPIN)
-                    .keyboardType(.numberPad)
-                    .padding(12)
-                    .foregroundColor(.white)
-                    .background(Color.white.opacity(0.08))
-                    .cornerRadius(10)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10)
-                            .stroke(Color.white.opacity(0.12), lineWidth: 1)
-                    )
-                    .onChange(of: enteredPIN) { _, newValue in
-                        let digits = newValue.filter(\.isNumber)
-                        enteredPIN = String(digits.prefix(4))
-                    }
-            }
-
-            Button(action: {
-                if useUSBMode {
-                    lastHostLabel = ""
-                    networkManager.startListening(port: 42042)
-                } else {
-                    lastHostLabel = normalizedManualHost
-                    networkManager.connect(to: normalizedManualHost)
-                }
-            }) {
-                Label(
-                    useUSBMode ? "Start USB Listener" : "Connect with IP and PIN",
-                    systemImage: useUSBMode ? "cable.connector" : "lock.fill")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-                    .background(
-                        LinearGradient(
-                            colors: [.blue, .purple],
-                            startPoint: .leading,
-                            endPoint: .trailing)
-                    )
-                    .cornerRadius(10)
-            }
-            .disabled(
-                (!useUSBMode && !isValidManualIPv4) ||
-                networkManager.connectionState == .connecting)
-
-            if !useUSBMode {
-                Divider().background(Color.white.opacity(0.15))
-
-                HStack {
-                    Text("Discovered PC Hosts")
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundColor(.gray)
-                    Spacer()
-                    if discoveryManager.discoveredHosts.isEmpty {
-                        ProgressView()
-                            .scaleEffect(0.8)
-                    }
-                }
-
-                if discoveryManager.discoveredHosts.isEmpty {
-                    VStack(spacing: 8) {
-                        Image(systemName: "antenna.radiowaves.left.and.right")
-                            .font(.system(size: 24))
-                            .foregroundColor(.blue.opacity(0.8))
-                        Text("Searching for ScreenCasting PCs on local Wi-Fi…")
-                            .font(.system(size: 12))
-                            .foregroundColor(.gray)
-                            .multilineTextAlignment(.center)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 16)
-                    .background(Color.white.opacity(0.04))
-                    .cornerRadius(12)
-                } else {
-                    VStack(spacing: 8) {
-                        ForEach(discoveryManager.discoveredHosts) { host in
-                            Button(action: {
-                                enteredPIN = ""
-                                lastHostLabel = host.name
-                                networkManager.connect(to: host.endpoint)
-                            }) {
-                                HStack(spacing: 12) {
-                                    Image(systemName: "desktopcomputer")
-                                        .font(.system(size: 18))
-                                        .foregroundColor(.blue)
-
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(host.name)
-                                            .font(.system(size: 14, weight: .semibold))
-                                            .foregroundColor(.white)
-                                        Text("Tap to connect securely")
-                                            .font(.system(size: 11))
-                                            .foregroundColor(.gray)
+                VStack(spacing: 0) {
+                    ForEach(Array(hosts.enumerated()), id: \.element.id) { index, host in
+                        Button {
+                            usbChosen = false
+                            enteredPIN = ""
+                            lastHostLabel = host.name
+                            lastWifiHostLabel = host.name
+                            networkManager.connect(to: host.endpoint)
+                        } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: "desktopcomputer").font(.title3).accessibilityHidden(true)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(host.name).font(.subheadline.weight(.semibold)).lineLimit(2)
+                                    if host.name == lastWifiHostLabel {
+                                        Text("Last used").font(.caption).foregroundStyle(Color.inkSecondary)
                                     }
-
-                                    Spacer()
-
-                                    Image(systemName: "lock.fill")
-                                        .font(.system(size: 12))
-                                        .foregroundColor(.blue)
                                 }
-                                .padding(12)
-                                .background(Color.white.opacity(0.08))
-                                .cornerRadius(10)
-                                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.12), lineWidth: 1))
+                                Spacer(minLength: 8)
+                                Image(systemName: "chevron.right").foregroundStyle(Color.inkSecondary).accessibilityHidden(true)
                             }
-                            .disabled(networkManager.connectionState == .connecting)
+                            .padding(.horizontal, 14)
+                            .frame(minHeight: 56)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(isConnectBusy)
+                        .accessibilityHint("Connects to this PC")
+                        if index < hosts.count - 1 {
+                            Rectangle().fill(Color.inkHairline).frame(height: 0.5)
                         }
                     }
                 }
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.inkHairline, lineWidth: 0.5))
             }
         }
+    }
+
+    private var usbCard: some View {
+        let listening = networkManager.connectionState == .listening
+        return rowLayout {
+            Image(systemName: "cable.connector").font(.title3).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("USB-C cable").font(.subheadline.weight(.semibold))
+                Text(listening ? "Waiting. On the PC, pick USB-C Direct. This iPad shows as \(UIDevice.current.name)."
+                     : "Plug in, tap Start, then pick USB-C Direct on the PC.")
+                    .font(.caption)
+                    .foregroundStyle(Color.inkSecondary)
+            }
+            if !typeSize.isAccessibilitySize { Spacer(minLength: 8) }
+            Button(listening ? "Stop" : "Start") {
+                if listening { networkManager.stop() } else { startUSB() }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+            .tint(Color.inkText)
+            .disabled(isConnectBusy && !listening)
+        }
+        .padding(14)
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.inkHairline, lineWidth: 0.5))
+    }
+
+    private var ipEntry: some View {
+        DisclosureGroup(isExpanded: $showIPEntry) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    TextField("192.168.1.20", text: $hostIP)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.numbersAndPunctuation)
+                        .textContentType(.URL)
+                        .padding(.horizontal, 12)
+                        .frame(minHeight: 44)
+                        .background(Color.inkRaised, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.inkHairline, lineWidth: 0.5))
+                        .accessibilityLabel("PC IP address")
+                    Button("Connect") {
+                        usbChosen = false
+                        enteredPIN = ""
+                        lastHostLabel = normalizedManualHost
+                        lastWifiHostLabel = normalizedManualHost
+                        networkManager.connect(to: normalizedManualHost)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .tint(Color.inkText)
+                    .disabled(!isValidManualIPv4 || isConnectBusy)
+                }
+                if !hostIP.isEmpty && !isValidManualIPv4 {
+                    Text("Enter an address like 192.168.1.20.")
+                        .font(.caption)
+                        .foregroundStyle(Color.inkWarning)
+                }
+            }
+            .padding(.top, 8)
+        } label: {
+            Text("Connect by IP address").font(.subheadline)
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+        .tint(Color.inkSecondary)
     }
 
     // MARK: - Streaming HUD

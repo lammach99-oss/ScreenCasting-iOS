@@ -201,6 +201,8 @@ public class NetworkManager: ObservableObject {
 
     // MARK: Published State
     @Published public var connectionState: ConnectionState = .idle
+    /// Automatic reconnect try number while one is running; 0 otherwise.
+    @Published public private(set) var autoReconnectAttempt = 0
     public private(set) var bytesReceived: UInt64 = 0
     @Published public private(set) var hostFingerprint: String?
     @Published public private(set) var hostIdentityCode: String?
@@ -678,8 +680,29 @@ public class NetworkManager: ObservableObject {
             if let target = WifiReconnectTargetPolicy.target(from: endpoint) {
                 WifiReconnectTargetStore.save(target)
             }
+            self.publishAutoReconnectAttempt(0)
             self.connectOnQueue(to: endpoint)
         }
+    }
+
+    /// The last Wi-Fi PC (saved target, or the legacy typed host) can be reconnected to.
+    public var hasReconnectTarget: Bool {
+        WifiReconnectTargetSelection.preferred(
+            structured: WifiReconnectTargetStore.load(),
+            legacyHost: UserDefaults.standard.string(forKey: Self.lastKnownHostKey))?.endpoint != nil
+    }
+
+    /// One-tap Reconnect on the connect screen: the same endpoint automatic reconnects use.
+    public func reconnectLastPC() {
+        networkQueue.async { [weak self] in
+            guard let self, let endpoint = self.loadWifiReconnectEndpoint() else { return }
+            self.publishAutoReconnectAttempt(0)
+            self.connectOnQueue(to: endpoint)
+        }
+    }
+
+    private func publishAutoReconnectAttempt(_ attempt: Int) {
+        DispatchQueue.main.async { self.autoReconnectAttempt = attempt }
     }
 
     private func connectOnQueue(to endpoint: NWEndpoint) {
@@ -1453,6 +1476,7 @@ public class NetworkManager: ObservableObject {
         let wasUSB = usbListenerExplicitlyStarted
         usbListenerExplicitlyStarted = false
         reconnectEnabled = false
+        publishAutoReconnectAttempt(0)
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
         wifiBackgroundDisconnectWorkItem?.cancel()
@@ -2139,11 +2163,15 @@ public class NetworkManager: ObservableObject {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard isForegroundActive,
               reconnectEnabled,
-              let endpoint = loadWifiReconnectEndpoint() else { return }
+              let endpoint = loadWifiReconnectEndpoint() else {
+            publishAutoReconnectAttempt(0) // Nothing is scheduled, so the screen must not say "Reconnecting".
+            return
+        }
         if reset { reconnectAttempt = 0 }
         reconnectWorkItem?.cancel()
         let delay = TrustedReconnectPolicy.delay(forAttempt: reconnectAttempt)
         reconnectAttempt += 1
+        publishAutoReconnectAttempt(reconnectAttempt)
         print("[IPAD][AUTO_RECONNECT_ATTEMPT] attempt=\(reconnectAttempt) delay=\(delay)")
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.isForegroundActive, self.reconnectEnabled else { return }
@@ -4889,6 +4917,7 @@ public class NetworkManager: ObservableObject {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         transportState = newState
         if case .authFailed = newState { resetAutoAcceptOnQueue() }
+        if newState == .streaming { publishAutoReconnectAttempt(0) }
         DispatchQueue.main.async {
             self.connectionState = newState
         }
