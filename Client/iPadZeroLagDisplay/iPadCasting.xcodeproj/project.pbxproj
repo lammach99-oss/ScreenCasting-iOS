@@ -78,6 +78,7 @@
 		FA2300000000000000000005 /* SessionPanelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000005 /* SessionPanelTests.swift */; };
 		FA2300000000000000000006 /* ConnectScreenTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000006 /* ConnectScreenTests.swift */; };
 		FA2300000000000000000007 /* GestureHelpTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000007 /* GestureHelpTests.swift */; };
+		FA2300000000000000000008 /* SettingsCopyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000008 /* SettingsCopyTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -165,6 +166,7 @@
 		FA2200000000000000000005 /* SessionPanelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionPanelTests.swift; sourceTree = "<group>"; };
 		FA2200000000000000000006 /* ConnectScreenTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectScreenTests.swift; sourceTree = "<group>"; };
 		FA2200000000000000000007 /* GestureHelpTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GestureHelpTests.swift; sourceTree = "<group>"; };
+		FA2200000000000000000008 /* SettingsCopyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsCopyTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -258,6 +260,7 @@
 				FA2200000000000000000005 /* SessionPanelTests.swift */,
 				FA2200000000000000000006 /* ConnectScreenTests.swift */,
 				FA2200000000000000000007 /* GestureHelpTests.swift */,
+				FA2200000000000000000008 /* SettingsCopyTests.swift */,
 				201711111111111111111117 /* WireProtocolTests.swift */,
 				D70211111111111111111104 /* DataTransferTests.swift */,
 				D70211111111111111111108,
@@ -435,6 +438,7 @@
 				FA2300000000000000000005 /* SessionPanelTests.swift in Sources */,
 				FA2300000000000000000006 /* ConnectScreenTests.swift in Sources */,
 				FA2300000000000000000007 /* GestureHelpTests.swift in Sources */,
+				FA2300000000000000000008 /* SettingsCopyTests.swift in Sources */,
 				300111111111111111111110 /* WireProtocolTests.swift in Sources */,
 				D70111111111111111111104 /* DataTransferTests.swift in Sources */,
 				D70111111111111111111108,

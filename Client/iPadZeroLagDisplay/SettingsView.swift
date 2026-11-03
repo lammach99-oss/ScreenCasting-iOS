@@ -538,6 +538,15 @@ extension ContentView {
     }
 }
 
+// MARK: - Plain wording
+
+enum SettingsCopy {
+    enum Level: Equatable { case good, fair, slow, none }
+    static func nowShowing(width: UInt32, height: UInt32, refreshHz: UInt32, portrait: Bool) -> String { "" }
+    static func pcUsing(adaptive: Bool, mbps: Double, audio: Bool) -> String { "" }
+    static func latency(_ ms: Double) -> (word: String, level: Level) { ("", .none) }
+}
+
 // MARK: - Color(hex:) helper
 
 private extension Color {
