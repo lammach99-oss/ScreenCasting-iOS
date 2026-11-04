@@ -4403,7 +4403,6 @@ final class USBListenerLifetimeTests: XCTestCase {
         private(set) var observedState = "unobserved"
         private(set) var terminalFailure: String?
         private var resolved = false
-        var restore: (() -> Void)?
 
         init(listener: NWListener, stage: String) {
             self.listener = listener
@@ -4450,12 +4449,9 @@ final class USBListenerLifetimeTests: XCTestCase {
         let owner: NetworkManager = manager
         dispatchPrecondition(condition: .onQueue(owner.networkQueueForTesting))
         let probe = ListenerReadinessProbe(listener: listener, stage: stage)
-        let prior = listener.stateUpdateHandler
-        probe.restore = { listener.stateUpdateHandler = prior }
-        listener.stateUpdateHandler = { [weak owner] state in
-            prior?(state)
-            guard let owner else { return }
-            probe.observe(state, event: "callback_after_upstream", owner: owner)
+        owner.usbListenerStateObservedForTesting = { [weak owner] observed, state in
+            guard let owner, observed === listener else { return }
+            probe.observe(state, event: "manager_callback", owner: owner)
         }
         probe.observe(listener.state, event: "armed_resample", owner: owner)
         return probe
@@ -4465,8 +4461,8 @@ final class USBListenerLifetimeTests: XCTestCase {
                                          waitResult: XCTWaiter.Result) throws {
         let owner = try XCTUnwrap(manager)
         let reading = owner.networkQueueForTesting.sync {
-            probe.restore?()
-            print("[C2_USB_LISTENER_PROBE] stage=\(probe.stage) event=handler_restored " +
+            owner.usbListenerStateObservedForTesting = nil
+            print("[C2_USB_LISTENER_PROBE] stage=\(probe.stage) event=observer_cleared " +
                   "listener=\(ObjectIdentifier(probe.listener)) uptime=\(ProcessInfo.processInfo.systemUptime)")
             let current = owner.usbSessionSnapshot()
             return (ready: probe.genuineReady, state: probe.observedState, terminal: probe.terminalFailure,
