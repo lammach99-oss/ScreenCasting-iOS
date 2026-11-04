@@ -3666,8 +3666,9 @@ final class USBListenerLifetimeTests: XCTestCase {
             // Hold the queue until Network.framework binds, so its ready block is queued
             // behind arming: the interleaving that failed CI run 41862858597.
             let deadline = Date().addingTimeInterval(5)
-            while listener.port == nil, Date() < deadline { usleep(1_000) }
-            XCTAssertNotNil(listener.port, "precondition: listener binds while the network queue is held")
+            // `port` reads Port(0), not nil, until the socket binds.
+            while (listener.port?.rawValue ?? 0) == 0, Date() < deadline { usleep(1_000) }
+            XCTAssertNotEqual(listener.port?.rawValue ?? 0, 0, "precondition: listener binds while the network queue is held")
             return armListenerReadiness(listener, stage: "armed_after_bind")
         }
         try finishListenerReadiness(probe, waitResult: XCTWaiter.wait(for: [probe.ready], timeout: 5))
