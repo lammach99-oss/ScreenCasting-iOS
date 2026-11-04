@@ -340,6 +340,8 @@ public class NetworkManager: ObservableObject {
     #if targetEnvironment(simulator)
     var manualUsbCandidateDeadlineForTesting = false
     var usbCandidateInstalledForTesting: ((NWConnection) -> Void)?
+    /// Called from the production listener handler; tests must not swap that handler after start.
+    var usbListenerStateObservedForTesting: ((NWListener, NWListener.State) -> Void)?
     #endif
     private let mirrorControl = MirrorClientControl()
     @Published public private(set) var mirrorControlState: MirrorControlState?
@@ -1631,6 +1633,9 @@ public class NetworkManager: ObservableObject {
                       self.usbListenerExplicitlyStarted,
                       self.usbListener === listener,
                       generation == self.listenerGeneration else { return }
+                #if targetEnvironment(simulator)
+                self.usbListenerStateObservedForTesting?(listener, state)
+                #endif
                 switch state {
                 case .ready:
                     let activePort = listener.port?.rawValue ?? port

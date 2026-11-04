@@ -3660,6 +3660,19 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertTrue(manager.usbSessionSnapshot().connection === secondPeer)
     }
 
+    func testReadinessProbeArmedAfterBindStillObservesReady() throws {
+        let listener = try XCTUnwrap(manager.usbSessionSnapshot().listener)
+        let probe = manager.networkQueueForTesting.sync { () -> ListenerReadinessProbe in
+            // Hold the queue until Network.framework binds, so its ready block is queued
+            // behind arming: the interleaving that failed CI run 41862858597.
+            let deadline = Date().addingTimeInterval(5)
+            while listener.port == nil, Date() < deadline { usleep(1_000) }
+            XCTAssertNotNil(listener.port, "precondition: listener binds while the network queue is held")
+            return armListenerReadiness(listener, stage: "armed_after_bind")
+        }
+        try finishListenerReadiness(probe, waitResult: XCTWaiter.wait(for: [probe.ready], timeout: 5))
+    }
+
     func testLandscapeDisconnectPortraitReconnectSendsCurrentDisplay() throws {
         try reconnect(from: .landscape, to: .portrait, loss: .failed(.posix(.ECONNRESET)))
     }
@@ -4321,25 +4334,17 @@ final class USBListenerLifetimeTests: XCTestCase {
 
     private func connectCausally(listener: NWListener) async throws -> CandidateProbe {
         let acceptHandler = try XCTUnwrap(listener.newConnectionHandler)
-        let listenerReady = expectation(description: "owned listener becomes ready")
-        let listenerStateHandler = listener.stateUpdateHandler
-        manager.networkQueueForTesting.sync {
-            if listener.state == .ready {
-                listenerReady.fulfill()
-            } else {
-                listener.stateUpdateHandler = { state in
-                    listenerStateHandler?(state)
-                    if state == .ready { listenerReady.fulfill() }
-                }
-            }
+        let listenerProbe = manager.networkQueueForTesting.sync {
+            armListenerReadiness(listener, stage: "causal_listener_startup")
         }
         defer {
             manager.networkQueueForTesting.async {
-                listener.stateUpdateHandler = listenerStateHandler
                 listener.newConnectionHandler = acceptHandler
             }
         }
-        try await waitForUSB([listenerReady], stage: "listener startup")
+        // The watchdog only bounds a hung listener startup; it is not a readiness SLA.
+        let listenerStartup = await XCTWaiter.fulfillment(of: [listenerProbe.ready], timeout: 10)
+        try finishListenerReadiness(listenerProbe, waitResult: listenerStartup)
         let port = try XCTUnwrap(listener.port)
         let acceptLoopEntered = expectation(description: "native accept loop delivers candidate")
         let candidateOwned = expectation(description: "production owns accepted candidate")
@@ -4390,85 +4395,100 @@ final class USBListenerLifetimeTests: XCTestCase {
         case readinessFailure(String)
     }
 
-    private func connect(stage: String = "unspecified") throws -> NWConnection {
-        let snapshot = manager.usbSessionSnapshot()
-        let listener = try XCTUnwrap(snapshot.listener)
-        let owner = try XCTUnwrap(manager)
-        let queue = owner.networkQueueForTesting
-        let acceptHandler = try queue.sync { try XCTUnwrap(listener.newConnectionHandler) }
-        let listenerReady = expectation(description: "ephemeral USB listener ready [\(stage)]")
-        var priorHandler: ((NWListener.State) -> Void)?
-        var probeInstalled = false
-        var resolved = false
-        var genuineReady = false
-        var observedState = "unobserved"
-        var terminalFailure: String?
-        queue.sync {
-            priorHandler = listener.stateUpdateHandler
-            func observe(_ state: NWListener.State, event: String) {
-                dispatchPrecondition(condition: .onQueue(queue))
-                observedState = String(describing: state)
-                let current = owner.usbSessionSnapshot()
-                print("[C2_USB_LISTENER_PROBE] stage=\(stage) event=\(event) " +
-                      "manager=\(ObjectIdentifier(owner)) listener=\(ObjectIdentifier(listener)) " +
-                      "generation=\(current.generation) sameOwner=\(current.listener === listener) " +
-                      "intent=\(current.listenerIntent) state=\(observedState) " +
-                      "port=\(listener.port?.rawValue ?? 0) queue=\(queue.label) " +
-                      "uptime=\(ProcessInfo.processInfo.systemUptime)")
-                guard !resolved else { return }
-                switch state {
-                case .ready:
-                    resolved = true
-                    genuineReady = true
-                    listenerReady.fulfill()
-                case .failed(let error):
-                    resolved = true
-                    terminalFailure = "failed(\(error))"
-                    listenerReady.fulfill()
-                case .cancelled:
-                    resolved = true
-                    terminalFailure = "cancelled"
-                    listenerReady.fulfill()
-                default:
-                    break
-                }
-            }
-            switch listener.state {
-            case .ready, .failed(_), .cancelled:
-                observe(listener.state, event: "initial_state")
-            default:
-                let upstream = priorHandler
-                probeInstalled = true
-                listener.stateUpdateHandler = { state in
-                    upstream?(state)
-                    observe(state, event: "callback_after_upstream")
-                }
-                observe(listener.state, event: "installed_resample")
-            }
+    private final class ListenerReadinessProbe {
+        let listener: NWListener
+        let stage: String
+        let ready: XCTestExpectation
+        private(set) var genuineReady = false
+        private(set) var observedState = "unobserved"
+        private(set) var terminalFailure: String?
+        private var resolved = false
+        var restore: (() -> Void)?
+
+        init(listener: NWListener, stage: String) {
+            self.listener = listener
+            self.stage = stage
+            ready = XCTestExpectation(description: "ephemeral USB listener ready [\(stage)]")
         }
-        defer {
-            if probeInstalled {
-                queue.sync {
-                    listener.stateUpdateHandler = priorHandler
-                    print("[C2_USB_LISTENER_PROBE] stage=\(stage) event=handler_restored " +
-                          "listener=\(ObjectIdentifier(listener)) uptime=\(ProcessInfo.processInfo.systemUptime)")
-                }
-            }
-        }
-        let waitResult = XCTWaiter.wait(for: [listenerReady], timeout: 5)
-        let reading = queue.sync {
+
+        func observe(_ state: NWListener.State, event: String, owner: NetworkManager) {
+            let queue = owner.networkQueueForTesting
+            dispatchPrecondition(condition: .onQueue(queue))
+            observedState = String(describing: state)
             let current = owner.usbSessionSnapshot()
-            return (ready: genuineReady, state: observedState, terminal: terminalFailure,
-                    sameOwner: current.listener === listener, intent: current.listenerIntent)
+            print("[C2_USB_LISTENER_PROBE] stage=\(stage) event=\(event) " +
+                  "manager=\(ObjectIdentifier(owner)) listener=\(ObjectIdentifier(listener)) " +
+                  "generation=\(current.generation) sameOwner=\(current.listener === listener) " +
+                  "intent=\(current.listenerIntent) state=\(observedState) " +
+                  "port=\(listener.port?.rawValue ?? 0) queue=\(queue.label) " +
+                  "uptime=\(ProcessInfo.processInfo.systemUptime)")
+            guard !resolved else { return }
+            switch state {
+            case .ready:
+                resolved = true
+                genuineReady = true
+                ready.fulfill()
+            case .failed(let error):
+                resolved = true
+                terminalFailure = "failed(\(error))"
+                ready.fulfill()
+            case .cancelled:
+                resolved = true
+                terminalFailure = "cancelled"
+                ready.fulfill()
+            default:
+                break
+            }
+        }
+    }
+
+    /// Runs on the network queue. Network.framework queues a listener state block with the
+    /// handler installed when it binds, so swapping `stateUpdateHandler` after start can lose
+    /// `ready`. Observe through the production handler instead; the resample covers a block
+    /// that already ran.
+    private func armListenerReadiness(_ listener: NWListener, stage: String) -> ListenerReadinessProbe {
+        let owner: NetworkManager = manager
+        dispatchPrecondition(condition: .onQueue(owner.networkQueueForTesting))
+        let probe = ListenerReadinessProbe(listener: listener, stage: stage)
+        let prior = listener.stateUpdateHandler
+        probe.restore = { listener.stateUpdateHandler = prior }
+        listener.stateUpdateHandler = { [weak owner] state in
+            prior?(state)
+            guard let owner else { return }
+            probe.observe(state, event: "callback_after_upstream", owner: owner)
+        }
+        probe.observe(listener.state, event: "armed_resample", owner: owner)
+        return probe
+    }
+
+    private func finishListenerReadiness(_ probe: ListenerReadinessProbe,
+                                         waitResult: XCTWaiter.Result) throws {
+        let owner = try XCTUnwrap(manager)
+        let reading = owner.networkQueueForTesting.sync {
+            probe.restore?()
+            print("[C2_USB_LISTENER_PROBE] stage=\(probe.stage) event=handler_restored " +
+                  "listener=\(ObjectIdentifier(probe.listener)) uptime=\(ProcessInfo.processInfo.systemUptime)")
+            let current = owner.usbSessionSnapshot()
+            return (ready: probe.genuineReady, state: probe.observedState, terminal: probe.terminalFailure,
+                    sameOwner: current.listener === probe.listener, intent: current.listenerIntent)
         }
         guard waitResult == .completed, reading.ready, reading.terminal == nil,
               reading.sameOwner, reading.intent else {
-            let reason = "stage=\(stage) waiter=\(waitResult) state=\(reading.state) " +
+            let reason = "stage=\(probe.stage) waiter=\(waitResult) state=\(reading.state) " +
                          "terminal=\(reading.terminal ?? "none") sameOwner=\(reading.sameOwner) " +
                          "intent=\(reading.intent)"
             XCTFail("USB native listener readiness failure: \(reason)")
             throw USBListenerFixtureError.readinessFailure(reason)
         }
+    }
+
+    private func connect(stage: String = "unspecified") throws -> NWConnection {
+        let snapshot = manager.usbSessionSnapshot()
+        let listener = try XCTUnwrap(snapshot.listener)
+        let queue = manager.networkQueueForTesting
+        let acceptHandler = try queue.sync { try XCTUnwrap(listener.newConnectionHandler) }
+        let probe = queue.sync { armListenerReadiness(listener, stage: stage) }
+        try finishListenerReadiness(probe, waitResult: XCTWaiter.wait(for: [probe.ready], timeout: 5))
         let port = try XCTUnwrap(listener.port)
         let acceptedReady = expectation(description: "USB candidate ready or rejected")
         var acceptedPeer: NWConnection?
