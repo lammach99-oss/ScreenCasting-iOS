@@ -12,7 +12,7 @@ public struct ConnectScreenStatus: Equatable {
 
     /// `usb` is a USB-C attempt (the last Wi-Fi PC is not involved); `canRetry` means a Wi-Fi reconnect target exists.
     public static func make(state: ConnectionState, pcName: String?, discoveredCount: Int, reconnectAttempt: Int,
-                            usb: Bool = false, canRetry: Bool = true) -> Self {
+                            usb: Bool = false, canRetry: Bool = true, tailnetTarget: Bool = false) -> Self {
         let trimmed = pcName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let pc = usb ? "the PC over USB-C" : trimmed.isEmpty ? "your PC" : trimmed
         let reconnecting = !usb && reconnectAttempt > 0
@@ -38,7 +38,8 @@ public struct ConnectScreenStatus: Equatable {
             if reconnecting { return Self(text: reconnectText, detail: detail, tone: .warning, action: .stop) }
             if reason.isEmpty { return searching(found: discoveredCount) }
             if usb { return Self(text: "The USB-C connection ended.", detail: detail, tone: .danger, action: .restartUSB) }
-            return Self(text: "Couldn't connect to \(pc).", detail: detail, tone: .danger, action: canRetry ? .retry : .none)
+            let failureDetail = tailnetTarget ? reason + " Check that Tailscale is connected on this iPad and on the PC." : reason
+            return Self(text: "Couldn't connect to \(pc).", detail: failureDetail, tone: .danger, action: canRetry ? .retry : .none)
         }
     }
 

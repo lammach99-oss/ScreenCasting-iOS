@@ -207,6 +207,8 @@ public class NetworkManager: ObservableObject {
     @Published public private(set) var hostFingerprint: String?
     @Published public private(set) var hostIdentityCode: String?
     @Published public private(set) var usbServerFingerprint: String?
+    /// Connected to the remote control service (whole PC) rather than the casting display.
+    @Published public private(set) var isRemoteControlSession = false
 
     // The Host is the authority for selectable modes. These values only mirror
     // authenticated control responses for the connected settings surface.
@@ -728,7 +730,9 @@ public class NetworkManager: ObservableObject {
         clientSettingsState.resetHostGeneration()
         settingsReconciliationGate.reset()
         settingsSyncPolicy.reset()
+        let isRemoteControl = RemoteSessionPolicy.isRemoteControl(endpoint: endpoint)
         DispatchQueue.main.async {
+            self.isRemoteControlSession = isRemoteControl
             self.settingsGeneration = 0
             self.settingsApplyStatus = ""
             self.hostIdentityCode = nil
@@ -757,6 +761,9 @@ public class NetworkManager: ObservableObject {
         networkQueue.asyncAfter(deadline: .now() + 8, execute: timeout)
         connection?.start(queue: networkQueue)
     }
+
+    /// Port of the remote control service (ScreenCastingRemoteHost) — same protocol, the PC's real screen.
+    public static let remoteControlPort: UInt16 = 27020
 
     /// Connect to the Windows host over TLS using host String IP & port.
     /// - Parameters:
@@ -1198,6 +1205,18 @@ public class NetworkManager: ObservableObject {
         }
     }
 
+    /// Ctrl+Alt+Del, Lock or Restart on the PC (remote control sessions only). Restart must be confirmed by the user first.
+    public func sendRemoteCommand(_ command: RemoteHostCommand, confirmed: Bool = false) {
+        guard isRemoteControlSession else { return }
+        let requestedGeneration = connectionGenerationClock.current
+        networkQueue.async { [weak self] in
+            guard let self, requestedGeneration == self.connectionGeneration,
+                  self.transportState == .streaming,
+                  self.committedTransportGeneration == requestedGeneration else { return }
+            self.sendWireMessage(type: .remoteCommand, payload: command.encode(confirmed: confirmed), sequence: 0)
+        }
+    }
+
     public func sendKeyboardInput(_ command: KeyboardInputCommand) {
         guard mirrorControl.allowsLegacyVirtualInput else { return }
         let requestedGeneration = connectionGenerationClock.current
@@ -1606,6 +1625,7 @@ public class NetworkManager: ObservableObject {
         stop()
         usbListenerExplicitlyStarted = true
         DispatchQueue.main.async {
+            self.isRemoteControlSession = false
             self.bytesReceived = 0
             self.lastFrameReceiveDurationMs = 0
             self.lastDecodeLatencyMs = 0
@@ -3782,6 +3802,10 @@ public class NetworkManager: ObservableObject {
                         offer.audioCodec != AudioCodecCapabilities.none)
             }
 
+        case .remoteCommandResult, .sessionInfo:
+            return   // remote host replies; the toolbar does not show them yet
+        case .remoteCommand, .sessionInfoRequest:
+            handleStreamError("Unexpected client-direction remote command.")
         case .clientCapabilities, .transportReady, .usbLaneBind,
              .usbLaneBindResult, .videoConfigurationAck,
              .displayConfigurationRequest, .clientHello,

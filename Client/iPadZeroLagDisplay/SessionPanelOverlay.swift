@@ -53,6 +53,7 @@ struct SessionPanelOverlay: View {
     @State private var failedFrom: String?
     @State private var permissionAsked = false
     @State private var lastInteraction = Date()
+    @State private var confirmRestart = false
     @State private var dragOffset: CGFloat = 0
     @State private var disconnectArming = DisconnectArming()
     @State private var disconnectTick = 0
@@ -340,12 +341,34 @@ struct SessionPanelOverlay: View {
             actionButton("Files", icon: "arrow.left.arrow.right") { close(); onFiles() }
             actionButton("Settings", icon: "gearshape") { close(); onSettings() }
         }
-        return Group {
+        return VStack(spacing: 8) {
+            if networkManager.isRemoteControlSession { remoteActions }
             if typeSize.isAccessibilitySize {
                 LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 8) { buttons }
             } else {
                 HStack(spacing: 8) { buttons }
             }
+        }
+    }
+
+    /// Remote control service only: keys the iPad cannot send, and power.
+    private var remoteActions: some View {
+        HStack(spacing: 8) {
+            actionButton("Ctrl+Alt+Del", icon: "lock.shield", hint: "Opens the Windows security screen") {
+                lastInteraction = Date()
+                networkManager.sendRemoteCommand(.secureAttention)
+            }
+            actionButton("Lock PC", icon: "lock") {
+                lastInteraction = Date()
+                networkManager.sendRemoteCommand(.lock)
+            }
+            actionButton("Restart PC", icon: "arrow.clockwise") { confirmRestart = true }
+        }
+        .confirmationDialog("Restart the PC?", isPresented: $confirmRestart, titleVisibility: .visible) {
+            Button("Restart", role: .destructive) { networkManager.sendRemoteCommand(.restart, confirmed: true) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Unsaved work on the PC may ask to be saved. The iPad reconnects when the PC is back.")
         }
     }
 

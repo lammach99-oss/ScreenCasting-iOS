@@ -259,6 +259,13 @@ final class WireStreamParser {
         case .mirrorState: fixedLength = MirrorControlCodec.stateBytes
         case .mirrorAction: fixedLength = 32
         case .mirrorSwitchRequest: fixedLength = 24
+        case .remoteCommand, .remoteCommandResult: fixedLength = 3
+        case .sessionInfoRequest: fixedLength = 1
+        case .sessionInfo:
+            guard (7...71).contains(payloadLength) else {
+                state = .failed; payload = Data(); onEvent(.failure(.invalidHeader)); return
+            }
+            fixedLength = nil
         case .mirrorCatalogue:
             guard (20...24576).contains(payloadLength) else {
                 state = .failed; payload = Data(); onEvent(.failure(.invalidHeader)); return

@@ -256,6 +256,7 @@ public struct ContentView: View {
     @State private var showConnectSheet: Bool = false
     @State private var hostIP: String = ""
     @State private var showIPEntry = false
+    @State private var recentRemoteHosts: [RecentRemoteHost] = []
     @State private var copiedIP = false
     /// The current attempt is USB-C, so the status line never borrows the last Wi-Fi PC.
     @State private var usbChosen = false
@@ -263,6 +264,7 @@ public struct ContentView: View {
     @Environment(\.dynamicTypeSize) private var typeSize
     /// The last Wi-Fi PC by name or typed address; Reconnect uses the matching saved target.
     @AppStorage("ScreenCasting.client.lastWifiHostLabel") private var lastWifiHostLabel = ""
+    @AppStorage("ScreenCasting.client.remoteControlMode") private var remoteControlMode = false
 
     // UI States
     @AppStorage(ClientPreferenceKeys.showPerformanceHUD)
@@ -316,6 +318,7 @@ public struct ContentView: View {
             }
         }
         .onAppear {
+            recentRemoteHosts = RecentRemoteHostStore.load()
             UIApplication.shared.isIdleTimerDisabled = true
             setWifiBrowsing(true)
             networkManager.setDesiredPipelineMode(
@@ -429,8 +432,8 @@ public struct ContentView: View {
         return ""
     }
 
-    private var normalizedManualHost: String {
-        hostIP.trimmingCharacters(in: .whitespacesAndNewlines)
+    private var normalizedManualHost: String? {
+        RemoteHostAddress.parse(hostIP)?.host
     }
 
     private func updateDisplayOrientation(for size: CGSize) {
@@ -439,23 +442,6 @@ public struct ContentView: View {
             width: size.width,
             height: size.height) else { return }
         networkManager.updateInterfaceOrientation(orientation)
-    }
-
-    private var isValidManualIPv4: Bool {
-        let octets = normalizedManualHost.split(
-            separator: ".",
-            omittingEmptySubsequences: false)
-        guard octets.count == 4 else { return false }
-        return octets.allSatisfy { octet in
-            guard !octet.isEmpty,
-                  octet.count <= 3,
-                  octet.allSatisfy(\.isNumber),
-                  let value = Int(octet),
-                  (0...255).contains(value) else {
-                return false
-            }
-            return true
-        }
     }
 
     // MARK: - Layers
@@ -647,12 +633,14 @@ public struct ContentView: View {
     // MARK: - Disconnected Dashboard
 
     private var connectStatus: ConnectScreenStatus {
-        .make(state: networkManager.connectionState,
-              pcName: lastHostLabel.isEmpty ? lastWifiHostLabel : lastHostLabel,
-              discoveredCount: discoveryManager.discoveredHosts.count,
-              reconnectAttempt: networkManager.autoReconnectAttempt,
-              usb: usbChosen,
-              canRetry: networkManager.hasReconnectTarget)
+        let hostLabel = lastHostLabel.isEmpty ? lastWifiHostLabel : lastHostLabel
+        return .make(state: networkManager.connectionState,
+                     pcName: hostLabel,
+                     discoveredCount: discoveryManager.discoveredHosts.count,
+                     reconnectAttempt: networkManager.autoReconnectAttempt,
+                     usb: usbChosen,
+                     canRetry: networkManager.hasReconnectTarget,
+                     tailnetTarget: RemoteHostAddress.parse(hostLabel)?.isTailnet ?? false)
     }
 
     private func setWifiBrowsing(_ on: Bool) {
@@ -900,38 +888,96 @@ public struct ContentView: View {
     private var ipEntry: some View {
         DisclosureGroup(isExpanded: $showIPEntry) {
             VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 8) {
-                    TextField("192.168.1.20", text: $hostIP)
+                if !recentRemoteHosts.isEmpty {
+                    Text("Recent").font(.footnote).foregroundStyle(Color.inkSecondary)
+                    VStack(spacing: 0) {
+                        ForEach(Array(recentRemoteHosts.enumerated()), id: \.element.id) { index, entry in
+                            Button {
+                                usbChosen = false
+                                enteredPIN = ""
+                                remoteControlMode = entry.remoteControl
+                                hostIP = entry.host
+                                lastHostLabel = entry.host
+                                lastWifiHostLabel = entry.host
+                                recentRemoteHosts = RecentRemoteHostStore.record(host: entry.host, remoteControl: entry.remoteControl)
+                                networkManager.connect(to: entry.host, port: entry.port)
+                            } label: {
+                                rowLayout {
+                                    Image(systemName: "desktopcomputer").font(.title3).foregroundStyle(Color.inkAccent)
+                                        .accessibilityHidden(true)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(entry.host).font(.subheadline.weight(.semibold))
+                                            .lineLimit(typeSize.isAccessibilitySize ? nil : 2)
+                                        Text(entry.remoteControl ? "Whole PC" : "Casting display")
+                                            .font(.caption).foregroundStyle(Color.inkSecondary)
+                                    }
+                                    if !typeSize.isAccessibilitySize { Spacer(minLength: 8) }
+                                    Image(systemName: "chevron.right").foregroundStyle(Color.inkSecondary).accessibilityHidden(true)
+                                }
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, typeSize.isAccessibilitySize ? 10 : 0)
+                                .frame(maxWidth: .infinity, minHeight: 56, alignment: .leading)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(isConnectBusy)
+                            .accessibilityHint("Connects to this PC using the saved mode")
+                            .contextMenu {
+                                Button("Forget", role: .destructive) {
+                                    recentRemoteHosts = RecentRemoteHostStore.remove(host: entry.host, remoteControl: entry.remoteControl)
+                                }
+                                .disabled(isConnectBusy)
+                            }
+                            if index < recentRemoteHosts.count - 1 {
+                                Rectangle().fill(Color.inkHairline).frame(height: 0.5)
+                            }
+                        }
+                    }
+                    .background(Color.inkSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                }
+                rowLayout {
+                    TextField("192.168.1.20 or pc-name", text: $hostIP)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                        .keyboardType(.numbersAndPunctuation)
+                        .keyboardType(.URL)
                         .textContentType(.URL)
                         .padding(.horizontal, 12)
                         .frame(minHeight: 44)
                         .background(Color.inkRaised, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                         .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.inkHairline, lineWidth: 0.5))
-                        .accessibilityLabel("PC IP address")
+                        .accessibilityLabel("PC address")
                     Button("Connect") {
+                        guard let host = normalizedManualHost else { return }
                         usbChosen = false
                         enteredPIN = ""
-                        lastHostLabel = normalizedManualHost
-                        lastWifiHostLabel = normalizedManualHost
-                        networkManager.connect(to: normalizedManualHost)
+                        lastHostLabel = host
+                        lastWifiHostLabel = host
+                        recentRemoteHosts = RecentRemoteHostStore.record(host: host, remoteControl: remoteControlMode)
+                        networkManager.connect(
+                            to: host,
+                            port: remoteControlMode ? NetworkManager.remoteControlPort : 27015)
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.large)
                     .tint(Color.inkAccent)
-                    .disabled(!isValidManualIPv4 || isConnectBusy)
+                    .disabled(normalizedManualHost == nil || isConnectBusy)
                 }
-                if !hostIP.isEmpty && !isValidManualIPv4 {
-                    Text("Enter an address like 192.168.1.20.")
+                // Remote host service (SPEC-host-runtime): the PC's real screen, also at the
+                // sign-in screen, instead of the casting display.
+                Toggle("Control the whole PC", isOn: $remoteControlMode)
+                    .font(.subheadline)
+                    .tint(Color.inkAccent)
+                    .frame(minHeight: 44)
+                    .accessibilityHint("Connects to the remote control service on port 27020")
+                if !hostIP.isEmpty && normalizedManualHost == nil {
+                    Text("Enter an IP address or a PC name, like 100.64.0.10 or office-pc.")
                         .font(.caption)
                         .foregroundStyle(Color.inkWarning)
                 }
             }
             .padding(.top, 8)
         } label: {
-            Text("Connect by IP address").font(.subheadline)
+            Text("Connect by address").font(.subheadline)
                 .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                 .contentShape(Rectangle())
         }

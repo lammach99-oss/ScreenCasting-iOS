@@ -52,6 +52,15 @@ enum WireMessageType: UInt8 {
     case transferOffer = 43, transferResponse, transferChunk, transferFileEnd, transferFileAck, transferCancel, transferEnd, transferAck
     case mirrorHello = 51, mirrorState = 52, mirrorInput = 53, mirrorAction = 54
     case mirrorCatalogue = 55, mirrorSwitchRequest = 56
+    // Remote control service (port 27020) only: requests go up, replies only answer them.
+    case remoteCommand = 57, remoteCommandResult = 58, sessionInfoRequest = 59, sessionInfo = 60
+}
+
+/// Toolbar actions the remote host runs on the PC. Payload: [version 1, command, flags(bit0 confirm)].
+public enum RemoteHostCommand: UInt8 {
+    case secureAttention = 1, lock = 2, restart = 3
+
+    func encode(confirmed: Bool) -> Data { Data([1, rawValue, confirmed ? 1 : 0]) }
 }
 
 public enum DirectTouchPhase: UInt8 { case down = 0, update = 1, up = 2, cancel = 3 }
