@@ -1214,7 +1214,7 @@ public class PencilUIKitView: UIView {
             y: contacts.reduce(CGFloat.zero) { $0 + $1.location(in: self).y } / CGFloat(contacts.count))
         let sample = RemoteMouseSample(point: point, timestamp: matching.map(\.timestamp).max() ?? 0,
             touchCount: contacts.count, tapCount: contacts.map(\.tapCount).max() ?? 1, device: scope.device,
-            buttons: RemoteMouseButtons(rawValue: event?.buttonMask.rawValue ?? 0))
+            buttons: RemoteMouseButtons(rawValue: UInt(truncatingIfNeeded: event?.buttonMask.rawValue ?? 0)))
         input.pointer(token: scope.token, generation: scope.generation) { mouse in
             switch flags {
             case 1: return mouse.touchBegan(sample, token: scope.token, generation: scope.generation)
