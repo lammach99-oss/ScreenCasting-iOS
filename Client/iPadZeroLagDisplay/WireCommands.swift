@@ -54,6 +54,8 @@ enum WireMessageType: UInt8 {
     case mirrorCatalogue = 55, mirrorSwitchRequest = 56
     // Remote control service (port 27020) only: requests go up, replies only answer them.
     case remoteCommand = 57, remoteCommandResult = 58, sessionInfoRequest = 59, sessionInfo = 60
+    case remoteFeaturesRequest = 61, remoteFeaturesResult = 62, remoteInputContext = 63
+    case remoteScanKey = 64, remotePointer = 65, remoteInputReset = 66, remoteCommittedText = 67
 }
 
 /// Toolbar actions the remote host runs on the PC. Payload: [version 1, command, flags(bit0 confirm)].

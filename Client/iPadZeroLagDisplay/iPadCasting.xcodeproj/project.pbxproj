@@ -25,6 +25,7 @@
 		FB2500000000000000000007 /* ConnectScreenModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000007 /* ConnectScreenModel.swift */; };
 		FB2500000000000000000008 /* GestureHelp.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000008 /* GestureHelp.swift */; };
 		FB2500000000000000000009 /* RemoteHostDirectory.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000009 /* RemoteHostDirectory.swift */; };
+		A11500000000000000000001 /* RemoteFeatureNegotiation.swift in Sources */ = {isa = PBXBuildFile; fileRef = A11400000000000000000001 /* RemoteFeatureNegotiation.swift */; };
 		300111111111111111111109 /* StreamManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201011111111111111111110 /* StreamManager.swift */; };
 		30011111111111111111110A /* DiscoveryManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201111111111111111111111 /* DiscoveryManager.swift */; };
 		30011111111111111111110B /* AudioManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201211111111111111111112 /* AudioManager.swift */; };
@@ -81,6 +82,7 @@
 		FA2300000000000000000007 /* GestureHelpTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000007 /* GestureHelpTests.swift */; };
 		FA2300000000000000000008 /* SettingsCopyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000008 /* SettingsCopyTests.swift */; };
 		FA2300000000000000000009 /* RemoteHostDirectoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000009 /* RemoteHostDirectoryTests.swift */; };
+		A11500000000000000000002 /* RemoteInputProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A11400000000000000000002 /* RemoteInputProtocolTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -114,6 +116,7 @@
 		FB2400000000000000000007 /* ConnectScreenModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectScreenModel.swift; sourceTree = "<group>"; };
 		FB2400000000000000000008 /* GestureHelp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GestureHelp.swift; sourceTree = "<group>"; };
 		FB2400000000000000000009 /* RemoteHostDirectory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteHostDirectory.swift; sourceTree = "<group>"; };
+		A11400000000000000000001 /* RemoteFeatureNegotiation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteFeatureNegotiation.swift; sourceTree = "<group>"; };
 		200911111111111111111109 /* PencilTouchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PencilTouchView.swift; sourceTree = "<group>"; };
 		201011111111111111111110 /* StreamManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamManager.swift; sourceTree = "<group>"; };
 		201111111111111111111111 /* DiscoveryManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiscoveryManager.swift; sourceTree = "<group>"; };
@@ -171,6 +174,7 @@
 		FA2200000000000000000007 /* GestureHelpTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GestureHelpTests.swift; sourceTree = "<group>"; };
 		FA2200000000000000000008 /* SettingsCopyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsCopyTests.swift; sourceTree = "<group>"; };
 		FA2200000000000000000009 /* RemoteHostDirectoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteHostDirectoryTests.swift; sourceTree = "<group>"; };
+		A11400000000000000000002 /* RemoteInputProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteInputProtocolTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -214,6 +218,7 @@
 				FB2400000000000000000007 /* ConnectScreenModel.swift */,
 				FB2400000000000000000008 /* GestureHelp.swift */,
 				FB2400000000000000000009 /* RemoteHostDirectory.swift */,
+				A11400000000000000000001 /* RemoteFeatureNegotiation.swift */,
 				FA2200000000000000000002 /* MirrorClientControl.swift */,
 				FA2200000000000000000001 /* MirrorControlProtocol.swift */,
 				D70211111111111111111105 /* TransferPanel.swift */,
@@ -267,6 +272,7 @@
 				FA2200000000000000000007 /* GestureHelpTests.swift */,
 				FA2200000000000000000008 /* SettingsCopyTests.swift */,
 				FA2200000000000000000009 /* RemoteHostDirectoryTests.swift */,
+				A11400000000000000000002 /* RemoteInputProtocolTests.swift */,
 				201711111111111111111117 /* WireProtocolTests.swift */,
 				D70211111111111111111104 /* DataTransferTests.swift */,
 				D70211111111111111111108,
@@ -402,6 +408,7 @@
 				FB2500000000000000000007 /* ConnectScreenModel.swift in Sources */,
 				FB2500000000000000000008 /* GestureHelp.swift in Sources */,
 				FB2500000000000000000009 /* RemoteHostDirectory.swift in Sources */,
+				A11500000000000000000001 /* RemoteFeatureNegotiation.swift in Sources */,
 				FA2300000000000000000002 /* MirrorClientControl.swift in Sources */,
 				FA2300000000000000000001 /* MirrorControlProtocol.swift in Sources */,
 				D70111111111111111111105 /* TransferPanel.swift in Sources */,
@@ -447,6 +454,7 @@
 				FA2300000000000000000007 /* GestureHelpTests.swift in Sources */,
 				FA2300000000000000000008 /* SettingsCopyTests.swift in Sources */,
 				FA2300000000000000000009 /* RemoteHostDirectoryTests.swift in Sources */,
+				A11500000000000000000002 /* RemoteInputProtocolTests.swift in Sources */,
 				300111111111111111111110 /* WireProtocolTests.swift in Sources */,
 				D70111111111111111111104 /* DataTransferTests.swift in Sources */,
 				D70111111111111111111108,

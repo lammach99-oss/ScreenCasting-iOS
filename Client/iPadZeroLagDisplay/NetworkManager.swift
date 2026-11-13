@@ -324,6 +324,14 @@ public class NetworkManager: ObservableObject {
         connectionGenerationClock.current
     }
     var remoteKeyboardGeneration: UInt64 { connectionGenerationClock.current }
+    private var remoteInputConnection = false
+    private var remoteFeatures = RemoteFeatureNegotiation()
+    private var remoteFeaturesPingNonce: UInt64?
+    @Published public private(set) var remoteInputFeatures: UInt64 = 0
+    @Published public private(set) var remoteInputReady = false
+    @Published public private(set) var remoteInputContext: RemoteInputContextCommand?
+    @Published public private(set) var remoteInputRevision: UInt64 = 0
+
     private var listenerGeneration: UInt64 = 0
     private struct PendingUsbCandidate {
         let id: UInt64
@@ -379,6 +387,10 @@ public class NetworkManager: ObservableObject {
         sender: { [weak self] data, diagnostic, completion in
             guard let self else {
                 completion(.posix(.ECANCELED))
+                return
+            }
+            if !self.remoteInputPacketIsCurrent(data) {
+                completion(nil)
                 return
             }
             #if targetEnvironment(simulator)
@@ -731,6 +743,9 @@ public class NetworkManager: ObservableObject {
         settingsReconciliationGate.reset()
         settingsSyncPolicy.reset()
         let isRemoteControl = RemoteSessionPolicy.isRemoteControl(endpoint: endpoint)
+        remoteInputConnection = isRemoteControl
+        resetRemoteInputOnQueue()
+
         DispatchQueue.main.async {
             self.isRemoteControlSession = isRemoteControl
             self.settingsGeneration = 0
@@ -1192,6 +1207,7 @@ public class NetworkManager: ObservableObject {
     public func sendTextCommit(_ text: String) {
         guard mirrorControl.allowsLegacyVirtualInput else { return }
         let requestedGeneration = connectionGenerationClock.current
+        let requestedInputToken = remoteInputContext?.token
         networkQueue.async { [weak self] in
             guard let self, requestedGeneration == self.connectionGeneration, self.mirrorControl.allowsLegacyVirtualInput else { return }
             let generation = requestedGeneration
@@ -1199,8 +1215,15 @@ public class NetworkManager: ObservableObject {
                   self.committedTransportGeneration == generation,
                   TextCommitDeliveryPolicy.maySend(inputSuppressed: self.displayRequestGate.isInputSuppressed) else { return }
             for command in TextCommitCommand.chunks(text) {
-                guard let payload = command.encode() else { return }
-                self.sendWireMessage(type: .textCommit, payload: payload, sequence: 0, movement: false)
+                if self.remoteInputConnection, self.remoteFeatures.accepted & 1 != 0 {
+                    guard let token = requestedInputToken,
+                          self.remoteFeatures.maySend(feature: 1, token: token),
+                          let payload = RemoteCommittedTextCommand(token: token, text: command.text).encode() else { return }
+                    self.sendWireMessage(type: .remoteCommittedText, payload: payload, sequence: 0)
+                } else {
+                    guard let payload = command.encode() else { return }
+                    self.sendWireMessage(type: .textCommit, payload: payload, sequence: 0, movement: false)
+                }
             }
         }
     }
@@ -1229,11 +1252,84 @@ public class NetworkManager: ObservableObject {
                   KeyboardInputDeliveryPolicy.maySend(
                     action: command.action,
                     inputSuppressed: self.displayRequestGate.isInputSuppressed) else { return }
+            guard !self.remoteInputConnection || self.remoteFeatures.accepted & 1 == 0 else { return }
             self.sendWireMessage(
                 type: .keyboardInput,
                 payload: command.encode(),
                 sequence: 0,
                 movement: false)
+        }
+    }
+
+    private func beginRemoteFeaturesOnQueue(generation: UInt64) {
+        guard remoteInputConnection, remoteFeatures.begin(now: ProcessInfo.processInfo.systemUptime) else { return }
+        remoteFeaturesPingNonce = sendClientPing(force: true, purpose: .telemetry, remoteFeaturesProbe: true)
+        networkQueue.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self, self.connectionGeneration == generation else { return }
+            self.remoteFeatures.expire(now: ProcessInfo.processInfo.systemUptime)
+        }
+    }
+
+    private func publishRemoteInputOnQueue(contextChanged: Bool = true) {
+        let generation = connectionGeneration, context = remoteFeatures.context, features = remoteFeatures.accepted
+        let ready = remoteFeatures.inputReady
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.connectionGenerationClock.current == generation else { return }
+            self.remoteInputContext = context; self.remoteInputFeatures = features; self.remoteInputReady = ready
+            if contextChanged { self.remoteInputRevision &+= 1 }
+        }
+    }
+    private func resetRemoteInputOnQueue() {
+        remoteFeatures = RemoteFeatureNegotiation(); remoteFeaturesPingNonce = nil
+        publishRemoteInputOnQueue()
+    }
+
+    private func remoteInputPacketIsCurrent(_ data: Data) -> Bool {
+        guard data.count >= 16, let type = WireMessageType(rawValue: data[5]) else { return true }
+        if !remoteInputConnection { return !(61...67).contains(type.rawValue) }
+        let payload = Data(data.dropFirst(16))
+        switch type {
+        case .remoteScanKey:
+            guard let key = RemoteScanKeyCommand.decode(payload) else { return false }
+            return remoteFeatures.maySend(feature: 1, token: key.token)
+        case .remotePointer:
+            guard let pointer = RemotePointerCommand.decode(payload) else { return false }
+            return remoteFeatures.maySend(feature: 2, token: pointer.token)
+        case .remoteCommittedText:
+            guard let text = RemoteCommittedTextCommand.decode(payload) else { return false }
+            return remoteFeatures.maySend(feature: 1, token: text.token)
+        case .keyboardInput, .textCommit: return remoteFeatures.accepted & 1 == 0
+        case .pointerInput: return remoteFeatures.accepted & 2 == 0
+        default: return true
+        }
+    }
+
+    public func sendRemoteScanKey(_ command: RemoteScanKeyCommand, expectedGeneration: UInt64) {
+        networkQueue.async { [weak self] in
+            guard let self, self.remoteInputConnection, self.connectionGeneration == expectedGeneration,
+                  self.transportState == .streaming, self.committedTransportGeneration == expectedGeneration,
+                  (command.action == 1 || !self.displayRequestGate.isInputSuppressed),
+                  self.remoteFeatures.maySend(feature: 1, token: command.token), let payload = command.encode() else { return }
+            self.sendWireMessage(type: .remoteScanKey, payload: payload, sequence: 0)
+        }
+    }
+    public func sendRemotePointer(_ command: RemotePointerCommand, expectedGeneration: UInt64) {
+        networkQueue.async { [weak self] in
+            guard let self, self.remoteInputConnection, self.connectionGeneration == expectedGeneration,
+                  self.transportState == .streaming, self.committedTransportGeneration == expectedGeneration,
+                  (command.kind == 2 && command.a == 1 || !self.displayRequestGate.isInputSuppressed),
+                  self.remoteFeatures.maySend(feature: 2, token: command.token), let payload = command.encode() else { return }
+            // Preserve relative deltas, wheels and move-before-button ordering.
+            self.sendWireMessage(type: .remotePointer, payload: payload, sequence: 0)
+        }
+    }
+    public func sendRemoteInputReset(_ command: RemoteInputResetCommand, expectedGeneration: UInt64) {
+        networkQueue.async { [weak self] in
+            guard let self, self.remoteInputConnection, self.connectionGeneration == expectedGeneration,
+                  self.wireAuthenticatedGeneration == expectedGeneration, self.remoteFeatures.accepted != 0,
+                  self.remoteFeatures.context?.token == command.token, let payload = command.encode() else { return }
+            self.remoteFeatures.invalidateInput(); self.publishRemoteInputOnQueue()
+            self.sendWireMessage(type: .remoteInputReset, payload: payload, sequence: 0)
         }
     }
 
@@ -1290,6 +1386,7 @@ public class NetworkManager: ObservableObject {
                     inputSuppressed: self.displayRequestGate.isInputSuppressed) else {
                 return
             }
+            guard !self.remoteInputConnection || self.remoteFeatures.accepted & 2 == 0 else { return }
             self.sendWireMessage(
                 type: .pointerInput,
                 payload: command.encode(),
@@ -1489,6 +1586,8 @@ public class NetworkManager: ObservableObject {
     }
 
     private func stopOnQueue() {
+        resetRemoteInputOnQueue()
+        remoteInputConnection = false
         cancelUsbCandidateArbitration(reason: "explicit_stop")
         dispatchPrecondition(condition: .onQueue(networkQueue))
         cancelLegacyUsbPcmFreshFence()
@@ -2643,7 +2742,7 @@ public class NetworkManager: ObservableObject {
     }
 
     @discardableResult
-    private func sendClientPing(force: Bool, purpose: ClientPingPurpose) -> UInt64? {
+    private func sendClientPing(force: Bool, purpose: ClientPingPurpose, remoteFeaturesProbe: Bool = false) -> UInt64? {
         guard let owner = activeControlConnection else { return nil }
         let now = ProcessInfo.processInfo.systemUptime
         guard force || now - lastClientPingSentAt >= 1 else { return nil }
@@ -2676,7 +2775,8 @@ public class NetworkManager: ObservableObject {
         sendWireMessage(
             type: .ping,
             payload: payload,
-            sequence: UInt32(truncatingIfNeeded: nonce))
+            sequence: UInt32(truncatingIfNeeded: nonce),
+            flags: remoteFeaturesProbe ? RemoteFeatureNegotiation.supportedFlag : 0)
         return nonce
     }
 
@@ -3283,6 +3383,7 @@ public class NetworkManager: ObservableObject {
                 print("[IPAD][AUTO_RECONNECT_SUCCESS] generation=\(generation)")
                 wireAuthenticatedGeneration = generation
                 committedTransportGeneration = nil
+                beginRemoteFeaturesOnQueue(generation: generation)
                 committedTransportAudioAvailable = false
                 committedRealtimeSessionID = nil
                 wifiLegacyFallbackRequestGeneration = nil
@@ -3491,6 +3592,10 @@ public class NetworkManager: ObservableObject {
             }
             guard mirrorControl.permitsVideoSequence(header.sequence) else { return }
             let receivedAt = CACurrentMediaTime()
+            if remoteInputConnection, header.flags & WireProtocol.videoFlagIDR != 0, !remoteFeatures.inputReady {
+                remoteFeatures.keyframeArrived()
+                publishRemoteInputOnQueue(contextChanged: false)
+            }
             let receiveDurationMs = max(0, (receivedAt - message.firstByteAt) * 1_000.0)
             recordVideoPayloadReceived(payload.count, sequence: header.sequence)
             bytesReceived &+= UInt64(payload.count)
@@ -3553,6 +3658,12 @@ public class NetworkManager: ObservableObject {
             guard payload.count == 16 else { return }
             let nonce = payload.withUnsafeBytes {
                 $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self).littleEndian
+            }
+            if remoteInputConnection, remoteFeaturesPingNonce == nonce {
+                remoteFeaturesPingNonce = nil
+                if let request = remoteFeatures.pong(flags: header.flags, now: ProcessInfo.processInfo.systemUptime) {
+                    sendWireMessage(type: .remoteFeaturesRequest, payload: request, sequence: 0)
+                }
             }
             if let pending = pendingClientPings[nonce],
                pending.generation == generation,
@@ -3802,6 +3913,18 @@ public class NetworkManager: ObservableObject {
                         offer.audioCodec != AudioCodecCapabilities.none)
             }
 
+        case .remoteFeaturesResult:
+            guard remoteInputConnection, remoteFeatures.result(flags: header.flags, payload: payload) else {
+                handleStreamError("Invalid remote feature result."); return
+            }
+            publishRemoteInputOnQueue()
+        case .remoteInputContext:
+            guard remoteInputConnection, remoteFeatures.receiveContext(flags: header.flags, payload: payload) else {
+                handleStreamError("Invalid remote input context."); return
+            }
+            publishRemoteInputOnQueue()
+        case .remoteFeaturesRequest, .remoteScanKey, .remotePointer, .remoteInputReset, .remoteCommittedText:
+            handleStreamError("Unexpected client-direction remote input.")
         case .remoteCommandResult, .sessionInfo:
             return   // remote host replies; the toolbar does not show them yet
         case .remoteCommand, .sessionInfoRequest:
@@ -4501,6 +4624,8 @@ public class NetworkManager: ObservableObject {
 
     private func teardownCurrentSession() {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        resetRemoteInputOnQueue()
+        remoteInputConnection = false
         cancelUsbCandidateArbitration(reason: "session_teardown")
         cancelLegacyUsbPcmFreshFence()
         legacyUsbPlaybackEnabledGeneration = nil

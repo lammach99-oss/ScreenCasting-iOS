@@ -253,6 +253,14 @@ final class WireStreamParser {
             sequence: sequence)
         let fixedLength: Int?
         switch type {
+        case .remoteFeaturesRequest, .remoteFeaturesResult, .remoteScanKey, .remoteInputReset: fixedLength = 16
+        case .remoteInputContext: fixedLength = 36
+        case .remotePointer: fixedLength = 24
+        case .remoteCommittedText:
+            guard (20...4115).contains(payloadLength) else {
+                state = .failed; payload = Data(); onEvent(.failure(.invalidHeader)); return
+            }
+            fixedLength = nil
         case .ping, .pong, .videoFeedback:
             fixedLength = 16
         case .mirrorHello: fixedLength = 8
@@ -328,6 +336,9 @@ final class WireStreamParser {
         }
 
         if let fixedLength, payloadLength != fixedLength {
+            if (61...67).contains(type.rawValue) {
+                state = .failed; payload = Data(); onEvent(.failure(.invalidHeader)); return
+            }
             payload = Data()
             payloadOffset = 0
             if payloadLength == 0 {
