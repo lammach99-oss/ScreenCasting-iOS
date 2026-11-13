@@ -250,6 +250,7 @@ public struct ContentView: View {
     @StateObject private var networkManager: NetworkManager
     @StateObject private var streamManager: StreamManager
     @StateObject private var discoveryManager = DiscoveryManager()
+    @StateObject private var remoteInput = RemoteSessionInputState()
 
     // PIN State
     @State private var enteredPIN: String = ""
@@ -318,6 +319,8 @@ public struct ContentView: View {
             }
         }
         .onAppear {
+            remoteInput.bind(networkManager)
+            remoteInput.configure(remoteInputConfiguration)
             recentRemoteHosts = RecentRemoteHostStore.load()
             UIApplication.shared.isIdleTimerDisabled = true
             setWifiBrowsing(true)
@@ -377,14 +380,20 @@ public struct ContentView: View {
         .onChange(of: connectStatus.text) { _, text in
             if !streamManager.isConnected { UIAccessibility.post(notification: .announcement, argument: text) }
         }
+        .onChange(of: remoteInputConfiguration) { _, value in
+            remoteInput.bind(networkManager)
+            remoteInput.configure(value)
+        }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:
                 networkManager.applicationDidBecomeActive()
                 updateDisplayOrientation(for: rootSurfaceSize)
             case .inactive:
+                remoteInput.suspend(reason: 0)
                 networkManager.applicationWillResignActive()
             case .background:
+                remoteInput.suspend(reason: 2)
                 networkManager.applicationDidEnterBackground()
             @unknown default:
                 break
@@ -459,6 +468,15 @@ public struct ContentView: View {
     // The decoder/renderer owns the viewport it actually draws. Keep the
     // Metal and UIKit touch surfaces in one full-window container so that the
     // same normalized viewport describes both surfaces.
+    private var remoteInputConfiguration: RemoteSessionInputConfiguration {
+        RemoteSessionInputConfiguration(remote: networkManager.isRemoteControlSession,
+            connected: streamManager.isConnected,
+            active: scenePhase == .active && !isSheetPresented && !showGestureGuide,
+            generation: networkManager.remoteKeyboardGeneration,
+            features: networkManager.remoteInputFeatures, context: networkManager.remoteInputContext,
+            ready: networkManager.remoteInputReady, revision: networkManager.remoteInputRevision)
+    }
+
     @ViewBuilder
     private var connectedVideoSurface: some View {
         GeometryReader { proxy in
@@ -513,6 +531,7 @@ public struct ContentView: View {
                     // The 3-finger tap opens the session panel; Settings is one tap inside it.
                     isSessionPanelOpen = true
                 })
+                .remoteSessionInput(remoteInput)
                 .gestureHints { hint in showGestureToast(hint) }
                 .frame(width: frame.width, height: frame.height)
                 .offset(x: frame.minX, y: frame.minY)
@@ -603,6 +622,7 @@ public struct ContentView: View {
                     hostLabel: SessionPanelSnapshot.sessionHost(current: lastHostLabel, lastWifi: lastWifiHostLabel,
                                                                 usb: usbChosen),
                     isOpen: $isSessionPanelOpen,
+                    remoteInput: remoteInput,
                     onFiles: { isTransferPresented = true },
                     onSettings: { isSettingsPresented = true },
                     onGestures: { showGestureGuide = true })

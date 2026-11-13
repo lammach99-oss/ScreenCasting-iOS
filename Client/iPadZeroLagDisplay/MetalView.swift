@@ -347,6 +347,9 @@ public final class ConnectedPresentationContainer: UIView {
         softwareTextView.onHardwarePresses = { [weak self] presses, action in
             self?.touchView.unhandledHardwarePresses(presses, action: action) ?? presses
         }
+        softwareTextView.onHardwareCancellation = { [weak self] presses in
+            self?.touchView.unhandledHardwarePresses(presses, action: .keyUp, phase: .cancelled) ?? presses
+        }
         for name in [UIResponder.keyboardWillShowNotification, UIResponder.keyboardWillChangeFrameNotification, UIResponder.keyboardWillHideNotification,
                      UIResponder.keyboardDidHideNotification, UIResponder.keyboardDidShowNotification,
                      UIApplication.willResignActiveNotification, UIApplication.didBecomeActiveNotification] {
@@ -617,6 +620,8 @@ public final class ConnectedPresentationContainer: UIView {
     private func handleKeyboardNotification(_ note: Notification) {
         defer { recordKeyboardAuthority(reason: note.name.rawValue) }
         if note.name == UIApplication.willResignActiveNotification {
+            touchView.remoteSessionInput?.suspend(reason: 0)
+            touchView.discardRemoteTouches()
             retireRemotePointerInputs()
             softwareRequested = false; applyRemoteKeyboardMode(.none); return
         }
@@ -695,6 +700,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     var onPencilInput: ((PencilPacket) -> Void)?
     var onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)?
     var remoteKeyboardActive: Bool
+    private var remoteInput: RemoteSessionInputState?
     var onKeyboardInput: ((KeyboardInputCommand) -> Void)?
     var onTextCommit: ((String) -> Void)?
     var onDirectTouchContact: ((DirectTouchContactCommand) -> Void)?
@@ -736,6 +742,12 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         self.onOpenSettings = onOpenSettings
     }
 
+    func remoteSessionInput(_ input: RemoteSessionInputState) -> Self {
+        var copy = self
+        copy.remoteInput = input
+        return copy
+    }
+
     /// Reports recognised finger gestures for the first-use toasts.
     func gestureHints(_ handler: @escaping (GestureHint) -> Void) -> Self {
         var copy = self
@@ -744,6 +756,8 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     }
 
     public static func dismantleUIView(_ uiView: ConnectedPresentationContainer, coordinator: Coordinator) {
+        uiView.touchView.remoteSessionInput?.suspend(reason: 0)
+        uiView.touchView.discardRemoteTouches()
         uiView.retireRemotePointerInputs()
         uiView.retireRemoteKeyboard()
     }
@@ -801,6 +815,18 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         container.setNeedsLayout()
 
         let touchView = container.touchView
+        if let remoteInput, networkManager.isRemoteControlSession {
+            remoteInput.bind(networkManager)
+            touchView.remoteSessionInput = remoteInput
+            if coordinator.remoteInputRevision != networkManager.remoteInputRevision ||
+                coordinator.remoteInputWaiting != remoteInput.waitingForContext {
+                touchView.discardRemoteTouches()
+                container.retireRemoteKeyboard()
+                coordinator.remoteInputRevision = networkManager.remoteInputRevision
+                coordinator.remoteInputWaiting = remoteInput.waitingForContext
+            }
+            touchView.updateRemoteVideoRect()
+        } else { touchView.remoteSessionInput = nil }
         let binding = networkManager.mirrorInputRevision
         let ticket = networkManager.mirrorTicketAtRegistration
         let legacy = networkManager.permitsLegacyVirtualInput
@@ -826,13 +852,28 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             } else if legacy { sendTouchEvent?(type, x, y, pressure) }
         }
         let keyInput = onKeyboardInput
-        touchView.onKeyboardInput = { [weak networkManager] command in
-            if let ticket { networkManager?.sendMirrorInput(ticket: ticket, kind: .keyboard, payload: command.encode()) }
+        let inputGeneration = networkManager.remoteKeyboardGeneration
+        let inputToken = networkManager.remoteInputContext?.token
+        touchView.onKeyboardInput = { [weak networkManager, weak remoteInput] command in
+            if networkManager?.isRemoteControlSession == true {
+                if remoteInput?.usesScanKeyboard == true {
+                    if remoteInput?.acceptsText(token: inputToken, generation: inputGeneration) == true {
+                        remoteInput?.softwareKey(command)
+                    }
+                } else { networkManager?.sendKeyboardInput(command) }
+            } else if let ticket { networkManager?.sendMirrorInput(ticket: ticket, kind: .keyboard, payload: command.encode()) }
             else if legacy { keyInput?(command) }
         }
         let textInput = onTextCommit
-        container.onTextCommit = { [weak networkManager] text in
-            if let ticket {
+        container.onTextCommit = { [weak networkManager, weak remoteInput] text in
+            if networkManager?.isRemoteControlSession == true {
+                guard networkManager?.remoteKeyboardGeneration == inputGeneration,
+                      networkManager?.remoteInputContext?.token == inputToken else { return }
+                if remoteInput == nil || remoteInput?.acceptsText(token: inputToken, generation: inputGeneration) == true {
+                    networkManager?.sendTextCommit(text)
+                }
+            }
+            else if let ticket {
                 for command in TextCommitCommand.chunks(text) {
                     guard let bytes = command.encode() else { return }
                     networkManager?.sendMirrorInput(ticket: ticket, kind: .text, payload: bytes)
@@ -848,12 +889,13 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             if let ticket { networkManager?.sendMirrorInput(ticket: ticket, kind: .directTouch, payload: command.encode()) }
             else if legacy { directInput?(command) }
         }
-        let admitted = remoteKeyboardActive && (ticket != nil || legacy)
+        let admitted = remoteKeyboardActive && (ticket != nil || legacy || networkManager.isRemoteControlSession)
         touchView.configureDirectTouch(active: admitted, generation: binding)
         touchView.configureExternalPointer(active: admitted, generation: binding)
         let pointerInput = onPointerInput
         touchView.onPointerInput = { [weak networkManager] command in
-            if let ticket { networkManager?.sendMirrorInput(ticket: ticket, kind: .pointer, payload: command.encode()) }
+            if networkManager?.isRemoteControlSession == true { networkManager?.sendPointerInput(command) }
+            else if let ticket { networkManager?.sendMirrorInput(ticket: ticket, kind: .pointer, payload: command.encode()) }
             else if legacy { pointerInput?(command) }
         }
         let openSettings = onOpenSettings
@@ -944,6 +986,8 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     #endif
 
     public final class Coordinator {
+        var remoteInputRevision: UInt64?
+        var remoteInputWaiting = false
         var mirrorBindingRevision: UInt64?
         var mirrorBindingSession: UInt64?
         var renderer: Renderer?

@@ -5365,3 +5365,177 @@ enum DirectTouchDeliveryPolicy {
         !inputSuppressed || phase == .up || phase == .cancel
     }
 }
+
+
+// One main-thread owner for the remote session's bar, hardware and pointer input.
+struct RemoteSessionInputConfiguration: Equatable {
+    let remote: Bool
+    let connected: Bool
+    let active: Bool
+    let generation: UInt64
+    let features: UInt64
+    let context: RemoteInputContextCommand?
+    let ready: Bool
+    let revision: UInt64
+}
+
+@MainActor final class RemoteSessionInputState: ObservableObject {
+    @Published var keyboard = RemoteKeyboardState(token: 0)
+    @Published private(set) var mouseMode: RemoteMouseMode = .auto
+    @Published private(set) var configuration: RemoteSessionInputConfiguration?
+    @Published private(set) var waitingForContext = false
+    var sendKey: (RemoteScanKeyCommand, UInt64) -> Void = { _, _ in }
+    var sendPointer: (RemotePointerCommand, UInt64) -> Void = { _, _ in }
+    var sendReset: (RemoteInputResetCommand, UInt64) -> Void = { _, _ in }
+    private var blockedToken: UInt64?
+    private var hardwareUsages: Set<Int> = []
+    private var suppressedUsages: Set<Int> = []
+    private var videoRect = CGRect.zero
+    private var mouse = RemoteMouseInput(context: nil, videoRect: .zero, generation: 0, inputReady: false)
+
+    var usesScanKeyboard: Bool { configuration?.remote == true && (configuration!.features & 1) != 0 }
+    var usesEnhancedPointer: Bool { configuration?.remote == true && (configuration!.features & 2) != 0 }
+    var generation: UInt64 { configuration?.generation ?? 0 }
+    var token: UInt64 { configuration?.context?.token ?? 0 }
+    var revision: UInt64 { configuration?.revision ?? 0 }
+    private var enabled: Bool {
+        guard let c = configuration, c.remote, c.connected, c.active, c.ready,
+              let context = c.context, context.state == 1, context.token != 0,
+              [1, 2, 3].contains(context.desktop),
+              context.width > 0, context.height > 0 else { return false }
+        return !waitingForContext
+    }
+    var keyboardEnabled: Bool { usesScanKeyboard && enabled }
+    var pointerEnabled: Bool { usesEnhancedPointer && enabled }
+
+    func bind(_ network: NetworkManager) {
+        sendKey = { [weak network] in network?.sendRemoteScanKey($0, expectedGeneration: $1) }
+        sendPointer = { [weak network] in network?.sendRemotePointer($0, expectedGeneration: $1) }
+        sendReset = { [weak network] in network?.sendRemoteInputReset($0, expectedGeneration: $1) }
+    }
+
+    func configure(_ value: RemoteSessionInputConfiguration) {
+        guard configuration != value else { return }
+        let old = configuration
+        let changedConnection = old?.generation != value.generation || old?.remote != value.remote
+        let retired = changedConnection || old?.revision != value.revision || old?.context != value.context
+            || old?.features != value.features || !value.connected || !value.ready
+        if retired {
+            suppressedUsages.formUnion(hardwareUsages)
+            hardwareUsages.removeAll()
+            keyboard = RemoteKeyboardState(token: 0)
+            mouse = RemoteMouseInput(context: nil, videoRect: videoRect,
+                generation: value.generation, mode: mouseMode, inputReady: false)
+        } else if old?.active == true && !value.active {
+            suspend(reason: 0)
+        }
+        if changedConnection {
+            blockedToken = nil
+            mouseMode = .auto
+            mouse = RemoteMouseInput(context: nil, videoRect: videoRect,
+                generation: value.generation, mode: .auto, inputReady: false)
+        }
+        configuration = value
+        waitingForContext = blockedToken != nil && (value.context == nil || value.context?.token == 0 || blockedToken == value.context?.token)
+        if !waitingForContext { blockedToken = nil }
+        if keyboardEnabled && keyboard.token != token { keyboard = RemoteKeyboardState(token: token) }
+        _ = mouse.configure(context: value.context, videoRect: videoRect,
+            generation: value.generation, inputReady: pointerEnabled)
+    }
+
+    func setVideoRect(_ rect: CGRect) {
+        guard rect != videoRect else { return }
+        videoRect = rect
+        let commands = mouse.configure(context: configuration?.context, videoRect: rect,
+            generation: generation, inputReady: pointerEnabled)
+        commands.forEach { sendPointer($0, generation) }
+    }
+
+    @discardableResult func hardware(usage: Int, phase: RemoteHardwareKeyboard.Phase) -> Bool {
+        if suppressedUsages.contains(usage) {
+            if phase != .began { suppressedUsages.remove(usage) }
+            return true
+        }
+        guard keyboardEnabled else { return false }
+        if phase != .began && !hardwareUsages.contains(usage) { return false }
+        var copy = keyboard
+        var commands: [RemoteScanKeyCommand] = []
+        let handled = RemoteHardwareKeyboard.handle(usage: usage, phase: phase,
+            state: &copy, send: { commands.append($0) })
+        keyboard = copy
+        if handled {
+            if phase == .began { hardwareUsages.insert(usage) } else { hardwareUsages.remove(usage) }
+        }
+        commands.forEach { emitKey($0, generation: generation) }
+        return handled
+    }
+
+    func emitKey(_ key: RemoteScanKeyCommand, generation: UInt64) {
+        guard keyboardEnabled, self.generation == generation, key.token == token else { return }
+        sendKey(key, generation)
+    }
+
+    func acceptsText(token: UInt64?, generation: UInt64) -> Bool {
+        guard self.generation == generation, let c = configuration,
+              c.remote, c.connected, c.active else { return false }
+        return usesScanKeyboard ? keyboardEnabled && token == self.token : true
+    }
+
+    func softwareKey(_ key: KeyboardInputCommand) {
+        let usage: Int
+        switch key.virtualKey {
+        case 0x08: usage = 0x2a
+        case 0x09: usage = 0x2b
+        case 0x0d: usage = 0x28
+        case 0x1b: usage = 0x29
+        default: return
+        }
+        guard keyboardEnabled else { return }
+        // A software control key is a bar owner, never a physical-key owner.
+        guard let physical = RemoteHardwareKeyboard.key(forUsage: usage) else { return }
+        let commands = key.action == .keyDown ? keyboard.barKeyDown(physical) : keyboard.barKeyUp(physical)
+        commands.forEach { emitKey($0, generation: generation) }
+    }
+
+    func pointer(token: UInt64, generation: UInt64,
+                 _ operation: (inout RemoteMouseInput) -> [RemotePointerCommand]) {
+        guard pointerEnabled, self.token == token, self.generation == generation else { return }
+        operation(&mouse).forEach { sendPointer($0, generation) }
+    }
+
+    func middleClick() {
+        let t = token, g = generation
+        pointer(token: t, generation: g) { $0.middleClick(token: t, generation: g) }
+    }
+
+    func changeMouseMode(_ mode: RemoteMouseMode) {
+        guard pointerEnabled, mode != mouseMode else { return }
+        suspend(reason: 3)
+        mouseMode = mode
+        mouse = RemoteMouseInput(context: nil, videoRect: videoRect,
+            generation: generation, mode: mode, inputReady: false)
+    }
+
+    func suspend(reason: UInt8) {
+        guard enabled, usesScanKeyboard || usesEnhancedPointer else { return }
+        let t = token, g = generation
+        let keys = keyboard.reset()
+        let buttons = mouse.reset(token: t, generation: g)
+        // Ordinary keys and all buttons precede modifier releases.
+        for key in keys where !RemotePhysicalKey(scan: key.scan, flags: key.flags).isModifier {
+            sendKey(key, g)
+        }
+        buttons.forEach { sendPointer($0, g) }
+        for key in keys where RemotePhysicalKey(scan: key.scan, flags: key.flags).isModifier {
+            sendKey(key, g)
+        }
+        suppressedUsages.formUnion(hardwareUsages)
+        hardwareUsages.removeAll()
+        keyboard = RemoteKeyboardState(token: 0)
+        blockedToken = t
+        waitingForContext = true
+        _ = mouse.configure(context: configuration?.context, videoRect: videoRect,
+            generation: g, inputReady: false)
+        sendReset(RemoteInputResetCommand(reason: reason, token: t), g)
+    }
+}

@@ -45,6 +45,7 @@ struct SessionPanelOverlay: View {
     @ObservedObject var networkManager: NetworkManager
     let hostLabel: String
     @Binding var isOpen: Bool
+    @ObservedObject var remoteInput: RemoteSessionInputState
     let onFiles: () -> Void
     let onSettings: () -> Void
     let onGestures: () -> Void
@@ -204,6 +205,25 @@ struct SessionPanelOverlay: View {
         let middle = VStack(alignment: .leading, spacing: 14) {
             if s.isMirror { screens(p) }
             actions(s)
+            if remoteInput.usesScanKeyboard {
+                let generation = remoteInput.generation
+                RemoteSpecialKeyBar(keyboard: Binding(
+                    get: { remoteInput.keyboard },
+                    set: { value in
+                        if remoteInput.keyboardEnabled && value.token == remoteInput.token {
+                            remoteInput.keyboard = value
+                        }
+                    }), sendKey: { remoteInput.emitKey($0, generation: generation) },
+                    remoteCommand: { networkManager.sendRemoteCommand($0) },
+                    releaseKeys: { remoteInput.suspend(reason: 4) })
+                    .disabled(!remoteInput.keyboardEnabled)
+                    .opacity(remoteInput.keyboardEnabled ? 1 : 0.45)
+            }
+            if remoteInput.usesEnhancedPointer {
+                RemoteMouseControls(mode: remoteInput.mouseMode,
+                    onModeChange: { remoteInput.changeMouseMode($0) },
+                    onMiddleClick: { remoteInput.middleClick() }, enabled: remoteInput.pointerEnabled)
+            }
         }
         return VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
@@ -335,7 +355,7 @@ struct SessionPanelOverlay: View {
                 actionButton(s.control == .on ? "Stop control" : "Ask control",
                              icon: s.control == .on ? "hand.raised.slash" : "hand.point.up.left") {
                     lastInteraction = Date()
-                    if s.control == .on { networkManager.releaseMirrorControl() } else { networkManager.requestMirrorControl() }
+                    if s.control == .on { remoteInput.suspend(reason: 1); networkManager.releaseMirrorControl() } else { networkManager.requestMirrorControl() }
                 }
             }
             actionButton("Files", icon: "arrow.left.arrow.right") { close(); onFiles() }
@@ -412,6 +432,7 @@ struct SessionPanelOverlay: View {
             lastInteraction = Date()
             if disconnectArming.tap(at: Date()) {
                 close()
+                remoteInput.suspend(reason: 1)
                 networkManager.stop()
             } else {
                 disconnectTick += 1
