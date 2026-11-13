@@ -620,9 +620,9 @@ public final class ConnectedPresentationContainer: UIView {
     private func handleKeyboardNotification(_ note: Notification) {
         defer { recordKeyboardAuthority(reason: note.name.rawValue) }
         if note.name == UIApplication.willResignActiveNotification {
+            retireRemotePointerInputs()
             touchView.remoteSessionInput?.suspend(reason: 0)
             touchView.discardRemoteTouches()
-            retireRemotePointerInputs()
             softwareRequested = false; applyRemoteKeyboardMode(.none); return
         }
         if note.name == UIApplication.didBecomeActiveNotification {
@@ -889,7 +889,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             if let ticket { networkManager?.sendMirrorInput(ticket: ticket, kind: .directTouch, payload: command.encode()) }
             else if legacy { directInput?(command) }
         }
-        let admitted = remoteKeyboardActive && (ticket != nil || legacy || networkManager.isRemoteControlSession)
+        let admitted = remoteKeyboardActive && (ticket != nil || legacy)
         touchView.configureDirectTouch(active: admitted, generation: binding)
         touchView.configureExternalPointer(active: admitted, generation: binding)
         let pointerInput = onPointerInput
