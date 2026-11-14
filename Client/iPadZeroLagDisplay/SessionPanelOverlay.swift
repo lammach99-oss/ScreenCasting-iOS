@@ -62,9 +62,13 @@ private extension Color {
     @Environment(\.dynamicTypeSize) private var typeSize
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOver
 
+    private var monitorControlEnabled: Bool {
+        networkManager.remoteMonitorState.isSourceRecovery ? remoteInput.monitorControlAvailable : remoteInput.pointerEnabled
+    }
     private var picker: ScreenPickerSnapshot {
         if networkManager.isRemoteControlSession {
-            return .make(remote: networkManager.remoteMonitorState, inputReady: networkManager.remoteInputReady)
+            return .make(remote: networkManager.remoteMonitorState, inputReady: networkManager.remoteInputReady,
+                         controlEnabled: monitorControlEnabled)
         }
         if networkManager.captureTargetState.enabled {
             return .make(captureTargets: networkManager.captureTargetState, state: networkManager.mirrorControlState,
@@ -283,13 +287,14 @@ private extension Color {
         HStack(alignment: .firstTextBaseline) {
             Text("Screens on this PC").font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
             Spacer()
-            if p.phase == .ready && !p.isSwitching {
+            if p.phase == .ready && !p.isSwitching && (!networkManager.isRemoteControlSession || p.control == .on) {
                 Text("Tap a screen to show it").font(.caption).foregroundStyle(Color(ink: SessionInk.secondary))
             }
         }
         if p.phase == .locked { lockedBanner(p) }
         if networkManager.isRemoteControlSession, p.phase != .locked,
-           let message = networkManager.remoteMonitorState.statusMessage {
+           let message = networkManager.remoteMonitorState.selectionStatus(inputReady: networkManager.remoteInputReady,
+                controlEnabled: monitorControlEnabled) {
             Text(message).font(.footnote)
                 .foregroundStyle(Color(ink: networkManager.remoteMonitorState.issue == .failed ||
                     networkManager.remoteMonitorState.issue == .denied ? SessionInk.danger : SessionInk.warning))
@@ -357,7 +362,7 @@ private extension Color {
         let selected = tile.status == .showing
         return Button {
             if networkManager.isRemoteControlSession {
-                guard tile.status == .available, let catalogue = networkManager.remoteMonitorState.catalogue else { return }
+                guard tile.canSelect, monitorControlEnabled, let catalogue = networkManager.remoteMonitorState.catalogue else { return }
                 lastInteraction = Date()
                 networkManager.requestRemoteMonitor(tile.id, catalogue: catalogue)
                 return

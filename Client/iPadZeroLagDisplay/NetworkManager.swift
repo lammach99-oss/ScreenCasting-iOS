@@ -113,6 +113,25 @@ private final class ConnectionGenerationClock {
     }
 }
 
+/// Thread-safe projection of the shared main-actor input owner's permission, not a readiness gate.
+private final class RemoteMonitorControlAuthority {
+    struct Snapshot: Equatable {
+        var generation: UInt64 = 0
+        var context: RemoteInputContextCommand?
+        var enabled = false
+        var available = false
+        var revision: UInt64 = 0
+    }
+    private let lock = NSLock()
+    private var value = Snapshot()
+    var snapshot: Snapshot { lock.lock(); defer { lock.unlock() }; return value }
+    func update(generation: UInt64, context: RemoteInputContextCommand?, enabled: Bool, available: Bool = false) {
+        lock.lock(); defer { lock.unlock() }
+        guard value.generation != generation || value.context != context || value.enabled != enabled || value.available != available else { return }
+        value.generation = generation; value.context = context; value.enabled = enabled; value.available = available; value.revision &+= 1
+    }
+}
+
 // MARK: - Touch Input Wire Protocol
 // Mirrors C# TouchInputPacket / TouchEventType exactly.
 // Layout: 8 bytes, little-endian:
@@ -327,6 +346,8 @@ public class NetworkManager: ObservableObject {
     private var remoteInputConnection = false
     private var remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: 7)
     private var remoteMonitors = RemoteMonitorState()
+    private let remoteMonitorControl = RemoteMonitorControlAuthority()
+    private var remoteMonitorAdmission: (requestId: UInt64, inputRevision: UInt64, controlRevision: UInt64)?
     private let remoteMonitorPublicationClock = ConnectionGenerationClock()
     @Published public private(set) var remoteMonitorState = RemoteMonitorState()
     private var remoteFeaturesPingNonce: UInt64?
@@ -1333,6 +1354,8 @@ public class NetworkManager: ObservableObject {
     private func resetRemoteInputOnQueue() {
         remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: 7); remoteFeaturesPingNonce = nil
         remoteMonitors.begin(session: UUID(), acceptedFeatures: 0)
+        remoteMonitorControl.update(generation: 0, context: nil, enabled: false)
+        remoteMonitorAdmission = nil
         publishRemoteInputOnQueue()
     }
 
@@ -1357,6 +1380,25 @@ public class NetworkManager: ObservableObject {
             self.requestRemoteCatalogueOnQueue()
         }
     }
+    @MainActor func updateRemoteMonitorControl(configuration: RemoteSessionInputConfiguration?, enabled: Bool, available: Bool) {
+        remoteMonitorControl.update(generation: configuration?.generation ?? 0, context: configuration?.context,
+            enabled: enabled, available: available)
+    }
+    private func remoteMonitorControlEnabled(_ control: RemoteMonitorControlAuthority.Snapshot) -> Bool {
+        guard control.generation == connectionGeneration else { return false }
+        if remoteMonitors.isSourceRecovery { return control.available }
+        return control.enabled && control.context == remoteFeatures.context
+    }
+    private func mayWriteRemoteMonitorSelection(_ request: RemoteMonitorSelectCommand) -> Bool {
+        let control = remoteMonitorControl.snapshot
+        guard let admission = remoteMonitorAdmission, admission.requestId == request.requestId,
+              admission.inputRevision == remoteFeatures.revision, admission.controlRevision == control.revision,
+              wireAuthenticatedGeneration == connectionGeneration, committedTransportGeneration == connectionGeneration,
+              transportState == .streaming, !displayRequestGate.isInputSuppressed else { return false }
+        let inputReady = remoteFeatures.context.map { remoteFeatures.maySend(feature: 3, token: $0.token) } ?? false
+        return remoteMonitors.mayWriteSelection(request, session: remoteMonitors.session,
+            inputReady: inputReady, controlEnabled: remoteMonitorControlEnabled(control))
+    }
     public func requestRemoteMonitor(_ id: UInt64, catalogue: RemoteMonitorCatalogueCommand) {
         let generation = connectionGenerationClock.current, session = remoteMonitorState.session
         networkQueue.async { [weak self] in
@@ -1364,12 +1406,16 @@ public class NetworkManager: ObservableObject {
                   self.remoteInputConnection, self.remoteFeatures.accepted & 7 == 7,
                   self.wireAuthenticatedGeneration == generation, self.committedTransportGeneration == generation,
                   self.transportState == .streaming, let connection = self.activeControlConnection else { return }
-            guard let request = self.remoteMonitors.select(targetId: id, catalogue: catalogue, session: session),
+            let control = self.remoteMonitorControl.snapshot
+            guard !self.displayRequestGate.isInputSuppressed,
+                  let request = self.remoteMonitors.select(targetId: id, catalogue: catalogue, session: session,
+                    inputReady: self.remoteFeatures.inputReady, controlEnabled: self.remoteMonitorControlEnabled(control)),
                   let payload = request.encode() else {
                 self.publishRemoteMonitorsOnQueue()
                 if self.remoteMonitors.needsCatalogueRefresh { self.requestRemoteCatalogueOnQueue() }
                 return
             }
+            self.remoteMonitorAdmission = (request.requestId, self.remoteFeatures.revision, control.revision)
             self.publishRemoteMonitorsOnQueue()
             // The service publishes paused/new contexts; the existing context/IDR rule owns input.
             self.sendWireMessage(type: .remoteMonitorSelectRequest, payload: payload, sequence: 0) { [weak self] error in
@@ -1400,7 +1446,13 @@ public class NetworkManager: ObservableObject {
         case .remoteMonitorSelectRequest:
             guard remoteMonitors.enabled, remoteFeatures.accepted & 7 == 7,
                   let request = RemoteMonitorSelectCommand.decode(payload) else { return false }
-            return remoteMonitors.pending?.request == request
+            guard mayWriteRemoteMonitorSelection(request) else {
+                // A context or shared-control retirement also retires a queued selection.
+                remoteMonitors.selectionFailed(requestId: request.requestId, session: remoteMonitors.session)
+                publishRemoteMonitorsOnQueue()
+                return false
+            }
+            return true
         case .remoteScanKey:
             guard let key = RemoteScanKeyCommand.decode(payload) else { return false }
             return remoteFeatures.maySend(feature: 1, token: key.token)
@@ -4087,6 +4139,7 @@ public class NetworkManager: ObservableObject {
                 handleStreamError("Invalid remote feature result."); return
             }
             remoteMonitors.begin(session: UUID(), acceptedFeatures: remoteFeatures.accepted)
+            remoteMonitorAdmission = nil
             publishRemoteInputOnQueue()
             requestRemoteCatalogueOnQueue()
         case .remoteInputContext:
@@ -4948,6 +5001,21 @@ public class NetworkManager: ObservableObject {
                   committedRealtimeMode == RealtimeTransportMode.wifiRTP else { return }
             _=consumeCaptureTargetVideoOnQueue(data, sequence: sequence, isIDR: isIDR,
                                                lengthPrefixed: true, receivedAt: CACurrentMediaTime())
+        }
+    }
+    func receiveRemoteMonitorContextForTesting(_ context: RemoteInputContextCommand, keyframe: Bool) {
+        networkQueue.sync {
+            guard let payload = context.encode() else { return }
+            handleWireMessage(WireMessage(header: WireHeader(type: .remoteInputContext, flags: 0,
+                payloadLength: payload.count, sequence: 0), payload: payload, firstByteAt: 0), generation: connectionGeneration)
+            if keyframe { remoteFeatures.keyframeArrived(); publishRemoteInputOnQueue(contextChanged: false) }
+        }
+    }
+    func bypassRemoteMonitorAdmissionForTesting(target: UInt64, catalogue: RemoteMonitorCatalogueCommand) {
+        networkQueue.async {
+            guard let request = self.remoteMonitors.select(targetId: target, catalogue: catalogue,
+                session: self.remoteMonitors.session, inputReady: true, controlEnabled: true), let payload = request.encode() else { return }
+            self.sendWireMessage(type: .remoteMonitorSelectRequest, payload: payload, sequence: 0)
         }
     }
     func beginRemoteMonitorForTesting(acceptedFeatures: UInt64) {
@@ -5855,6 +5923,10 @@ struct RemoteSessionInputConfiguration: Equatable {
     var sendKey: (RemoteScanKeyCommand, UInt64) -> Void = { _, _ in }
     var sendPointer: (RemotePointerCommand, UInt64) -> Void = { _, _ in }
     var sendReset: (RemoteInputResetCommand, UInt64) -> Void = { _, _ in }
+    private weak var boundNetwork: NetworkManager?
+    private func publishMonitorControl() {
+        boundNetwork?.updateRemoteMonitorControl(configuration: configuration, enabled: pointerEnabled, available: monitorControlAvailable)
+    }
     private var blockedToken: UInt64?
     private var hardwareUsages: Set<Int> = []
     private var suppressedUsages: Set<Int> = []
@@ -5875,8 +5947,15 @@ struct RemoteSessionInputConfiguration: Equatable {
     }
     var keyboardEnabled: Bool { usesScanKeyboard && enabled }
     var pointerEnabled: Bool { usesEnhancedPointer && enabled }
+    /// Permission survives a missing capture source; normal input still uses the existing ready/context gate.
+    var monitorControlAvailable: Bool {
+        guard let c = configuration else { return false }
+        return c.remote && c.connected && c.active && c.features & 7 == 7
+    }
 
     func bind(_ network: NetworkManager) {
+        boundNetwork = network
+        publishMonitorControl()
         sendKey = { [weak network] in network?.sendRemoteScanKey($0, expectedGeneration: $1) }
         sendPointer = { [weak network] in network?.sendRemotePointer($0, expectedGeneration: $1) }
         sendReset = { [weak network] in network?.sendRemoteInputReset($0, expectedGeneration: $1) }
@@ -5884,6 +5963,7 @@ struct RemoteSessionInputConfiguration: Equatable {
 
     func configure(_ value: RemoteSessionInputConfiguration) {
         guard configuration != value else { return }
+        defer { publishMonitorControl() }
         let old = configuration
         let changedConnection = old?.generation != value.generation || old?.remote != value.remote
         let retired = changedConnection || old?.revision != value.revision || old?.context != value.context
@@ -5986,6 +6066,7 @@ struct RemoteSessionInputConfiguration: Equatable {
 
     func suspend(reason: UInt8) {
         guard enabled, usesScanKeyboard || usesEnhancedPointer else { return }
+        defer { publishMonitorControl() }
         let t = token, g = generation
         let keys = keyboard.reset()
         let buttons = mouse.reset(token: t, generation: g)

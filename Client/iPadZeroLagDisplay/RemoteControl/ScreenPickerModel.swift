@@ -88,20 +88,22 @@ public struct ScreenPickerSnapshot: Equatable {
     }
 
     /// Remote catalogue adapter. Casting's factory and its tile semantics stay intact.
-    public static func make(remote: RemoteMonitorState, inputReady: Bool) -> Self {
-        let control: Control = remote.context?.state == 1 ? (inputReady ? .on : .viewOnly) : .unavailable
+    public static func make(remote: RemoteMonitorState, inputReady: Bool, controlEnabled: Bool = false) -> Self {
+        let control: Control = remote.isSourceRecovery ? (controlEnabled ? .on : .viewOnly)
+            : remote.context?.state == 1 ? (inputReady && controlEnabled ? .on : .viewOnly) : .unavailable
         guard remote.enabled, let catalogue = remote.catalogue else {
             return Self(phase: .loading, tiles: [], control: control, canAskPermission: false,
                         isSwitching: remote.pending != nil, currentLabel: nil)
         }
         let unavailable = catalogue.state == 0 || remote.issue == .unavailable
         let busy = remote.pending != nil || catalogue.state == 2 || remote.needsCatalogueRefresh
-        let current = unavailable ? 0 : remote.confirmedCurrentId
+        let current = unavailable ? 0 : remote.displayCurrentId
+        let selectable = control == .on && remote.selectionReady(inputReady: inputReady, controlEnabled: controlEnabled)
         let tiles = catalogue.entries.map { entry -> ScreenPickerTile in
             let status: ScreenPickerTile.Status
             if entry.id == current { status = .showing }
             else if !unavailable && entry.id == remote.pending?.request.targetId { status = .switching }
-            else if unavailable || busy { status = .locked }
+            else if unavailable || busy || control != .on || !selectable { status = .locked }
             else { status = .available }
             return ScreenPickerTile(id: entry.id, label: entry.name, isBuiltIn: isBuiltIn(entry.name), status: status)
         }

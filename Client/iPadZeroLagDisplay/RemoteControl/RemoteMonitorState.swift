@@ -17,6 +17,7 @@ public struct RemoteMonitorState: Equatable {
     private var nextRequestId: UInt64 = 0
     private var latestRevision: UInt64 = 0
     private var latestEpoch: UInt64 = 0
+    private var lastConfirmedCurrentId: UInt64 = 0
     public init() {}
 
     public mutating func begin(session: UUID, acceptedFeatures: UInt64) {
@@ -34,15 +35,32 @@ public struct RemoteMonitorState: Equatable {
         catalogue = value; needsCatalogueRefresh = false
         if value.state == 0 { pending = nil; issue = .unavailable }
         else if issue == .unavailable { issue = nil }
+        rememberCurrent()
         settleApplied()
         return true
     }
     public mutating func receiveContext(_ value: RemoteInputContextCommand?, session: UUID) {
         guard session == self.session, enabled else { return }
-        context = value; settleApplied()
+        context = value; rememberCurrent(); settleApplied()
     }
-    public mutating func select(targetId: UInt64, catalogue expected: RemoteMonitorCatalogueCommand, session: UUID) -> RemoteMonitorSelectCommand? {
-        guard session == self.session, enabled, pending == nil, !needsCatalogueRefresh,
+    public var isSourceRecovery: Bool {
+        catalogue?.state == 1 && catalogue?.currentId == 0 && catalogue?.entries.isEmpty == false
+    }
+    public func selectionReady(inputReady: Bool, controlEnabled: Bool) -> Bool {
+        guard enabled, controlEnabled, let catalogue, catalogue.state == 1, issue != .unavailable else { return false }
+        if isSourceRecovery { return true }
+        guard inputReady, let context, context.state == 1, context.token != 0 else { return false }
+        return context.desktop == catalogue.desktop && context.desktopEpoch == catalogue.epoch
+    }
+    public func mayWriteSelection(_ request: RemoteMonitorSelectCommand, session: UUID,
+                                  inputReady: Bool, controlEnabled: Bool) -> Bool {
+        session == self.session && pending?.request == request && pending?.applied == nil && !needsCatalogueRefresh &&
+            selectionReady(inputReady: inputReady, controlEnabled: controlEnabled)
+    }
+    public mutating func select(targetId: UInt64, catalogue expected: RemoteMonitorCatalogueCommand, session: UUID,
+                                inputReady: Bool = false, controlEnabled: Bool = false) -> RemoteMonitorSelectCommand? {
+        guard session == self.session, selectionReady(inputReady: inputReady, controlEnabled: controlEnabled),
+              pending == nil, !needsCatalogueRefresh,
               let catalogue, catalogue.state == 1 else { return nil }
         guard catalogue == expected else { issue = .stale; needsCatalogueRefresh = true; return nil }
         guard targetId != catalogue.currentId, catalogue.entries.contains(where: { $0.id == targetId }),
@@ -83,6 +101,23 @@ public struct RemoteMonitorState: Equatable {
               current.left == context.left, current.top == context.top,
               current.width == context.width, current.height == context.height else { return 0 }
         return current.id
+    }
+    /// Keep the last confirmed tile visible during a pause, without promoting an unconfirmed selection.
+    public var displayCurrentId: UInt64 {
+        let current = confirmedCurrentId
+        if current != 0 { return current }
+        return catalogue?.entries.contains(where: { $0.id == lastConfirmedCurrentId }) == true ? lastConfirmedCurrentId : 0
+    }
+    private mutating func rememberCurrent() {
+        if catalogue?.state == 0 || catalogue?.currentId == 0 { lastConfirmedCurrentId = 0 }
+        else if confirmedCurrentId != 0 { lastConfirmedCurrentId = confirmedCurrentId }
+    }
+    public func selectionStatus(inputReady: Bool, controlEnabled: Bool) -> String? {
+        if let statusMessage { return statusMessage }
+        if !controlEnabled { return "Turn Control on to choose a screen." }
+        if isSourceRecovery { return pending == nil ? "Choose a screen to restore the picture." : "Switching screens..." }
+        if !selectionReady(inputReady: inputReady, controlEnabled: controlEnabled) { return "Waiting for the remote picture." }
+        return nil
     }
     private mutating func settleApplied() {
         guard let applied = pending?.applied, let catalogue, catalogue.state == 1,
