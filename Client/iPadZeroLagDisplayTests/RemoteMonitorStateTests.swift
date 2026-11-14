@@ -20,6 +20,25 @@ final class RemoteMonitorStateTests: XCTestCase {
         state.receiveContext(Self.context(), session: session)
         return state
     }
+    func testCycleRetainsCatalogueOrderAndControlAdmission() {
+        let model = ready()
+        let allowed = ScreenPickerSnapshot.make(remote: model, inputReady: true, controlEnabled: true)
+        XCTAssertEqual(allowed.cycle(kind: .wholePCRemote).nextTargetId, 2)
+        XCTAssertEqual(allowed.cycle(kind: .wholePCRemote).accessibilityValue, "Built-in display, 1 of 2")
+        let viewOnly = ScreenPickerSnapshot.make(remote: model, inputReady: true, controlEnabled: false)
+        XCTAssertFalse(viewOnly.cycle(kind: .wholePCRemote).enabled)
+        XCTAssertEqual(viewOnly.cycle(kind: .wholePCRemote).reason, "Turn Control on to choose a screen.")
+    }
+
+    func testStaleCatalogueDisablesCycleWithoutPretendingASwitchIsPending() {
+        var model = ready()
+        XCTAssertNil(model.select(targetId: 2, catalogue: Self.catalogue(revision: 2), session: model.session,
+            inputReady: true, controlEnabled: true))
+        let picker = ScreenPickerSnapshot.make(remote: model, inputReady: true, controlEnabled: true)
+        XCTAssertFalse(picker.cycle(kind: .wholePCRemote).enabled)
+        XCTAssertFalse(picker.cycle(kind: .wholePCRemote).pending)
+        XCTAssertNotNil(picker.cycle(kind: .wholePCRemote).reason)
+    }
     func testNegotiationRequestsSevenAndFallsBackToThree() throws {
         for accepted in [UInt64(0), 1, 2, 3, 7] {
             var negotiation = RemoteFeatureNegotiation(requestedFeatures: 7)
@@ -309,6 +328,9 @@ final class RemoteMonitorStateTests: XCTestCase {
             let picker = ScreenPickerSnapshot.make(remote: state, inputReady: gate.inputReady, controlEnabled: true)
             XCTAssertEqual(picker.control, .on); XCTAssertEqual(picker.tiles.map(\.status), [.available])
             XCTAssertTrue(picker.tiles[0].canSelect); XCTAssertNil(picker.currentLabel)
+            let cycle = picker.cycle(kind: .wholePCRemote)
+            XCTAssertTrue(cycle.enabled); XCTAssertEqual(cycle.nextTargetId, 2)
+            XCTAssertEqual(cycle.currentLabel, "Choose a screen")
             XCTAssertEqual(state.displayCurrentId, 0)
             XCTAssertEqual(state.selectionStatus(inputReady: false, controlEnabled: true), "Choose a screen to restore the picture.")
             let request = try XCTUnwrap(state.select(targetId: 2, catalogue: Self.recoveryCatalogue(), session: session,

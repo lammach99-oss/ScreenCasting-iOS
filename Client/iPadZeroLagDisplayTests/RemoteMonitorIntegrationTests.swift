@@ -248,7 +248,7 @@ final class RemoteMonitorIntegrationTests: XCTestCase {
         XCTAssertTrue(source.contains("case .remoteMonitorSelectRequest:"))
         let panel = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/SessionPanelOverlay.swift"), encoding: .utf8)
         XCTAssertTrue(panel.contains("ScreenPickerSnapshot.shouldShowPicker"))
-        XCTAssertTrue(panel.contains("networkManager.requestRemoteMonitor(tile.id, catalogue: catalogue)"))
-        XCTAssertTrue(panel.contains("networkManager.requestMirrorMonitor(tile.id, catalogue: catalogue)"))
+        XCTAssertTrue(panel.contains("networkManager.requestRemoteMonitor(targetId, catalogue: catalogue)"))
+        XCTAssertTrue(panel.contains("networkManager.requestMirrorMonitor(targetId, catalogue: catalogue)"))
     }
 }

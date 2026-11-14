@@ -279,6 +279,7 @@ public struct ContentView: View {
     @State private var isSettingsPresented = false
     @State private var isTransferPresented = false
     @State private var isSessionPanelOpen = false
+    @State private var sessionPillHeight: CGFloat = 44
     @State private var showGestureGuide = false
     @State private var gestureToast: GestureToast?
     @AppStorage("ScreenCasting.client.gestureGuideSeen.v1") private var gestureGuideSeen = false
@@ -623,6 +624,10 @@ public struct ContentView: View {
                                                                 usb: usbChosen),
                     isOpen: $isSessionPanelOpen,
                     remoteInput: remoteInput,
+                    tailnetTarget: RemoteHostAddress.parse(hostIP.isEmpty ? lastWifiHostLabel : hostIP)?.isTailnet ?? false,
+                    performance: isHudVisible ? SessionPerformanceReadout(fps: Double(streamManager.currentFPS),
+                        frameReceiveMs: Double(streamManager.frameReceiveMs), videoRxMbps: networkManager.hudTelemetry.videoRxMbps) : nil,
+                    onPillHeightChange: { sessionPillHeight = $0 },
                     onFiles: { isTransferPresented = true },
                     onSettings: { isSettingsPresented = true },
                     onGestures: { showGestureGuide = true })
@@ -637,7 +642,7 @@ public struct ContentView: View {
                 .allowsHitTesting(false)
                 .animation(.easeOut(duration: 0.2), value: gestureToast)
                 if showGestureGuide {
-                    GestureGuideCard(onDone: {
+                    GestureGuideCard(mode: remoteInput.usesEnhancedPointer ? .remote(remoteInput.mouseMode) : .casting, onDone: {
                         gestureGuideSeen = true
                         showGestureGuide = false
                     })
@@ -1021,55 +1026,25 @@ public struct ContentView: View {
     // MARK: - Streaming HUD
 
     private var streamingHUD: some View {
-        ZStack {
-            // Stats HUD (Top-Right)
-            if isHudVisible {
+        GeometryReader { proxy in
+            if isHudVisible && !isSessionPanelOpen {
                 VStack {
                     HStack {
-                        Spacer()
-                        HStack(spacing: 16) {
-                            // FPS Pill
-                            HStack(spacing: 6) {
-                                Circle().fill(Color(uiColor: SessionInk.secondary)).frame(width: 6, height: 6)
-                                Text(String(format: "%.1f FPS", streamManager.currentFPS))
-                                    .font(.system(size: 13, weight: .bold, design: .monospaced))
-                            }
-                            Color(uiColor: SessionInk.hairline).frame(width: 1, height: 14)
-                            // This is a local receive-stage measurement, not RTT/ping.
-                            HStack(spacing: 6) {
-                                Image(systemName: "gauge.with.needle.fill")
-                                    .foregroundColor(Color(uiColor: SessionInk.secondary)).font(.caption)
-                                VStack(alignment: .leading, spacing: 0) {
-                                    Text(String(format: "%.1f ms", streamManager.frameReceiveMs))
-                                    Text("Frame receive")
-                                        .font(.caption2)
-                                        .foregroundColor(Color(uiColor: SessionInk.secondary))
-                                }
-                                    .font(.system(size: 13, weight: .bold, design: .monospaced))
-                            }
-                            Color(uiColor: SessionInk.hairline).frame(width: 1, height: 14)
-                            VStack(alignment: .leading, spacing: 0) {
-                                Text(String(format: "%.1f Mbps", networkManager.hudTelemetry.videoRxMbps))
-                                    .font(.system(size: 13, weight: .bold, design: .monospaced))
-                                Text("Video RX")
-                                    .font(.caption2)
-                                    .foregroundColor(Color(uiColor: SessionInk.secondary))
-                            }
-                        }
-                        .foregroundColor(Color(uiColor: SessionInk.text))
-                        .padding(.horizontal, 16).padding(.vertical, 10)
-                        .background(Color(uiColor: SessionInk.surface).opacity(0.94),
-                                    in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .stroke(Color(uiColor: SessionInk.hairline), lineWidth: 0.5))
-                        .padding(.top, 16).padding(.trailing, 16)
+                        Spacer(minLength: 0)
+                        SessionPerformanceReadout(fps: Double(streamManager.currentFPS),
+                            frameReceiveMs: Double(streamManager.frameReceiveMs), videoRxMbps: networkManager.hudTelemetry.videoRxMbps)
+                            .padding(12)
+                            .background(Color(uiColor: SessionInk.surface).opacity(0.94),
+                                in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .stroke(Color(uiColor: SessionInk.hairline), lineWidth: 0.5))
                     }
-                    Spacer()
+                    Spacer(minLength: 0)
                 }
-                .transition(.asymmetric(
-                    insertion: .move(edge: .top).combined(with: .opacity),
-                    removal: .opacity
-                ))
+                // The draggable pill can occupy the full top row. Stats always sit below that row.
+                .padding(.top, sessionPillHeight + 24).padding(.horizontal, 12)
+                .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
+                .allowsHitTesting(false)
             }
         }
     }

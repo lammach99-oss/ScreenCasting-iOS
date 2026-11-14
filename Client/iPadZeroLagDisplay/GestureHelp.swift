@@ -64,25 +64,71 @@ struct GestureToastLedger {
     }
 }
 
-/// The gesture card: shown once on the first session, and again from the session panel's Gestures button.
+enum GestureGuideMode: Equatable {
+    case casting
+    case remote(RemoteMouseMode)
+}
+
+struct GestureGuideItem: Equatable {
+    let symbol: String
+    let gesture: String
+    let result: String
+}
+
+/// Copy follows the engine actually receiving touches; remote Direct still sends mouse input.
+enum GestureGuideContent {
+    static func items(for mode: GestureGuideMode) -> [GestureGuideItem] {
+        switch mode {
+        case .casting:
+            return [
+                GestureGuideItem(symbol: "hand.tap", gesture: "Tap", result: "Click"),
+                GestureGuideItem(symbol: "arrow.up.arrow.down", gesture: "Swipe one finger", result: "Scroll"),
+                GestureGuideItem(symbol: "hand.draw", gesture: "Hold, then move", result: "Drag or select"),
+                GestureGuideItem(symbol: "cursorarrow.click.2", gesture: "Two-finger tap", result: "Right-click"),
+                GestureGuideItem(symbol: "hand.pinch", gesture: "Pinch", result: "Zoom in or out"),
+                GestureGuideItem(symbol: "rectangle.topthird.inset.filled", gesture: "Three-finger tap", result: "Open the session panel")
+            ]
+        case .remote(let mouseMode):
+            return [
+                GestureGuideItem(symbol: "hand.tap", gesture: "Tap", result: mouseMode == .direct ? "Click where you tap" : "Click at the pointer"),
+                GestureGuideItem(symbol: "hand.draw", gesture: "Move one finger", result: mouseMode == .direct ? "Point at the screen position" : "Move the pointer"),
+                GestureGuideItem(symbol: "arrow.up.arrow.down", gesture: "Move two fingers", result: "Scroll"),
+                GestureGuideItem(symbol: "hand.draw", gesture: "Double-tap and hold", result: "Drag or select"),
+                GestureGuideItem(symbol: "cursorarrow.click.2", gesture: "Two-finger tap", result: "Right-click")
+            ]
+        }
+    }
+
+    static func helper(for mode: GestureGuideMode) -> String {
+        switch mode {
+        case .casting: return "Fingers act like a mouse. Apple Pencil acts like a pen."
+        case .remote: return "Touch controls the PC pointer. Direct sends mouse clicks, without pen pressure."
+        }
+    }
+
+    static func pencil(for mode: GestureGuideMode) -> String {
+        switch mode {
+        case .casting:
+            return "Writes and clicks with pressure. Fingers are ignored while the Pencil touches the screen. " +
+                "To open the keyboard after using the Pencil, tap the keyboard button with a finger."
+        case .remote(let mouseMode):
+            return mouseMode == .trackpad ? "Pencil and mouse move the pointer using Trackpad. Change this in More input."
+                : "Pencil and mouse point directly and send mouse input. They do not send pen pressure."
+        }
+    }
+}
+
+/// The gesture card follows the current input engine and selected touch behavior.
 struct GestureGuideCard: View {
+    let mode: GestureGuideMode
     let onDone: () -> Void
     @Environment(\.dynamicTypeSize) private var typeSize
-
-    private struct Item { let symbol: String; let gesture: String; let result: String }
-    private let gestures: [Item] = [
-        Item(symbol: "hand.tap", gesture: "Tap", result: "Click"),
-        Item(symbol: "arrow.up.arrow.down", gesture: "Swipe one finger", result: "Scroll"),
-        Item(symbol: "hand.draw", gesture: "Hold, then move", result: "Drag or select"),
-        Item(symbol: "cursorarrow.click.2", gesture: "Two-finger tap", result: "Right-click"),
-        Item(symbol: "hand.pinch", gesture: "Pinch", result: "Zoom in or out"),
-        Item(symbol: "rectangle.topthird.inset.filled", gesture: "Three-finger tap", result: "Open the session panel"),
-    ]
+    private var gestures: [GestureGuideItem] { GestureGuideContent.items(for: mode) }
 
     var body: some View {
         ZStack {
             // Covers the stream: while the card is open no touch reaches the PC.
-            Color.black.opacity(0.55).contentShape(Rectangle()).onTapGesture {}
+            Color(uiColor: SessionInk.canvas).opacity(0.55).contentShape(Rectangle()).onTapGesture {}
                 .ignoresSafeArea()
                 .accessibilityHidden(true)
             GeometryReader { proxy in
@@ -102,7 +148,7 @@ struct GestureGuideCard: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Control your PC by touch").font(.title3.weight(.semibold))
                     .accessibilityAddTraits(.isHeader)
-                Text("Fingers act like a mouse. Apple Pencil acts like a pen.")
+                Text(GestureGuideContent.helper(for: mode))
                     .font(.subheadline).foregroundStyle(Color(uiColor: SessionInk.secondary))
             }
             LazyVGrid(columns: [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? 220 : 140), spacing: 8)], spacing: 8) {
@@ -124,8 +170,7 @@ struct GestureGuideCard: View {
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Apple Pencil").font(.subheadline.weight(.semibold))
-                    Text("Writes and clicks with pressure. Fingers are ignored while the Pencil touches the screen. " +
-                         "To open the keyboard after using the Pencil, tap the keyboard button with a finger.")
+                    Text(GestureGuideContent.pencil(for: mode))
                         .font(.caption).foregroundStyle(Color(uiColor: SessionInk.secondary))
                 }
             }
@@ -139,14 +184,14 @@ struct GestureGuideCard: View {
         .padding(20)
         .background(Color(uiColor: SessionInk.surface), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(Color(uiColor: SessionInk.hairline), lineWidth: 0.5))
-        .shadow(color: .black.opacity(0.45), radius: 24, y: 12)
+        .shadow(color: Color(uiColor: SessionInk.canvas).opacity(0.45), radius: 24, y: 12)
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(.isModal)
         .accessibilityAction(.escape) { onDone() }
     }
 
     private var footer: some View {
-        let hint = Text("Find this again: session panel › Gestures")
+        let hint = Text("Find this again: session panel > Gestures")
             .font(.caption).foregroundStyle(Color(uiColor: SessionInk.secondary))
         let done = Button(action: onDone) {
             Text("Got it")

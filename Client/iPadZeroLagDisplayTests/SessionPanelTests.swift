@@ -4,46 +4,180 @@ import UIKit
 
 /// The session pill is the one visible handle for every session: what it says, and how Disconnect is confirmed.
 final class SessionPanelTests: XCTestCase {
+    func testScreenCycleUsesCatalogueOrderAndWrapsWithoutNamesAsIdentity() {
+        let entries = [ScreenPickerTile(id: 30, label: "Screen", isBuiltIn: false, status: .available),
+                       ScreenPickerTile(id: 10, label: "Screen", isBuiltIn: false, status: .available),
+                       ScreenPickerTile(id: 20, label: "Screen", isBuiltIn: false, status: .available)]
+        for (current, next, position) in [(UInt64(30), UInt64(10), 1), (10, 20, 2), (20, 30, 3)] {
+            let cycle = ScreenCyclePresentation.make(candidates: entries, currentId: current, pending: false)
+            XCTAssertEqual(cycle.nextTargetId, next)
+            XCTAssertEqual(cycle.position, position)
+            XCTAssertEqual(cycle.count, 3)
+            XCTAssertTrue(cycle.enabled)
+        }
+        XCTAssertEqual(ScreenCyclePresentation.make(candidates: Array(entries.prefix(2)), currentId: 10,
+            pending: false).nextTargetId, 30)
+    }
+
+    func testSingleScreenDisablesOnlyWhenItIsCurrentAndRecoveryRemainsSelectable() {
+        let entries = [ScreenPickerTile(id: 7, label: "Screen 1", isBuiltIn: false, status: .available)]
+        let current = ScreenCyclePresentation.make(candidates: entries, currentId: 7, pending: false)
+        XCTAssertFalse(current.enabled)
+        XCTAssertEqual(current.reason, "Only one screen is available.")
+        let recovery = ScreenCyclePresentation.make(candidates: entries, currentId: nil, pending: false)
+        XCTAssertTrue(recovery.enabled)
+        XCTAssertEqual(recovery.currentLabel, "Choose a screen")
+        XCTAssertEqual(recovery.nextTargetId, 7)
+        XCTAssertEqual(recovery.accessibilityValue, "Choose a screen")
+    }
+
+    func testCycleEmptyPendingAndPermissionHaveExplicitReasons() {
+        XCTAssertEqual(ScreenCyclePresentation.make(candidates: [], currentId: nil, pending: false).reason,
+                       "No screens are available.")
+        let entries = [ScreenPickerTile(id: 7, label: "Screen 1", isBuiltIn: false, status: .locked)]
+        let pending = ScreenCyclePresentation.make(candidates: entries, currentId: nil, pending: true)
+        XCTAssertFalse(pending.enabled)
+        XCTAssertEqual(pending.reason, "Switching screens\u{2026}")
+        let locked = ScreenCyclePresentation.make(candidates: entries, currentId: nil, pending: false,
+            disabledReason: "Screen switching is off on the PC.")
+        XCTAssertFalse(locked.enabled)
+        XCTAssertEqual(locked.reason, "Screen switching is off on the PC.")
+    }
+
+    func testTouchChoicesPreserveAutomaticAndForcedAllDeviceTrackpad() {
+        XCTAssertTrue(RemoteTouchPresentation(mode: .auto).trackpadSelected)
+        XCTAssertTrue(RemoteTouchPresentation(mode: .trackpad).trackpadSelected)
+        XCTAssertFalse(RemoteTouchPresentation(mode: .direct).trackpadSelected)
+        XCTAssertEqual(RemoteTouchPresentation.trackpadChoice, .auto)
+        XCTAssertEqual(RemoteTouchPresentation.advancedChoice(enabled: true), .trackpad)
+        XCTAssertEqual(RemoteTouchPresentation.advancedChoice(enabled: false), .auto)
+    }
+
+    func testActionsReflowByAvailableWidthAndAccessibilityTextSize() {
+        XCTAssertEqual(SessionPanelLayout.actionColumns(width: 388, idealWidths: [100, 110, 90], accessibility: false), 3)
+        XCTAssertEqual(SessionPanelLayout.actionColumns(width: 288, idealWidths: [100, 110, 90], accessibility: false), 2)
+        XCTAssertEqual(SessionPanelLayout.actionColumns(width: 200, idealWidths: [100, 110, 90], accessibility: false), 1)
+        for width in [Double(288), 388] {
+            XCTAssertEqual(SessionPanelLayout.actionColumns(width: width, idealWidths: [100, 110, 90], accessibility: true), 1)
+        }
+    }
+
+    func testGestureHelpFollowsTheActualEngineAndDoesNotAdvertiseRemotePenPressure() {
+        for mode in [RemoteMouseMode.auto, .trackpad, .direct] {
+            let guide = GestureGuideContent.items(for: .remote(mode))
+            XCTAssertTrue(guide.contains { $0.gesture == "Double-tap and hold" })
+            XCTAssertTrue(guide.contains { $0.gesture == "Move two fingers" && $0.result == "Scroll" })
+            XCTAssertTrue(guide.contains { $0.gesture == "Two-finger tap" && $0.result == "Right-click" })
+            XCTAssertFalse(guide.contains { $0.gesture == "Pinch" || $0.gesture == "Three-finger tap" || $0.gesture == "Swipe one finger" })
+        }
+        XCTAssertTrue(GestureGuideContent.items(for: .casting).contains { $0.gesture == "Swipe one finger" })
+        XCTAssertTrue(GestureGuideContent.items(for: .casting).contains { $0.gesture == "Pinch" })
+        XCTAssertTrue(GestureGuideContent.pencil(for: .remote(.direct)).contains("do not send pen pressure"))
+        XCTAssertTrue(GestureGuideContent.pencil(for: .remote(.trackpad)).contains("Trackpad"))
+    }
+
+    func testLegacyModeChoiceShowsKnownModeWithoutInventingTypedRequests() {
+        let modes = CaptureModePresentation.make(targets: CaptureTargetState(), kind: .castingExtend, lastPhysicalId: nil)
+        XCTAssertTrue(modes.extend.selected); XCTAssertFalse(modes.mirror.selected)
+        XCTAssertFalse(modes.extend.enabled); XCTAssertFalse(modes.mirror.enabled)
+        XCTAssertNil(modes.extend.targetId); XCTAssertNil(modes.mirror.targetId)
+        XCTAssertEqual(modes.explanation, "Update ScreenCasting on the PC to change Extend or Mirror.")
+    }
+
+    func testSharedShellHasOneCycleActionAndFixedSectionOrderForAllSizes() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let panel = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/SessionPanelOverlay.swift"), encoding: .utf8)
+        XCTAssertEqual(panel.components(separatedBy: ".accessibilityIdentifier(\"session.switch-screen\")").count - 1, 1)
+        XCTAssertFalse(panel.contains("tileView("))
+        let sections = try XCTUnwrap(panel.components(separatedBy: "private var panelSections:").last?
+            .components(separatedBy: "private var panelHeader:").first)
+        var previous = sections.startIndex
+        for name in ["screens(picker)", "connectionPicker", "castingControl", "tools", "touchSection", "remoteActions"] {
+            let range = try XCTUnwrap(sections.range(of: name))
+            XCTAssertGreaterThanOrEqual(range.lowerBound, previous)
+            previous = range.upperBound
+        }
+        XCTAssertTrue(panel.contains("min(420, proxy.size.width - 24)"))
+        XCTAssertTrue(panel.contains("footer(session)"))
+        XCTAssertFalse(panel.contains("minimumScaleFactor"))
+    }
+
+    func testPerformanceAppearsOnceAndUsesMeasuredPillHeightWithoutChangingMetrics() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let content = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/ContentView.swift"), encoding: .utf8)
+        let panel = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/SessionPanelOverlay.swift"), encoding: .utf8)
+        XCTAssertTrue(content.contains("if isHudVisible && !isSessionPanelOpen"))
+        XCTAssertTrue(content.contains("performance: isHudVisible ? SessionPerformanceReadout"))
+        XCTAssertTrue(content.contains("sessionPillHeight + 24"))
+        XCTAssertTrue(panel.contains("if let performance { performance }"))
+        XCTAssertTrue(panel.contains("metric(\"Frame receive\""))
+        XCTAssertTrue(panel.contains("metric(\"Video RX\""))
+    }
+
+    func testLegacyKeyboardRemainsAvailableWithoutScanNegotiation() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let panel = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/SessionPanelOverlay.swift"), encoding: .utf8)
+        XCTAssertTrue(panel.contains("!remoteInput.usesScanKeyboard || remoteInput.keyboardEnabled"))
+    }
+
+    func testMissingLegacyCurrentNeverClaimsToStillShowAStaleScreen() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let panel = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/SessionPanelOverlay.swift"), encoding: .utf8)
+        XCTAssertTrue(panel.contains("Couldn't switch screens. Choose a screen to restore the picture."))
+        XCTAssertFalse(panel.contains("?.label ?? \"the current screen\""))
+    }
     func testPermissionRequestExplainsPCApprovalPopup() {
         XCTAssertEqual(CastingPermissionCopy.requestSent, "Request sent. Approve it in the pop-up on the PC.")
     }
-    func testExtendedWifiSessionNamesThePC() {
-        let s = SessionPanelSnapshot.make(hostLabel: "Lam-Laptop", transport: "Wi-Fi", connection: .streaming,
-                                          control: .unavailable, mirrorLabel: nil)
-        XCTAssertEqual(s.title, "Lam-Laptop")
-        XCTAssertEqual(s.hostLabel, "Lam-Laptop")
-        XCTAssertEqual(s.transport, "Wi-Fi")
-        XCTAssertFalse(s.isMirror)
-        XCTAssertFalse(s.reconnecting)
-        XCTAssertEqual(s.icon, .extended)
+    func testExplicitSessionKindTitleAndRouteDoNotDependOnControl() {
+        for control in [ScreenPickerSnapshot.Control.on, .viewOnly, .unavailable] {
+            let extended = SessionPanelSnapshot.make(hostLabel: nil, transport: "Wi-Fi", connection: .streaming,
+                control: control, mirrorLabel: nil, kind: .castingExtend)
+            XCTAssertEqual(extended.title, "Extend iPad")
+            XCTAssertEqual(extended.control, control)
+            XCTAssertFalse(extended.isMirror)
+            XCTAssertEqual(extended.icon, .extended)
+            let mirror = SessionPanelSnapshot.make(hostLabel: nil, transport: "USB-C", connection: .streaming,
+                control: control, mirrorLabel: "Screen 1", kind: .castingMirror)
+            XCTAssertEqual(mirror.title, "Screen 1")
+            XCTAssertEqual(mirror.transport, "USB")
+            XCTAssertTrue(mirror.isMirror)
+            let remote = SessionPanelSnapshot.make(hostLabel: nil, transport: "Wi-Fi", connection: .streaming,
+                control: control, mirrorLabel: "Screen 1", kind: .wholePCRemote, tailnet: true)
+            XCTAssertEqual(remote.title, "Screen 1")
+            XCTAssertEqual(remote.transport, "Tailnet")
+            XCTAssertFalse(remote.isMirror)
+        }
     }
 
-    func testMirrorSessionNamesTheScreenAndControl() {
-        let s = SessionPanelSnapshot.make(hostLabel: "Lam-Laptop", transport: "USB-C", connection: .streaming,
-                                          control: .on, mirrorLabel: "Built-in display")
-        XCTAssertEqual(s.title, "Built-in display")
-        XCTAssertEqual(s.hostLabel, "Lam-Laptop")
-        XCTAssertTrue(s.isMirror)
-        XCTAssertEqual(s.control, .on)
-        XCTAssertEqual(s.icon, .laptop)
-        let monitor = SessionPanelSnapshot.make(hostLabel: "Lam-Laptop", transport: "USB-C", connection: .streaming,
-                                                control: .viewOnly, mirrorLabel: nil)
-        XCTAssertEqual(monitor.title, "Lam-Laptop")
-        XCTAssertEqual(monitor.icon, .monitor)
+    func testSessionKindUsesAuthoritativeTargetAndLegacyMode() {
+        var targets = CaptureTargetState(); targets.begin(generation: 7)
+        let legacy = MirrorControlState(revision: 1, epoch: 1, source: 0, mode: .virtualDisplay,
+            token: MirrorToken(low: 0, high: 0), geometry: nil, firstFrame: nil, lastSent: nil)
+        XCTAssertEqual(SessionPanelKind.make(remote: false, targets: targets, legacy: legacy, catalogue: nil), .castingExtend)
+        _ = targets.advertise(flags: 0x7c00, generation: 7)
+        XCTAssertEqual(SessionPanelKind.make(remote: false, targets: targets, legacy: legacy, catalogue: nil), .castingUnknown)
+        _ = targets.receiveCatalogue(CaptureTargetCatalogue(state: 1, allowed: false, owner: 2, revision: 1,
+            currentId: 4, epoch: 5, entries: [CaptureTargetEntry(id: 4, kind: .physical, name: "Screen 1")]), session: targets.session)
+        XCTAssertEqual(SessionPanelKind.make(remote: false, targets: targets, legacy: legacy, catalogue: nil), .castingMirror)
+        XCTAssertEqual(SessionPanelKind.make(remote: true, targets: targets, legacy: legacy, catalogue: nil), .wholePCRemote)
     }
 
-    func testUnknownPCAndPlaceholderTransport() {
-        let s = SessionPanelSnapshot.make(hostLabel: "  ", transport: "Connected to PC", connection: .streaming,
-                                          control: .unavailable, mirrorLabel: nil)
-        XCTAssertEqual(s.hostLabel, "Your PC")
-        XCTAssertNil(s.transport)
+    func testNoCurrentScreenNeverFallsBackToAnOldScreenOrHost() {
+        for kind in [SessionPanelKind.wholePCRemote, .castingMirror, .castingUnknown] {
+            let s = SessionPanelSnapshot.make(hostLabel: nil, transport: "Connected to PC", connection: .streaming,
+                control: .unavailable, mirrorLabel: nil, kind: kind)
+            XCTAssertEqual(s.title, "Choose a screen")
+            XCTAssertEqual(s.hostLabel, "Your PC")
+            XCTAssertEqual(s.transport, kind == .wholePCRemote ? "Network" : nil)
+        }
     }
 
     func testReconnectingSaysSo() {
-        let s = SessionPanelSnapshot.make(hostLabel: "Lam-Laptop", transport: "Wi-Fi", connection: .connecting,
-                                          control: .unavailable, mirrorLabel: nil)
+        let s = SessionPanelSnapshot.make(hostLabel: nil, transport: "Wi-Fi", connection: .connecting,
+            control: .unavailable, mirrorLabel: nil, kind: .castingUnknown)
         XCTAssertTrue(s.reconnecting)
-        XCTAssertEqual(s.reconnectingText, "Reconnecting to Lam-Laptop…")
+        XCTAssertEqual(s.reconnectingText, "Reconnecting to Your PC\u{2026}")
     }
 
     func testDisconnectNeedsASecondTapWithinFourSeconds() {
@@ -85,9 +219,9 @@ final class SessionPanelTests: XCTestCase {
     }
 
     func testSessionNamesTheWifiPCWhenTheLabelWasCleared() {
-        XCTAssertEqual(SessionPanelSnapshot.sessionHost(current: "", lastWifi: "ADMINISTRATOR", usb: false), "ADMINISTRATOR")
-        XCTAssertEqual(SessionPanelSnapshot.sessionHost(current: "Lam-PC", lastWifi: "ADMINISTRATOR", usb: false), "Lam-PC")
-        XCTAssertEqual(SessionPanelSnapshot.sessionHost(current: "", lastWifi: "ADMINISTRATOR", usb: true), "",
+        XCTAssertEqual(SessionPanelSnapshot.sessionHost(current: "", lastWifi: "Previous PC", usb: false), "Previous PC")
+        XCTAssertEqual(SessionPanelSnapshot.sessionHost(current: "Current PC", lastWifi: "Previous PC", usb: false), "Current PC")
+        XCTAssertEqual(SessionPanelSnapshot.sessionHost(current: "", lastWifi: "Previous PC", usb: true), "",
                        "a USB-C PC may not be the Wi-Fi one")
     }
 

@@ -1,5 +1,118 @@
 import Foundation
 
+/// Session identity is independent of whether input permission is available.
+public enum SessionPanelKind: Equatable {
+    case wholePCRemote, castingMirror, castingExtend, castingUnknown
+
+    public static func make(remote: Bool, targets: CaptureTargetState, legacy: MirrorControlState?,
+                            catalogue: MirrorMonitorCatalogue?) -> Self {
+        if remote { return .wholePCRemote }
+        if targets.enabled {
+            guard !targets.unknownOutcome, let entry = targets.catalogue?.entries.first(where: {
+                $0.id == targets.confirmedCurrentId
+            }) else { return .castingUnknown }
+            return entry.kind == .extend ? .castingExtend : .castingMirror
+        }
+        if legacy?.mode == .virtualDisplay { return .castingExtend }
+        if let catalogue, catalogue.monitors.contains(where: { $0.id == catalogue.selected }) { return .castingMirror }
+        return .castingUnknown
+    }
+}
+
+/// Display-only cycle. The network owner still admits every request against its catalogue.
+public struct ScreenCyclePresentation: Equatable {
+    public let currentLabel: String
+    public let position: Int?
+    public let count: Int
+    public let nextTargetId: UInt64?
+    public let nextLabel: String?
+    public let pending: Bool
+    public let reason: String?
+    public var enabled: Bool { nextTargetId != nil && reason == nil }
+    public var accessibilityValue: String {
+        position.map { "\(currentLabel), \($0) of \(count)" } ?? currentLabel
+    }
+    public var detail: String {
+        position.map { "\(currentLabel) \u{00B7} \($0) of \(count)" } ?? currentLabel
+    }
+    public var hint: String { reason ?? nextLabel.map { "Show \($0)" } ?? "Choose a screen" }
+
+    public static func make(candidates: [ScreenPickerTile], currentId: UInt64?, pending: Bool,
+                            disabledReason: String? = nil, extendActive: Bool = false) -> Self {
+        let screens = candidates.filter { !$0.isExtend }
+        let index = screens.firstIndex { $0.id == currentId }
+        let next = screens.isEmpty ? nil : screens[index.map { ($0 + 1) % screens.count } ?? 0]
+        let reason: String?
+        if pending { reason = "Switching screens\u{2026}" }
+        else if extendActive { reason = "Choose Mirror to switch PC screens." }
+        else if let disabledReason { reason = disabledReason }
+        else if screens.isEmpty { reason = "No screens are available." }
+        else if screens.count == 1 && index != nil { reason = "Only one screen is available." }
+        else if next?.canSelect != true { reason = "Screen selection is not ready. Refresh screens to try again." }
+        else { reason = nil }
+        return Self(currentLabel: extendActive ? "Extend iPad" : index.map { screens[$0].label } ?? "Choose a screen",
+                    position: extendActive ? nil : index.map { $0 + 1 }, count: screens.count,
+                    nextTargetId: next?.id, nextLabel: next?.label, pending: pending, reason: reason)
+    }
+}
+
+public struct CaptureModeChoice: Equatable {
+    public let targetId: UInt64?
+    public let selected: Bool
+    public let enabled: Bool
+}
+
+/// A selected Extend segment can be activated again only for an admitted unknown-outcome recovery.
+public struct CaptureModePresentation: Equatable {
+    public let extend: CaptureModeChoice
+    public let mirror: CaptureModeChoice
+    public let explanation: String?
+
+    public static func make(targets: CaptureTargetState, kind: SessionPanelKind,
+                            lastPhysicalId: UInt64?) -> Self {
+        guard targets.enabled else {
+            return Self(extend: CaptureModeChoice(targetId: nil, selected: kind == .castingExtend, enabled: false),
+                        mirror: CaptureModeChoice(targetId: nil, selected: kind == .castingMirror, enabled: false),
+                        explanation: "Update ScreenCasting on the PC to change Extend or Mirror.")
+        }
+        let catalogue = targets.catalogue
+        let entries = catalogue?.entries ?? []
+        let physical = entries.filter { $0.kind == .physical }
+        let extended = entries.first { $0.kind == .extend }
+        let current = entries.first { $0.id == targets.confirmedCurrentId }
+        let ready = targets.canSelect && !targets.needsCatalogueRefresh && !targets.isSwitching &&
+            catalogue?.state == 1 && catalogue?.allowed == true
+        let mirror = physical.first { $0.id == lastPhysicalId } ?? physical.first
+        let recoveringExtend = targets.unknownOutcome && current?.kind == .extend
+        return Self(extend: CaptureModeChoice(targetId: extended?.id, selected: current?.kind == .extend,
+                        enabled: ready && extended != nil && (current?.kind != .extend || recoveringExtend)),
+                    mirror: CaptureModeChoice(targetId: mirror?.id, selected: current?.kind == .physical,
+                        enabled: ready && mirror != nil && current?.kind != .physical),
+                    explanation: recoveringExtend ? "Choose Extend again to restore the picture." : nil)
+    }
+}
+
+/// Remembers confirmed physical identity only within the current source/session owner.
+public struct ConfirmedPhysicalScreen: Equatable {
+    private var session: UUID?
+    private var owner: UInt64?
+    public private(set) var id: UInt64?
+    public init() {}
+    public mutating func observe(_ targets: CaptureTargetState) {
+        if session != targets.session || owner != targets.catalogue?.owner || !targets.enabled {
+            id = nil
+        }
+        session = targets.session; owner = targets.catalogue?.owner
+        if let id, targets.catalogue?.entries.contains(where: { $0.id == id && $0.kind == .physical }) != true {
+            self.id = nil
+        }
+        guard !targets.isSwitching, !targets.unknownOutcome, !targets.inputBlocked,
+              let entry = targets.catalogue?.entries.first(where: { $0.id == targets.confirmedCurrentId }),
+              entry.kind == .physical else { return }
+        id = entry.id
+    }
+}
+
 /// One PC screen as the iPad picker shows it.
 public struct ScreenPickerTile: Equatable, Identifiable {
     public enum Status: Equatable { case showing, available, switching, locked }
@@ -17,7 +130,7 @@ public struct ScreenPickerTile: Equatable, Identifiable {
 }
 
 /// Pure view state for the screen picker. Everything it shows comes from the Host's catalogue and mirror
-/// state; tapping a tile or a button is the only thing that asks the Host for a change.
+/// state. Only an explicit cycle or mode activation asks the Host for a change.
 public struct ScreenPickerSnapshot: Equatable {
     public enum Phase: Equatable { case loading, ready, locked }
     public enum Control: Equatable { case on, viewOnly, unavailable }
@@ -30,6 +143,15 @@ public struct ScreenPickerSnapshot: Equatable {
     public let isSwitching: Bool
     /// Name of the screen the iPad is showing now, or nil before the list arrives.
     public let currentLabel: String?
+    public var selectionDisabledReason: String? = nil
+
+    public func cycle(kind: SessionPanelKind, disabledReason: String? = nil) -> ScreenCyclePresentation {
+        let fallback: String? = phase == .loading ? "Loading screens..."
+            : phase == .locked ? "Screen switching is off on the PC." : nil
+        return .make(candidates: tiles, currentId: tiles.first { $0.status == .showing }?.id,
+                     pending: isSwitching, disabledReason: disabledReason ?? selectionDisabledReason ?? fallback,
+                     extendActive: kind == .castingExtend)
+    }
 
     public static func make(catalogue: MirrorMonitorCatalogue?, state: MirrorControlState?, switchingTo: UInt64?,
                             switchPending: Bool, pickerSupported: Bool, permissionAsked: Bool) -> Self {
@@ -60,12 +182,13 @@ public struct ScreenPickerSnapshot: Equatable {
 
     public static func make(captureTargets: CaptureTargetState, state: MirrorControlState?,
                             permissionAsked: Bool = false) -> Self {
-        let current=captureTargets.confirmedCurrentId
+        let current=captureTargets.unknownOutcome ? 0 : captureTargets.confirmedCurrentId
         let control: Control = state?.geometry == nil ? .unavailable
             : state?.mode == .active && !captureTargets.inputBlocked ? .on : .viewOnly
         guard let catalogue=captureTargets.catalogue else {
             return Self(phase: captureTargets.listUnavailable ? .locked : .loading, tiles: [], control: control,
-                        canAskPermission: false, isSwitching: captureTargets.isSwitching, currentLabel: nil)
+                        canAskPermission: false, isSwitching: captureTargets.isSwitching, currentLabel: nil,
+                        selectionDisabledReason: captureTargets.listUnavailable ? "The screen list is unavailable. Refresh screens to try again." : nil)
         }
         let ready=catalogue.state == 1 && catalogue.allowed
         let selectable=ready && captureTargets.canSelect && !captureTargets.needsCatalogueRefresh
@@ -84,10 +207,14 @@ public struct ScreenPickerSnapshot: Equatable {
                     control: control, canAskPermission: catalogue.state == 1 && !catalogue.allowed &&
                         !permissionAsked && !captureTargets.isSwitching,
                     isSwitching: captureTargets.isSwitching,
-                    currentLabel: tiles.first(where: { $0.id == current })?.label)
+                    currentLabel: tiles.first(where: { $0.id == current })?.label,
+                    selectionDisabledReason: catalogue.state != 1 ? "Screens are unavailable. Stop and restart the session."
+                        : !catalogue.allowed ? "Screen switching is off on the PC."
+                        : captureTargets.needsCatalogueRefresh ? "Refresh screens before choosing a screen."
+                        : !captureTargets.canSelect ? "Wait for the new screen picture." : nil)
     }
 
-    /// Remote catalogue adapter. Casting's factory and its tile semantics stay intact.
+    /// Remote catalogue adapter; admission remains owned by RemoteMonitorState.
     public static func make(remote: RemoteMonitorState, inputReady: Bool, controlEnabled: Bool = false) -> Self {
         let control: Control = remote.isSourceRecovery ? (controlEnabled ? .on : .viewOnly)
             : remote.context?.state == 1 ? (inputReady && controlEnabled ? .on : .viewOnly) : .unavailable
@@ -108,8 +235,10 @@ public struct ScreenPickerSnapshot: Equatable {
             return ScreenPickerTile(id: entry.id, label: entry.name, isBuiltIn: isBuiltIn(entry.name), status: status)
         }
         return Self(phase: unavailable ? .locked : .ready, tiles: tiles, control: unavailable ? .unavailable : control,
-                    canAskPermission: false, isSwitching: busy,
-                    currentLabel: catalogue.entries.first { $0.id == current }?.name)
+                    canAskPermission: false, isSwitching: remote.pending != nil || catalogue.state == 2,
+                    currentLabel: catalogue.entries.first { $0.id == current }?.name,
+                    selectionDisabledReason: control != .on ? "Turn Control on to choose a screen."
+                        : !selectable ? remote.selectionStatus(inputReady: inputReady, controlEnabled: controlEnabled) : nil)
     }
 
     /// The Host names a laptop panel with no reported name "Built-in display".
@@ -128,19 +257,23 @@ public struct SessionPanelSnapshot: Equatable {
     public let control: ScreenPickerSnapshot.Control
     public let reconnecting: Bool
     public let icon: Icon
-    public var reconnectingText: String { "Reconnecting to \(hostLabel)…" }
+    public let kind: SessionPanelKind
+    public var reconnectingText: String { "Reconnecting to \(hostLabel)\u{2026}" }
 
-    /// `transport` is the transfer snapshot's label; anything but "Wi-Fi" or "USB-C" means not known yet.
+    /// Casting uses the actual transfer route; remote uses the target category, never measured routing.
     public static func make(hostLabel: String?, transport: String, connection: ConnectionState,
-                            control: ScreenPickerSnapshot.Control, mirrorLabel: String?) -> Self {
+                            control: ScreenPickerSnapshot.Control, mirrorLabel: String?,
+                            kind: SessionPanelKind, tailnet: Bool = false) -> Self {
         let trimmed = hostLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let host = trimmed.isEmpty ? "Your PC" : trimmed
-        let isMirror = control != .unavailable
-        let icon: Icon = !isMirror ? .extended
+        let isMirror = kind == .castingMirror
+        let icon: Icon = kind == .castingExtend ? .extended
             : mirrorLabel.map(ScreenPickerSnapshot.isBuiltIn) == true ? .laptop : .monitor
-        return Self(title: isMirror ? mirrorLabel ?? host : host, hostLabel: host,
-                    transport: ["Wi-Fi", "USB-C"].contains(transport) ? transport : nil,
-                    isMirror: isMirror, control: control, reconnecting: connection != .streaming, icon: icon)
+        let route: String? = kind == .wholePCRemote ? (tailnet ? "Tailnet" : "Network")
+            : transport == "USB-C" ? "USB" : transport == "Wi-Fi" ? "Wi-Fi" : nil
+        return Self(title: kind == .castingExtend ? "Extend iPad" : mirrorLabel ?? "Choose a screen", hostLabel: host,
+                    transport: route, isMirror: isMirror, control: control, reconnecting: connection != .streaming,
+                    icon: icon, kind: kind)
     }
 }
 
@@ -175,4 +308,14 @@ public struct DisconnectArming: Equatable {
         return false
     }
     public mutating func reset() { armedAt = nil }
+}
+
+/// Geometry changes columns, never the section order or control set.
+public enum SessionPanelLayout {
+    public static func actionColumns(width: Double, idealWidths: [Double], accessibility: Bool) -> Int {
+        guard !accessibility, let widest = idealWidths.max() else { return 1 }
+        if widest * 3 + 16 <= width { return 3 }
+        if widest * 2 + 8 <= width { return 2 }
+        return 1
+    }
 }

@@ -7,10 +7,8 @@ import UIKit
 struct RemoteSpecialKeyBar: View {
     @Binding var keyboard: RemoteKeyboardState
     let sendKey: (RemoteScanKeyCommand) -> Void
-    let remoteCommand: (RemoteHostCommand) -> Void
     let releaseKeys: () -> Void
 
-    @State private var expanded = false
     @State private var functionsExpanded = false
     @Environment(\.dynamicTypeSize) private var typeSize
 
@@ -20,69 +18,55 @@ struct RemoteSpecialKeyBar: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Button { expanded.toggle() } label: {
-                Label("Keys", systemImage: "keyboard")
-                    .font(.subheadline.weight(.semibold))
-                    .padding(.horizontal, 14)
-                    .frame(minWidth: 44, minHeight: 44)
-                    .background(Color(uiColor: SessionInk.raised), in: Capsule())
-                    .contentShape(Capsule())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Keys")
-            .accessibilityValue(expanded ? "Expanded" : "Collapsed")
-            .accessibilityHint("Shows or hides remote special keys")
-            .accessibilityAddTraits(.isButton)
+            Text("Special keys").font(.subheadline.weight(.semibold))
+                .accessibilityAddTraits(.isHeader)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    LazyVGrid(columns: columns, spacing: 8) {
+                        keyButton("Esc", label: "Escape", usage: 0x29)
+                        keyButton("Tab", label: "Tab", usage: 0x2b)
+                        ForEach(RemoteKeyboardState.Modifier.allCases, id: \.self) { modifier in
+                            modifierButton(modifier)
+                        }
+                        keyButton("Left", label: "Left arrow", usage: 0x50)
+                        keyButton("Up", label: "Up arrow", usage: 0x52)
+                        keyButton("Down", label: "Down arrow", usage: 0x51)
+                        keyButton("Right", label: "Right arrow", usage: 0x4f)
+                    }
 
-            if expanded {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 8) {
+                    Button { functionsExpanded.toggle() } label: {
+                        Label("F1-F12", systemImage: "chevron.down")
+                            .font(.footnote.weight(.medium))
+                            .frame(maxWidth: .infinity, minHeight: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Function keys F1 through F12")
+                    .accessibilityValue(functionsExpanded ? "Expanded" : "Collapsed")
+                    .accessibilityHint("Shows or hides function keys")
+                    .accessibilityAddTraits(.isButton)
+
+                    if functionsExpanded {
                         LazyVGrid(columns: columns, spacing: 8) {
-                            keyButton("Esc", label: "Escape", usage: 0x29)
-                            keyButton("Tab", label: "Tab", usage: 0x2b)
-                            ForEach(RemoteKeyboardState.Modifier.allCases, id: \.self) { modifier in
-                                modifierButton(modifier)
+                            ForEach(1...12, id: \.self) { number in
+                                keyButton("F\(number)", label: "F\(number)", usage: 0x39 + number)
                             }
-                            keyButton("Left", label: "Left arrow", usage: 0x50)
-                            keyButton("Up", label: "Up arrow", usage: 0x52)
-                            keyButton("Down", label: "Down arrow", usage: 0x51)
-                            keyButton("Right", label: "Right arrow", usage: 0x4f)
-                        }
-
-                        Button { functionsExpanded.toggle() } label: {
-                            Label("F1-F12", systemImage: "chevron.down")
-                                .font(.footnote.weight(.medium))
-                                .frame(maxWidth: .infinity, minHeight: 44)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Function keys F1 through F12")
-                        .accessibilityValue(functionsExpanded ? "Expanded" : "Collapsed")
-                        .accessibilityHint("Shows or hides function keys")
-                        .accessibilityAddTraits(.isButton)
-
-                        if functionsExpanded {
-                            LazyVGrid(columns: columns, spacing: 8) {
-                                ForEach(1...12, id: \.self) { number in
-                                    keyButton("F\(number)", label: "F\(number)", usage: 0x39 + number)
-                                }
-                            }
-                        }
-
-                        ViewThatFits(in: .horizontal) {
-                            HStack(spacing: 8) { commandButtons }
-                            VStack(spacing: 8) { commandButtons }
                         }
                     }
-                    .padding(12)
+
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 8) { commandButtons }
+                        VStack(spacing: 8) { commandButtons }
+                    }
                 }
-                .scrollBounceBehavior(.basedOnSize)
-                .frame(maxHeight: 280)
-                .background(Color(uiColor: SessionInk.surface),
-                            in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .stroke(Color(uiColor: SessionInk.hairline), lineWidth: 0.5))
+                .padding(12)
             }
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(maxHeight: 280)
+            .background(Color(uiColor: SessionInk.surface),
+                        in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(Color(uiColor: SessionInk.hairline), lineWidth: 0.5))
         }
         .foregroundStyle(Color(uiColor: SessionInk.text))
         .environment(\.colorScheme, .dark)
@@ -138,14 +122,6 @@ struct RemoteSpecialKeyBar: View {
 
     private var commandButtons: some View {
         Group {
-            Button { remoteCommand(.secureAttention) } label: {
-                keyLabel("Ctrl+Alt+Del")
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Ctrl Alt Delete")
-            .accessibilityHint("Opens the Windows security screen using a remote command")
-            .accessibilityAddTraits(.isButton)
-
             Button {
                 releaseKeys()
             } label: {

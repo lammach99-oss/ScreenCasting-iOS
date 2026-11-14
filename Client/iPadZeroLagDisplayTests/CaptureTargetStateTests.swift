@@ -19,6 +19,106 @@ final class CaptureTargetStateTests: XCTestCase {
             kind: status == .accepted ? nil : kind, transaction: transaction, owner: 2, revision: revision,
             currentId: status == .accepted ? 0 : current, epoch: 5, source: 6, firstFrame: 0)
     }
+    func testTypedCycleExcludesExtendAndModeChoiceUsesOnlyConfirmedIdentity() {
+        var model = negotiated()
+        let extended = ScreenPickerSnapshot.make(captureTargets: model, state: nil)
+        let extendCycle = extended.cycle(kind: .castingExtend)
+        XCTAssertEqual(extendCycle.count, 1)
+        XCTAssertEqual(extendCycle.currentLabel, "Extend iPad")
+        XCTAssertFalse(extendCycle.enabled)
+        XCTAssertEqual(extendCycle.reason, "Choose Mirror to switch PC screens.")
+        let modes = CaptureModePresentation.make(targets: model, kind: .castingExtend, lastPhysicalId: nil)
+        XCTAssertTrue(modes.extend.selected); XCTAssertFalse(modes.extend.enabled)
+        XCTAssertTrue(modes.mirror.enabled); XCTAssertEqual(modes.mirror.targetId, 4)
+        _ = model.select(4, catalogue: catalogue(), session: model.session)
+        let pending = CaptureModePresentation.make(targets: model, kind: .castingExtend, lastPhysicalId: nil)
+        XCTAssertTrue(pending.extend.selected); XCTAssertFalse(pending.mirror.selected)
+        XCTAssertFalse(pending.extend.enabled); XCTAssertFalse(pending.mirror.enabled)
+    }
+
+    func testTypedPhysicalCycleUsesReceivedOrderAndWrapsAcrossThreeScreens() {
+        var model = negotiated()
+        let entries = [CaptureTargetEntry(id: 4, kind: .physical, name: "Screen"),
+                       CaptureTargetEntry(id: 1, kind: .extend, name: "Extend iPad"),
+                       CaptureTargetEntry(id: 8, kind: .physical, name: "Screen"),
+                       CaptureTargetEntry(id: 6, kind: .physical, name: "Screen")]
+        for (revision, current, next) in [(UInt64(4), UInt64(4), UInt64(8)), (5, 8, 6), (6, 6, 4)] {
+            let list = CaptureTargetCatalogue(state: 1, allowed: true, owner: 2, revision: revision,
+                currentId: current, epoch: 5, entries: entries)
+            _ = model.receiveCatalogue(list, session: model.session)
+            let cycle = ScreenPickerSnapshot.make(captureTargets: model, state: nil).cycle(kind: .castingMirror)
+            XCTAssertEqual(cycle.count, 3); XCTAssertEqual(cycle.nextTargetId, next)
+            XCTAssertTrue(cycle.enabled)
+        }
+    }
+
+    func testMirrorReturnsToLastConfirmedPhysicalAndFallsBackWhenItDisappears() {
+        var model = negotiated(); var memory = ConfirmedPhysicalScreen()
+        let entries = [CaptureTargetEntry(id: 8, kind: .physical, name: "Screen 1")] + catalogue().entries
+        for (revision, current) in [(UInt64(4), UInt64(4)), (5, 1)] {
+            _ = model.receiveCatalogue(CaptureTargetCatalogue(state: 1, allowed: true, owner: 2, revision: revision,
+                currentId: current, epoch: 5, entries: entries), session: model.session)
+            memory.observe(model)
+        }
+        XCTAssertEqual(memory.id, 4)
+        XCTAssertEqual(CaptureModePresentation.make(targets: model, kind: .castingExtend, lastPhysicalId: memory.id).mirror.targetId, 4)
+        _ = model.receiveCatalogue(CaptureTargetCatalogue(state: 1, allowed: true, owner: 2, revision: 6,
+            currentId: 1, epoch: 5, entries: entries.filter { $0.id != 4 }), session: model.session)
+        memory.observe(model); XCTAssertNil(memory.id)
+        XCTAssertEqual(CaptureModePresentation.make(targets: model, kind: .castingExtend, lastPhysicalId: memory.id).mirror.targetId, 8)
+    }
+
+    func testUnknownOutcomeAllowsOnePhysicalSurvivorOnlyAfterFreshCatalogue() {
+        var model = negotiated()
+        _ = model.select(4, catalogue: catalogue(), session: model.session)
+        XCTAssertTrue(model.expire(transaction: 1, session: model.session))
+        XCTAssertFalse(ScreenPickerSnapshot.make(captureTargets: model, state: nil).cycle(kind: .castingUnknown).enabled)
+        _ = model.receiveCatalogue(catalogue(revision: 4, current: 4), session: model.session)
+        let picker = ScreenPickerSnapshot.make(captureTargets: model, state: nil)
+        XCTAssertNil(picker.currentLabel)
+        let cycle = picker.cycle(kind: .castingUnknown)
+        XCTAssertEqual(cycle.count, 1); XCTAssertTrue(cycle.enabled)
+        XCTAssertEqual(cycle.currentLabel, "Choose a screen"); XCTAssertEqual(cycle.nextTargetId, 4)
+        XCTAssertNotNil(model.select(4, catalogue: catalogue(revision: 4, current: 4), session: model.session))
+    }
+
+    func testUnknownExtendCanBeReactivatedWithoutBypassingUnavailableStates() {
+        var model = negotiated()
+        _ = model.select(4, catalogue: catalogue(), session: model.session)
+        _ = model.expire(transaction: 1, session: model.session)
+        _ = model.receiveCatalogue(catalogue(revision: 4), session: model.session)
+        let choices = CaptureModePresentation.make(targets: model, kind: .castingUnknown, lastPhysicalId: nil)
+        XCTAssertTrue(choices.extend.selected); XCTAssertTrue(choices.extend.enabled)
+        XCTAssertEqual(choices.explanation, "Choose Extend again to restore the picture.")
+        let unavailable = CaptureTargetCatalogue(state: 3, allowed: true, owner: 2, revision: 5,
+            currentId: 0, epoch: 5, entries: catalogue().entries)
+        _ = model.receiveCatalogue(unavailable, session: model.session)
+        let blocked = CaptureModePresentation.make(targets: model, kind: .castingUnknown, lastPhysicalId: nil)
+        XCTAssertFalse(blocked.extend.enabled); XCTAssertFalse(blocked.mirror.enabled)
+        XCTAssertFalse(ScreenPickerSnapshot.make(captureTargets: model, state: nil).cycle(kind: .castingUnknown).enabled)
+    }
+
+    func testPhysicalMemoryRetiresWithSessionAndOnlyRecordsConfirmedPhysicalScreens() {
+        var model = negotiated(); var memory = ConfirmedPhysicalScreen()
+        memory.observe(model); XCTAssertNil(memory.id)
+        _ = model.receiveCatalogue(catalogue(revision: 4, current: 4), session: model.session)
+        memory.observe(model); XCTAssertEqual(memory.id, 4)
+        _ = model.receiveCatalogue(catalogue(revision: 5), session: model.session)
+        memory.observe(model); XCTAssertEqual(memory.id, 4)
+        model.retireRoute(); memory.observe(model); XCTAssertNil(memory.id)
+    }
+
+    func testScreenPermissionDoesNotDependOnControlAndApprovalDoesNotCreateARequest() {
+        var model = negotiated()
+        _ = model.receiveCatalogue(catalogue(revision: 4, current: 4, allowed: false), session: model.session)
+        let locked = ScreenPickerSnapshot.make(captureTargets: model, state: nil)
+        XCTAssertEqual(locked.control, .unavailable); XCTAssertTrue(locked.canAskPermission)
+        XCTAssertFalse(locked.cycle(kind: .castingMirror).enabled)
+        XCTAssertFalse(ScreenPickerSnapshot.make(captureTargets: model, state: nil, permissionAsked: true).canAskPermission)
+        _ = model.receiveCatalogue(catalogue(revision: 5), session: model.session)
+        XCTAssertNil(model.pending)
+        XCTAssertTrue(CaptureModePresentation.make(targets: model, kind: .castingExtend, lastPhysicalId: nil).mirror.enabled)
+    }
     func testFourPeerCombinationsKeepLegacyHelloAndOnlyAdvertisedTypedOptIn() {
         for newHost in [false, true] {
             for newClient in [false, true] {

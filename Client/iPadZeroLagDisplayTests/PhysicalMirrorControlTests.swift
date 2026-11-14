@@ -565,6 +565,21 @@ final class PhysicalMirrorControlTests: XCTestCase {
         XCTAssertNotNil(model.captureTicket(),"asking for the list or for permission never retires input")
         model.beginSession(8);XCTAssertFalse(model.supportsScreenPicker,"capability belongs to one connection")
     }
+    func testLegacyCycleWrapsInCatalogueOrderAndPreservesOneSurvivorRecovery() throws {
+        let entries = [(UInt64(9), "Screen"), (UInt64(3), "Screen"), (UInt64(6), "Screen")]
+        for (current, next) in [(UInt64(9), UInt64(3)), (3, 6), (6, 9)] {
+            let picker = ScreenPickerSnapshot.make(catalogue: try catalogue(selected: current, allowed: true, entries),
+                state: nil, switchingTo: nil, switchPending: false, pickerSupported: true, permissionAsked: false)
+            XCTAssertEqual(picker.cycle(kind: .castingMirror).nextTargetId, next)
+            XCTAssertTrue(picker.cycle(kind: .castingMirror).enabled)
+        }
+        for current in [UInt64(0), 9] {
+            let picker = ScreenPickerSnapshot.make(catalogue: try catalogue(selected: current, allowed: true, [entries[0]]),
+                state: nil, switchingTo: nil, switchPending: false, pickerSupported: true, permissionAsked: false)
+            XCTAssertEqual(picker.cycle(kind: .castingMirror).enabled, current == 0)
+        }
+    }
+
     func testScreenPickerSnapshotStates() throws {
         let active=try MirrorControlCodec.decodeState(state(2,1,1,.active,token,100))
         let viewOnly=try MirrorControlCodec.decodeState(state(2,1,1,.viewOnly,zero,100))
@@ -577,6 +592,8 @@ final class PhysicalMirrorControlTests: XCTestCase {
         XCTAssertEqual(locked.phase,.locked);XCTAssertTrue(locked.canAskPermission);XCTAssertEqual(locked.control,.on)
         XCTAssertEqual(locked.tiles.map(\.status),[.showing,.locked]);XCTAssertEqual(locked.tiles.map(\.isBuiltIn),[true,false])
         XCTAssertEqual(locked.currentLabel,"Built-in display")
+        XCTAssertFalse(locked.cycle(kind: .castingMirror).enabled)
+        XCTAssertEqual(locked.cycle(kind: .castingMirror).reason, "Screen switching is off on the PC.")
         XCTAssertFalse(ScreenPickerSnapshot.make(catalogue:try catalogue(selected:1,allowed:false,two),state:active,switchingTo:nil,
             switchPending:false,pickerSupported:true,permissionAsked:true).canAskPermission,"one ask until the Host decides")
         XCTAssertFalse(ScreenPickerSnapshot.make(catalogue:try catalogue(selected:1,allowed:false,two),state:active,switchingTo:nil,
@@ -584,9 +601,12 @@ final class PhysicalMirrorControlTests: XCTestCase {
         let ready=ScreenPickerSnapshot.make(catalogue:try catalogue(selected:1,allowed:true,two),state:active,switchingTo:nil,
             switchPending:false,pickerSupported:true,permissionAsked:false)
         XCTAssertEqual(ready.phase,.ready);XCTAssertEqual(ready.tiles.map(\.status),[.showing,.available]);XCTAssertFalse(ready.canAskPermission)
+        XCTAssertEqual(ready.cycle(kind: .castingMirror).nextTargetId, 2)
+        XCTAssertTrue(ready.cycle(kind: .castingMirror).enabled)
         let switching=ScreenPickerSnapshot.make(catalogue:try catalogue(selected:1,allowed:true,two),state:active,switchingTo:2,
             switchPending:true,pickerSupported:true,permissionAsked:false)
         XCTAssertEqual(switching.tiles.map(\.status),[.showing,.switching]);XCTAssertTrue(switching.isSwitching)
+        XCTAssertFalse(switching.cycle(kind: .castingMirror).enabled)
         let three=two+[(UInt64(3),"DELL U2720Q")]
         let busy=ScreenPickerSnapshot.make(catalogue:try catalogue(selected:1,allowed:true,three),state:active,switchingTo:2,
             switchPending:true,pickerSupported:true,permissionAsked:false)

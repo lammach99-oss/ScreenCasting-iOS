@@ -39,19 +39,30 @@ private extension Color {
     init(ink: UIColor) { self.init(uiColor: ink) }
 }
 
-/// The one visible handle in every session. The pill names the PC (or mirrored screen), the link and control;
-/// the panel holds Screens, Keyboard, control, Files, Settings and Disconnect. Touches on it stay on the iPad.
+/// One session shell: current Screen, route and control, then the same ordered panel sections.
+/// Touches on the panel stay on the iPad.
 @MainActor struct SessionPanelOverlay: View {
     @ObservedObject var networkManager: NetworkManager
     let hostLabel: String
     @Binding var isOpen: Bool
     @ObservedObject var remoteInput: RemoteSessionInputState
+    let tailnetTarget: Bool
+    let performance: SessionPerformanceReadout?
+    let onPillHeightChange: (CGFloat) -> Void
     let onFiles: () -> Void
     let onSettings: () -> Void
     let onGestures: () -> Void
 
+    @State private var moreInputExpanded = false
+    @State private var rememberedPhysical = ConfirmedPhysicalScreen()
+    @State private var requestedScreen: UInt64?
+    @State private var pillHeight: CGFloat = 44
+    @State private var awaitingSwitchAnnouncement = false
+    @AccessibilityFocusState private var switchFocused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var switchingTo: UInt64?
     @State private var failedFrom: String?
+    @State private var failedSelection = false
     @State private var permissionAsked = false
     @State private var controlPermissionAsked = false
     @State private var lastInteraction = Date()
@@ -80,9 +91,35 @@ private extension Color {
               pickerSupported: networkManager.mirrorScreenPickerSupported, permissionAsked: permissionAsked)
     }
 
+    private var kind: SessionPanelKind {
+        .make(remote: networkManager.isRemoteControlSession, targets: networkManager.captureTargetState,
+              legacy: networkManager.mirrorControlState, catalogue: networkManager.mirrorMonitorCatalogue)
+    }
+
     private var session: SessionPanelSnapshot {
         .make(hostLabel: hostLabel, transport: networkManager.transferSnapshot.transport,
-              connection: networkManager.connectionState, control: picker.control, mirrorLabel: picker.currentLabel)
+              connection: networkManager.connectionState, control: picker.control, mirrorLabel: picker.currentLabel,
+              kind: kind, tailnet: tailnetTarget)
+    }
+
+    private var cycle: ScreenCyclePresentation {
+        let p = picker
+        let reason: String?
+        if p.phase == .loading { reason = "Loading screens..." }
+        else if networkManager.isRemoteControlSession && p.control != .on {
+            reason = "Turn Control on to choose a screen."
+        } else if p.phase == .locked {
+            if networkManager.captureTargetState.enabled && networkManager.captureTargetState.catalogue?.state != 1 {
+                reason = screenWords(networkManager.captureTargetState.statusMessage ?? "Screens are unavailable. Refresh screens.")
+            } else if networkManager.isRemoteControlSession {
+                reason = screenWords(networkManager.remoteMonitorState.statusMessage ?? "Screens are unavailable.")
+            } else { reason = "Screen switching is off on the PC." }
+        } else { reason = nil }
+        return p.cycle(kind: kind, disabledReason: reason)
+    }
+
+    private var modeChoices: CaptureModePresentation {
+        .make(targets: networkManager.captureTargetState, kind: kind, lastPhysicalId: rememberedPhysical.id)
     }
 
     var body: some View {
@@ -90,7 +127,7 @@ private extension Color {
             ZStack(alignment: .top) {
                 if isOpen {
                     // Tapping outside closes the panel; while it is open nothing reaches the PC.
-                    Color.black.opacity(0.001).contentShape(Rectangle()).onTapGesture { close() }
+                    Color(ink: SessionInk.canvas).opacity(0.001).contentShape(Rectangle()).onTapGesture { close() }
                 }
                 VStack(spacing: 10) {
                     // After a few idle seconds the pill shrinks to a slim handle so the top of the PC stays visible.
@@ -106,11 +143,14 @@ private extension Color {
                                 handle(maxX: proxy.size.width).transition(.opacity)
                             }
                         }
-                        .animation(.easeOut(duration: 0.3), value: mode)
+                        .animation(reduceMotion ? nil : .easeOut(duration: 0.3), value: mode)
                     }
+                    .background(GeometryReader { pillProxy in
+                        Color.clear.preference(key: SessionPillHeightKey.self, value: pillProxy.size.height)
+                    })
                     if isOpen {
                         // Sized to its content; only very large text or many screens reach the cap and scroll.
-                        panel(width: min(420, proxy.size.width - 24), maxHeight: max(160, proxy.size.height - 102))
+                        panel(width: min(420, proxy.size.width - 24), maxHeight: max(120, proxy.size.height - pillHeight - 34))
                             .transition(.opacity.combined(with: .move(edge: .top)))
                     }
                 }
@@ -120,20 +160,35 @@ private extension Color {
             .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
         }
         .environment(\.colorScheme, .dark)
+        .tint(Color(ink: SessionInk.accent))
+        .onPreferenceChange(SessionPillHeightKey.self) { height in
+            pillHeight = height
+            onPillHeightChange(height)
+        }
         .onChange(of: isOpen) { _, open in
             lastInteraction = Date()
             disconnectArming.reset()
             if open {
-                failedFrom = nil
+                failedFrom = nil; failedSelection = false
                 if networkManager.isRemoteControlSession { networkManager.refreshRemoteScreens() }
                 else { networkManager.refreshMirrorScreens() }
             }
         }
+        .onAppear { rememberedPhysical.observe(networkManager.captureTargetState) }
+        .onChange(of: networkManager.captureTargetState) { _, targets in rememberedPhysical.observe(targets) }
+        .onChange(of: picker.isSwitching) { wasSwitching, switching in
+            if wasSwitching && !switching { finishSwitch() }
+        }
         .onChange(of: networkManager.captureTargetState.session) { _, _ in
-            switchingTo=nil;failedFrom=nil;permissionAsked=false
+            switchingTo=nil;failedFrom=nil;permissionAsked=false;controlPermissionAsked=false
+            failedSelection=false
+            requestedScreen=nil;awaitingSwitchAnnouncement=false
         }
         .onChange(of: networkManager.captureTargetState.catalogue?.allowed) { _, allowed in
             if allowed == true { permissionAsked=false }
+        }
+        .onChange(of: picker.control) { _, control in
+            if control == .on { controlPermissionAsked = false }
         }
         .onChange(of: networkManager.mirrorMonitorCatalogue) { _, catalogue in settle(catalogue) }
         .onChange(of: networkManager.mirrorMonitorSwitchPending) { _, pending in if !pending { settle(networkManager.mirrorMonitorCatalogue) } }
@@ -147,40 +202,45 @@ private extension Color {
         return Button {
             isOpen ? close() : open()
         } label: {
-            HStack(spacing: 8) {
+            Group {
                 if s.reconnecting {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                    Text(s.reconnectingText).lineLimit(1)
+                    HStack(spacing: 8) {
+                        Image(systemName: "arrow.triangle.2.circlepath").accessibilityHidden(true)
+                        Text(s.reconnectingText).fixedSize(horizontal: false, vertical: true)
+                    }
                 } else {
-                    Image(systemName: icon(s.icon)).foregroundStyle(Color(ink: SessionInk.accent))
-                    Text(s.title).fontWeight(.semibold).lineLimit(1).frame(maxWidth: 220)
-                    if let transport = s.transport {
-                        Text("· \(transport)").foregroundStyle(Color(ink: SessionInk.secondary))
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 8) { pillTitle; routeAndControl }.fixedSize(horizontal: true, vertical: false)
+                        VStack(alignment: .leading, spacing: 8) { pillTitle; routeAndControl }
                     }
-                    if s.isMirror {
-                        Rectangle().fill(Color(ink: SessionInk.hairline)).frame(width: 1, height: 14)
-                        controlBadge(s.control, compact: true)
-                    }
-                    Image(systemName: "chevron.down").font(.caption.weight(.bold))
-                        .rotationEffect(.degrees(isOpen ? 180 : 0))
-                        .foregroundStyle(Color(ink: SessionInk.secondary))
                 }
             }
+            .frame(maxWidth: max(44, min(392, maxX - 52)))
             .font(.subheadline)
             .foregroundStyle(Color(ink: s.reconnecting ? SessionInk.warning : SessionInk.text))
             .padding(.horizontal, 14).padding(.vertical, 10)
             .frame(minHeight: 44)
             .background(Color(ink: SessionInk.surface).opacity(0.94), in: Capsule())
             .overlay(Capsule().stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
-            .shadow(color: .black.opacity(0.35), radius: 10, y: 4)
+            .shadow(color: Color(ink: SessionInk.canvas).opacity(0.35), radius: 10, y: 4)
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
         .gesture(moveAlongTop(maxX: maxX))
         .accessibilityLabel(pillLabel(s))
         .accessibilityValue(isOpen ? "Expanded" : "Collapsed")
         .accessibilityHint("Opens screens, keyboard, files, settings and disconnect")
+    }
+
+    private var pillTitle: some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon(session.icon)).accessibilityHidden(true)
+                .foregroundStyle(Color(ink: SessionInk.accent))
+            Text(session.title).fontWeight(.semibold).fixedSize(horizontal: false, vertical: true)
+            Image(systemName: "chevron.down").font(.caption.weight(.bold)).accessibilityHidden(true)
+                .rotationEffect(.degrees(isOpen ? 180 : 0))
+                .foregroundStyle(Color(ink: SessionInk.secondary))
+        }
     }
 
     /// The idle pill: a slim bar at the top edge, green while touches drive the PC. Tapping it opens the panel.
@@ -194,7 +254,7 @@ private extension Color {
                 .frame(width: 66, height: 13)
                 .background(Color(ink: SessionInk.canvas).opacity(0.72), in: Capsule())
                 .overlay(Capsule().stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
-                .frame(width: 96, height: 22)
+                .frame(width: 96, height: 44)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -216,231 +276,357 @@ private extension Color {
 
     private func pillLabel(_ s: SessionPanelSnapshot) -> String {
         s.reconnecting ? s.reconnectingText
-            : "\(s.title)\(s.transport.map { ", \($0)" } ?? "")\(s.isMirror ? ". \(controlText(s.control))" : "")"
+            : "\(s.title)\(s.transport.map { ", \($0)" } ?? "")\(". " + controlText(s.control))"
     }
 
     // MARK: Panel
 
     private func panel(width: CGFloat, maxHeight: CGFloat) -> some View {
-        let s = session
-        let p = picker
-        let middle = VStack(alignment: .leading, spacing: 14) {
-            if !networkManager.isRemoteControlSession { connectionPicker }
-            if ScreenPickerSnapshot.shouldShowPicker(remote: networkManager.isRemoteControlSession,
-                mirror: s.isMirror, acceptedFeatures: networkManager.remoteMonitorState.enabled ? 7 : 0,
-                typedSources: networkManager.captureTargetState.enabled) { screens(p) }
-            actions(s)
-            if remoteInput.usesScanKeyboard {
-                let generation = remoteInput.generation
-                RemoteSpecialKeyBar(keyboard: Binding(
-                    get: { remoteInput.keyboard },
-                    set: { value in
-                        if remoteInput.keyboardEnabled && value.token == remoteInput.token {
-                            remoteInput.keyboard = value
-                        }
-                    }), sendKey: { remoteInput.emitKey($0, generation: generation) },
-                    remoteCommand: { networkManager.sendRemoteCommand($0) },
-                    releaseKeys: { remoteInput.suspend(reason: 4) })
-                    .disabled(!remoteInput.keyboardEnabled)
-                    .opacity(remoteInput.keyboardEnabled ? 1 : 0.45)
-            }
-            if remoteInput.usesEnhancedPointer {
-                RemoteMouseControls(mode: remoteInput.mouseMode,
-                    onModeChange: { remoteInput.changeMouseMode($0) },
-                    onMiddleClick: { remoteInput.middleClick() }, enabled: remoteInput.pointerEnabled)
-            }
-        }
-        return VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(s.hostLabel).font(.headline).lineLimit(1)
-                Spacer()
-                if let transport = s.transport {
-                    Label(transport, systemImage: transport == "USB-C" ? "cable.connector" : "wifi")
-                        .font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
-                }
-            }
-            if s.reconnecting {
-                Label(s.reconnectingText, systemImage: "arrow.triangle.2.circlepath")
-                    .font(.footnote).foregroundStyle(Color(ink: SessionInk.warning))
-            }
-            // Large text or many screens scroll; the header and Disconnect stay put.
+        VStack(alignment: .leading, spacing: 14) {
+            panelHeader
             ViewThatFits(in: .vertical) {
-                middle
-                ScrollView { middle }.scrollBounceBehavior(.basedOnSize)
+                panelSections.fixedSize(horizontal: false, vertical: true)
+                ScrollView { panelSections }.scrollBounceBehavior(.basedOnSize)
             }
-            footer(s)
+            footer(session)
         }
         .foregroundStyle(Color(ink: SessionInk.text))
         .padding(16)
         .frame(width: width)
         .background(Color(ink: SessionInk.surface).opacity(0.96), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
-        .shadow(color: .black.opacity(0.45), radius: 24, y: 12)
+        .shadow(color: Color(ink: SessionInk.canvas).opacity(0.45), radius: 24, y: 12)
         .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
         .onTapGesture { lastInteraction = Date() }
-        // The cap goes outside the background: a capped frame takes the whole cap, which left a tall empty panel.
         .frame(maxHeight: maxHeight, alignment: .top)
         .accessibilityAddTraits(.isModal)
         .accessibilityAction(.escape) { close() }
     }
 
-    @ViewBuilder
+    private var panelSections: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if ScreenPickerSnapshot.shouldShowPicker(remote: networkManager.isRemoteControlSession,
+                mirror: !networkManager.isRemoteControlSession, acceptedFeatures: networkManager.remoteMonitorState.enabled ? 7 : 0,
+                typedSources: networkManager.captureTargetState.enabled) { screens(picker) }
+            if !networkManager.isRemoteControlSession { connectionPicker }
+            if !networkManager.isRemoteControlSession && picker.control != .unavailable { castingControl }
+            tools
+            touchSection
+            if networkManager.isRemoteControlSession { remoteActions }
+        }
+    }
+
+    private var panelHeader: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(session.hostLabel).font(.headline).fixedSize()
+                    Spacer(minLength: 8)
+                    routeAndControl.fixedSize()
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(session.hostLabel).font(.headline)
+                    routeAndControl
+                }
+            }
+            if session.reconnecting {
+                Label(session.reconnectingText, systemImage: "arrow.triangle.2.circlepath")
+                    .font(.footnote).foregroundStyle(Color(ink: SessionInk.warning))
+            }
+            if let performance { performance }
+        }
+    }
+
+    private var routeAndControl: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) { routeLabel; controlBadge(session.control, compact: true) }
+            VStack(alignment: .leading, spacing: 8) { routeLabel; controlBadge(session.control, compact: true) }
+        }
+        .font(.footnote)
+    }
+
+    @ViewBuilder private var routeLabel: some View {
+        if let route = session.transport {
+            Text(route).foregroundStyle(Color(ink: SessionInk.secondary))
+        }
+    }
+
+    private func sectionTitle(_ title: String) -> some View {
+        Text(title).font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
+            .accessibilityAddTraits(.isHeader)
+    }
+
     private func screens(_ p: ScreenPickerSnapshot) -> some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text("Screens on this PC").font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
-            Spacer()
-            if p.phase == .ready && !p.isSwitching && (!networkManager.isRemoteControlSession || p.control == .on) {
-                Text("Tap a screen to show it").font(.caption).foregroundStyle(Color(ink: SessionInk.secondary))
+        VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("Screen")
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) { switchScreenButton.fixedSize(horizontal: true, vertical: false); castingModes }
+                VStack(alignment: .leading, spacing: 8) { switchScreenButton; castingModes }
             }
+            screenStatus(p)
         }
-        if p.phase == .locked { lockedBanner(p) }
-        if networkManager.isRemoteControlSession, p.phase != .locked,
-           let message = networkManager.remoteMonitorState.selectionStatus(inputReady: networkManager.remoteInputReady,
-                controlEnabled: monitorControlEnabled) {
-            Text(message).font(.footnote)
-                .foregroundStyle(Color(ink: networkManager.remoteMonitorState.issue == .failed ||
-                    networkManager.remoteMonitorState.issue == .denied ? SessionInk.danger : SessionInk.warning))
-        }
-        if !networkManager.isRemoteControlSession, networkManager.captureTargetState.enabled,
-           let message=networkManager.captureTargetState.statusMessage {
-            Text(message).font(.footnote).foregroundStyle(Color(ink: SessionInk.warning))
-                .accessibilityLabel(message)
-        }
-        if !networkManager.isRemoteControlSession, networkManager.captureTargetState.enabled,
-           !p.isSwitching, networkManager.captureTargetState.listUnavailable ||
-            networkManager.captureTargetState.catalogue?.state == 0 || networkManager.captureTargetState.catalogue?.state == 3 {
-            Button("Refresh sources") { networkManager.refreshMirrorScreens() }
-                .buttonStyle(.bordered).frame(minHeight: 44)
-        }
-        if let failedFrom {
-            Text("Couldn't switch. Still showing \(failedFrom).")
-                .font(.footnote).foregroundStyle(Color(ink: SessionInk.danger))
-        }
-        if p.phase == .loading && !networkManager.isRemoteControlSession &&
-            !networkManager.captureTargetState.enabled && !networkManager.mirrorScreenPickerSupported && !p.isSwitching && switchingTo == nil {
-            Text("This PC can't list its screens. Update ScreenCasting on the PC.")
-                .font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
-        } else if p.phase == .loading {
-            HStack(spacing: 10) {
-                ProgressView().tint(Color(ink: SessionInk.accent))
-                Text(networkManager.isRemoteControlSession ? "Loading screens..." :
-                    (p.isSwitching || switchingTo != nil ? "Switching\u{2026}" : "Screens appear once the picture is showing."))
-                    .font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
+    }
+
+    private var switchScreenButton: some View {
+        Button { cycleScreen() } label: {
+            HStack(spacing: 8) {
+                if cycle.pending { ProgressView().tint(Color(ink: SessionInk.warning)).accessibilityHidden(true) }
+                else { Image(systemName: "display").accessibilityHidden(true) }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Switch screen").font(.subheadline.weight(.semibold))
+                    Text(cycle.detail).font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
+                }
+                .fixedSize(horizontal: false, vertical: true)
             }
-            .frame(maxWidth: .infinity, minHeight: 72)
-        } else {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 8)], spacing: 8) {
-                ForEach(p.tiles) { tile in tileView(tile) }
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+            .padding(8)
+            .background(Color(ink: SessionInk.raised), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
+        }
+        .buttonStyle(.plain)
+        .disabled(!cycle.enabled)
+        .opacity(cycle.enabled ? 1 : 0.6)
+        .accessibilityLabel("Switch screen")
+        .accessibilityValue(cycle.accessibilityValue)
+        .accessibilityHint(cycle.hint)
+        .accessibilityIdentifier("session.switch-screen")
+        .accessibilityFocused($switchFocused)
+    }
+
+    @ViewBuilder private var castingModes: some View {
+        if !networkManager.isRemoteControlSession {
+            if typeSize.isAccessibilitySize {
+                VStack(spacing: 8) { modeButtons }
+            } else {
+                HStack(spacing: 8) { modeButtons }
             }
         }
     }
 
-    private func lockedBanner(_ p: ScreenPickerSnapshot) -> some View {
-        let amber = Color(ink: SessionInk.warning)
-        return HStack(spacing: 10) {
-            Image(systemName: "lock").foregroundStyle(amber).accessibilityHidden(true)
-            Text(networkManager.isRemoteControlSession
-                 ? networkManager.remoteMonitorState.statusMessage ?? "Screens are unavailable."
-                 : networkManager.captureTargetState.enabled && networkManager.captureTargetState.catalogue?.state != 1
-                    ? networkManager.captureTargetState.statusMessage ?? "Sources are unavailable. Refresh sources."
-                 : permissionAsked ? CastingPermissionCopy.requestSent
-                 : networkManager.mirrorScreenPickerSupported ? "Switching is off on the PC."
-                 : "Turn on monitor switching on the PC.")
-                .font(.footnote).foregroundStyle(amber)
-            Spacer(minLength: 4)
+    private var modeButtons: some View {
+        Group {
+            modeButton("Extend", choice: modeChoices.extend, identifier: "session.mode.extend")
+            modeButton("Mirror", choice: modeChoices.mirror, identifier: "session.mode.mirror")
+        }
+    }
+
+    private func modeButton(_ title: String, choice: CaptureModeChoice, identifier: String) -> some View {
+        Button {
+            guard choice.enabled, let id = choice.targetId else { return }
+            requestScreen(id)
+        } label: {
+            Text(title).font(.subheadline.weight(.semibold))
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 8)
+                .frame(minWidth: 44, maxWidth: .infinity, minHeight: 44)
+                .background(Color(ink: choice.selected ? SessionInk.accent : SessionInk.raised)
+                    .opacity(choice.selected ? 0.16 : 1), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color(ink: choice.selected ? SessionInk.accent : SessionInk.hairline), lineWidth: 0.5))
+        }
+        .buttonStyle(.plain)
+        .disabled(!choice.enabled)
+        .accessibilityLabel(title)
+        .accessibilityValue(choice.selected ? "Selected" : "Not selected")
+        .accessibilityAddTraits(choice.selected ? .isSelected : [])
+        .accessibilityHint(modeChoices.explanation ?? "")
+        .accessibilityIdentifier(identifier)
+    }
+
+    private func screenStatus(_ p: ScreenPickerSnapshot) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let message = screenMessage {
+                Text(message).font(.footnote).fixedSize(horizontal: false, vertical: true)
+                    .foregroundStyle(Color(ink: screenHasFailure ? SessionInk.danger : SessionInk.warning))
+            }
+            if permissionAsked && !p.canAskPermission && p.phase == .locked {
+                Text(CastingPermissionCopy.requestSent).font(.footnote).foregroundStyle(Color(ink: SessionInk.warning))
+            }
             if p.canAskPermission {
                 Button("Ask PC to allow") {
                     permissionAsked = true; lastInteraction = Date()
                     networkManager.requestMirrorSwitchPermission()
                 }
-                .buttonStyle(.bordered).tint(amber).frame(minHeight: 44)
+                .buttonStyle(.bordered).frame(minHeight: 44)
+                .accessibilityHint("Shows an approval pop-up on the PC")
+            }
+            if !networkManager.isRemoteControlSession, let explanation = modeChoices.explanation {
+                Text(explanation).font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if networkManager.captureTargetState.enabled && !p.isSwitching &&
+                (networkManager.captureTargetState.listUnavailable || networkManager.captureTargetState.needsCatalogueRefresh ||
+                 networkManager.captureTargetState.catalogue?.state == 0 || networkManager.captureTargetState.catalogue?.state == 3) {
+                Button("Refresh screens") { networkManager.refreshMirrorScreens() }
+                    .buttonStyle(.bordered).frame(minHeight: 44)
             }
         }
-        .padding(10)
-        .background(amber.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
-    private func tileView(_ tile: ScreenPickerTile) -> some View {
-        let selected = tile.status == .showing
-        return Button {
-            if networkManager.isRemoteControlSession {
-                guard tile.canSelect, monitorControlEnabled, let catalogue = networkManager.remoteMonitorState.catalogue else { return }
+    private var screenHasFailure: Bool {
+        failedSelection || networkManager.remoteMonitorState.issue == .failed ||
+            networkManager.remoteMonitorState.issue == .denied || networkManager.captureTargetState.issue == .failed
+    }
+
+    private var screenMessage: String? {
+        if cycle.pending { return cycle.reason }
+        if failedSelection {
+            if let failedFrom { return "Couldn't switch. Still showing \(failedFrom)." }
+            return "Couldn't switch screens. Choose a screen to restore the picture."
+        }
+        if kind == .castingExtend { return cycle.reason }
+        if networkManager.isRemoteControlSession {
+            return networkManager.remoteMonitorState.selectionStatus(inputReady: networkManager.remoteInputReady,
+                controlEnabled: monitorControlEnabled).map(screenWords) ?? cycle.reason
+        }
+        if networkManager.captureTargetState.enabled {
+            return networkManager.captureTargetState.statusMessage.map(screenWords) ?? cycle.reason
+        }
+        if picker.phase == .loading && !networkManager.mirrorScreenPickerSupported {
+            return "This PC can't list its screens. Update ScreenCasting on the PC."
+        }
+        return cycle.reason
+    }
+
+    private func screenWords(_ message: String) -> String {
+        message.replacingOccurrences(of: "display source", with: "screen")
+            .replacingOccurrences(of: "Sources", with: "Screens")
+            .replacingOccurrences(of: "sources", with: "screens")
+            .replacingOccurrences(of: "Source", with: "Screen")
+            .replacingOccurrences(of: "source", with: "screen")
+    }
+
+    private func cycleScreen() {
+        guard cycle.enabled, let targetId = cycle.nextTargetId else { return }
+        requestScreen(targetId)
+    }
+
+    private func requestScreen(_ targetId: UInt64) {
+        let p = picker
+        if networkManager.isRemoteControlSession {
+            guard p.tiles.contains(where: { $0.id == targetId && $0.canSelect }), monitorControlEnabled,
+                  let catalogue = networkManager.remoteMonitorState.catalogue else { return }
+            networkManager.requestRemoteMonitor(targetId, catalogue: catalogue)
+        } else if networkManager.captureTargetState.enabled {
+            guard p.tiles.contains(where: { $0.id == targetId && $0.canSelect }),
+                  let catalogue = networkManager.captureTargetState.catalogue else { return }
+            networkManager.requestCaptureTarget(targetId, catalogue: catalogue)
+        } else {
+            guard p.tiles.contains(where: { $0.id == targetId && $0.canSelect }),
+                  let catalogue = networkManager.mirrorMonitorCatalogue else { return }
+            switchingTo = targetId
+            networkManager.requestMirrorMonitor(targetId, catalogue: catalogue)
+        }
+        failedFrom = nil; failedSelection = false; lastInteraction = Date(); requestedScreen = targetId
+        switchFocused = false; awaitingSwitchAnnouncement = true
+    }
+
+    private func finishSwitch() {
+        guard awaitingSwitchAnnouncement else { return }
+        awaitingSwitchAnnouncement = false
+        let failed = failedSelection || networkManager.remoteMonitorState.issue != nil ||
+            networkManager.captureTargetState.issue != nil || networkManager.captureTargetState.unknownOutcome ||
+            picker.tiles.first(where: { $0.status == .showing })?.id != requestedScreen
+        let message = failed ? "Couldn't switch screens."
+            : "Showing \(cycle.currentLabel)."
+        requestedScreen = nil
+        UIAccessibility.post(notification: .announcement, argument: message)
+        switchFocused = true
+    }
+
+    private var castingControl: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("Control")
+            actionButton(picker.control == .on ? "Stop control" : "Ask control",
+                         icon: picker.control == .on ? "hand.raised.slash" : "hand.point.up.left",
+                         enabled: picker.control == .on || !controlPermissionAsked) {
                 lastInteraction = Date()
-                networkManager.requestRemoteMonitor(tile.id, catalogue: catalogue)
-                return
+                if picker.control == .on {
+                    remoteInput.suspend(reason: 1); networkManager.releaseMirrorControl(); controlPermissionAsked = false
+                } else { networkManager.requestMirrorControl(); controlPermissionAsked = true }
             }
-            if networkManager.captureTargetState.enabled {
-                guard tile.canSelect, let catalogue=networkManager.captureTargetState.catalogue else { return }
-                failedFrom=nil;lastInteraction=Date()
-                networkManager.requestCaptureTarget(tile.id, catalogue: catalogue)
-                return
-            }
-            guard tile.status == .available, let catalogue = networkManager.mirrorMonitorCatalogue else { return }
-            failedFrom = nil; switchingTo = tile.id; lastInteraction = Date()
-            networkManager.requestMirrorMonitor(tile.id, catalogue: catalogue)
-        } label: {
-            VStack(alignment: .leading, spacing: 6) {
-                Image(systemName: tile.isExtend ? "rectangle.on.rectangle" : tile.isBuiltIn ? "laptopcomputer" : "display").font(.title2)
-                    .foregroundStyle(Color(ink: selected ? SessionInk.accent : SessionInk.secondary))
-                Text(tile.label).font(.subheadline.weight(.semibold)).lineLimit(2).multilineTextAlignment(.leading)
-                HStack(spacing: 6) {
-                    if tile.status == .switching { ProgressView().controlSize(.mini).tint(Color(ink: SessionInk.accent)) }
-                    Text(statusText(tile.status)).font(.caption)
-                        .foregroundStyle(Color(ink: selected ? SessionInk.text : SessionInk.secondary))
-                }
-            }
-            .frame(maxWidth: .infinity, minHeight: 88, alignment: .topLeading)
-            .padding(12)
-            .background(selected ? Color(ink: SessionInk.accent).opacity(0.16) : Color(ink: SessionInk.raised),
-                        in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color(ink: selected ? SessionInk.accent : SessionInk.hairline), lineWidth: selected ? 1.5 : 0.5))
-            .opacity(tile.status == .locked ? 0.45 : 1)
-        }
-        .buttonStyle(.plain)
-        .disabled(!tile.canSelect)
-        .accessibilityLabel("\(tile.label), \(statusText(tile.status))")
-        .accessibilityAddTraits(selected ? .isSelected : [])
-    }
-
-    private func actions(_ s: SessionPanelSnapshot) -> some View {
-        // Mirrored keys reach the PC only under granted control; view-only typing would vanish.
-        let canType = !s.isMirror || s.control == .on
-        let buttons = Group {
-            actionButton("Keyboard", icon: "keyboard", enabled: canType,
-                         hint: canType ? nil : "Ask for control first to type on the PC") {
-                close()
-                DispatchQueue.main.async { NotificationCenter.default.post(name: .sessionPanelToggleKeyboard, object: nil) }
-            }
-            if s.isMirror && !networkManager.isRemoteControlSession {
-                actionButton(s.control == .on ? "Stop control" : "Ask control",
-                             icon: s.control == .on ? "hand.raised.slash" : "hand.point.up.left") {
-                    lastInteraction = Date()
-                    if s.control == .on { remoteInput.suspend(reason: 1); networkManager.releaseMirrorControl(); controlPermissionAsked = false }
-                    else { networkManager.requestMirrorControl(); controlPermissionAsked = true }
-                }
-            }
-            actionButton("Files", icon: "arrow.left.arrow.right") { close(); onFiles() }
-            actionButton("Settings", icon: "gearshape") { close(); onSettings() }
-        }
-        return VStack(spacing: 8) {
-            if controlPermissionAsked && s.control != .on {
+            if controlPermissionAsked && picker.control != .on {
                 Text(CastingPermissionCopy.requestSent).font(.footnote)
                     .foregroundStyle(Color(ink: SessionInk.secondary))
-                    .accessibilityLabel(CastingPermissionCopy.requestSent)
-            }
-            if networkManager.isRemoteControlSession { remoteActions }
-            if typeSize.isAccessibilitySize {
-                LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 8) { buttons }
-            } else {
-                HStack(spacing: 8) { buttons }
             }
         }
+    }
+
+    private var tools: some View {
+        let canType = networkManager.isRemoteControlSession ? (!remoteInput.usesScanKeyboard || remoteInput.keyboardEnabled)
+            : picker.control == .unavailable || picker.control == .on
+        return VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("Tools")
+            SessionActionLayout(accessibility: typeSize.isAccessibilitySize) {
+                actionButton("Keyboard", icon: "keyboard", enabled: canType,
+                             hint: canType ? nil : "Ask for control first to type on the PC") {
+                    close()
+                    DispatchQueue.main.async { NotificationCenter.default.post(name: .sessionPanelToggleKeyboard, object: nil) }
+                }
+                actionButton("Files", icon: "arrow.left.arrow.right") { close(); onFiles() }
+                actionButton("Settings", icon: "gearshape") { close(); onSettings() }
+            }
+        }
+    }
+
+    private var touchSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("Touch")
+            if remoteInput.usesEnhancedPointer {
+                RemoteMouseControls(mode: remoteInput.mouseMode,
+                    onModeChange: { remoteInput.changeMouseMode($0) }, enabled: remoteInput.pointerEnabled)
+            } else {
+                Text(networkManager.isRemoteControlSession ? "Use touch to point and click on the PC."
+                     : "Tap to click. Swipe one finger to scroll. Hold, then move to drag. Use Pencil to write.")
+                    .font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if remoteInput.usesScanKeyboard || remoteInput.usesEnhancedPointer { moreInput }
+        }
+    }
+
+    private var moreInput: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button { moreInputExpanded.toggle() } label: {
+                HStack(spacing: 8) {
+                    Text("More input").font(.subheadline.weight(.semibold))
+                    Image(systemName: "chevron.down").rotationEffect(.degrees(moreInputExpanded ? 180 : 0))
+                        .accessibilityHidden(true)
+                }
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(moreInputExpanded ? "Expanded" : "Collapsed")
+            .accessibilityIdentifier("session.more-input")
+            if moreInputExpanded {
+                if remoteInput.usesScanKeyboard { specialKeys }
+                if remoteInput.usesEnhancedPointer {
+                    RemoteMouseExtras(mode: remoteInput.mouseMode,
+                        onModeChange: { remoteInput.changeMouseMode($0) },
+                        onMiddleClick: { remoteInput.middleClick() }, enabled: remoteInput.pointerEnabled)
+                }
+            }
+        }
+    }
+
+    private var specialKeys: some View {
+        let generation = remoteInput.generation
+        return RemoteSpecialKeyBar(keyboard: Binding(
+            get: { remoteInput.keyboard },
+            set: { value in
+                if remoteInput.keyboardEnabled && value.token == remoteInput.token { remoteInput.keyboard = value }
+            }), sendKey: { remoteInput.emitKey($0, generation: generation) },
+            releaseKeys: { remoteInput.suspend(reason: 4) })
+            .disabled(!remoteInput.keyboardEnabled)
+            .opacity(remoteInput.keyboardEnabled ? 1 : 0.45)
     }
 
     private var connectionPicker: some View {
         let state = networkManager.connectionSwitchState
         return VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("Connection")
             Text(state.recommendationText).font(.footnote)
                 .foregroundStyle(Color(ink: SessionInk.secondary))
             ForEach([ConnectionRoute.usb, .wifi], id: \.rawValue) { route in
@@ -507,7 +693,7 @@ private extension Color {
 
     /// Remote control service only: keys the iPad cannot send, and power.
     private var remoteActions: some View {
-        HStack(spacing: 8) {
+        SessionActionLayout(accessibility: typeSize.isAccessibilitySize) {
             actionButton("Ctrl+Alt+Del", icon: "lock.shield", hint: "Opens the Windows security screen") {
                 lastInteraction = Date()
                 networkManager.sendRemoteCommand(.secureAttention)
@@ -530,8 +716,8 @@ private extension Color {
                               action: @escaping () -> Void) -> some View {
         Button(action: action) {
             VStack(spacing: 6) {
-                Image(systemName: icon).font(.title3).foregroundStyle(Color(ink: SessionInk.accent))
-                Text(title).font(.footnote.weight(.medium)).lineLimit(typeSize.isAccessibilitySize ? 2 : 1).minimumScaleFactor(0.8)
+                Image(systemName: icon).accessibilityHidden(true).font(.title3).foregroundStyle(Color(ink: SessionInk.accent))
+                Text(title).font(.footnote.weight(.medium)).fixedSize(horizontal: false, vertical: true)
                     .multilineTextAlignment(.center)
             }
             .frame(maxWidth: .infinity, minHeight: 60)
@@ -600,8 +786,8 @@ private extension Color {
 
     private func controlBadge(_ control: ScreenPickerSnapshot.Control, compact: Bool) -> some View {
         HStack(spacing: 4) {
-            Image(systemName: control == .on ? "hand.point.up.left" : "eye")
-            Text(compact ? (control == .on ? "Control on" : "View only") : controlText(control))
+            Image(systemName: control == .on ? "hand.point.up.left" : "eye").accessibilityHidden(true)
+            Text(compact && control == .on ? "Control on" : controlText(control))
         }
         .foregroundStyle(Color(ink: control == .on ? SessionInk.positive : SessionInk.secondary))
     }
@@ -611,7 +797,7 @@ private extension Color {
     private func open() { isOpen = true }
 
     private func close() {
-        withAnimation(.easeOut(duration: 0.2)) { isOpen = false }
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) { isOpen = false }
         lastInteraction = Date()
     }
 
@@ -619,10 +805,10 @@ private extension Color {
     private func settle(_ catalogue: MirrorMonitorCatalogue?) {
         guard let target = switchingTo, let catalogue else { return }
         if catalogue.selected == target {
-            switchingTo = nil
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { close() }
+            switchingTo = nil; failedSelection = false
         } else if !networkManager.mirrorMonitorSwitchPending {
-            failedFrom = catalogue.monitors.first { $0.id == catalogue.selected }?.label ?? "the current screen"
+            failedFrom = catalogue.monitors.first { $0.id == catalogue.selected }?.label
+            failedSelection = true
             switchingTo = nil
         }
     }
@@ -632,15 +818,6 @@ private extension Color {
         case .extended: "rectangle.on.rectangle"
         case .monitor: "display"
         case .laptop: "laptopcomputer"
-        }
-    }
-
-    private func statusText(_ status: ScreenPickerTile.Status) -> String {
-        switch status {
-        case .showing: "Showing now"
-        case .available: "Tap to show"
-        case .switching: "Switching…"
-        case .locked: "Not available"
         }
     }
 
@@ -657,4 +834,94 @@ private extension Color {
         let limit = max(0, width / 2 - 240)
         return min(max(x, -limit), limit)
     }
+}
+
+/// Reflows actions from three columns to two, then one at accessibility sizes.
+struct SessionActionLayout: Layout {
+    let accessibility: Bool
+    private let gap: CGFloat = 8
+
+    init(accessibility: Bool) { self.accessibility = accessibility }
+
+    private func columnCount(width: CGFloat, subviews: Subviews) -> Int {
+        SessionPanelLayout.actionColumns(width: Double(width),
+            idealWidths: subviews.map { Double($0.sizeThatFits(.unspecified).width) },
+            accessibility: accessibility)
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard !subviews.isEmpty else { return .zero }
+        let width = proposal.width ?? 388
+        let columns = columnCount(width: width, subviews: subviews)
+        let cellWidth = max(0, (width - CGFloat(columns - 1) * gap) / CGFloat(columns))
+        var height: CGFloat = 0
+        for start in stride(from: 0, to: subviews.count, by: columns) {
+            let row = subviews[start..<min(start + columns, subviews.count)]
+            height += row.map { $0.sizeThatFits(ProposedViewSize(width: cellWidth, height: nil)).height }.max() ?? 0
+            if start + columns < subviews.count { height += gap }
+        }
+        return CGSize(width: width, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let columns = columnCount(width: bounds.width, subviews: subviews)
+        let cellWidth = max(0, (bounds.width - CGFloat(columns - 1) * gap) / CGFloat(columns))
+        var y = bounds.minY
+        for start in stride(from: 0, to: subviews.count, by: columns) {
+            let end = min(start + columns, subviews.count)
+            let rowHeight = subviews[start..<end].map {
+                $0.sizeThatFits(ProposedViewSize(width: cellWidth, height: nil)).height
+            }.max() ?? 0
+            for index in start..<end {
+                subviews[index].place(at: CGPoint(x: bounds.minX + CGFloat(index - start) * (cellWidth + gap), y: y),
+                    anchor: .topLeading, proposal: ProposedViewSize(width: cellWidth, height: rowHeight))
+            }
+            y += rowHeight + gap
+        }
+    }
+}
+
+/// Same metrics, labels and semantic type in the open panel and standalone HUD.
+struct SessionPerformanceReadout: View {
+    let fps: Double
+    let frameReceiveMs: Double
+    let videoRxMbps: Double
+    @Environment(\.dynamicTypeSize) private var typeSize
+
+    var body: some View {
+        Group {
+            if typeSize.isAccessibilitySize {
+                VStack(alignment: .leading, spacing: 8) { metrics }
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) { metrics }.fixedSize(horizontal: true, vertical: false)
+                    VStack(alignment: .leading, spacing: 8) { metrics }
+                }
+            }
+        }
+        .font(.caption.monospacedDigit())
+        .foregroundStyle(Color(ink: SessionInk.text))
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("session.performance")
+    }
+
+    private var metrics: some View {
+        Group {
+            Text(String(format: "%.1f FPS", fps))
+            metric("Frame receive", value: String(format: "%.1f ms", frameReceiveMs))
+            metric("Video RX", value: String(format: "%.1f Mbps", videoRxMbps))
+        }
+    }
+
+    private func metric(_ label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(value).fontWeight(.semibold)
+            Text(label).foregroundStyle(Color(ink: SessionInk.secondary))
+        }
+    }
+}
+
+private struct SessionPillHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 44
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }
