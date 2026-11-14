@@ -282,6 +282,7 @@ struct USBSessionIdentityProof {
     static let optInFlag: UInt16 = 0x0080
     enum Phase { case initial, offered, waitingChallenge, waitingResult, identified, unidentified }
     private(set) var phase: Phase = .initial
+    private(set) var optedIn = false
     private var credential: TrustedHostCredential?
     private var started: TimeInterval = 0
     private var lastTime: TimeInterval = 0
@@ -293,7 +294,7 @@ struct USBSessionIdentityProof {
               credential.hostID.count == 16, credential.secret.count == 32, credential.sessionID.count == 16 else {
             phase = .unidentified; return 0
         }
-        self.credential = credential; started = now; lastTime = now; phase = .offered
+        self.credential = credential; started = now; lastTime = now; phase = .offered; optedIn = true
         return Self.optInFlag
     }
     mutating func tick(now: TimeInterval) {

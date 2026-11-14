@@ -106,20 +106,34 @@ final class ConnectionControlIntegrationTests: XCTestCase {
             XCTAssertFalse(network.usbIdentityBoundForTesting)
             XCTAssertFalse(writes.snapshot.contains { (76...79).contains($0[5]) })
             XCTAssertFalse(writes.snapshot.contains { $0[5] == 24 })
+            if scenario == 0 {
+                // No identity offer: retain the original legacy auth-result dispatch.
+                network.receiveIdentityWireForTesting(type: .trustedAuthResult, payload: Data([0]))
+                await drain(network)
+                XCTAssertEqual(network.connectionState, .authFailed(reason: "Trusted device authentication failed."))
+            }
             network.stopForTesting()
         }
     }
     @MainActor func testPrematureUsbCredentialMessagesCannotCommitReadiness() async {
         for type in [WireMessageType.trustedDeviceChallenge, .trustedAuthResult] {
-            let network = NetworkManager()
-            _ = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
-            network.beginTransferWriterForTesting(); network.configureUsbIdentityForTesting()
-            network.receiveIdentityWireForTesting(type: type,
-                payload: type == .trustedDeviceChallenge ? ConnectionControlProtocolTests.usbChallenge : Data([1]))
-            await drain(network)
-            XCTAssertNil(network.wifiSessionSnapshotForTesting().committedGeneration)
-            XCTAssertFalse(network.usbIdentityBoundForTesting)
-            network.stopForTesting()
+            for pongPending in [false, true] {
+                let network = NetworkManager()
+                // Keep the legacy readiness Pong in flight in the second case.
+                network.controlSendForAudioTesting = { _, _ in }
+                _ = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+                network.beginTransferWriterForTesting(); network.configureUsbIdentityForTesting()
+                if pongPending {
+                    network.receiveIdentityWireForTesting(type: .ping, payload: Data(0..<16))
+                    await drain(network)
+                }
+                network.receiveIdentityWireForTesting(type: type,
+                    payload: type == .trustedDeviceChallenge ? ConnectionControlProtocolTests.usbChallenge : Data([1]))
+                await drain(network)
+                XCTAssertNil(network.wifiSessionSnapshotForTesting().committedGeneration)
+                XCTAssertFalse(network.usbIdentityBoundForTesting)
+                network.stopForTesting()
+            }
         }
     }
     @MainActor func testWifiToOrdinaryUsbSendsOnlyResumeAfterIdentityAndAdvertisement() async throws {

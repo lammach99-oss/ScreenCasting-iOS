@@ -381,7 +381,6 @@ public class NetworkManager: ObservableObject {
     @Published public private(set) var captureTargetState = CaptureTargetState()
     private var captureTargets = CaptureTargetState()
     private var captureTargetVideo = CaptureTargetVideoBuffer()
-    private var captureTargetCatalogueAt: TimeInterval = 0
     private var captureTargetMirrorRevisionAtTap: UInt64 = 0
     private var captureTargetDecodeStarted = false
     private var captureTargetLastVideoSequence: UInt32?
@@ -530,7 +529,7 @@ public class NetworkManager: ObservableObject {
             mirrorControl.beginSession(wireAuthenticatedGeneration ?? 0)
             mirrorControl.setConnectionInputBlocked(connectionSwitch.inputBlocked)
             captureTargets.begin(generation: wireAuthenticatedGeneration ?? 0)
-            captureTargetVideo.reset();captureTargetCatalogueAt=0;captureTargetDecodeStarted=false
+            captureTargetVideo.reset();captureTargetDecodeStarted=false
             captureTargetH264ParameterSets=nil
             cancelCaptureTargetRecoveryOnQueue()
             mirrorDecoderLock.lock();captureTargetDecoderOwner=nil;mirrorDecoderLock.unlock()
@@ -2635,8 +2634,10 @@ public class NetworkManager: ObservableObject {
             handleStreamError("Unable to save the trusted Host identity in Keychain.")
             return
         }
-        pairedControlGeneration = connectionGeneration
-        negotiateConnectionControlOnQueue()
+        if activeTransportKind == .wifi {
+            pairedControlGeneration = connectionGeneration
+            negotiateConnectionControlOnQueue()
+        }
         print("[IPAD][PAIRING_SUCCESS] credential=keychain")
     }
 
@@ -3028,6 +3029,10 @@ public class NetworkManager: ObservableObject {
 
     @discardableResult
     private func sendClientPing(force: Bool, purpose: ClientPingPurpose, remoteFeaturesProbe: Bool = false) -> UInt64? {
+        // The dedicated USB probes already measure this owner. Do not put an
+        // unrelated telemetry Pong ahead of their single-use liveness proof.
+        if purpose == .telemetry, activeTransportKind == .usb,
+           (usbLegacyPcmFreshFenceNonce != nil || pendingUsbCandidate != nil) { return nil }
         guard let owner = activeControlConnection else { return nil }
         let now = ProcessInfo.processInfo.systemUptime
         guard force || now - lastClientPingSentAt >= 1 else { return nil }
@@ -3672,7 +3677,7 @@ public class NetworkManager: ObservableObject {
         }
 
         if activeTransportKind == .usb && [.clientHello, .pairingRequired, .trustedDeviceChallenge,
-            .trustedDeviceProof, .pairingSuccess, .trustedAuthResult, .sessionResumeResult].contains(header.type) {
+            .trustedDeviceProof, .pairingSuccess, .trustedAuthResult, .sessionResumeResult].contains(header.type) && usbIdentity.optedIn {
             return
         }
 
@@ -3859,7 +3864,6 @@ public class NetworkManager: ObservableObject {
             do {
                 let value=try CaptureTargetCatalogue.decode(payload)
                 if captureTargets.receiveCatalogue(value, session: captureTargets.session) {
-                    captureTargetCatalogueAt=ProcessInfo.processInfo.systemUptime
                     if let applied=captureTargets.applied, value.epoch != applied.epoch || value.state != 1 {
                         abandonCaptureTargetPresentationOnQueue()
                     }
@@ -5241,6 +5245,10 @@ public class NetworkManager: ObservableObject {
     var realtimeAudioPlaybackForTesting: ((Bool) -> Void)?
     var controlSendForAudioTesting: ((Data, @escaping (NWError?) -> Void) -> Void)?
 
+    func sendTelemetryPingForTesting() -> UInt64? {
+        networkQueue.sync { sendClientPing(force: true, purpose: .telemetry) }
+    }
+
     func isLegacyPcmFreshFencePingForTesting(_ data: Data) -> Bool {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard data.count == WireProtocol.headerSize + 16,
@@ -5550,21 +5558,26 @@ public class NetworkManager: ObservableObject {
 
     @MainActor public func requestCaptureTarget(_ id: UInt64, catalogue: CaptureTargetCatalogue) {
         let generation=connectionGenerationClock.current
+        // Retire held input on the caller before any queue admission or early
+        // rejection. Releasing a key/button must not depend on catalogue age.
+        captureTargetRetireInput?()
         let admitted: (CaptureTargetRequest, UUID, NWConnection)? = networkQueue.sync {
-            let age=ProcessInfo.processInfo.systemUptime-captureTargetCatalogueAt
             guard !remoteInputConnection, generation == connectionGeneration,
                   wireAuthenticatedGeneration == generation, committedTransportGeneration == generation,
-                  let connection=activeControlConnection else { return nil }
-            guard age >= 0, age < 30 else { refreshCaptureTargetsOnQueue();return nil }
+                  let connection=activeControlConnection else {
+                recordDiagnosticLine("[CAPTURE_TARGET] event=local_rejection reason=connection_unavailable"); return nil
+            }
+            // Only the host knows when this catalogue was issued. Send the
+            // exact selected authority once; a Stale result refreshes it.
             let session=captureTargets.session
-            guard let request=captureTargets.select(id, catalogue: catalogue, session: session) else { return nil }
+            guard let request=captureTargets.select(id, catalogue: catalogue, session: session) else {
+                recordDiagnosticLine("[CAPTURE_TARGET] event=local_rejection reason=selection_unavailable"); return nil
+            }
             cancelCaptureTargetRecoveryOnQueue()
             captureTargetMirrorRevisionAtTap=mirrorControl.currentState?.revision ?? 0
             return (request, session, connection)
         }
         guard let (request, session, connection)=admitted else { return }
-        // These existing methods emit terminal releases and retire marked text synchronously on main.
-        captureTargetRetireInput?()
         // Drain the retired callbacks' queued encodes before blocking their old tickets.
         networkQueue.sync { mirrorControl.setCaptureTargetInputBlocked(true, session: generation) }
         networkQueue.async { [weak self] in
@@ -5760,11 +5773,12 @@ public class NetworkManager: ObservableObject {
         let header = message.header
         usbIdentity.tick(now: connectionControlNow())
         if header.type == .ping, message.payload.count == 16 {
-            let flags = usbIdentity.offer(flags: header.flags, credential: selectedUsbCredentialOnQueue(), now: connectionControlNow())
+            let credential = header.flags & USBSessionIdentityProof.offerFlag != 0 ? selectedUsbCredentialOnQueue() : nil
+            let flags = usbIdentity.offer(flags: header.flags, credential: credential, now: connectionControlNow())
             sendWireMessage(type: .pong, payload: message.payload, sequence: header.sequence, flags: flags) { [weak self] error in
                 guard let self, generation == self.connectionGeneration,
                       self.wireAuthenticatedGeneration == nil else { return }
-                guard error == nil else { self.finishUsbIdentityOnQueue(generation: generation, identified: false); return }
+                guard error == nil else { self.usbIdentity.abandon(); return }
                 if flags == USBSessionIdentityProof.optInFlag {
                     guard let hello = self.usbIdentity.clientHello(name: "iPad", now: self.connectionControlNow()) else {
                         self.finishUsbIdentityOnQueue(generation: generation, identified: false); return
@@ -5783,7 +5797,7 @@ public class NetworkManager: ObservableObject {
             }
             return
         }
-        guard usbIdentity.phase != .initial else {
+        guard usbIdentity.optedIn else {
             handleStreamError("Expected a 16-byte SCDP Ping before USB session commit."); return
         }
         if header.type == .trustedDeviceChallenge {
@@ -5810,6 +5824,7 @@ public class NetworkManager: ObservableObject {
     private func finishUsbIdentityOnQueue(generation: UInt64, identified: Bool) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard generation == connectionGeneration, wireAuthenticatedGeneration == nil,
+              wireReceiveActiveGeneration == generation,
               let current = connection, current === usbScdpConnection else { return }
         usbIdentityDeadline?.cancel(); usbIdentityDeadline = nil
         if !identified { usbIdentity.abandon() }
@@ -5821,7 +5836,9 @@ public class NetworkManager: ObservableObject {
         wireAuthenticatedGeneration = generation
         pairedControlGeneration = identified ? generation : nil
         commitLegacyTransport(generation: generation)
-        recordDiagnosticLine("[USB_IDENTITY] event=finished identified=\(identified ? 1 : 0)")
+        print("[IPAD][USB_SCDP_READY] generation=\(generation)")
+        recordUsbLifecycleDiagnostic("[USB_SCDP_READY] generation=\(generation)")
+        if usbIdentity.optedIn { recordDiagnosticLine("[USB_IDENTITY] event=finished identified=\(identified ? 1 : 0)") }
         negotiateConnectionControlOnQueue()
     }
     private func connectionControlNow() -> TimeInterval {

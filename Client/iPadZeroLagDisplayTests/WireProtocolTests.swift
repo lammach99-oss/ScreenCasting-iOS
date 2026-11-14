@@ -4055,6 +4055,58 @@ final class USBListenerLifetimeTests: XCTestCase {
                      "Candidate rejected by proven liveness must not later promote")
     }
 
+    func testDedicatedUsbProbesDeferForcedTelemetryAndRejectedCandidateCannotPromote() throws {
+        manager.manualUsbCandidateDeadlineForTesting = true
+        let incumbent = try connect()
+        let probe = LegacyPcmProbe()
+        func waitForPing(_ nonce: UInt64) throws -> Data {
+            func matchingPing() -> Data? {
+                probe.pings.first { payload in
+                    payload.withUnsafeBytes {
+                        $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self).littleEndian
+                    } == nonce
+                }
+            }
+            let sent = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in matchingPing() != nil }, object: nil)
+            wait(for: [sent], timeout: 5)
+            return try XCTUnwrap(matchingPing())
+        }
+        manager.networkQueueForTesting.sync {
+            manager.controlSendForAudioTesting = { data, completion in
+                if data.count == 32, data[5] == WireMessageType.ping.rawValue {
+                    probe.recordPing(Data(data.dropFirst(16)))
+                }
+                completion(nil)
+            }
+        }
+        awaitLegacyPing(probe) { manager.simulateSessionAuthenticatedAndCommitted() }
+        let generation = manager.usbSessionSnapshot().generation
+        let freshness = try XCTUnwrap(probe.pings.first)
+        let freshCount = probe.pings.count
+        XCTAssertNil(manager.sendTelemetryPingForTesting(), "PCM freshness proof owns the probe lane")
+        XCTAssertEqual(probe.pings.count, freshCount)
+        manager.receiveUsbWireForTesting(type: .pong, payload: freshness,
+                                        generation: generation, connection: incumbent)
+        let telemetryNonce = try XCTUnwrap(manager.sendTelemetryPingForTesting(), "Ordinary telemetry resumes after the proof")
+        _ = try waitForPing(telemetryNonce)
+        probe.clearPings()
+
+        let candidate = try connect()
+        let nonce = try XCTUnwrap(manager.usbCandidateArbitrationForTesting?.nonce)
+        let challenge = try waitForPing(nonce)
+        let challengedCount = probe.pings.count
+        // Force the timer's send path without waiting for its wall-clock cadence.
+        // The PCM fence is already open, so only candidate ownership can defer it.
+        XCTAssertNil(manager.sendTelemetryPingForTesting(), "Candidate liveness owns the probe lane")
+        XCTAssertEqual(probe.pings.count, challengedCount)
+        manager.receiveUsbWireForTesting(type: .pong, payload: challenge,
+                                        generation: generation, connection: incumbent)
+        XCTAssertNil(manager.usbCandidateArbitrationForTesting)
+        XCTAssertNil(candidate.stateUpdateHandler)
+        try deliver(.failed(.posix(.ECONNRESET)), to: incumbent)
+        XCTAssertNil(manager.usbSessionSnapshot().connection)
+    }
+
     private func withC2Candidate(committed: Bool,
         _ body: (NWConnection, NWConnection, UInt64, () -> [Data]) throws -> Void) throws {
         manager.manualUsbCandidateDeadlineForTesting = true
