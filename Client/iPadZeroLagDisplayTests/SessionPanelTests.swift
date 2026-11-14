@@ -4,6 +4,9 @@ import UIKit
 
 /// The session pill is the one visible handle for every session: what it says, and how Disconnect is confirmed.
 final class SessionPanelTests: XCTestCase {
+    func testPermissionRequestExplainsPCApprovalPopup() {
+        XCTAssertEqual(CastingPermissionCopy.requestSent, "Request sent. Approve it in the pop-up on the PC.")
+    }
     func testExtendedWifiSessionNamesThePC() {
         let s = SessionPanelSnapshot.make(hostLabel: "Lam-Laptop", transport: "Wi-Fi", connection: .streaming,
                                           control: .unavailable, mirrorLabel: nil)

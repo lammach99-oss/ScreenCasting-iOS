@@ -653,6 +653,7 @@ public struct ContentView: View {
     // MARK: - Disconnected Dashboard
 
     private var connectStatus: ConnectScreenStatus {
+        if let operation = ConnectScreenStatus.connectionChange(networkManager.connectionSwitchState) { return operation }
         let hostLabel = lastHostLabel.isEmpty ? lastWifiHostLabel : lastHostLabel
         return .make(state: networkManager.connectionState,
                      pcName: hostLabel,
@@ -715,8 +716,19 @@ public struct ContentView: View {
                 }
                 VStack(alignment: .leading, spacing: 16) {
                     statusLine
+                    Text(ConnectScreenStatus.connectionRecommendation(networkManager.connectionSwitchState))
+                        .font(.footnote).foregroundStyle(Color.inkSecondary)
+                        .accessibilityIdentifier("connectionRecommendation")
                     // Hidden, not faded, while a connect or USB wait runs: a faded card read as broken.
-                    if networkManager.hasReconnectTarget && !isConnectBusy { reconnectButton }
+                    if networkManager.connectionSwitchState.offersReconnect {
+                        Button("Reconnect over Wi-Fi") {
+                            usbChosen = false; enteredPIN = ""
+                            networkManager.reconnectConnectionOverWifi()
+                        }
+                        .buttonStyle(.bordered).controlSize(.large).tint(Color.inkAccent)
+                        .frame(minHeight: 44)
+                        .disabled(!networkManager.hasReconnectTarget)
+                    } else if networkManager.hasReconnectTarget && !isConnectBusy { reconnectButton }
                     discoveredPCs
                     usbCard
                     ipEntry
@@ -887,6 +899,8 @@ public struct ContentView: View {
             Image(systemName: "cable.connector").font(.title3).foregroundStyle(Color.inkAccent).accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 Text("USB-C cable").font(.subheadline.weight(.semibold))
+                Text(ConnectScreenStatus.connectionRecommendation(networkManager.connectionSwitchState))
+                    .font(.caption).foregroundStyle(Color.inkSecondary)
                 Text(listening ? "Waiting. On the PC, pick USB-C Direct. This iPad shows as \(UIDevice.current.name)."
                      : "Plug in, tap Start, then pick USB-C Direct on the PC.")
                     .font(.caption)

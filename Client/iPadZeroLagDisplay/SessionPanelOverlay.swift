@@ -53,6 +53,7 @@ private extension Color {
     @State private var switchingTo: UInt64?
     @State private var failedFrom: String?
     @State private var permissionAsked = false
+    @State private var controlPermissionAsked = false
     @State private var lastInteraction = Date()
     @State private var confirmRestart = false
     @State private var dragOffset: CGFloat = 0
@@ -224,6 +225,7 @@ private extension Color {
         let s = session
         let p = picker
         let middle = VStack(alignment: .leading, spacing: 14) {
+            if !networkManager.isRemoteControlSession { connectionPicker }
             if ScreenPickerSnapshot.shouldShowPicker(remote: networkManager.isRemoteControlSession,
                 mirror: s.isMirror, acceptedFeatures: networkManager.remoteMonitorState.enabled ? 7 : 0,
                 typedSources: networkManager.captureTargetState.enabled) { screens(p) }
@@ -341,7 +343,7 @@ private extension Color {
                  ? networkManager.remoteMonitorState.statusMessage ?? "Screens are unavailable."
                  : networkManager.captureTargetState.enabled && networkManager.captureTargetState.catalogue?.state != 1
                     ? networkManager.captureTargetState.statusMessage ?? "Sources are unavailable. Refresh sources."
-                 : permissionAsked ? "Asked. Tick \"Allow paired iPad to switch monitors\" on the PC."
+                 : permissionAsked ? CastingPermissionCopy.requestSent
                  : networkManager.mirrorScreenPickerSupported ? "Switching is off on the PC."
                  : "Turn on monitor switching on the PC.")
                 .font(.footnote).foregroundStyle(amber)
@@ -414,18 +416,91 @@ private extension Color {
                 actionButton(s.control == .on ? "Stop control" : "Ask control",
                              icon: s.control == .on ? "hand.raised.slash" : "hand.point.up.left") {
                     lastInteraction = Date()
-                    if s.control == .on { remoteInput.suspend(reason: 1); networkManager.releaseMirrorControl() } else { networkManager.requestMirrorControl() }
+                    if s.control == .on { remoteInput.suspend(reason: 1); networkManager.releaseMirrorControl(); controlPermissionAsked = false }
+                    else { networkManager.requestMirrorControl(); controlPermissionAsked = true }
                 }
             }
             actionButton("Files", icon: "arrow.left.arrow.right") { close(); onFiles() }
             actionButton("Settings", icon: "gearshape") { close(); onSettings() }
         }
         return VStack(spacing: 8) {
+            if controlPermissionAsked && s.control != .on {
+                Text(CastingPermissionCopy.requestSent).font(.footnote)
+                    .foregroundStyle(Color(ink: SessionInk.secondary))
+                    .accessibilityLabel(CastingPermissionCopy.requestSent)
+            }
             if networkManager.isRemoteControlSession { remoteActions }
             if typeSize.isAccessibilitySize {
                 LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 8) { buttons }
             } else {
                 HStack(spacing: 8) { buttons }
+            }
+        }
+    }
+
+    private var connectionPicker: some View {
+        let state = networkManager.connectionSwitchState
+        return VStack(alignment: .leading, spacing: 8) {
+            Text(state.recommendationText).font(.footnote)
+                .foregroundStyle(Color(ink: SessionInk.secondary))
+            ForEach([ConnectionRoute.usb, .wifi], id: \.rawValue) { route in
+                let reason = state.disabledReason(for: route, hasWifiEndpoint: networkManager.hasReconnectTarget)
+                Button {
+                    lastInteraction = Date()
+                    remoteInput.suspend(reason: 1)
+                    networkManager.requestConnectionRoute(route)
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: route == .usb ? "cable.connector" : "wifi").accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack {
+                                Text(route.label).font(.subheadline.weight(.semibold))
+                                if state.snapshot?.recommended == route && !state.needsRefresh {
+                                    Text("Recommended").font(.caption)
+                                }
+                            }
+                            if let reason { Text(reason).font(.caption).fixedSize(horizontal: false, vertical: true) }
+                        }
+                        Spacer(minLength: 4)
+                        if state.actualRoute == route {
+                            Image(systemName: "checkmark").accessibilityHidden(true)
+                        }
+                    }
+                    .foregroundStyle(Color(ink: SessionInk.text))
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                    .padding(.horizontal, 10).padding(.vertical, 4)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .background(Color(ink: SessionInk.raised), in: RoundedRectangle(cornerRadius: 10))
+                .disabled(reason != nil)
+                .opacity(reason == nil ? 1 : 0.6)
+                .accessibilityLabel(route.label + (state.actualRoute == route ? ", Connected" : ""))
+                .accessibilityHint(reason ?? ("Switch to " + route.label))
+                .accessibilityAddTraits(state.actualRoute == route ? .isSelected : [])
+            }
+            HStack(spacing: 8) {
+                if state.pending != nil { ProgressView().tint(Color(ink: SessionInk.accent)) }
+                Text(state.message).font(.footnote).fixedSize(horizontal: false, vertical: true)
+            }
+            .foregroundStyle(Color(ink: state.offersReconnect ? SessionInk.warning : SessionInk.secondary))
+            .accessibilityElement(children: .combine)
+            if state.enabled && state.snapshot?.allowed == false && state.pending == nil && !state.offersReconnect {
+                Button("Ask PC") {
+                    let target: ConnectionRoute = state.actualRoute == .usb ? .wifi : .usb
+                    networkManager.requestConnectionRoute(target, askPC: true)
+                }
+                .buttonStyle(.bordered).frame(minHeight: 44)
+                .disabled(state.phase == .permissionRequired || state.needsRefresh)
+            }
+            if state.needsRefresh && state.pending == nil && !state.offersReconnect {
+                Button("Refresh connection status") { networkManager.refreshConnectionStatus() }
+                    .buttonStyle(.bordered).frame(minHeight: 44)
+            }
+            if state.offersReconnect {
+                Button("Reconnect over Wi-Fi") { networkManager.reconnectConnectionOverWifi() }
+                    .buttonStyle(.bordered).frame(minHeight: 44)
+                    .disabled(!networkManager.hasReconnectTarget)
             }
         }
     }

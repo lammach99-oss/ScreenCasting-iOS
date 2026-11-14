@@ -251,6 +251,10 @@ final class WireStreamParser {
             flags: flags,
             payloadLength: payloadLength,
             sequence: sequence)
+        if (76...79).contains(type.rawValue) &&
+            !ConnectionControlProtocol.validInbound(type: type.rawValue, flags: flags, length: payloadLength) {
+            state = .failed; payload = Data(); onEvent(.failure(.invalidHeader)); return
+        }
         // Monitor extensions fail closed before allocating a payload buffer.
         if (68...71).contains(type.rawValue) &&
             (flags != 0 || !RemoteMonitorProtocol.isValidLength(type: type.rawValue, length: payloadLength)) {

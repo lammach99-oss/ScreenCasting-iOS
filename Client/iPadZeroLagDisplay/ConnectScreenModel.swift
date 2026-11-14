@@ -2,6 +2,7 @@ import Foundation
 
 /// The connect screen's single status line: plain words, one tone, at most one action.
 public struct ConnectScreenStatus: Equatable {
+    public static func connectionRecommendation(_ state: ConnectionSwitchState) -> String { state.recommendationText }
     public enum Tone: Equatable { case neutral, busy, warning, danger, ready }
     public enum Action: Equatable { case none, cancel, stop, retry, restartUSB }
     public let text: String
@@ -9,6 +10,12 @@ public struct ConnectScreenStatus: Equatable {
     public let detail: String?
     public let tone: Tone
     public let action: Action
+
+    public static func connectionChange(_ state: ConnectionSwitchState) -> Self? {
+        guard state.pending != nil || state.offersReconnect else { return nil }
+        return Self(text: state.message, detail: nil, tone: state.offersReconnect ? .danger : .busy,
+                    action: state.offersReconnect ? .none : .cancel)
+    }
 
     /// `usb` is a USB-C attempt (the last Wi-Fi PC is not involved); `canRetry` means a Wi-Fi reconnect target exists.
     public static func make(state: ConnectionState, pcName: String?, discoveredCount: Int, reconnectAttempt: Int,
@@ -47,4 +54,8 @@ public struct ConnectScreenStatus: Equatable {
         Self(text: found == 0 ? "Looking for PCs on this Wi-Fi…" : found == 1 ? "1 PC on this Wi-Fi" : "\(found) PCs on this Wi-Fi",
              detail: nil, tone: found == 0 ? .busy : .neutral, action: .none)
     }
+}
+
+public enum CastingPermissionCopy {
+    public static let requestSent = "Request sent. Approve it in the pop-up on the PC."
 }

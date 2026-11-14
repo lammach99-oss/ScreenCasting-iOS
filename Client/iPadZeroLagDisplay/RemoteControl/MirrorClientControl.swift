@@ -23,6 +23,13 @@ public final class MirrorClientControl {
     private var terminalCapable=false
     private var screenPickerCapable=false
     private var captureTargetInputBlocked=false
+    private var connectionInputBlocked=false
+    public func setConnectionInputBlocked(_ blocked: Bool) {
+        synchronized {
+            guard connectionInputBlocked != blocked else { return }
+            connectionInputBlocked=blocked; revision &+= 1
+        }
+    }
     private var typedSources=false
     private struct TerminalSwitch {
         let nonce:UInt64, epoch:UInt64, source:UInt64
@@ -61,7 +68,7 @@ public final class MirrorClientControl {
         }
     }
     /// Once PMR is advertised, absence of a descriptor is not permission to send legacy input.
-    public var allowsLegacyVirtualInput:Bool { synchronized{session != 0 && foreground && (!typedSources || !settingsOpen) && !captureTargetInputBlocked && (!advertised || state?.mode == .virtualDisplay)} }
+    public var allowsLegacyVirtualInput:Bool { synchronized{!connectionInputBlocked && session != 0 && foreground && (!typedSources || !settingsOpen) && !captureTargetInputBlocked && (!advertised || state?.mode == .virtualDisplay)} }
 
     public var gestureRevision:UInt64 { synchronized{revision} }
 
@@ -69,7 +76,7 @@ public final class MirrorClientControl {
         synchronized { if generation == session && generation != 0 { typedSources=true } }
     }
     public func legacyRegistrationIsCurrent(revision captured: UInt64) -> Bool {
-        synchronized { !typedSources || captured == revision && !captureTargetInputBlocked }
+        synchronized { !connectionInputBlocked && (!typedSources || captured == revision && !captureTargetInputBlocked) }
     }
 
     /// Retire registrations in either input mode without revoking the Host's attended consent.
@@ -265,6 +272,7 @@ public final class MirrorClientControl {
     }
     public func captureTicket()->MirrorInputTicket? {
         synchronized {
+            guard !connectionInputBlocked else { return nil }
             guard !captureTargetInputBlocked,terminalSwitch == nil,transportFloor == nil,foreground,!settingsOpen,!suspended,let s=state,s.mode == .active,!s.token.isEmpty,
                   acknowledgedEpoch==s.epoch,let first=s.firstFrame,let seen=rendered,
                   MirrorControlCodec.sequenceAtOrAfter(seen,first) else {return nil}
@@ -274,6 +282,7 @@ public final class MirrorClientControl {
     /// Invoke on the serialized control-send lane. Movement may be coalesced; terminal input must not be.
     public func encodeInput(ticket:MirrorInputTicket,kind:MirrorInputKind,payload:Data)throws->Data {
         lock.lock();defer{lock.unlock()}
+        guard !connectionInputBlocked else { throw MirrorControlError.stale }
         guard !captureTargetInputBlocked,terminalSwitch == nil,transportFloor == nil,!suspended,let s=state,s.mode == .active,acknowledgedEpoch==s.epoch,
               ticket.session==session,ticket.epoch==s.epoch,
               ticket.source==s.source,ticket.token==s.token else {throw MirrorControlError.stale}
