@@ -256,6 +256,10 @@ final class WireStreamParser {
             (flags != 0 || !RemoteMonitorProtocol.isValidLength(type: type.rawValue, length: payloadLength)) {
             state = .failed; payload = Data(); onEvent(.failure(.invalidHeader)); return
         }
+        if (72...75).contains(type.rawValue) &&
+            !CaptureTargetProtocol.validInbound(type: type.rawValue, flags: flags, length: payloadLength) {
+            state = .failed; payload = Data(); onEvent(.failure(.invalidHeader)); return
+        }
         let fixedLength: Int?
         switch type {
         case .remoteFeaturesRequest, .remoteFeaturesResult, .remoteScanKey, .remoteInputReset: fixedLength = 16

@@ -41,7 +41,7 @@ private extension Color {
 
 /// The one visible handle in every session. The pill names the PC (or mirrored screen), the link and control;
 /// the panel holds Screens, Keyboard, control, Files, Settings and Disconnect. Touches on it stay on the iPad.
-struct SessionPanelOverlay: View {
+@MainActor struct SessionPanelOverlay: View {
     @ObservedObject var networkManager: NetworkManager
     let hostLabel: String
     @Binding var isOpen: Bool
@@ -65,6 +65,10 @@ struct SessionPanelOverlay: View {
     private var picker: ScreenPickerSnapshot {
         if networkManager.isRemoteControlSession {
             return .make(remote: networkManager.remoteMonitorState, inputReady: networkManager.remoteInputReady)
+        }
+        if networkManager.captureTargetState.enabled {
+            return .make(captureTargets: networkManager.captureTargetState, state: networkManager.mirrorControlState,
+                         permissionAsked: permissionAsked)
         }
         return .make(catalogue: networkManager.mirrorMonitorCatalogue, state: networkManager.mirrorControlState,
               switchingTo: switchingTo, switchPending: networkManager.mirrorMonitorSwitchPending,
@@ -119,6 +123,12 @@ struct SessionPanelOverlay: View {
                 if networkManager.isRemoteControlSession { networkManager.refreshRemoteScreens() }
                 else { networkManager.refreshMirrorScreens() }
             }
+        }
+        .onChange(of: networkManager.captureTargetState.session) { _, _ in
+            switchingTo=nil;failedFrom=nil;permissionAsked=false
+        }
+        .onChange(of: networkManager.captureTargetState.catalogue?.allowed) { _, allowed in
+            if allowed == true { permissionAsked=false }
         }
         .onChange(of: networkManager.mirrorMonitorCatalogue) { _, catalogue in settle(catalogue) }
         .onChange(of: networkManager.mirrorMonitorSwitchPending) { _, pending in if !pending { settle(networkManager.mirrorMonitorCatalogue) } }
@@ -211,7 +221,8 @@ struct SessionPanelOverlay: View {
         let p = picker
         let middle = VStack(alignment: .leading, spacing: 14) {
             if ScreenPickerSnapshot.shouldShowPicker(remote: networkManager.isRemoteControlSession,
-                mirror: s.isMirror, acceptedFeatures: networkManager.remoteMonitorState.enabled ? 7 : 0) { screens(p) }
+                mirror: s.isMirror, acceptedFeatures: networkManager.remoteMonitorState.enabled ? 7 : 0,
+                typedSources: networkManager.captureTargetState.enabled) { screens(p) }
             actions(s)
             if remoteInput.usesScanKeyboard {
                 let generation = remoteInput.generation
@@ -283,12 +294,23 @@ struct SessionPanelOverlay: View {
                 .foregroundStyle(Color(ink: networkManager.remoteMonitorState.issue == .failed ||
                     networkManager.remoteMonitorState.issue == .denied ? SessionInk.danger : SessionInk.warning))
         }
+        if !networkManager.isRemoteControlSession, networkManager.captureTargetState.enabled,
+           let message=networkManager.captureTargetState.statusMessage {
+            Text(message).font(.footnote).foregroundStyle(Color(ink: SessionInk.warning))
+                .accessibilityLabel(message)
+        }
+        if !networkManager.isRemoteControlSession, networkManager.captureTargetState.enabled,
+           !p.isSwitching, networkManager.captureTargetState.listUnavailable ||
+            networkManager.captureTargetState.catalogue?.state == 0 || networkManager.captureTargetState.catalogue?.state == 3 {
+            Button("Refresh sources") { networkManager.refreshMirrorScreens() }
+                .buttonStyle(.bordered).frame(minHeight: 44)
+        }
         if let failedFrom {
             Text("Couldn't switch. Still showing \(failedFrom).")
                 .font(.footnote).foregroundStyle(Color(ink: SessionInk.danger))
         }
         if p.phase == .loading && !networkManager.isRemoteControlSession &&
-            !networkManager.mirrorScreenPickerSupported && !p.isSwitching && switchingTo == nil {
+            !networkManager.captureTargetState.enabled && !networkManager.mirrorScreenPickerSupported && !p.isSwitching && switchingTo == nil {
             Text("This PC can't list its screens. Update ScreenCasting on the PC.")
                 .font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
         } else if p.phase == .loading {
@@ -312,6 +334,8 @@ struct SessionPanelOverlay: View {
             Image(systemName: "lock").foregroundStyle(amber).accessibilityHidden(true)
             Text(networkManager.isRemoteControlSession
                  ? networkManager.remoteMonitorState.statusMessage ?? "Screens are unavailable."
+                 : networkManager.captureTargetState.enabled && networkManager.captureTargetState.catalogue?.state != 1
+                    ? networkManager.captureTargetState.statusMessage ?? "Sources are unavailable. Refresh sources."
                  : permissionAsked ? "Asked. Tick \"Allow paired iPad to switch monitors\" on the PC."
                  : networkManager.mirrorScreenPickerSupported ? "Switching is off on the PC."
                  : "Turn on monitor switching on the PC.")
@@ -338,12 +362,18 @@ struct SessionPanelOverlay: View {
                 networkManager.requestRemoteMonitor(tile.id, catalogue: catalogue)
                 return
             }
+            if networkManager.captureTargetState.enabled {
+                guard tile.canSelect, let catalogue=networkManager.captureTargetState.catalogue else { return }
+                failedFrom=nil;lastInteraction=Date()
+                networkManager.requestCaptureTarget(tile.id, catalogue: catalogue)
+                return
+            }
             guard tile.status == .available, let catalogue = networkManager.mirrorMonitorCatalogue else { return }
             failedFrom = nil; switchingTo = tile.id; lastInteraction = Date()
             networkManager.requestMirrorMonitor(tile.id, catalogue: catalogue)
         } label: {
             VStack(alignment: .leading, spacing: 6) {
-                Image(systemName: tile.isBuiltIn ? "laptopcomputer" : "display").font(.title2)
+                Image(systemName: tile.isExtend ? "rectangle.on.rectangle" : tile.isBuiltIn ? "laptopcomputer" : "display").font(.title2)
                     .foregroundStyle(Color(ink: selected ? SessionInk.accent : SessionInk.secondary))
                 Text(tile.label).font(.subheadline.weight(.semibold)).lineLimit(2).multilineTextAlignment(.leading)
                 HStack(spacing: 6) {
@@ -361,7 +391,7 @@ struct SessionPanelOverlay: View {
             .opacity(tile.status == .locked ? 0.45 : 1)
         }
         .buttonStyle(.plain)
-        .disabled(tile.status != .available)
+        .disabled(!tile.canSelect)
         .accessibilityLabel("\(tile.label), \(statusText(tile.status))")
         .accessibilityAddTraits(selected ? .isSelected : [])
     }

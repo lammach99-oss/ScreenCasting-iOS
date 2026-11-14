@@ -357,6 +357,30 @@ public class NetworkManager: ObservableObject {
     var usbListenerStateObservedForTesting: ((NWListener, NWListener.State) -> Void)?
     #endif
     private let mirrorControl = MirrorClientControl()
+    @Published public private(set) var captureTargetState = CaptureTargetState()
+    private var captureTargets = CaptureTargetState()
+    private var captureTargetVideo = CaptureTargetVideoBuffer()
+    private var captureTargetCatalogueAt: TimeInterval = 0
+    private var captureTargetMirrorRevisionAtTap: UInt64 = 0
+    private var captureTargetDecodeStarted = false
+    private var captureTargetLastVideoSequence: UInt32?
+    private var captureTargetH264ParameterSets: [Data]?
+    private var captureTargetRecoveryToken: UUID?
+    private var captureTargetRecoveryWork: [DispatchWorkItem] = []
+    private struct CaptureTargetDecoderOwner: Equatable {
+        let session: UUID
+        let generation: UInt64, transaction: UInt64, owner: UInt64, epoch: UInt64, source: UInt64, decoder: UInt64
+        let kind: CaptureTargetKind
+        let mirrorEpoch: UInt64
+    }
+    // Protected by mirrorDecoderLock, including reads from the completed Metal callback.
+    private var captureTargetDecoderOwner: CaptureTargetDecoderOwner?
+    // Installed and invoked only by the main-thread presentation surface.
+    var captureTargetRetireInput: (() -> Void)?
+    #if targetEnvironment(simulator)
+    var captureTargetScheduleForTesting: ((TimeInterval, @escaping () -> Void) -> Void)?
+    var captureTargetDecodeForTesting: ((Data, UInt32, UInt64) -> Void)?
+    #endif
     @Published public private(set) var mirrorControlState: MirrorControlState?
     @Published public private(set) var mirrorMonitorCatalogue: MirrorMonitorCatalogue?
     @Published public private(set) var mirrorMonitorSwitchPending=false
@@ -392,7 +416,7 @@ public class NetworkManager: ObservableObject {
                 completion(.posix(.ECANCELED))
                 return
             }
-            if !self.remoteInputPacketIsCurrent(data) {
+            if !self.remoteInputPacketIsCurrent(data) || !self.captureTargetPacketIsCurrent(data) {
                 completion(nil)
                 return
             }
@@ -451,6 +475,11 @@ public class NetworkManager: ObservableObject {
         didSet { if oldValue != wireAuthenticatedGeneration {
             refreshAutoAcceptPolicyOnQueue()
             mirrorControl.beginSession(wireAuthenticatedGeneration ?? 0)
+            captureTargets.begin(generation: wireAuthenticatedGeneration ?? 0)
+            captureTargetVideo.reset();captureTargetCatalogueAt=0;captureTargetDecodeStarted=false
+            captureTargetH264ParameterSets=nil
+            cancelCaptureTargetRecoveryOnQueue()
+            mirrorDecoderLock.lock();captureTargetDecoderOwner=nil;mirrorDecoderLock.unlock()
             currentMirrorCatalogue=nil;mirrorCatalogueSource=nil;lastMirrorCatalogueRevision=0
             mirrorSwitchAdvertised=false;mirrorSwitchPending=false
             mirrorSwitchAttempt=nil;mirrorSwitchDeadlineToken=nil
@@ -476,6 +505,12 @@ public class NetworkManager: ObservableObject {
             guard let self,
                   self.committedTransportGeneration == self.connectionGeneration,
                   self.committedRealtimeMode == RealtimeTransportMode.wifiRTP else { return }
+            if self.captureTargetOwnsPresentation {
+                self.recordVideoPayloadReceived(data.count, sequence: sequence)
+                _=self.consumeCaptureTargetVideoOnQueue(data, sequence: sequence, isIDR: isIDR,
+                    lengthPrefixed: true, receivedAt: receivedAt)
+                return
+            }
             guard self.mirrorControl.permitsVideoSequence(sequence) else { return }
             self.recordVideoPayloadReceived(data.count, sequence: sequence)
             self.decoder.processInputData(
@@ -565,7 +600,15 @@ public class NetworkManager: ObservableObject {
     private var performanceFeedbackSequence: UInt32 = 0
     private var adaptiveTelemetryTimer: DispatchSourceTimer?
     private var committedRealtimeMode: UInt8? {
-        didSet { if oldValue != committedRealtimeMode { _ = realtimeModeClock.advance() } }
+        didSet { if oldValue != committedRealtimeMode {
+            _ = realtimeModeClock.advance()
+            if oldValue != nil, committedRealtimeMode != nil, captureTargets.enabled {
+                captureTargets.retireRoute()
+                retireCaptureTargetDecoderOnQueue()
+                mirrorControl.setCaptureTargetInputBlocked(true)
+                refreshCaptureTargetsOnQueue();publishMirrorStateOnQueue()
+            }
+        } }
     }
     // Lock-protected epoch of committedRealtimeMode so main-thread closures never read the queue-owned value.
     private let realtimeModeClock = ConnectionGenerationClock()
@@ -646,7 +689,8 @@ public class NetworkManager: ObservableObject {
             guard let self else { return }
             self.networkQueue.async {
                 let networkGeneration: UInt64
-                if let owner = self.currentMirrorDecoderOwner, owner.decoder == generation { networkGeneration = owner.connection }
+                if let owner = self.currentCaptureTargetDecoderOwner, owner.decoder == generation { networkGeneration = owner.generation }
+                else if let owner = self.currentMirrorDecoderOwner, owner.decoder == generation { networkGeneration = owner.connection }
                 else if generation & 0x8000_0000_0000_0000 == 0 { networkGeneration = generation }
                 else { return }
                 self.wifiMediaReceiver.decoderDidComplete(
@@ -667,7 +711,9 @@ public class NetworkManager: ObservableObject {
             guard let self else { return }
             self.networkQueue.async {
                 guard self.wireAuthenticatedGeneration == self.connectionGeneration else { return }
-                if self.committedRealtimeMode == RealtimeTransportMode.wifiRTP {
+                if self.captureTargets.applied != nil {
+                    self.recoverCaptureTargetDecodeRootOnQueue()
+                } else if self.committedRealtimeMode == RealtimeTransportMode.wifiRTP {
                     self.wifiMediaReceiver.requestImmediateRecoveryFeedback(
                         generation: self.connectionGeneration)
                 } else {
@@ -3195,7 +3241,7 @@ public class NetworkManager: ObservableObject {
         message.append(payload)
         enqueueControlData(
             message,
-            telemetry: type == .videoFeedback,
+            telemetry: type == .videoFeedback && flags != CaptureTargetProtocol.recoveryFlag,
             movement: movement,
             bulk: bulk,
             completion: { [weak self] error in
@@ -3549,6 +3595,13 @@ public class NetworkManager: ObservableObject {
                 mirrorSwitchAdvertised=header.flags & 0x2000 != 0
                 sendWireMessage(type: .mirrorHello, payload: hello, sequence: 0)
             }
+            if !remoteInputConnection, committedTransportGeneration == generation,
+               let hello = captureTargets.advertise(flags: header.flags, generation: generation) {
+                mirrorControl.enableTypedSources(session: generation)
+                sendWireMessage(type: .sourceHello, payload: hello, sequence: 0)
+                scheduleCaptureTargetListWaitOnQueue()
+                publishMirrorStateOnQueue()
+            }
             receiveDisplayCapabilities(capabilities)
 
         case .displayReady:
@@ -3573,6 +3626,7 @@ public class NetworkManager: ObservableObject {
                   committedTransportGeneration == generation,
                   let mode = PipelineMode.decode(payload),
                   committedPipelineMode.acknowledge(mode) else { return }
+            if captureTargetOwnsPresentation { abandonCaptureTargetPresentationOnQueue() }
             transportTelemetry.beginFreshFrameRate(generation: generation)
             return
 
@@ -3595,7 +3649,7 @@ public class NetworkManager: ObservableObject {
             do {
                 let oldState = mirrorControl.currentState
                 if let transition = try mirrorControl.receiveState(session: generation, data: payload) {
-                    if oldState?.epoch != transition.state.epoch {
+                    if oldState?.epoch != transition.state.epoch && !captureTargetOwnsPresentation {
                         currentMirrorCatalogue=nil;mirrorCatalogueSource=nil
                         decoder.invalidate(waitForCompletion: false)
                         beginOwnedDecoderSession(networkGeneration: generation)
@@ -3603,7 +3657,7 @@ public class NetworkManager: ObservableObject {
                     // The first anchor is reported after its completed write. That IDR may
                     // already have been discarded while metadata was pending; request a fresh
                     // dependency root using the existing recovery owner, not a media retry lane.
-                    if oldState?.firstFrame == nil, transition.state.firstFrame != nil {
+                    if !captureTargetOwnsPresentation, oldState?.firstFrame == nil, transition.state.firstFrame != nil {
                         if committedRealtimeMode == RealtimeTransportMode.wifiRTP {
                             wifiMediaReceiver.requestImmediateRecoveryFeedback(generation: generation)
                         } else if let recovery=mirrorControl.presentationRecoveryRequest() {
@@ -3612,9 +3666,48 @@ public class NetworkManager: ObservableObject {
                     }
                     if let ack = transition.acknowledgement { sendWireMessage(type: .mirrorAction, payload: ack, sequence: 0) }
                     advanceMirrorTerminalSwitchOnQueue()
+                    if captureTargets.pending == nil, let owner=currentCaptureTargetDecoderOwner, !captureTargetModeMatches(owner: owner) {
+                        abandonCaptureTargetPresentationOnQueue()
+                    } else { advanceCaptureTargetVideoOnQueue() }
                     publishMirrorStateOnQueue()
                 }
             } catch { handleStreamError("Invalid physical-source control state.") }
+            return
+        case .sourceCatalogue:
+            guard !remoteInputConnection, committedTransportGeneration == generation, captureTargets.enabled,
+                  header.flags == 0 else { return }
+            do {
+                let value=try CaptureTargetCatalogue.decode(payload)
+                if captureTargets.receiveCatalogue(value, session: captureTargets.session) {
+                    captureTargetCatalogueAt=ProcessInfo.processInfo.systemUptime
+                    if let applied=captureTargets.applied, value.epoch != applied.epoch || value.state != 1 {
+                        abandonCaptureTargetPresentationOnQueue()
+                    }
+                    publishMirrorStateOnQueue()
+                }
+            } catch { handleStreamError("Invalid capture source catalogue.") }
+            return
+        case .sourceSwitchResult:
+            guard !remoteInputConnection, committedTransportGeneration == generation, captureTargets.enabled,
+                  header.flags == 0 else { return }
+            do {
+                let value=try CaptureTargetResult.decode(payload)
+                let wasAccepted=captureTargets.pending?.accepted == true
+                guard captureTargets.receiveResult(value, session: captureTargets.session) else { return }
+                if value.status == .accepted {
+                    if !wasAccepted { retireCaptureTargetDecoderOnQueue() }
+                } else if value.status == .applied, captureTargets.applied != nil {
+                    if let applied=captureTargets.applied,
+                       captureTargets.catalogue?.epoch != applied.epoch || captureTargets.catalogue?.state != 1 {
+                        abandonCaptureTargetPresentationOnQueue()
+                    } else { advanceCaptureTargetVideoOnQueue();startCaptureTargetRecoveryOnQueue() }
+                } else { retireCaptureTargetDecoderOnQueue() }
+                if captureTargets.needsCatalogueRefresh { refreshCaptureTargetsOnQueue() }
+                publishMirrorStateOnQueue()
+            } catch { handleStreamError("Invalid capture source switch result.") }
+            return
+        case .sourceHello, .sourceSwitchRequest:
+            handleStreamError("Invalid capture source control direction.")
             return
         case .mirrorCatalogue:
             guard committedTransportGeneration==generation,mirrorSwitchAdvertised,header.flags==0 else {return}
@@ -3656,7 +3749,9 @@ public class NetworkManager: ObservableObject {
                 // exact host commit must arrive first on authenticated TLS.
                 return
             }
-            guard mirrorControl.permitsVideoSequence(header.sequence) else { return }
+            if !captureTargetOwnsPresentation {
+                guard mirrorControl.permitsVideoSequence(header.sequence) else { return }
+            }
             let receivedAt = CACurrentMediaTime()
             if remoteInputConnection, header.flags & WireProtocol.videoFlagIDR != 0, !remoteFeatures.inputReady {
                 remoteFeatures.keyframeArrived()
@@ -3675,6 +3770,10 @@ public class NetworkManager: ObservableObject {
                 transportKind: activeTransportKind == .usb
                     ? StreamingTransportKind.usbTypeC.rawValue
                     : StreamingTransportKind.wifi.rawValue)
+            if consumeCaptureTargetVideoOnQueue(payload, sequence: header.sequence,
+                isIDR: header.flags & WireProtocol.videoFlagIDR != 0,
+                lengthPrefixed: header.flags & WireProtocol.videoFlagLengthPrefixed != 0,
+                receivedAt: receivedAt) { return }
             decoder.processInputData(
                 payload,
                 sequence: header.sequence,
@@ -3690,6 +3789,7 @@ public class NetworkManager: ObservableObject {
                 handleStreamError("Malformed or stale video configuration.")
                 return
             }
+            if captureTargets.applied != nil { abandonCaptureTargetPresentationOnQueue() }
             let accepted: Bool
             let errorCode: UInt16
             if configuration.codec == .h264,
@@ -3704,7 +3804,10 @@ public class NetworkManager: ObservableObject {
                 accepted = false
                 errorCode = 1
             }
-            if accepted { activeVideoCodec = configuration.codec }
+            if accepted {
+                activeVideoCodec = configuration.codec
+                captureTargetH264ParameterSets=configuration.parameterSets
+            }
             let ack = VideoConfigurationAckV1(
                 generation: configuration.generation,
                 accepted: accepted,
@@ -4266,6 +4369,7 @@ public class NetworkManager: ObservableObject {
     private func sendDesiredPipelineMode(reason: String) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard wireAuthenticatedGeneration == connectionGeneration else { return }
+        if captureTargets.pending != nil || captureTargets.applied != nil { abandonCaptureTargetPresentationOnQueue() }
         committedPipelineMode.request(desiredPipelineMode)
         sendWireMessage(
             type: .pipelineMode,
@@ -4291,6 +4395,7 @@ public class NetworkManager: ObservableObject {
             interfaceOrientation: interfaceOrientation,
             requestId: 0)
         guard let request = displayRequestGate.begin(proposed) else { return }
+        if captureTargets.pending != nil || captureTargets.applied != nil { abandonCaptureTargetPresentationOnQueue() }
         if activeTransportKind == .usb {
             recordUsbLifecycleDiagnostic(
                 "[USB_RECONNECT_DISPLAY] generation=\(connectionGeneration) desiredOrientation=\(request.orientation)")
@@ -4311,6 +4416,7 @@ public class NetworkManager: ObservableObject {
         guard displayRequestGate.pending?.requestId == ready.requestId else {
             return
         }
+        if captureTargetOwnsPresentation { abandonCaptureTargetPresentationOnQueue() }
         let nextRequest = displayRequestGate.accept(ready)
         if let nextRequest,
            let latestPreference = latestDisplayPreference {
@@ -4823,6 +4929,27 @@ public class NetworkManager: ObservableObject {
     #if targetEnvironment(simulator)
     // Captures the real pending-switch completion without wall-clock sleeps in XCTest.
     var mirrorSwitchDeadlineForTesting: ((TimeInterval, @escaping () -> Void) -> Void)?
+    var captureTargetDecoderForTesting: UInt64? { currentCaptureTargetDecoderOwner?.decoder }
+    func receiveCaptureTargetWireForTesting(type: WireMessageType, payload: Data, flags: UInt16 = 0,
+                                            sequence: UInt32 = 0, generation: UInt64, connection owner: NWConnection) {
+        networkQueue.sync {
+            guard generation == connectionGeneration, activeControlConnection === owner,
+                  wireAuthenticatedGeneration == generation, committedTransportGeneration == generation else { return }
+            handleWireMessage(WireMessage(header: WireHeader(type: type, flags: flags,
+                payloadLength: payload.count, sequence: sequence), payload: payload, firstByteAt: CACurrentMediaTime()),
+                generation: generation)
+        }
+    }
+    func receiveCaptureTargetVideoForTesting(_ data: Data, sequence: UInt32, isIDR: Bool,
+                                             generation: UInt64, connection owner: NWConnection) {
+        networkQueue.sync {
+            guard generation == connectionGeneration, activeControlConnection === owner,
+                  wireAuthenticatedGeneration == generation, committedTransportGeneration == generation,
+                  committedRealtimeMode == RealtimeTransportMode.wifiRTP else { return }
+            _=consumeCaptureTargetVideoOnQueue(data, sequence: sequence, isIDR: isIDR,
+                                               lengthPrefixed: true, receivedAt: CACurrentMediaTime())
+        }
+    }
     func beginRemoteMonitorForTesting(acceptedFeatures: UInt64) {
         networkQueue.sync {
             remoteInputConnection = true
@@ -5189,10 +5316,214 @@ public class NetworkManager: ObservableObject {
         frameReceiveMs: 0,
         decodeMs: 0)
 
+    private var captureTargetOwnsPresentation: Bool {
+        captureTargets.enabled && (captureTargets.pending != nil || captureTargets.applied != nil || captureTargets.inputBlocked)
+    }
+    private var currentCaptureTargetDecoderOwner: CaptureTargetDecoderOwner? {
+        mirrorDecoderLock.lock();defer { mirrorDecoderLock.unlock() };return captureTargetDecoderOwner
+    }
+    public func legacyInputIsCurrent(revision: UInt64) -> Bool {
+        mirrorControl.legacyRegistrationIsCurrent(revision: revision)
+    }
+
+    @MainActor public func requestCaptureTarget(_ id: UInt64, catalogue: CaptureTargetCatalogue) {
+        let generation=connectionGenerationClock.current
+        let admitted: (CaptureTargetRequest, UUID, NWConnection)? = networkQueue.sync {
+            let age=ProcessInfo.processInfo.systemUptime-captureTargetCatalogueAt
+            guard !remoteInputConnection, generation == connectionGeneration,
+                  wireAuthenticatedGeneration == generation, committedTransportGeneration == generation,
+                  let connection=activeControlConnection else { return nil }
+            guard age >= 0, age < 30 else { refreshCaptureTargetsOnQueue();return nil }
+            let session=captureTargets.session
+            guard let request=captureTargets.select(id, catalogue: catalogue, session: session) else { return nil }
+            cancelCaptureTargetRecoveryOnQueue()
+            captureTargetMirrorRevisionAtTap=mirrorControl.currentState?.revision ?? 0
+            return (request, session, connection)
+        }
+        guard let (request, session, connection)=admitted else { return }
+        // These existing methods emit terminal releases and retire marked text synchronously on main.
+        captureTargetRetireInput?()
+        // Drain the retired callbacks' queued encodes before blocking their old tickets.
+        networkQueue.sync { mirrorControl.setCaptureTargetInputBlocked(true, session: generation) }
+        networkQueue.async { [weak self] in
+            guard let self, self.captureTargets.session == session,
+                  self.captureTargets.pending?.request == request, self.connectionGeneration == generation,
+                  self.activeControlConnection === connection, let payload=try? request.encode() else { return }
+            self.sendWireMessage(type: .sourceSwitchRequest, payload: payload, sequence: 0)
+            self.publishMirrorStateOnQueue()
+            self.scheduleCaptureTargetCallback(CaptureTargetProtocol.terminalWait) { [weak self, weak connection] in
+                guard let self, let connection, self.activeControlConnection === connection,
+                      self.connectionGeneration == generation,
+                      self.captureTargets.expire(transaction: request.transaction, session: session) else { return }
+                self.retireCaptureTargetDecoderOnQueue()
+                self.refreshCaptureTargetsOnQueue();self.publishMirrorStateOnQueue()
+            }
+        }
+    }
+    private func refreshCaptureTargetsOnQueue() {
+        guard wireAuthenticatedGeneration == connectionGeneration, committedTransportGeneration == connectionGeneration,
+              let payload=captureTargets.refresh(session: captureTargets.session) else { return }
+        sendWireMessage(type: .sourceHello, payload: payload, sequence: 0)
+        scheduleCaptureTargetListWaitOnQueue()
+    }
+    private func scheduleCaptureTargetListWaitOnQueue() {
+        let session=captureTargets.session
+        scheduleCaptureTargetCallback(5) { [weak self] in
+            guard let self, self.captureTargets.session == session else { return }
+            self.captureTargets.markListUnavailable(session: session);self.publishMirrorStateOnQueue()
+        }
+    }
+    private func scheduleCaptureTargetCallback(_ seconds: TimeInterval, recovery: Bool = false,
+                                               completion: @escaping () -> Void) {
+        #if targetEnvironment(simulator)
+        if let schedule=captureTargetScheduleForTesting { schedule(seconds, completion);return }
+        #endif
+        let work=DispatchWorkItem(block: completion)
+        if recovery { captureTargetRecoveryWork.append(work) }
+        networkQueue.asyncAfter(deadline: .now()+seconds, execute: work)
+    }
+    private func cancelCaptureTargetRecoveryOnQueue() {
+        captureTargetRecoveryToken=nil
+        captureTargetRecoveryWork.forEach { $0.cancel() };captureTargetRecoveryWork.removeAll()
+    }
+    private func retireCaptureTargetDecoderOnQueue() {
+        cancelCaptureTargetRecoveryOnQueue();captureTargetVideo.reset()
+        captureTargetDecodeStarted=false;captureTargetLastVideoSequence=nil
+        mirrorDecoderLock.lock();captureTargetDecoderOwner=nil;mirrorDecoderOwner=nil;mirrorDecoderLock.unlock()
+        decoder.invalidate(waitForCompletion: false)
+        guard nextMirrorDecoder != UInt64.max else { handleStreamError("Source decoder identity exhausted.");return }
+        nextMirrorDecoder+=1
+        decoder.beginSession(generation: nextMirrorDecoder)
+    }
+    private func abandonCaptureTargetPresentationOnQueue() {
+        guard captureTargets.enabled else { return }
+        captureTargets.abandonPresentation(session: captureTargets.session)
+        mirrorControl.setCaptureTargetInputBlocked(true)
+        retireCaptureTargetDecoderOnQueue()
+        refreshCaptureTargetsOnQueue();publishMirrorStateOnQueue()
+    }
+    private func captureTargetModeIsReady(_ applied: CaptureTargetResult) -> Bool {
+        guard let state=mirrorControl.currentState, state.revision > captureTargetMirrorRevisionAtTap else { return false }
+        if applied.kind == .extend { return state.mode == .virtualDisplay }
+        return state.epoch == applied.epoch && state.source == applied.source && state.geometry != nil &&
+            state.firstFrame != nil && (state.mode == .viewOnly || state.mode == .awaitingPresentation || state.mode == .active)
+    }
+    private func captureTargetModeMatches(owner: CaptureTargetDecoderOwner) -> Bool {
+        guard captureTargets.session == owner.session, let applied=captureTargets.applied,
+              applied.transaction == owner.transaction, applied.owner == owner.owner,
+              applied.epoch == owner.epoch, applied.source == owner.source,
+              captureTargetModeIsReady(applied) else { return false }
+        // Virtual MirrorState has a separate identity; remember it to detect later supersession.
+        return owner.kind != .extend || mirrorControl.currentState?.epoch == owner.mirrorEpoch
+    }
+    private func advanceCaptureTargetVideoOnQueue() {
+        guard let applied=captureTargets.applied, captureTargetModeIsReady(applied),
+              let state=mirrorControl.currentState, let kind=applied.kind else { return }
+        if currentCaptureTargetDecoderOwner == nil {
+            guard nextMirrorDecoder != UInt64.max else { handleStreamError("Source decoder identity exhausted.");return }
+            nextMirrorDecoder+=1
+            let owner=CaptureTargetDecoderOwner(session: captureTargets.session, generation: connectionGeneration,
+                transaction: applied.transaction, owner: applied.owner, epoch: applied.epoch, source: applied.source,
+                decoder: nextMirrorDecoder, kind: kind, mirrorEpoch: state.epoch)
+            mirrorDecoderLock.lock();captureTargetDecoderOwner=owner;mirrorDecoderOwner=nil;mirrorDecoderLock.unlock()
+            decoder.invalidate(waitForCompletion: false)
+            decoder.beginSession(generation: owner.decoder)
+            if activeVideoCodec == .h264 {
+                guard let sets=captureTargetH264ParameterSets, sets.count == 2,
+                      decoder.configureH264(sps: sets[0], pps: sets[1]) else {
+                    abandonCaptureTargetPresentationOnQueue();return
+                }
+            }
+        }
+        guard !captureTargetDecodeStarted else { return }
+        let frames=captureTargetVideo.take(firstFrame: applied.firstFrame)
+        guard !frames.isEmpty else { return }
+        captureTargetDecodeStarted=true
+        for frame in frames { decodeCaptureTargetFrameOnQueue(frame) }
+    }
+    private func decodeCaptureTargetFrameOnQueue(_ frame: CaptureTargetVideoBuffer.Frame) {
+        guard let applied=captureTargets.applied, let owner=currentCaptureTargetDecoderOwner,
+              captureTargetModeMatches(owner: owner),
+              MirrorControlCodec.sequenceAtOrAfter(frame.sequence, applied.firstFrame) else { return }
+        if let last=captureTargetLastVideoSequence, !MirrorControlCodec.sequenceAtOrAfter(frame.sequence, last &+ 1) { return }
+        captureTargetLastVideoSequence=frame.sequence
+        #if targetEnvironment(simulator)
+        if let decode=captureTargetDecodeForTesting { decode(frame.data, frame.sequence, owner.decoder);return }
+        #endif
+        decoder.processInputData(frame.data, sequence: frame.sequence, isIDR: frame.isIDR,
+                                 isLengthPrefixed: frame.lengthPrefixed, receivedAt: frame.receivedAt)
+    }
+    /// Both the TLS parser and authenticated RTP access-unit owner pass through this same gate.
+    private func consumeCaptureTargetVideoOnQueue(_ data: Data, sequence: UInt32, isIDR: Bool,
+                                                  lengthPrefixed: Bool, receivedAt: TimeInterval) -> Bool {
+        guard captureTargetOwnsPresentation else { return false }
+        let frame=CaptureTargetVideoBuffer.Frame(data: data, sequence: sequence, isIDR: isIDR,
+                                                lengthPrefixed: lengthPrefixed, receivedAt: receivedAt)
+        if let pending=captureTargets.pending {
+            if pending.accepted { captureTargetVideo.append(frame) }
+            return true
+        }
+        guard let applied=captureTargets.applied,
+              MirrorControlCodec.sequenceAtOrAfter(sequence, applied.firstFrame) else { return true }
+        if captureTargetDecodeStarted { decodeCaptureTargetFrameOnQueue(frame) }
+        else { captureTargetVideo.append(frame);advanceCaptureTargetVideoOnQueue() }
+        return true
+    }
+    private func sendCaptureTargetRecoveryOnQueue(_ applied: CaptureTargetResult) {
+        guard captureTargets.applied == applied, wireAuthenticatedGeneration == connectionGeneration,
+              committedTransportGeneration == connectionGeneration, let payload=try? applied.recoveryPayload() else { return }
+        sendWireMessage(type: .videoFeedback, payload: payload, sequence: 0, flags: CaptureTargetProtocol.recoveryFlag)
+    }
+    private func startCaptureTargetRecoveryOnQueue() {
+        guard let applied=captureTargets.applied else { return }
+        cancelCaptureTargetRecoveryOnQueue()
+        let token=UUID(), session=captureTargets.session
+        captureTargetRecoveryToken=token
+        if !captureTargetDecodeStarted { sendCaptureTargetRecoveryOnQueue(applied) }
+        for second in 1...5 {
+            scheduleCaptureTargetCallback(TimeInterval(second), recovery: true) { [weak self] in
+                guard let self, self.captureTargetRecoveryToken == token, self.captureTargets.session == session,
+                      self.captureTargets.applied == applied, self.captureTargets.inputBlocked else { return }
+                if second == 5 { self.abandonCaptureTargetPresentationOnQueue() }
+                else { self.sendCaptureTargetRecoveryOnQueue(applied) }
+            }
+        }
+    }
+    private func recoverCaptureTargetDecodeRootOnQueue() {
+        guard captureTargets.applied != nil else { return }
+        // Keep an existing attempt's deadline. A decoder failure never extends its five-second budget.
+        if captureTargetRecoveryToken != nil {
+            captureTargetDecodeStarted=false;captureTargetLastVideoSequence=nil;captureTargetVideo.reset()
+            if let applied=captureTargets.applied { sendCaptureTargetRecoveryOnQueue(applied) }
+            return
+        }
+        captureTargets.requireFreshPresentation(session: captureTargets.session)
+        mirrorControl.setCaptureTargetInputBlocked(true)
+        retireCaptureTargetDecoderOnQueue();advanceCaptureTargetVideoOnQueue()
+        startCaptureTargetRecoveryOnQueue();publishMirrorStateOnQueue()
+    }
+    private func captureTargetPacketIsCurrent(_ data: Data) -> Bool {
+        guard data.count >= 16, data[0] == 0x53, data[1] == 0x43 else { return true }
+        if data[5] == WireMessageType.sourceSwitchRequest.rawValue {
+            guard data.count == 56, let request=captureTargets.pending?.request else { return false }
+            return data.loadLittleEndian(UInt64.self, at: 24) == request.transaction &&
+                data.loadLittleEndian(UInt64.self, at: 32) == request.owner
+        }
+        if data[5] == WireMessageType.videoFeedback.rawValue,
+           data.loadLittleEndian(UInt16.self, at: 6) == CaptureTargetProtocol.recoveryFlag {
+            guard data.count == 40, let applied=captureTargets.applied else { return false }
+            return data.loadLittleEndian(UInt64.self, at: 16) == applied.owner &&
+                data.loadLittleEndian(UInt64.self, at: 24) == applied.epoch &&
+                data.loadLittleEndian(UInt64.self, at: 32) == applied.source
+        }
+        return true
+    }
+
     private var currentMirrorDecoderOwner: MirrorDecoderOwner? {
         mirrorDecoderLock.lock(); defer { mirrorDecoderLock.unlock() }; return mirrorDecoderOwner
     }
     private func beginOwnedDecoderSession(networkGeneration generation: UInt64) {
+        if captureTargetOwnsPresentation { abandonCaptureTargetPresentationOnQueue() }
         guard let state = mirrorControl.currentState else { decoder.beginSession(generation: generation); return }
         guard generation & 0x8000_0000_0000_0000 == 0, nextMirrorDecoder != UInt64.max else {
             handleStreamError("Physical-source decoder identity exhausted."); return
@@ -5214,17 +5545,36 @@ public class NetworkManager: ObservableObject {
         } else {catalogue=nil}
         let pending=mirrorSwitchPending
         let picker=mirrorControl.supportsScreenPicker
+        let sources=captureTargets
         DispatchQueue.main.async { [weak self] in
             guard let self, self.connectionGenerationClock.current == generation else { return }
             self.mirrorControlState = state; self.mirrorInputRevision = revision
             self.mirrorMonitorCatalogue=catalogue;self.mirrorMonitorSwitchPending=pending
             self.mirrorScreenPickerSupported=picker
+            self.captureTargetState=sources
         }
     }
     /// Screen picker opened: ask the Host for a fresh list (the stored one goes stale after 30 s).
-    public func refreshMirrorScreens() { sendScreenPickerAction { $0.screenListRequest() } }
+    public func refreshMirrorScreens() {
+        let generation=connectionGenerationClock.current
+        networkQueue.async { [weak self] in
+            guard let self, generation == self.connectionGeneration else { return }
+            if self.captureTargets.enabled { self.refreshCaptureTargetsOnQueue() }
+            else { self.sendScreenPickerAction { $0.screenListRequest() } }
+        }
+    }
     /// Ask the attended Host to allow monitor switching. The Host shows a notice; nothing is granted here.
-    public func requestMirrorSwitchPermission() { sendScreenPickerAction { $0.switchPermissionRequest() } }
+    public func requestMirrorSwitchPermission() {
+        let generation=connectionGenerationClock.current
+        networkQueue.async { [weak self] in
+            guard let self, generation == self.connectionGeneration,
+                  self.wireAuthenticatedGeneration == generation else { return }
+            let action=self.captureTargets.enabled
+                ? self.mirrorControl.typedSwitchPermissionRequest(negotiated: true)
+                : self.mirrorControl.switchPermissionRequest()
+            if let action { self.sendWireMessage(type: .mirrorAction, payload: action, sequence: 0) }
+        }
+    }
     private func sendScreenPickerAction(_ make: @escaping (MirrorClientControl) -> Data?) {
         let generation = connectionGenerationClock.current
         networkQueue.async { [weak self] in
@@ -5384,8 +5734,29 @@ public class NetworkManager: ObservableObject {
     /// Records completion of the Metal command buffer as a distinct presentation stage.
     public func recordRenderCompletion(sequence: UInt32, generation: UInt64) {
         mirrorDecoderLock.lock()
+        let typed = captureTargetDecoderOwner
         let captured = mirrorDecoderOwner
         mirrorDecoderLock.unlock()
+        if let typed, typed.decoder == generation {
+            networkQueue.async { [weak self] in
+                guard let self, self.currentCaptureTargetDecoderOwner == typed,
+                      self.captureTargets.session == typed.session, self.connectionGeneration == typed.generation,
+                      self.captureTargetDecodeStarted, self.captureTargetModeMatches(owner: typed),
+                      let applied=self.captureTargets.applied,
+                      MirrorControlCodec.sequenceAtOrAfter(sequence, applied.firstFrame) else { return }
+                self.transportTelemetry.recordRenderCompletion(sequence: sequence, generation: typed.generation)
+                if self.captureTargets.observeRendered(sequence: sequence, session: typed.session) {
+                    self.cancelCaptureTargetRecoveryOnQueue()
+                    self.mirrorControl.setCaptureTargetInputBlocked(false)
+                }
+                if typed.kind == .physical,
+                   let ack=self.mirrorControl.observeRendered(session: typed.generation, sequence: sequence) {
+                    self.sendWireMessage(type: .mirrorAction, payload: ack, sequence: 0)
+                }
+                self.publishMirrorStateOnQueue()
+            }
+            return
+        }
         if let captured, captured.decoder == generation {
             transportTelemetry.recordRenderCompletion(sequence: sequence, generation: captured.connection)
             networkQueue.async { [weak self] in

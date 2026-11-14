@@ -827,6 +827,12 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             }
             touchView.updateRemoteVideoRect()
         } else { touchView.remoteSessionInput = nil }
+        // Typed taps retire the same held input before their serialized request is queued.
+        networkManager.captureTargetRetireInput = { [weak container, weak touchView] in
+            touchView?.retireMirrorInputScope()
+            container?.retireRemotePointerInputs()
+            container?.retireRemoteKeyboard()
+        }
         let binding = networkManager.mirrorInputRevision
         let ticket = networkManager.mirrorTicketAtRegistration
         let legacy = networkManager.permitsLegacyVirtualInput
@@ -849,7 +855,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             if let ticket {
                 networkManager?.sendMirrorInput(ticket: ticket, kind: .pencil,
                     payload: NetworkManager.mirrorPencilPayload(type: type, x: x, y: y, pressure: pressure))
-            } else if legacy { sendTouchEvent?(type, x, y, pressure) }
+            } else if legacy && networkManager?.legacyInputIsCurrent(revision: binding) == true { sendTouchEvent?(type, x, y, pressure) }
         }
         let keyInput = onKeyboardInput
         let inputGeneration = networkManager.remoteKeyboardGeneration
@@ -862,7 +868,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
                     }
                 } else { networkManager?.sendKeyboardInput(command) }
             } else if let ticket { networkManager?.sendMirrorInput(ticket: ticket, kind: .keyboard, payload: command.encode()) }
-            else if legacy { keyInput?(command) }
+            else if legacy && networkManager?.legacyInputIsCurrent(revision: binding) == true { keyInput?(command) }
         }
         let textInput = onTextCommit
         container.onTextCommit = { [weak networkManager, weak remoteInput] text in
@@ -878,7 +884,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
                     guard let bytes = command.encode() else { return }
                     networkManager?.sendMirrorInput(ticket: ticket, kind: .text, payload: bytes)
                 }
-            } else if legacy { textInput?(text) }
+            } else if legacy && networkManager?.legacyInputIsCurrent(revision: binding) == true { textInput?(text) }
         }
         touchView.diagnosticSink = { [weak networkManager] line in networkManager?.recordDiagnosticLine(line) }
         container.configureRemoteKeyboard(active: remoteKeyboardActive, generation: networkManager.remoteKeyboardGeneration)
@@ -887,7 +893,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         let directInput = onDirectTouchContact
         touchView.onDirectTouchContact = { [weak networkManager] command in
             if let ticket { networkManager?.sendMirrorInput(ticket: ticket, kind: .directTouch, payload: command.encode()) }
-            else if legacy { directInput?(command) }
+            else if legacy && networkManager?.legacyInputIsCurrent(revision: binding) == true { directInput?(command) }
         }
         let admitted = remoteKeyboardActive && (ticket != nil || legacy)
         touchView.configureDirectTouch(active: admitted, generation: binding)
@@ -896,7 +902,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         touchView.onPointerInput = { [weak networkManager] command in
             if networkManager?.isRemoteControlSession == true { networkManager?.sendPointerInput(command) }
             else if let ticket { networkManager?.sendMirrorInput(ticket: ticket, kind: .pointer, payload: command.encode()) }
-            else if legacy { pointerInput?(command) }
+            else if legacy && networkManager?.legacyInputIsCurrent(revision: binding) == true { pointerInput?(command) }
         }
         let openSettings = onOpenSettings
         touchView.onOpenSettings = { [weak container] in

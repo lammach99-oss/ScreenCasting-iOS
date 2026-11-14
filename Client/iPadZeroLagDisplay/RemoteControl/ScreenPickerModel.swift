@@ -7,6 +7,13 @@ public struct ScreenPickerTile: Equatable, Identifiable {
     public let label: String
     public let isBuiltIn: Bool
     public let status: Status
+    public let isExtend: Bool
+    public let canSelect: Bool
+    public init(id: UInt64, label: String, isBuiltIn: Bool, status: Status,
+                isExtend: Bool = false, canSelect: Bool? = nil) {
+        self.id=id;self.label=label;self.isBuiltIn=isBuiltIn;self.status=status;self.isExtend=isExtend
+        self.canSelect=canSelect ?? (status == .available)
+    }
 }
 
 /// Pure view state for the screen picker. Everything it shows comes from the Host's catalogue and mirror
@@ -46,8 +53,38 @@ public struct ScreenPickerSnapshot: Equatable {
                     currentLabel: catalogue.monitors.first { $0.id == catalogue.selected }?.label)
     }
 
-    public static func shouldShowPicker(remote: Bool, mirror: Bool, acceptedFeatures: UInt64) -> Bool {
-        remote ? acceptedFeatures & 7 == 7 : mirror
+    public static func shouldShowPicker(remote: Bool, mirror: Bool, acceptedFeatures: UInt64,
+                                        typedSources: Bool = false) -> Bool {
+        remote ? acceptedFeatures & 7 == 7 : mirror || typedSources
+    }
+
+    public static func make(captureTargets: CaptureTargetState, state: MirrorControlState?,
+                            permissionAsked: Bool = false) -> Self {
+        let current=captureTargets.confirmedCurrentId
+        let control: Control = state?.geometry == nil ? .unavailable
+            : state?.mode == .active && !captureTargets.inputBlocked ? .on : .viewOnly
+        guard let catalogue=captureTargets.catalogue else {
+            return Self(phase: captureTargets.listUnavailable ? .locked : .loading, tiles: [], control: control,
+                        canAskPermission: false, isSwitching: captureTargets.isSwitching, currentLabel: nil)
+        }
+        let ready=catalogue.state == 1 && catalogue.allowed
+        let selectable=ready && captureTargets.canSelect && !captureTargets.needsCatalogueRefresh
+        let tiles=catalogue.entries.map { entry -> ScreenPickerTile in
+            let status: ScreenPickerTile.Status
+            if entry.id == captureTargets.pending?.request.targetId &&
+                catalogue.revision == captureTargets.pending?.request.revision { status = .switching }
+            else if entry.id == current { status = .showing }
+            else if !selectable { status = .locked }
+            else { status = .available }
+            return ScreenPickerTile(id: entry.id, label: entry.kind == .extend ? "Extend iPad" : entry.name,
+                isBuiltIn: entry.kind == .physical && isBuiltIn(entry.name), status: status,
+                isExtend: entry.kind == .extend, canSelect: selectable)
+        }
+        return Self(phase: catalogue.state == 1 && catalogue.allowed ? .ready : .locked, tiles: tiles,
+                    control: control, canAskPermission: catalogue.state == 1 && !catalogue.allowed &&
+                        !permissionAsked && !captureTargets.isSwitching,
+                    isSwitching: captureTargets.isSwitching,
+                    currentLabel: tiles.first(where: { $0.id == current })?.label)
     }
 
     /// Remote catalogue adapter. Casting's factory and its tile semantics stay intact.
