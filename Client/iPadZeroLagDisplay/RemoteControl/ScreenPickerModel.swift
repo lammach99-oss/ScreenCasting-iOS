@@ -46,6 +46,33 @@ public struct ScreenPickerSnapshot: Equatable {
                     currentLabel: catalogue.monitors.first { $0.id == catalogue.selected }?.label)
     }
 
+    public static func shouldShowPicker(remote: Bool, mirror: Bool, acceptedFeatures: UInt64) -> Bool {
+        remote ? acceptedFeatures & 7 == 7 : mirror
+    }
+
+    /// Remote catalogue adapter. Casting's factory and its tile semantics stay intact.
+    public static func make(remote: RemoteMonitorState, inputReady: Bool) -> Self {
+        let control: Control = remote.context?.state == 1 ? (inputReady ? .on : .viewOnly) : .unavailable
+        guard remote.enabled, let catalogue = remote.catalogue else {
+            return Self(phase: .loading, tiles: [], control: control, canAskPermission: false,
+                        isSwitching: remote.pending != nil, currentLabel: nil)
+        }
+        let unavailable = catalogue.state == 0 || remote.issue == .unavailable
+        let busy = remote.pending != nil || catalogue.state == 2 || remote.needsCatalogueRefresh
+        let current = unavailable ? 0 : remote.confirmedCurrentId
+        let tiles = catalogue.entries.map { entry -> ScreenPickerTile in
+            let status: ScreenPickerTile.Status
+            if entry.id == current { status = .showing }
+            else if !unavailable && entry.id == remote.pending?.request.targetId { status = .switching }
+            else if unavailable || busy { status = .locked }
+            else { status = .available }
+            return ScreenPickerTile(id: entry.id, label: entry.name, isBuiltIn: isBuiltIn(entry.name), status: status)
+        }
+        return Self(phase: unavailable ? .locked : .ready, tiles: tiles, control: unavailable ? .unavailable : control,
+                    canAskPermission: false, isSwitching: busy,
+                    currentLabel: catalogue.entries.first { $0.id == current }?.name)
+    }
+
     /// The Host names a laptop panel with no reported name "Built-in display".
     static func isBuiltIn(_ label: String) -> Bool {
         label.caseInsensitiveCompare("Built-in display") == .orderedSame

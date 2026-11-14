@@ -26,6 +26,8 @@
 		FB2500000000000000000008 /* GestureHelp.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000008 /* GestureHelp.swift */; };
 		FB2500000000000000000009 /* RemoteHostDirectory.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000009 /* RemoteHostDirectory.swift */; };
 		A11500000000000000000001 /* RemoteFeatureNegotiation.swift in Sources */ = {isa = PBXBuildFile; fileRef = A11400000000000000000001 /* RemoteFeatureNegotiation.swift */; };
+		C71500000000000000000002 /* RemoteMonitorState.swift in Sources */ = {isa = PBXBuildFile; fileRef = C71400000000000000000002 /* RemoteMonitorState.swift */; };
+		C71500000000000000000001 /* RemoteMonitorProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = C71400000000000000000001 /* RemoteMonitorProtocol.swift */; };
 		F1F500000000000000000006 /* RemoteMouseControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1F400000000000000000006 /* RemoteMouseControls.swift */; };
 		F1F500000000000000000005 /* RemoteMouseInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1F400000000000000000005 /* RemoteMouseInput.swift */; };
 		F1F500000000000000000004 /* RemoteMouseMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1F400000000000000000004 /* RemoteMouseMode.swift */; };
@@ -89,6 +91,9 @@
 		FA2300000000000000000008 /* SettingsCopyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000008 /* SettingsCopyTests.swift */; };
 		FA2300000000000000000009 /* RemoteHostDirectoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000009 /* RemoteHostDirectoryTests.swift */; };
 		A11500000000000000000002 /* RemoteInputProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A11400000000000000000002 /* RemoteInputProtocolTests.swift */; };
+		C71500000000000000000005 /* RemoteMonitorIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C71400000000000000000005 /* RemoteMonitorIntegrationTests.swift */; };
+		C71500000000000000000004 /* RemoteMonitorStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C71400000000000000000004 /* RemoteMonitorStateTests.swift */; };
+		C71500000000000000000003 /* RemoteMonitorProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C71400000000000000000003 /* RemoteMonitorProtocolTests.swift */; };
 		F1F50000000000000000000A /* RemoteSessionInputTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1F40000000000000000000A /* RemoteSessionInputTests.swift */; };
 		F1F500000000000000000009 /* RemoteMouseInputTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1F400000000000000000009 /* RemoteMouseInputTests.swift */; };
 		F1F500000000000000000008 /* RemoteKeyboardStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1F400000000000000000008 /* RemoteKeyboardStateTests.swift */; };
@@ -127,6 +132,8 @@
 		FB2400000000000000000008 /* GestureHelp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GestureHelp.swift; sourceTree = "<group>"; };
 		FB2400000000000000000009 /* RemoteHostDirectory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteHostDirectory.swift; sourceTree = "<group>"; };
 		A11400000000000000000001 /* RemoteFeatureNegotiation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteFeatureNegotiation.swift; sourceTree = "<group>"; };
+		C71400000000000000000002 /* RemoteMonitorState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteMonitorState.swift; sourceTree = "<group>"; };
+		C71400000000000000000001 /* RemoteMonitorProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteMonitorProtocol.swift; sourceTree = "<group>"; };
 		F1F400000000000000000006 /* RemoteMouseControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteMouseControls.swift; sourceTree = "<group>"; };
 		F1F400000000000000000005 /* RemoteMouseInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteMouseInput.swift; sourceTree = "<group>"; };
 		F1F400000000000000000004 /* RemoteMouseMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteMouseMode.swift; sourceTree = "<group>"; };
@@ -191,6 +198,9 @@
 		FA2200000000000000000008 /* SettingsCopyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsCopyTests.swift; sourceTree = "<group>"; };
 		FA2200000000000000000009 /* RemoteHostDirectoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteHostDirectoryTests.swift; sourceTree = "<group>"; };
 		A11400000000000000000002 /* RemoteInputProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteInputProtocolTests.swift; sourceTree = "<group>"; };
+		C71400000000000000000005 /* RemoteMonitorIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteMonitorIntegrationTests.swift; sourceTree = "<group>"; };
+		C71400000000000000000004 /* RemoteMonitorStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteMonitorStateTests.swift; sourceTree = "<group>"; };
+		C71400000000000000000003 /* RemoteMonitorProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteMonitorProtocolTests.swift; sourceTree = "<group>"; };
 		F1F40000000000000000000A /* RemoteSessionInputTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteSessionInputTests.swift; sourceTree = "<group>"; };
 		F1F400000000000000000009 /* RemoteMouseInputTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteMouseInputTests.swift; sourceTree = "<group>"; };
 		F1F400000000000000000008 /* RemoteKeyboardStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteKeyboardStateTests.swift; sourceTree = "<group>"; };
@@ -239,6 +249,8 @@
 				FB2400000000000000000008 /* GestureHelp.swift */,
 				FB2400000000000000000009 /* RemoteHostDirectory.swift */,
 				A11400000000000000000001 /* RemoteFeatureNegotiation.swift */,
+				C71400000000000000000002 /* RemoteMonitorState.swift */,
+				C71400000000000000000001 /* RemoteMonitorProtocol.swift */,
 				F1F400000000000000000006 /* RemoteMouseControls.swift */,
 				F1F400000000000000000005 /* RemoteMouseInput.swift */,
 				F1F400000000000000000004 /* RemoteMouseMode.swift */,
@@ -299,6 +311,9 @@
 				FA2200000000000000000008 /* SettingsCopyTests.swift */,
 				FA2200000000000000000009 /* RemoteHostDirectoryTests.swift */,
 				A11400000000000000000002 /* RemoteInputProtocolTests.swift */,
+				C71400000000000000000005 /* RemoteMonitorIntegrationTests.swift */,
+				C71400000000000000000004 /* RemoteMonitorStateTests.swift */,
+				C71400000000000000000003 /* RemoteMonitorProtocolTests.swift */,
 				F1F40000000000000000000A /* RemoteSessionInputTests.swift */,
 				F1F400000000000000000009 /* RemoteMouseInputTests.swift */,
 				F1F400000000000000000008 /* RemoteKeyboardStateTests.swift */,
@@ -439,6 +454,8 @@
 				FB2500000000000000000008 /* GestureHelp.swift in Sources */,
 				FB2500000000000000000009 /* RemoteHostDirectory.swift in Sources */,
 				A11500000000000000000001 /* RemoteFeatureNegotiation.swift in Sources */,
+				C71500000000000000000002 /* RemoteMonitorState.swift in Sources */,
+				C71500000000000000000001 /* RemoteMonitorProtocol.swift in Sources */,
 				F1F500000000000000000006 /* RemoteMouseControls.swift in Sources */,
 				F1F500000000000000000005 /* RemoteMouseInput.swift in Sources */,
 				F1F500000000000000000004 /* RemoteMouseMode.swift in Sources */,
@@ -491,6 +508,9 @@
 				FA2300000000000000000008 /* SettingsCopyTests.swift in Sources */,
 				FA2300000000000000000009 /* RemoteHostDirectoryTests.swift in Sources */,
 				A11500000000000000000002 /* RemoteInputProtocolTests.swift in Sources */,
+				C71500000000000000000005 /* RemoteMonitorIntegrationTests.swift in Sources */,
+				C71500000000000000000004 /* RemoteMonitorStateTests.swift in Sources */,
+				C71500000000000000000003 /* RemoteMonitorProtocolTests.swift in Sources */,
 				F1F50000000000000000000A /* RemoteSessionInputTests.swift in Sources */,
 				F1F500000000000000000009 /* RemoteMouseInputTests.swift in Sources */,
 				F1F500000000000000000008 /* RemoteKeyboardStateTests.swift in Sources */,

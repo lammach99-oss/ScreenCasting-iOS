@@ -116,7 +116,10 @@ public struct RemoteCommittedTextCommand: Equatable {
 /// Connection-scoped, networkQueue owned. No unknown ID is sent until marked Pong.
 struct RemoteFeatureNegotiation {
     static let supportedFlag: UInt16 = 0x4000
-    static let knownFeatures: UInt64 = 3
+    static let knownFeatures: UInt64 = 7
+    private let requestedFeatures: UInt64
+    // Input-only callers retain their mask; remote sessions explicitly request 7.
+    init(requestedFeatures: UInt64 = 3) { self.requestedFeatures = requestedFeatures }
     private enum Phase { case initial, pong, result, legacy, complete }
     private var phase: Phase = .initial
     private var deadline: TimeInterval = 0
@@ -134,11 +137,13 @@ struct RemoteFeatureNegotiation {
     mutating func pong(flags: UInt16, now: TimeInterval) -> Data? {
         guard phase == .pong else { return nil }
         guard now < deadline, flags & Self.supportedFlag != 0 else { phase = .legacy; return nil }
-        phase = .result; return RemoteFeaturesMessage(features: Self.knownFeatures).encode()
+        phase = .result; return RemoteFeaturesMessage(features: requestedFeatures).encode()
     }
     mutating func result(flags: UInt16, payload: Data) -> Bool {
         guard phase == .result else { return false }; phase = .legacy
-        guard flags == 0, let message = RemoteFeaturesMessage.decode(payload), message.features & ~Self.knownFeatures == 0 else { return false }
+        guard flags == 0, let message = RemoteFeaturesMessage.decode(payload),
+              message.features & ~Self.knownFeatures == 0, message.features & ~requestedFeatures == 0,
+              message.features & 4 == 0 || message.features & 3 == 3 else { return false }
         accepted = message.features; phase = .complete; return true
     }
     mutating func receiveContext(flags: UInt16, payload: Data) -> Bool {

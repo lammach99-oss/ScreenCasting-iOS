@@ -56,6 +56,10 @@ enum WireMessageType: UInt8 {
     case remoteCommand = 57, remoteCommandResult = 58, sessionInfoRequest = 59, sessionInfo = 60
     case remoteFeaturesRequest = 61, remoteFeaturesResult = 62, remoteInputContext = 63
     case remoteScanKey = 64, remotePointer = 65, remoteInputReset = 66, remoteCommittedText = 67
+    case remoteMonitorCatalogueRequest = 68
+    case remoteMonitorCatalogue = 69
+    case remoteMonitorSelectRequest = 70
+    case remoteMonitorSelectResult = 71
 }
 
 /// Toolbar actions the remote host runs on the PC. Payload: [version 1, command, flags(bit0 confirm)].

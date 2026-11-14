@@ -325,7 +325,10 @@ public class NetworkManager: ObservableObject {
     }
     var remoteKeyboardGeneration: UInt64 { connectionGenerationClock.current }
     private var remoteInputConnection = false
-    private var remoteFeatures = RemoteFeatureNegotiation()
+    private var remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: 7)
+    private var remoteMonitors = RemoteMonitorState()
+    private let remoteMonitorPublicationClock = ConnectionGenerationClock()
+    @Published public private(set) var remoteMonitorState = RemoteMonitorState()
     private var remoteFeaturesPingNonce: UInt64?
     @Published public private(set) var remoteInputFeatures: UInt64 = 0
     @Published public private(set) var remoteInputReady = false
@@ -1273,6 +1276,8 @@ public class NetworkManager: ObservableObject {
     private func publishRemoteInputOnQueue(contextChanged: Bool = true) {
         let generation = connectionGeneration, context = remoteFeatures.context, features = remoteFeatures.accepted
         let ready = remoteFeatures.inputReady
+        remoteMonitors.receiveContext(context, session: remoteMonitors.session)
+        publishRemoteMonitorsOnQueue()
         DispatchQueue.main.async { [weak self] in
             guard let self, self.connectionGenerationClock.current == generation else { return }
             self.remoteInputContext = context; self.remoteInputFeatures = features; self.remoteInputReady = ready
@@ -1280,15 +1285,76 @@ public class NetworkManager: ObservableObject {
         }
     }
     private func resetRemoteInputOnQueue() {
-        remoteFeatures = RemoteFeatureNegotiation(); remoteFeaturesPingNonce = nil
+        remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: 7); remoteFeaturesPingNonce = nil
+        remoteMonitors.begin(session: UUID(), acceptedFeatures: 0)
         publishRemoteInputOnQueue()
+    }
+
+    private func publishRemoteMonitorsOnQueue() {
+        let snapshot = remoteMonitors
+        let publication = remoteMonitorPublicationClock.advance()
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.remoteMonitorPublicationClock.current == publication else { return }
+            self.remoteMonitorState = snapshot
+        }
+    }
+    private func requestRemoteCatalogueOnQueue() {
+        guard remoteInputConnection, remoteFeatures.accepted & 7 == 7,
+              wireAuthenticatedGeneration == connectionGeneration,
+              let request = remoteMonitors.catalogueRequest(session: remoteMonitors.session) else { return }
+        sendWireMessage(type: .remoteMonitorCatalogueRequest, payload: request.encode(), sequence: 0)
+    }
+    public func refreshRemoteScreens() {
+        let generation = connectionGenerationClock.current, session = remoteMonitorState.session
+        networkQueue.async { [weak self] in
+            guard let self, self.connectionGeneration == generation, self.remoteMonitors.session == session else { return }
+            self.requestRemoteCatalogueOnQueue()
+        }
+    }
+    public func requestRemoteMonitor(_ id: UInt64, catalogue: RemoteMonitorCatalogueCommand) {
+        let generation = connectionGenerationClock.current, session = remoteMonitorState.session
+        networkQueue.async { [weak self] in
+            guard let self, self.connectionGeneration == generation, self.remoteMonitors.session == session,
+                  self.remoteInputConnection, self.remoteFeatures.accepted & 7 == 7,
+                  self.wireAuthenticatedGeneration == generation, self.committedTransportGeneration == generation,
+                  self.transportState == .streaming, let connection = self.activeControlConnection else { return }
+            guard let request = self.remoteMonitors.select(targetId: id, catalogue: catalogue, session: session),
+                  let payload = request.encode() else {
+                self.publishRemoteMonitorsOnQueue()
+                if self.remoteMonitors.needsCatalogueRefresh { self.requestRemoteCatalogueOnQueue() }
+                return
+            }
+            self.publishRemoteMonitorsOnQueue()
+            // The service publishes paused/new contexts; the existing context/IDR rule owns input.
+            self.sendWireMessage(type: .remoteMonitorSelectRequest, payload: payload, sequence: 0) { [weak self] error in
+                guard let self, error != nil, self.connectionGeneration == generation,
+                      self.activeControlConnection === connection, self.remoteMonitors.session == session else { return }
+                self.remoteMonitors.selectionFailed(requestId: request.requestId, session: session)
+                self.publishRemoteMonitorsOnQueue()
+                self.requestRemoteCatalogueOnQueue()
+            }
+            self.networkQueue.asyncAfter(deadline: .now() + 10) { [weak self] in
+                guard let self, self.connectionGeneration == generation, self.activeControlConnection === connection,
+                      self.remoteMonitors.session == session,
+                      self.remoteMonitors.pending?.request.requestId == request.requestId else { return }
+                self.remoteMonitors.selectionFailed(requestId: request.requestId, session: session)
+                self.publishRemoteMonitorsOnQueue()
+                self.requestRemoteCatalogueOnQueue()
+            }
+        }
     }
 
     private func remoteInputPacketIsCurrent(_ data: Data) -> Bool {
         guard data.count >= 16, let type = WireMessageType(rawValue: data[5]) else { return true }
-        if !remoteInputConnection { return !(61...67).contains(type.rawValue) }
+        if !remoteInputConnection { return !(61...71).contains(type.rawValue) }
         let payload = Data(data.dropFirst(16))
         switch type {
+        case .remoteMonitorCatalogueRequest:
+            return remoteMonitors.enabled && remoteFeatures.accepted & 7 == 7 && RemoteMonitorCatalogueRequest.decode(payload) != nil
+        case .remoteMonitorSelectRequest:
+            guard remoteMonitors.enabled, remoteFeatures.accepted & 7 == 7,
+                  let request = RemoteMonitorSelectCommand.decode(payload) else { return false }
+            return remoteMonitors.pending?.request == request
         case .remoteScanKey:
             guard let key = RemoteScanKeyCommand.decode(payload) else { return false }
             return remoteFeatures.maySend(feature: 1, token: key.token)
@@ -3917,12 +3983,32 @@ public class NetworkManager: ObservableObject {
             guard remoteInputConnection, remoteFeatures.result(flags: header.flags, payload: payload) else {
                 handleStreamError("Invalid remote feature result."); return
             }
+            remoteMonitors.begin(session: UUID(), acceptedFeatures: remoteFeatures.accepted)
             publishRemoteInputOnQueue()
+            requestRemoteCatalogueOnQueue()
         case .remoteInputContext:
             guard remoteInputConnection, remoteFeatures.receiveContext(flags: header.flags, payload: payload) else {
                 handleStreamError("Invalid remote input context."); return
             }
             publishRemoteInputOnQueue()
+        case .remoteMonitorCatalogue:
+            guard remoteInputConnection, remoteMonitors.enabled, remoteFeatures.accepted & 7 == 7,
+                  header.flags == 0, let catalogue = RemoteMonitorCatalogueCommand.decode(payload) else {
+                handleStreamError("Invalid remote monitor catalogue."); return
+            }
+            remoteMonitors.receiveCatalogue(catalogue, session: remoteMonitors.session)
+            publishRemoteMonitorsOnQueue()
+        case .remoteMonitorSelectResult:
+            guard remoteInputConnection, remoteMonitors.enabled, remoteFeatures.accepted & 7 == 7,
+                  header.flags == 0, let result = RemoteMonitorSelectResultCommand.decode(payload) else {
+                handleStreamError("Invalid remote monitor selection result."); return
+            }
+            if remoteMonitors.receiveResult(result, session: remoteMonitors.session) {
+                publishRemoteMonitorsOnQueue()
+                if remoteMonitors.needsCatalogueRefresh { requestRemoteCatalogueOnQueue() }
+            }
+        case .remoteMonitorCatalogueRequest, .remoteMonitorSelectRequest:
+            handleStreamError("Unexpected client-direction remote monitor command.")
         case .remoteFeaturesRequest, .remoteScanKey, .remotePointer, .remoteInputReset, .remoteCommittedText:
             handleStreamError("Unexpected client-direction remote input.")
         case .remoteCommandResult, .sessionInfo:
@@ -4737,6 +4823,17 @@ public class NetworkManager: ObservableObject {
     #if targetEnvironment(simulator)
     // Captures the real pending-switch completion without wall-clock sleeps in XCTest.
     var mirrorSwitchDeadlineForTesting: ((TimeInterval, @escaping () -> Void) -> Void)?
+    func beginRemoteMonitorForTesting(acceptedFeatures: UInt64) {
+        networkQueue.sync {
+            remoteInputConnection = true
+            resetRemoteInputOnQueue()
+            _ = remoteFeatures.begin(now: 0)
+            _ = remoteFeatures.pong(flags: 0x4000, now: 1)
+            let payload = RemoteFeaturesMessage(features: acceptedFeatures).encode()
+            handleWireMessage(WireMessage(header: WireHeader(type: .remoteFeaturesResult, flags: 0,
+                payloadLength: payload.count, sequence: 0), payload: payload, firstByteAt: 0), generation: connectionGeneration)
+        }
+    }
     func beginMirrorControlForTesting(generation:UInt64, monitorSelection:Bool=false, terminal:Bool=false) {
         mirrorControl.beginSession(generation)
         _=mirrorControl.helloIfAdvertised(session:generation,flags:terminal ? 0x7000:(monitorSelection ? 0x6000:0x4000))

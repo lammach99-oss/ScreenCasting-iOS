@@ -251,6 +251,11 @@ final class WireStreamParser {
             flags: flags,
             payloadLength: payloadLength,
             sequence: sequence)
+        // Monitor extensions fail closed before allocating a payload buffer.
+        if (68...71).contains(type.rawValue) &&
+            (flags != 0 || !RemoteMonitorProtocol.isValidLength(type: type.rawValue, length: payloadLength)) {
+            state = .failed; payload = Data(); onEvent(.failure(.invalidHeader)); return
+        }
         let fixedLength: Int?
         switch type {
         case .remoteFeaturesRequest, .remoteFeaturesResult, .remoteScanKey, .remoteInputReset: fixedLength = 16
