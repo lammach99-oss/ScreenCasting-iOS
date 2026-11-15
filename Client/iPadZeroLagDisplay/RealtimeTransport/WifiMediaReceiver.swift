@@ -995,6 +995,16 @@ final class WifiMediaReceiver {
     private var lastFrameTimestamp: UInt32?
     private var frameIntervalMs: Double = 1000.0 / 120.0
     private var dependencyBreakActive = false
+    private var captureSuspended = false
+    func setCaptureSuspended(_ suspended: Bool) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard captureSuspended != suspended else { return }
+        captureSuspended = suspended
+        if suspended {
+            dependencyBreakActive = false; pendingRecoveryIdr = nil; recoveryEpisodeStartedAt = nil
+            mediaProcessor?.prepareForFreshIDRAnchor()
+        }
+    }
     private var recoveryEpisode: UInt32 = 0
     private var recoveryEpisodeStartedAt: TimeInterval?
     private var preservedSessionRecoveryGeneration: UInt64?
@@ -1308,7 +1318,7 @@ final class WifiMediaReceiver {
 
     func requestImmediateRecoveryFeedback(generation: UInt64) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
-        guard activeGeneration == generation else { return }
+        guard activeGeneration == generation, !captureSuspended else { return }
         guard !dependencyBreakActive else {
             if pendingRecoveryIdr != nil {
                 beginRecoveryEpisode()
@@ -1360,6 +1370,7 @@ final class WifiMediaReceiver {
     private func beginRecoveryEpisode(
         startedAt: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) {
+        guard !captureSuspended else { return }
         feedbackLedger.beginRecoveryEpisode()
         recoveryEpisode &+= 1
         if recoveryEpisode == 0 { recoveryEpisode = 1 }
@@ -1372,6 +1383,7 @@ final class WifiMediaReceiver {
     }
 
     func clearOffer() {
+        captureSuspended = false
         dispatchPrecondition(condition: .onQueue(networkQueue))
         inputWriter.cancel()
         connection?.cancel()
@@ -1667,6 +1679,7 @@ final class WifiMediaReceiver {
     }
 
     private func handleFeedbackTimerTick(now: TimeInterval) {
+        if captureSuspended { sendFeedback(immediate: false); return }
         if dependencyBreakActive,
            pendingRecoveryIdr == nil,
            let startedAt = recoveryEpisodeStartedAt,

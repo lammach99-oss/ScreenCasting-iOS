@@ -251,6 +251,18 @@ final class WireStreamParser {
             flags: flags,
             payloadLength: payloadLength,
             sequence: sequence)
+        // This advisory extension ignores bounded malformed traffic instead of
+        // turning a security-prompt notice into a session failure.
+        switch type {
+        case .captureAvailabilityHello, .captureAvailability:
+            if type != .captureAvailability || flags != 0 || payloadLength != 8 {
+                payload = Data(); payloadOffset = 0
+                if payloadLength == 0 { resetForNextHeader(); onEvent(.discardedFixedControl(header)) }
+                else { state = .draining(header, remaining: payloadLength) }
+                return
+            }
+        default: break
+        }
         if (76...79).contains(type.rawValue) &&
             !ConnectionControlProtocol.validInbound(type: type.rawValue, flags: flags, length: payloadLength) {
             state = .failed; payload = Data(); onEvent(.failure(.invalidHeader)); return

@@ -937,7 +937,13 @@ public class PencilUIKitView: UIView {
     // deterministically without synthesizing UIKit hardware events.
     @discardableResult
     func handleHardwareKey(_ usage: UIKeyboardHIDUsage, action: KeyboardInputAction) -> Bool {
-        if action == .keyDown && (!keyboardCaptureEnabled || softwareResponderOwnsInput) && hardwareKeyActivityEnabled {
+        if softwareResponderOwnsInput {
+            // Key activity can synchronously reconcile responder ownership. The
+            // owner at entry still receives this event through UIKit.
+            if action == .keyDown && hardwareKeyActivityEnabled { onHardwareKeyActivity?() }
+            return false
+        }
+        if action == .keyDown && !keyboardCaptureEnabled && hardwareKeyActivityEnabled {
             onHardwareKeyActivity?()
         }
         guard !softwareResponderOwnsInput, keyboardCaptureEnabled,

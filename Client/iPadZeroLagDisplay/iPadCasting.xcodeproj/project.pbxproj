@@ -8,10 +8,12 @@
 
 /* Begin PBXBuildFile section */
 		F4C150000000000000000005 /* ConnectionControlIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4C140000000000000000005 /* ConnectionControlIntegrationTests.swift */; };
+		CA8115000000000000000002 /* SecureDesktopRecoveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA8114000000000000000002 /* SecureDesktopRecoveryTests.swift */; };
 		F4C150000000000000000004 /* ConnectionSwitchStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4C140000000000000000004 /* ConnectionSwitchStateTests.swift */; };
 		F4C150000000000000000003 /* ConnectionControlProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4C140000000000000000003 /* ConnectionControlProtocolTests.swift */; };
 		F4C150000000000000000002 /* ConnectionSwitchState.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4C140000000000000000002 /* ConnectionSwitchState.swift */; };
 		F4C150000000000000000001 /* ConnectionControlProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4C140000000000000000001 /* ConnectionControlProtocol.swift */; };
+		CA8115000000000000000001 /* CaptureAvailability.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA8114000000000000000001 /* CaptureAvailability.swift */; };
 		300111111111111111111101 /* iPadZeroLagDisplayApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200111111111111111111101 /* iPadZeroLagDisplayApp.swift */; };
 		300111111111111111111102 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200211111111111111111102 /* ContentView.swift */; };
 		300111111111111111111103 /* MetalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200311111111111111111103 /* MetalView.swift */; };
@@ -122,10 +124,12 @@
 
 /* Begin PBXFileReference section */
 		F4C140000000000000000005 /* ConnectionControlIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionControlIntegrationTests.swift; sourceTree = "<group>"; };
+		CA8114000000000000000002 /* SecureDesktopRecoveryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureDesktopRecoveryTests.swift; sourceTree = "<group>"; };
 		F4C140000000000000000004 /* ConnectionSwitchStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionSwitchStateTests.swift; sourceTree = "<group>"; };
 		F4C140000000000000000003 /* ConnectionControlProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionControlProtocolTests.swift; sourceTree = "<group>"; };
 		F4C140000000000000000002 /* ConnectionSwitchState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionSwitchState.swift; sourceTree = "<group>"; };
 		F4C140000000000000000001 /* ConnectionControlProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionControlProtocol.swift; sourceTree = "<group>"; };
+		CA8114000000000000000001 /* CaptureAvailability.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureAvailability.swift; sourceTree = "<group>"; };
 		111111111111111111111100 /* iPadCasting.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = iPadCasting.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		200111111111111111111101 /* iPadZeroLagDisplayApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = iPadZeroLagDisplayApp.swift; sourceTree = "<group>"; };
 		200211111111111111111102 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -265,6 +269,7 @@
 				FB2400000000000000000001 /* WireCommands.swift */,
 				F4C140000000000000000002 /* ConnectionSwitchState.swift */,
 				F4C140000000000000000001 /* ConnectionControlProtocol.swift */,
+				CA8114000000000000000001 /* CaptureAvailability.swift */,
 				FB2400000000000000000005 /* ScreenPickerModel.swift */,
 				FB2400000000000000000006 /* SessionPanelOverlay.swift */,
 				FB2400000000000000000007 /* ConnectScreenModel.swift */,
@@ -339,6 +344,7 @@
 				C71400000000000000000004 /* RemoteMonitorStateTests.swift */,
 				C81400000000000000000003 /* CaptureTargetProtocolTests.swift */,
 				F4C140000000000000000005 /* ConnectionControlIntegrationTests.swift */,
+				CA8114000000000000000002 /* SecureDesktopRecoveryTests.swift */,
 				F4C140000000000000000004 /* ConnectionSwitchStateTests.swift */,
 				F4C140000000000000000003 /* ConnectionControlProtocolTests.swift */,
 				C81400000000000000000004 /* CaptureTargetStateTests.swift */,
@@ -480,6 +486,7 @@
 				FB2500000000000000000001 /* WireCommands.swift in Sources */,
 				F4C150000000000000000002 /* ConnectionSwitchState.swift in Sources */,
 				F4C150000000000000000001 /* ConnectionControlProtocol.swift in Sources */,
+				CA8115000000000000000001 /* CaptureAvailability.swift in Sources */,
 				FB2500000000000000000005 /* ScreenPickerModel.swift in Sources */,
 				FB2500000000000000000006 /* SessionPanelOverlay.swift in Sources */,
 				FB2500000000000000000007 /* ConnectScreenModel.swift in Sources */,
@@ -546,6 +553,7 @@
 				C71500000000000000000004 /* RemoteMonitorStateTests.swift in Sources */,
 				C81500000000000000000003 /* CaptureTargetProtocolTests.swift in Sources */,
 				F4C150000000000000000005 /* ConnectionControlIntegrationTests.swift in Sources */,
+				CA8115000000000000000002 /* SecureDesktopRecoveryTests.swift in Sources */,
 				F4C150000000000000000004 /* ConnectionSwitchStateTests.swift in Sources */,
 				F4C150000000000000000003 /* ConnectionControlProtocolTests.swift in Sources */,
 				C81500000000000000000004 /* CaptureTargetStateTests.swift in Sources */,

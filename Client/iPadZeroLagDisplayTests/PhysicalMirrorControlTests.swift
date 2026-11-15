@@ -28,6 +28,27 @@ final class PhysicalMirrorControlTests: XCTestCase {
         XCTAssertNil(model.helloIfAdvertised(session: 7, flags: 0))
         XCTAssertTrue(model.allowsLegacyVirtualInput); XCTAssertNil(model.captureTicket())
     }
+    func testLegacyRegistrationCompatibilityDoesNotAdmitNewInputDuringPause() {
+        for typed in [false, true] {
+            let control = MirrorClientControl(); control.beginSession(7)
+            if typed { control.enableTypedSources(session: 7) }
+            let registration = control.gestureRevision
+            XCTAssertTrue(control.legacyRegistrationIsCurrent(revision: registration))
+            control.setForeground(false)
+            XCTAssertEqual(control.legacyRegistrationIsCurrent(revision: registration), !typed)
+            XCTAssertFalse(control.allowsLegacyVirtualInput, "registration validity is not permission to start input")
+            control.setForeground(true)
+            XCTAssertEqual(control.legacyRegistrationIsCurrent(revision: registration), !typed)
+            control.setCaptureSuspended(true)
+            XCTAssertFalse(control.legacyRegistrationIsCurrent(revision: registration))
+            XCTAssertFalse(control.allowsLegacyVirtualInput)
+            control.setCaptureSuspended(false)
+            XCTAssertEqual(control.legacyRegistrationIsCurrent(revision: registration), !typed)
+            control.setConnectionInputBlocked(true)
+            XCTAssertFalse(control.legacyRegistrationIsCurrent(revision: registration))
+        }
+    }
+
     func testHelloIsExactAndSentOncePerAuthenticatedConnection() {
         let model = self.model()
         XCTAssertNil(model.helloIfAdvertised(session: 7, flags: 0x4000))

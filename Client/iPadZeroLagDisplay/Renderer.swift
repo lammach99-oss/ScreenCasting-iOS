@@ -597,6 +597,7 @@ public class Renderer: NSObject, MTKViewDelegate {
         case gameRepeated
     }
 
+    var onFramePresented: ((UInt32, UInt64) -> Void)?
     public var onFrameRendered: ((UInt32, UInt64) -> Void)?
     public var onDrawableCommitted: ((UInt32, UInt64) -> Void)?
     public var onFrameDropped: ((UInt32, UInt64) -> Void)?
@@ -1039,6 +1040,16 @@ public class Renderer: NSObject, MTKViewDelegate {
         }
 
         let presentedDrawableSize = CGSize(width: drawable.texture.width, height: drawable.texture.height)
+        // Availability needs actual display evidence, independently of GPU completion
+        // telemetry. A dropped drawable reports zero presentedTime.
+        drawable.addPresentedHandler { [weak self] presented in
+            guard let self, CapturePresentationPolicy.confirmed(time: presented.presentedTime) else { return }
+            self.lock.lock()
+            let current = self.freshness.isCurrent(identity)
+            self.lock.unlock()
+            guard current else { return }
+            self.onFramePresented?(identity.sequence, identity.generation)
+        }
         commandBuffer.present(drawable)
         let retainedPixelBuffer = pixelBuffer
         commandBuffer.addCompletedHandler { [weak self] completedBuffer in

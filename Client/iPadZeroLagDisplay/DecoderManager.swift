@@ -450,6 +450,14 @@ public final class DecoderManager {
         onSessionBegan?(generation)
     }
 
+    // Drop pre-suspension decode tickets without changing VT/session/renderer ownership.
+    // The renderer keeps its last image; only a fresh IDR may restart the mailbox chain.
+    func fenceCaptureContinuation() {
+        mailboxStateLock.lock()
+        mailbox.beginSession(generation: localSessionGeneration)
+        mailboxStateLock.unlock()
+    }
+
     /// Changes only the bounded decode age policy; never waits for the decoder queue.
     @discardableResult
     public func configureRefreshRate(_ refreshHz: UInt32) -> Bool {

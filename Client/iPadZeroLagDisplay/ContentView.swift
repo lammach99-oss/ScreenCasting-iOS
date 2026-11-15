@@ -618,6 +618,13 @@ public struct ContentView: View {
         if streamManager.isConnected {
             ZStack {
                 streamingHUD
+                VStack {
+                    CaptureAvailabilityNotice(message: networkManager.captureAvailabilityNotice)
+                        .padding(.top, sessionPillHeight + (isHudVisible && !isSessionPanelOpen ? 48 : 24))
+                        .padding(.horizontal, 24)
+                    Spacer()
+                }
+                .allowsHitTesting(false)
                 SessionPanelOverlay(
                     networkManager: networkManager,
                     hostLabel: SessionPanelSnapshot.sessionHost(current: lastHostLabel, lastWifi: lastWifiHostLabel,

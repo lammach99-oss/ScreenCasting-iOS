@@ -70,7 +70,17 @@ public final class MirrorClientControl {
     private var screenPickerCapable=false
     private var captureTargetInputBlocked=false
     private var connectionInputBlocked=false
+    private var captureSuspended = false
+    private var captureDescriptorPending = false
+    private var captureDescriptorRevision: UInt64 = 0
     private var inputLifetime = InputLifetime()
+    // Local eligibility only. Keep consent, presentation acknowledgements and held-input ownership.
+    public func setCaptureSuspended(_ blocked: Bool) {
+        synchronized {
+            guard captureSuspended != blocked else { return }
+            captureSuspended = blocked; revision &+= 1
+        }
+    }
     public func setConnectionInputBlocked(_ blocked: Bool) {
         synchronized {
             guard connectionInputBlocked != blocked else { return }
@@ -88,7 +98,7 @@ public final class MirrorClientControl {
 
     public func beginSession(_ generation:UInt64) {
         synchronized {
-            session=generation;revision &+= 1;ordinal=0;advertised=false;helloSent=false
+            captureSuspended=false;captureDescriptorPending=false;captureDescriptorRevision=0;session=generation;revision &+= 1;ordinal=0;advertised=false;helloSent=false
             inputLifetime = InputLifetime()
             state=nil;rendered=nil;acknowledgedEpoch=nil;lastAcknowledged=nil;suspended=false;transportFloor=nil;settingsOpen=false
             terminalCapable=false;terminalSwitch=nil;screenPickerCapable=false;captureTargetInputBlocked=false;typedSources=false
@@ -116,7 +126,7 @@ public final class MirrorClientControl {
         }
     }
     /// Once PMR is advertised, absence of a descriptor is not permission to send legacy input.
-    public var allowsLegacyVirtualInput:Bool { synchronized{!connectionInputBlocked && session != 0 && foreground && (!typedSources || !settingsOpen) && !captureTargetInputBlocked && (!advertised || state?.mode == .virtualDisplay)} }
+    public var allowsLegacyVirtualInput:Bool { synchronized{!captureSuspended && !captureDescriptorPending && !connectionInputBlocked && session != 0 && foreground && (!typedSources || !settingsOpen) && !captureTargetInputBlocked && (!advertised || state?.mode == .virtualDisplay)} }
 
     public var gestureRevision:UInt64 { synchronized{revision} }
 
@@ -124,7 +134,10 @@ public final class MirrorClientControl {
         synchronized { if generation == session && generation != 0 { typedSources=true } }
     }
     public func legacyRegistrationIsCurrent(revision captured: UInt64) -> Bool {
-        synchronized { !connectionInputBlocked && captured == revision && !captureTargetInputBlocked }
+        synchronized {
+            !captureSuspended && !captureDescriptorPending && !connectionInputBlocked &&
+                (!typedSources || captured == revision && !captureTargetInputBlocked)
+        }
     }
 
     /// Retire registrations in either input mode without revoking the Host's attended consent.
@@ -162,6 +175,14 @@ public final class MirrorClientControl {
         let next=try MirrorControlCodec.decodeState(data)
         lock.lock();defer{lock.unlock()}
         guard generation==session,generation != 0,advertised,helloSent else {throw MirrorControlError.denied}
+        if captureSuspended, let old=state, next.revision > max(old.revision, captureDescriptorRevision),
+           next.epoch == old.epoch, next.source == old.source,
+           next.mode == .unavailable || next.mode == .faulted {
+            // Preserve picture admission, but never revive control from a retained token.
+            captureDescriptorPending = true; captureDescriptorRevision = next.revision
+            return nil
+        }
+        if captureDescriptorPending, next.revision <= captureDescriptorRevision { return nil }
         if let old=state {
             if next.revision <= old.revision {return nil}
             guard next.epoch >= old.epoch else {throw MirrorControlError.stale}
@@ -173,6 +194,7 @@ public final class MirrorClientControl {
         if retire {revision &+= 1;ordinal=0;inputLifetime = InputLifetime()}
         if old?.epoch != next.epoch {acknowledgedEpoch=nil;lastAcknowledged=nil;rendered=nil}
         if old?.token != next.token || next.mode != .active {suspended=false}
+        captureDescriptorPending = false
         state=next
         if let floor=transportFloor, next.epoch>floor, next.mode != .active {
             transportFloor=nil
@@ -320,7 +342,7 @@ public final class MirrorClientControl {
     }
     public func captureTicket()->MirrorInputTicket? {
         synchronized {
-            guard !connectionInputBlocked else { return nil }
+            guard !captureSuspended, !captureDescriptorPending, !connectionInputBlocked else { return nil }
             guard !captureTargetInputBlocked,terminalSwitch == nil,transportFloor == nil,foreground,!settingsOpen,!suspended,let s=state,s.mode == .active,!s.token.isEmpty,
                   acknowledgedEpoch==s.epoch,let first=s.firstFrame,let seen=rendered,
                   MirrorControlCodec.sequenceAtOrAfter(seen,first) else {return nil}
@@ -340,7 +362,7 @@ public final class MirrorClientControl {
         let encoded = try MirrorControlCodec.encodeInput(MirrorInputEnvelope(epoch: s.epoch, source: s.source,
             token: s.token, sequence: ordinal + 1, kind: kind, payload: payload))
         guard inputLifetime.accept(kind: kind, payload: payload, generation: ticket.session,
-            revision: ticket.uiRevision, mayStart: foreground && !settingsOpen && ticket.uiRevision == revision)
+            revision: ticket.uiRevision, mayStart: !captureSuspended && !captureDescriptorPending && foreground && !settingsOpen && ticket.uiRevision == revision)
         else { throw MirrorControlError.stale }
         ordinal+=1
         return encoded

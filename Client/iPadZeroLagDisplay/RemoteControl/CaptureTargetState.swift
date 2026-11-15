@@ -18,6 +18,8 @@ public struct CaptureTargetState: Equatable {
     public private(set) var inputBlocked = false
     public private(set) var needsCatalogueRefresh = false
     public private(set) var listUnavailable = false
+    private var retainedPresentation: CaptureTargetResult?
+    public private(set) var awaitingReattachIDR = false
     private var owner: UInt64?
     private var nextTransaction: UInt64 = 0
     private var latestRevision: UInt64 = 0
@@ -29,13 +31,22 @@ public struct CaptureTargetState: Equatable {
         self = Self(); self.generation = generation
     }
     /// A route changes the frame sequence domain but not the authenticated owner's consumed transactions.
-    public mutating func retireRoute() {
+    public mutating func retireRoute(preserveAppliedSource: Bool = false) {
         let generation = self.generation, enabled = self.enabled, nextTransaction = self.nextTransaction, owner = self.owner
         let latestRevision = self.latestRevision
+        let previous = preserveAppliedSource ? applied : nil
+        let catalogue = self.catalogue
         self = Self(); self.generation = generation; self.enabled = enabled
         self.nextTransaction = nextTransaction; self.owner = owner; inputBlocked = enabled
         self.latestRevision = latestRevision
         unknownOutcome = enabled; needsCatalogueRefresh = enabled
+        if let previous {
+            self.catalogue = catalogue
+            applied = CaptureTargetResult(status: previous.status, state: previous.state, kind: previous.kind,
+                transaction: previous.transaction, owner: previous.owner, revision: previous.revision,
+                currentId: previous.currentId, epoch: previous.epoch, source: previous.source, firstFrame: 0)
+            awaitingReattachIDR = true; unknownOutcome = false
+        }
     }
     public mutating func advertise(flags: UInt16, generation: UInt64) -> Data? {
         guard generation != 0, generation == self.generation, !enabled,
@@ -47,21 +58,43 @@ public struct CaptureTargetState: Equatable {
         guard session == self.session, enabled else { return nil }
         return CaptureTargetProtocol.hello(knownRevision: needsCatalogueRefresh ? 0 : catalogue?.revision ?? 0)
     }
-    @discardableResult public mutating func receiveCatalogue(_ value: CaptureTargetCatalogue, session: UUID) -> Bool {
+    @discardableResult public mutating func receiveCatalogue(_ value: CaptureTargetCatalogue, session: UUID,
+                                                               preservingSuspendedPresentation: Bool = false) -> Bool {
         guard session == self.session, enabled, owner == nil || owner == value.owner,
               value.revision > latestRevision else { return false }
         latestRevision = value.revision
+        if preservingSuspendedPresentation, pending == nil, let applied,
+           value.epoch == applied.epoch, value.state != 1,
+           value.currentId == 0 || value.currentId == applied.currentId,
+           value.entries.contains(where: { $0.id == applied.currentId && $0.kind == applied.kind }) {
+            // A temporary unavailable snapshot has no replacement authority. Keep the
+            // confirmed UI/picture, but consume its revision to reject stale refreshes.
+            return false
+        }
         owner = value.owner; catalogue = value; revisions[value.revision] = value; needsCatalogueRefresh = false
         // Terminal publication precedes the result. Keep recent revisions to resolve it without regressing the UI.
         if pending == nil { revisions = [value.revision: value] }
         if pending == nil { selectionSuppressed = false }
         listUnavailable = false
+        if let retained = retainedPresentation, pending == nil {
+            if value.currentId != retained.currentId || !value.entries.contains(where: { $0.id == retained.currentId && $0.kind == retained.kind }) {
+                retainedPresentation = nil
+            } else if value.state == 1, value.epoch >= retained.epoch {
+                applied = CaptureTargetResult(status: .applied, state: 1, kind: retained.kind,
+                    transaction: retained.transaction, owner: retained.owner, revision: value.revision,
+                    currentId: retained.currentId, epoch: value.epoch, source: retained.source,
+                    firstFrame: value.epoch == retained.epoch ? retained.firstFrame : 0)
+                retainedPresentation = nil; awaitingReattachIDR = true
+                unknownOutcome = false; inputBlocked = true; issue = nil
+            }
+        }
         return true
     }
     public mutating func select(_ id: UInt64, catalogue expected: CaptureTargetCatalogue, session: UUID) -> CaptureTargetRequest? {
         guard session == self.session, canSelect, !needsCatalogueRefresh,
               let catalogue, catalogue == expected, catalogue.state == 1, catalogue.allowed,
               let entry = catalogue.entries.first(where: { $0.id == id }), nextTransaction != UInt64.max else { return nil }
+        retainedPresentation = nil; awaitingReattachIDR = false
         nextTransaction += 1
         let request = CaptureTargetRequest(transaction: nextTransaction, owner: catalogue.owner,
                                           revision: catalogue.revision, targetId: id)
@@ -104,7 +137,7 @@ public struct CaptureTargetState: Equatable {
     }
     /// Called only for the owned decoder after Applied, never for reception/decode/write acknowledgements.
     @discardableResult public mutating func observeRendered(sequence: UInt32, session: UUID) -> Bool {
-        guard session == self.session, inputBlocked, let applied,
+        guard session == self.session, inputBlocked, !awaitingReattachIDR, let applied,
               MirrorControlCodec.sequenceAtOrAfter(sequence, applied.firstFrame) else { return false }
         inputBlocked = false
         return true
@@ -120,9 +153,22 @@ public struct CaptureTargetState: Equatable {
         listUnavailable = true
     }
     /// Supersession preserves monotonic transactions, but no old Applied or callback can reopen input.
-    public mutating func abandonPresentation(session: UUID) {
+    public mutating func abandonPresentation(session: UUID, allowSameSourceReattach: Bool = false) {
         guard session == self.session, enabled else { return }
+        if allowSameSourceReattach, pending == nil, let applied { retainedPresentation = applied }
+        else { retainedPresentation = nil }
+        awaitingReattachIDR = false
         pending = nil; applied = nil; unknownOutcome = true; inputBlocked = true; needsCatalogueRefresh = true
+    }
+    /// Reattachment has no new source request: a fresh IDR establishes its presentation floor.
+    @discardableResult mutating func anchorReattachedSource(sequence: UInt32, isIDR: Bool) -> Bool {
+        guard awaitingReattachIDR, let old = applied, isIDR,
+              MirrorControlCodec.sequenceAtOrAfter(sequence, old.firstFrame) else { return false }
+        applied = CaptureTargetResult(status: old.status, state: old.state, kind: old.kind,
+            transaction: old.transaction, owner: old.owner, revision: old.revision, currentId: old.currentId,
+            epoch: old.epoch, source: old.source, firstFrame: sequence)
+        awaitingReattachIDR = false
+        return true
     }
     public mutating func requireFreshPresentation(session: UUID) {
         guard session == self.session, applied != nil else { return }

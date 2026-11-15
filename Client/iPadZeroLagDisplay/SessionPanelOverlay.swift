@@ -555,8 +555,8 @@ private extension Color {
     }
 
     private var tools: some View {
-        let canType = networkManager.isRemoteControlSession ? (!remoteInput.usesScanKeyboard || remoteInput.keyboardEnabled)
-            : picker.canType
+        let canType = !networkManager.captureInputBlocked && (networkManager.isRemoteControlSession
+            ? (!remoteInput.usesScanKeyboard || remoteInput.keyboardEnabled) : picker.canType)
         return VStack(alignment: .leading, spacing: 8) {
             sectionTitle("Tools")
             SessionActionLayout(accessibility: typeSize.isAccessibilitySize) {
@@ -996,4 +996,36 @@ private struct SessionPerformanceLine: View {
 private struct SessionPillHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 44
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
+/// Intentional capture silence: same bare-text language as telemetry, no blocking panel.
+struct CaptureAvailabilityNotice: View {
+    let message: String?
+    @State private var announcement = CaptureAvailabilityAnnouncement()
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    var body: some View {
+        Group {
+            if let message {
+                Text(message)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color(ink: SessionInk.text))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .shadow(color: Color(ink: SessionInk.canvas), radius: 0.5, x: 0, y: 1)
+                    .background {
+                        if contrast == .increased { Color(ink: SessionInk.canvas) }
+                    }
+                    .accessibilityIdentifier("session.captureAvailability")
+            }
+        }
+        .allowsHitTesting(false)
+        .onAppear { announce() }
+        .onChange(of: message) { _, _ in announce() }
+    }
+    private func announce() {
+        if let text = announcement.update(message) {
+            UIAccessibility.post(notification: .announcement, argument: text)
+        }
+    }
 }

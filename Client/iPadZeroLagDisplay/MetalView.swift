@@ -73,6 +73,9 @@ public struct MetalView: UIViewRepresentable {
             }
             renderer.beginSession(
                 generation: networkManager.decoder.currentSessionGeneration)
+            renderer.onFramePresented = { [weak networkManager] sequence, generation in
+                networkManager?.recordCapturePresentation(sequence: sequence, generation: generation)
+            }
             renderer.onFrameRendered = { [weak coordinator = context.coordinator, weak networkManager] sequence, generation in
                 networkManager?.recordRenderCompletion(
                     sequence: sequence,
@@ -905,7 +908,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             } else if legacy && networkManager?.legacyInputIsCurrent(revision: binding) == true { textInput?(text) }
         }
         touchView.diagnosticSink = { [weak networkManager] line in networkManager?.recordDiagnosticLine(line) }
-        container.configureRemoteKeyboard(active: remoteKeyboardActive, generation: networkManager.remoteKeyboardGeneration)
+        container.configureRemoteKeyboard(active: remoteKeyboardActive && !networkManager.captureInputBlocked, generation: networkManager.remoteKeyboardGeneration)
         container.configureClientCursor(ownership: networkManager.cursorOwnershipState,
             generation: networkManager.remoteKeyboardGeneration, active: remoteKeyboardActive)
         let directInput = onDirectTouchContact
@@ -962,6 +965,9 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             networkManager?.recordDiagnosticLine(line)
         }
         renderer.beginSession(generation: networkManager.decoder.currentSessionGeneration)
+        renderer.onFramePresented = { [weak networkManager] sequence, generation in
+            networkManager?.recordCapturePresentation(sequence: sequence, generation: generation)
+        }
         renderer.onFrameRendered = { [weak coordinator, weak networkManager] sequence, generation in
             networkManager?.recordRenderCompletion(
                 sequence: sequence,

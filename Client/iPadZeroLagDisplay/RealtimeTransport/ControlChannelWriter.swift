@@ -144,6 +144,15 @@ final class ControlChannelWriter {
         }
     }
 
+    /// Drop unsent input at a local eligibility boundary, retaining terminal events
+    /// and the active write. Settle discarded work successfully: suspension is not a socket fault.
+    func discardPending(where predicate: (Data) -> Bool) {
+        dispatchPrecondition(condition: .onQueue(queue))
+        let removed = pending.filter { predicate($0.data) }
+        pending.removeAll { predicate($0.data) }
+        for item in removed { item.completion(nil) }
+    }
+
     /// Retires queued transfer frames without disturbing reliable input or the active write.
     func cancelBulk() {
         dispatchPrecondition(condition: .onQueue(queue))
