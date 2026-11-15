@@ -430,6 +430,7 @@ public final class ConnectedPresentationContainer: UIView {
     }
 
     func retireRemotePointerInputs() {
+        touchView.retireMirrorInputScope()
         retireDirectPointer()
         touchView.configureExternalPointer(active: false, generation: keyboardGeneration ?? 0)
     }
@@ -845,8 +846,17 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             touchView.retireMirrorInputScope()
             container.retireRemotePointerInputs()
             container.retireRemoteKeyboard() // Discards marked text before a new callback can acquire ownership.
+            coordinator.legacyLifetime = InputLifetime()
             coordinator.mirrorBindingRevision = binding
             coordinator.mirrorBindingSession = networkManager.remoteKeyboardGeneration
+        }
+        let inputGeneration = networkManager.remoteKeyboardGeneration
+        let legacyStartsEnabled = legacy && remoteKeyboardActive
+        let legacySend: (MirrorInputKind, Data) -> Bool = { [weak networkManager, weak coordinator] kind, payload in
+            guard networkManager?.remoteKeyboardGeneration == inputGeneration else { return false }
+            guard let coordinator else { return false }
+            return coordinator.legacyLifetime.accept(kind: kind, payload: payload, generation: inputGeneration,
+                revision: binding, mayStart: legacyStartsEnabled && networkManager?.permitsLegacyVirtualInput == true && networkManager?.legacyInputIsCurrent(revision: binding) == true)
         }
         let pencilInput = onPencilInput
         touchView.onPencilInput = { [weak container] packet in
@@ -857,23 +867,26 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         }
         let sendTouchEvent = onSendTouchEvent
         touchView.onSendTouchEvent = { [weak networkManager] type, x, y, pressure in
+            guard networkManager?.remoteKeyboardGeneration == inputGeneration else { return }
             if let ticket {
                 networkManager?.sendMirrorInput(ticket: ticket, kind: .pencil,
                     payload: NetworkManager.mirrorPencilPayload(type: type, x: x, y: y, pressure: pressure))
-            } else if legacy && networkManager?.legacyInputIsCurrent(revision: binding) == true { sendTouchEvent?(type, x, y, pressure) }
+            } else if legacySend(.pencil, NetworkManager.mirrorPencilPayload(type: type, x: x, y: y, pressure: pressure)) {
+                sendTouchEvent?(type, x, y, pressure)
+            }
         }
         let keyInput = onKeyboardInput
-        let inputGeneration = networkManager.remoteKeyboardGeneration
         let inputToken = networkManager.remoteInputContext?.token
         touchView.onKeyboardInput = { [weak networkManager, weak remoteInput] command in
+            guard networkManager?.remoteKeyboardGeneration == inputGeneration else { return }
             if networkManager?.isRemoteControlSession == true {
                 if remoteInput?.usesScanKeyboard == true {
                     if remoteInput?.acceptsText(token: inputToken, generation: inputGeneration) == true {
                         remoteInput?.softwareKey(command)
                     }
-                } else { networkManager?.sendKeyboardInput(command) }
+                } else if legacySend(.keyboard, command.encode()) { networkManager?.sendKeyboardInput(command) }
             } else if let ticket { networkManager?.sendMirrorInput(ticket: ticket, kind: .keyboard, payload: command.encode()) }
-            else if legacy && networkManager?.legacyInputIsCurrent(revision: binding) == true { keyInput?(command) }
+            else if legacySend(.keyboard, command.encode()) { keyInput?(command) }
         }
         let textInput = onTextCommit
         container.onTextCommit = { [weak networkManager, weak remoteInput] text in
@@ -897,17 +910,21 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             generation: networkManager.remoteKeyboardGeneration, active: remoteKeyboardActive)
         let directInput = onDirectTouchContact
         touchView.onDirectTouchContact = { [weak networkManager] command in
+            guard networkManager?.remoteKeyboardGeneration == inputGeneration else { return }
             if let ticket { networkManager?.sendMirrorInput(ticket: ticket, kind: .directTouch, payload: command.encode()) }
-            else if legacy && networkManager?.legacyInputIsCurrent(revision: binding) == true { directInput?(command) }
+            else if legacySend(.directTouch, command.encode()) { directInput?(command) }
         }
         let admitted = remoteKeyboardActive && (ticket != nil || legacy)
         touchView.configureDirectTouch(active: admitted, generation: binding)
         touchView.configureExternalPointer(active: admitted, generation: binding)
         let pointerInput = onPointerInput
         touchView.onPointerInput = { [weak networkManager] command in
-            if networkManager?.isRemoteControlSession == true { networkManager?.sendPointerInput(command) }
+            guard networkManager?.remoteKeyboardGeneration == inputGeneration else { return }
+            if networkManager?.isRemoteControlSession == true {
+                if legacySend(.pointer, command.encode()) { networkManager?.sendPointerInput(command) }
+            }
             else if let ticket { networkManager?.sendMirrorInput(ticket: ticket, kind: .pointer, payload: command.encode()) }
-            else if legacy && networkManager?.legacyInputIsCurrent(revision: binding) == true { pointerInput?(command) }
+            else if legacySend(.pointer, command.encode()) { pointerInput?(command) }
         }
         let openSettings = onOpenSettings
         touchView.onOpenSettings = { [weak container] in
@@ -999,6 +1016,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     public final class Coordinator {
         var remoteInputRevision: UInt64?
         var remoteInputWaiting = false
+        var legacyLifetime = InputLifetime()
         var mirrorBindingRevision: UInt64?
         var mirrorBindingSession: UInt64?
         var renderer: Renderer?

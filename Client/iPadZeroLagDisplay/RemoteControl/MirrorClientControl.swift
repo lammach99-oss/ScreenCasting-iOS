@@ -1,5 +1,51 @@
 import Foundation
 
+// Only admitted downs acquire ownership. Local eligibility may close before their
+// terminal callback; neither a new registration nor a new session inherits it.
+struct InputLifetime {
+    private enum Identity: Hashable { case key(UInt16), button, touch(UInt64), pencil }
+    private struct Owner: Equatable { let generation: UInt64; let revision: UInt64 }
+    private var owners: [Identity: Owner] = [:]
+
+    mutating func accept(kind: MirrorInputKind, payload: Data, generation: UInt64,
+                         revision: UInt64, mayStart: Bool) -> Bool {
+        let p = Array(payload)
+        let identity: Identity?
+        let down: Bool
+        switch kind {
+        case .keyboard:
+            guard p.count == 4, p[0] == 1, p[1] <= 1 else { return false }
+            identity = .key(UInt16(p[2]) | UInt16(p[3]) << 8)
+            down = p[1] == KeyboardInputAction.keyDown.rawValue
+        case .pointer:
+            guard p.count == 8 else { return false }
+            identity = p[1] == PointerInputAction.leftDown.rawValue || p[1] == PointerInputAction.leftUp.rawValue ? .button : nil
+            down = p[1] == PointerInputAction.leftDown.rawValue
+        case .directTouch:
+            guard let contact = DirectTouchContactCommand.decode(payload) else { return false }
+            identity = .touch(contact.contactID); down = contact.phase == .down
+        case .pencil:
+            guard p.count == 8, p[0] == 0x49, p[1] == 0x54 else { return false }
+            identity = .pencil; down = p[2] == TouchEventType.down.rawValue
+        case .text: identity = nil; down = false
+        }
+        let owner = Owner(generation: generation, revision: revision)
+        if MirrorClientControl.isRelease(kind: kind, payload: payload) {
+            guard let identity, owners[identity] == owner else { return false }
+            owners.removeValue(forKey: identity)
+            return true
+        }
+        guard mayStart else { return false }
+        if let identity {
+            if down {
+                guard owners[identity] == nil || owners[identity] == owner else { return false }
+                owners[identity] = owner
+            } else if owners[identity] != owner { return false }
+        }
+        return true
+    }
+}
+
 public struct MirrorInputTicket: Equatable {
     public let session:UInt64, uiRevision:UInt64, epoch:UInt64, source:UInt64, token:MirrorToken
 }
@@ -24,6 +70,7 @@ public final class MirrorClientControl {
     private var screenPickerCapable=false
     private var captureTargetInputBlocked=false
     private var connectionInputBlocked=false
+    private var inputLifetime = InputLifetime()
     public func setConnectionInputBlocked(_ blocked: Bool) {
         synchronized {
             guard connectionInputBlocked != blocked else { return }
@@ -42,6 +89,7 @@ public final class MirrorClientControl {
     public func beginSession(_ generation:UInt64) {
         synchronized {
             session=generation;revision &+= 1;ordinal=0;advertised=false;helloSent=false
+            inputLifetime = InputLifetime()
             state=nil;rendered=nil;acknowledgedEpoch=nil;lastAcknowledged=nil;suspended=false;transportFloor=nil;settingsOpen=false
             terminalCapable=false;terminalSwitch=nil;screenPickerCapable=false;captureTargetInputBlocked=false;typedSources=false
         }
@@ -76,7 +124,7 @@ public final class MirrorClientControl {
         synchronized { if generation == session && generation != 0 { typedSources=true } }
     }
     public func legacyRegistrationIsCurrent(revision captured: UInt64) -> Bool {
-        synchronized { !connectionInputBlocked && (!typedSources || captured == revision && !captureTargetInputBlocked) }
+        synchronized { !connectionInputBlocked && captured == revision && !captureTargetInputBlocked }
     }
 
     /// Retire registrations in either input mode without revoking the Host's attended consent.
@@ -122,7 +170,7 @@ public final class MirrorClientControl {
         }
         let old=state
         let retire=old?.epoch != next.epoch || old?.source != next.source || old?.token != next.token || old?.mode != next.mode
-        if retire {revision &+= 1;ordinal=0}
+        if retire {revision &+= 1;ordinal=0;inputLifetime = InputLifetime()}
         if old?.epoch != next.epoch {acknowledgedEpoch=nil;lastAcknowledged=nil;rendered=nil}
         if old?.token != next.token || next.mode != .active {suspended=false}
         state=next
@@ -288,11 +336,14 @@ public final class MirrorClientControl {
               ticket.source==s.source,ticket.token==s.token else {throw MirrorControlError.stale}
         // A local pause retires the gesture scope but not the Host grant: a held key, button or contact must still
         // reach the Host as its release instead of staying down on the PC.
-        guard foreground && !settingsOpen && ticket.uiRevision==revision || Self.isRelease(kind:kind,payload:payload)
-        else {throw MirrorControlError.stale}
         guard ordinal != UInt64.max else {suspended=true;throw MirrorControlError.sequenceExhausted}
+        let encoded = try MirrorControlCodec.encodeInput(MirrorInputEnvelope(epoch: s.epoch, source: s.source,
+            token: s.token, sequence: ordinal + 1, kind: kind, payload: payload))
+        guard inputLifetime.accept(kind: kind, payload: payload, generation: ticket.session,
+            revision: ticket.uiRevision, mayStart: foreground && !settingsOpen && ticket.uiRevision == revision)
+        else { throw MirrorControlError.stale }
         ordinal+=1
-        return try MirrorControlCodec.encodeInput(MirrorInputEnvelope(epoch:s.epoch,source:s.source,token:s.token,sequence:ordinal,kind:kind,payload:payload))
+        return encoded
     }
     static func isRelease(kind:MirrorInputKind,payload:Data)->Bool {
         let p=Array(payload)

@@ -84,11 +84,12 @@ private extension Color {
         }
         if networkManager.captureTargetState.enabled {
             return .make(captureTargets: networkManager.captureTargetState, state: networkManager.mirrorControlState,
-                         permissionAsked: permissionAsked)
+                         permissionAsked: permissionAsked, legacyInputAvailable: networkManager.permitsLegacyVirtualInput)
         }
         return .make(catalogue: networkManager.mirrorMonitorCatalogue, state: networkManager.mirrorControlState,
               switchingTo: switchingTo, switchPending: networkManager.mirrorMonitorSwitchPending,
-              pickerSupported: networkManager.mirrorScreenPickerSupported, permissionAsked: permissionAsked)
+              pickerSupported: networkManager.mirrorScreenPickerSupported, permissionAsked: permissionAsked,
+              legacyInputAvailable: networkManager.permitsLegacyVirtualInput)
     }
 
     private var kind: SessionPanelKind {
@@ -555,7 +556,7 @@ private extension Color {
 
     private var tools: some View {
         let canType = networkManager.isRemoteControlSession ? (!remoteInput.usesScanKeyboard || remoteInput.keyboardEnabled)
-            : picker.control == .unavailable || picker.control == .on
+            : picker.canType
         return VStack(alignment: .leading, spacing: 8) {
             sectionTitle("Tools")
             SessionActionLayout(accessibility: typeSize.isAccessibilitySize) {

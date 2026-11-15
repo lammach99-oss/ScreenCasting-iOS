@@ -102,8 +102,14 @@ struct RemoteMouseInput {
             return hover(point: sample.point, buttons: sample.buttons, token: token, generation: generation)
         }
         guard inside(sample.point) else { return [] }
-        if gesture != nil {
-            return touchMoved(sample, token: token, generation: generation)
+        var retired: [RemotePointerCommand] = []
+        if let current = gesture {
+            if current.device == .finger && sample.device == .pencil {
+                retired = reset(token: token, generation: generation)
+            } else {
+                guard current.device == sample.device else { return [] }
+                return touchMoved(sample, token: token, generation: generation)
+            }
         }
         let resolved = mode.resolved(for: sample.device)
         let recentTap = lastTap.map {
@@ -116,8 +122,8 @@ struct RemoteMouseInput {
         gesture = Gesture(device: sample.device, mode: resolved, start: sample.point,
             began: sample.timestamp, last: sample.point, timestamp: sample.timestamp,
             count: sample.touchCount, tapEligible: sample.touchCount <= 2, dragging: dragging)
-        var result: [RemotePointerCommand] = []
-        if resolved == .direct { result = absolute(sample.point, token: token) }
+        var result = retired
+        if resolved == .direct { result += absolute(sample.point, token: token) }
         if dragging { result += button(1, down: true, token: token) }
         return result
     }
@@ -212,6 +218,15 @@ struct RemoteMouseInput {
             if !down || accepted { result += button(id, down: down, token: token) }
         }
         return result
+    }
+
+    mutating func hoverEnded(cancelled: Bool, token: UInt64,
+                             generation: UInt64) -> [RemotePointerCommand] {
+        guard owns(token, generation) else { return [] }
+        hoverPoint = nil
+        relativeX = 0; relativeY = 0
+        guard cancelled else { return [] }
+        return heldButtons.sorted().flatMap { button($0, down: false, token: token) }
     }
 
     // Deltas here are Windows wheel units, positive vertical up/horizontal right.

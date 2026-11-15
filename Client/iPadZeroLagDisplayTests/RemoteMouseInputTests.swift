@@ -314,3 +314,42 @@ final class RemoteMouseInputTests: XCTestCase {
             [command(1, 32767, -32767)])
     }
 }
+
+extension RemoteMouseInputTests {
+    func testRelativeHoverExitAndCancelReanchorWithoutJump() {
+        for cancelled in [false, true] {
+            var mouse = input(mode: .trackpad)
+            _ = mouse.hover(point: CGPoint(x: 150, y: 75), buttons: .left, token: token, generation: generation)
+            _ = mouse.hover(point: CGPoint(x: 150.25, y: 75), buttons: .left, token: token, generation: generation)
+            XCTAssertEqual(mouse.hoverEnded(cancelled: cancelled, token: token, generation: generation),
+                cancelled ? [command(2, 1, button: 1)] : [])
+            XCTAssertEqual(mouse.hover(point: CGPoint(x: 290, y: 120),
+                buttons: cancelled ? [] : .left, token: token, generation: generation), [])
+            XCTAssertEqual(mouse.hover(point: CGPoint(x: 290.25, y: 120),
+                buttons: cancelled ? [] : .left, token: token, generation: generation), [])
+            XCTAssertEqual(mouse.hover(point: CGPoint(x: 290.5, y: 120),
+                buttons: cancelled ? [] : .left, token: token, generation: generation), [command(1, 1)])
+        }
+    }
+}
+
+extension RemoteMouseInputTests {
+    func testPencilPreemptsFingerDragInEitherArrivalOrder() {
+        for pencilFirst in [false, true] {
+            var mouse = input()
+            let pencil = sample(time: 0.1, device: .pencil)
+            if !pencilFirst {
+                _ = mouse.touchBegan(sample(taps: 2), token: token, generation: generation)
+                let takeover = mouse.touchBegan(pencil, token: token, generation: generation)
+                XCTAssertEqual(takeover.filter { $0.kind == 2 }.map(\.a), [1, 0])
+            } else {
+                _ = mouse.touchBegan(pencil, token: token, generation: generation)
+                XCTAssertTrue(mouse.touchBegan(sample(time: 0.2, taps: 2), token: token, generation: generation).isEmpty)
+            }
+            XCTAssertTrue(mouse.touchEnded(sample(time: 0.3), token: token, generation: generation).isEmpty)
+            XCTAssertEqual(mouse.touchEnded(sample(time: 0.4, device: .pencil), token: token, generation: generation)
+                .filter { $0.kind == 2 }.map(\.a), [1])
+            XCTAssertTrue(mouse.heldButtons.isEmpty)
+        }
+    }
+}

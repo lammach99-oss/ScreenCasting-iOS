@@ -501,6 +501,7 @@ struct DirectTouchGestureStateMachine {
     }
 
     private mutating func wheel(action: PointerInputAction, points: CGFloat, target: CGPoint) -> [DirectTouchGestureOutput] {
+        if wheelRemainder * points < 0 { wheelRemainder = 0 }
         wheelRemainder += points
         guard abs(wheelRemainder) >= scrollPointsPerNotch else { return [] }
         let direction: CGFloat = wheelRemainder > 0 ? 1 : -1
@@ -840,6 +841,18 @@ struct ExternalPinchGestureState {
     mutating func retire() { self = Self() }
 }
 
+enum ExternalWheelDelta {
+    // A wheel tick is one Windows notch, independent of UIKit's point magnitude.
+    // Continuous trackpad samples keep their existing 24-point calibration.
+    static func discretePoints(_ delta: CGPoint) -> CGPoint {
+        func axis(_ value: CGFloat) -> CGFloat {
+            guard value.isFinite, value != 0 else { return 0 }
+            return value > 0 ? 24 : -24
+        }
+        return CGPoint(x: axis(delta.x), y: axis(delta.y))
+    }
+}
+
 public class PencilUIKitView: UIView {
 
     var remoteSessionInput: RemoteSessionInputState?
@@ -853,6 +866,8 @@ public class PencilUIKitView: UIView {
     private var remoteContacts: [ObjectIdentifier: UITouch] = [:]
     private var remoteEndedContacts: Set<ObjectIdentifier> = []
     private var remoteScrollScope: RemotePointerScope?
+    private var discreteScrollScope: RemotePointerScope?
+    private var discreteScrollTranslation = CGPoint.zero
     private var remoteScrollTranslation = CGPoint.zero
 
     public var onKeyboardInput: ((KeyboardInputCommand) -> Void)?
@@ -866,6 +881,7 @@ public class PencilUIKitView: UIView {
     }
     var softwareResponderOwnsInput = false {
         didSet {
+            if softwareResponderOwnsInput && !oldValue { releaseActiveRemoteKeys() }
             if softwareResponderOwnsInput && !oldValue,
                let input = remoteSessionInput, input.usesScanKeyboard,
                !input.keyboard.heldKeys.isEmpty { input.suspend(reason: 0) }
@@ -912,7 +928,7 @@ public class PencilUIKitView: UIView {
         if window == nil {
             remoteSessionInput?.suspend(reason: 0)
             discardRemoteTouches()
-            retireDirectTouch(); directTouchEnabled = false
+            retirePencil(); retireDirectTouch(); directTouchEnabled = false; pencilInputEnabled = false
             configureExternalPointer(active: false, generation: externalPointer.generation ?? 0)
         }
     }
@@ -921,8 +937,10 @@ public class PencilUIKitView: UIView {
     // deterministically without synthesizing UIKit hardware events.
     @discardableResult
     func handleHardwareKey(_ usage: UIKeyboardHIDUsage, action: KeyboardInputAction) -> Bool {
-        if action == .keyDown && !keyboardCaptureEnabled && hardwareKeyActivityEnabled { onHardwareKeyActivity?() }
-        guard keyboardCaptureEnabled,
+        if action == .keyDown && (!keyboardCaptureEnabled || softwareResponderOwnsInput) && hardwareKeyActivityEnabled {
+            onHardwareKeyActivity?()
+        }
+        guard !softwareResponderOwnsInput, keyboardCaptureEnabled,
               let virtualKey = RemoteKeyboardKeyMapper.virtualKey(for: usage) else { return false }
         if action == .keyDown {
             if activeRemotePhysicalKeys[usage] == nil {
@@ -945,6 +963,10 @@ public class PencilUIKitView: UIView {
 
     func unhandledHardwarePresses(_ presses: Set<UIPress>, action: KeyboardInputAction,
                                   phase: RemoteHardwareKeyboard.Phase? = nil) -> Set<UIPress> {
+        if softwareResponderOwnsInput {
+            if action == .keyDown && !presses.isEmpty && hardwareKeyActivityEnabled { onHardwareKeyActivity?() }
+            return presses
+        }
         if let input = remoteSessionInput, input.usesScanKeyboard {
             if action == .keyDown && hardwareKeyActivityEnabled { onHardwareKeyActivity?() }
             // The text responder owns IME and committed Unicode, including hardware typing.
@@ -1004,7 +1026,7 @@ public class PencilUIKitView: UIView {
     /// A right-click, drag, pinch or scroll was recognised; drives the first-use toasts.
     var onGestureHint: ((GestureHint) -> Void)?
     public var contentViewport: VideoContentViewport? {
-        willSet { if newValue != contentViewport { retireDirectTouch(); retireExternalPointer() } }
+        willSet { if newValue != contentViewport { retirePencil(); retireDirectTouch(); retireExternalPointer() } }
         didSet { updateRemoteVideoRect() }
     }
     private var directTouchEnabled = false
@@ -1014,14 +1036,10 @@ public class PencilUIKitView: UIView {
     public var onBoundsChanged: ((CGRect) -> Void)?
 
     func retireMirrorInputScope() {
-        if activeTouchIdentifier != nil, let point = lastNormalizedPoint {
-            let x = UInt16(clamping: Int((point.x * 65535).rounded()))
-            let y = UInt16(clamping: Int((point.y * 65535).rounded()))
-            onSendTouchEvent?(.up, x, y, 0)
-        }
-        activeTouchIdentifier = nil; lastNormalizedPoint = nil
+        retirePencil()
         retireDirectTouch(); retireExternalPointer(); releaseActiveRemoteKeys()
     }
+    private var pencilInputEnabled = true
     private var activeTouchIdentifier: ObjectIdentifier?
     private var lastNormalizedPoint: CGPoint?
     private var lastReportedBounds: CGRect?
@@ -1052,7 +1070,7 @@ public class PencilUIKitView: UIView {
     override public func layoutSubviews() {
         super.layoutSubviews()
         guard bounds != lastReportedBounds else { return }
-        if lastReportedBounds != nil { retireDirectTouch(); retireExternalPointer() }
+        if lastReportedBounds != nil { retirePencil(); retireDirectTouch(); retireExternalPointer() }
         lastReportedBounds = bounds
         updateRemoteVideoRect()
         onBoundsChanged?(bounds)
@@ -1164,11 +1182,40 @@ public class PencilUIKitView: UIView {
         remoteContacts.removeAll()
         remoteEndedContacts.removeAll()
         remoteScrollScope = nil
+        discreteScrollScope = nil
     }
 
     private func current(_ scope: RemotePointerScope, input: RemoteSessionInputState) -> Bool {
         input.pointerEnabled && scope.token == input.token && scope.generation == input.generation
             && scope.revision == input.revision
+    }
+
+    @discardableResult
+    func prepareRemotePointerScope(device: RemoteMouseDevice, input: RemoteSessionInputState) -> Bool {
+        guard input.pointerEnabled else { return false }
+        if let scope = remotePointerScope, !current(scope, input: input) { discardRemoteTouches() }
+        if let scope = remotePointerScope, scope.device != device {
+            guard device == .pencil && scope.device == .finger else { return false }
+            input.pointer(token: scope.token, generation: scope.generation) {
+                $0.reset(token: scope.token, generation: scope.generation)
+            }
+            discardRemoteTouches()
+        }
+        if remotePointerScope == nil {
+            remotePointerScope = RemotePointerScope(token: input.token, generation: input.generation,
+                revision: input.revision, device: device)
+        }
+        return remotePointerScope?.device == device
+    }
+
+    @discardableResult
+    func cancelRemotePointerScope(device: RemoteMouseDevice, input: RemoteSessionInputState) -> Bool {
+        guard let scope = remotePointerScope, scope.device == device, current(scope, input: input) else { return false }
+        input.pointer(token: scope.token, generation: scope.generation) {
+            $0.reset(token: scope.token, generation: scope.generation)
+        }
+        discardRemoteTouches()
+        return true
     }
 
     private func routeRemoteTouches(_ touches: Set<UITouch>, flags: UInt8, event: UIEvent?,
@@ -1177,21 +1224,16 @@ public class PencilUIKitView: UIView {
         updateRemoteVideoRect()
         if let scope = remotePointerScope, !current(scope, input: input) { discardRemoteTouches() }
         if cancelled {
-            if let scope = remotePointerScope {
-                input.pointer(token: scope.token, generation: scope.generation) {
-                    $0.reset(token: scope.token, generation: scope.generation)
-                }
-            }
-            discardRemoteTouches()
+            // UIKit may cancel a palm after Pencil already took ownership.
+            guard let scope = remotePointerScope,
+                  touches.contains(where: { remoteContacts[ObjectIdentifier($0)] != nil }) else { return }
+            cancelRemotePointerScope(device: scope.device, input: input)
             return
         }
-        if flags == 1 && remotePointerScope == nil, input.pointerEnabled {
-            let type = touches.contains { $0.type == .pencil } ? UITouch.TouchType.pencil
-                : touches.contains { $0.type == .indirectPointer } ? .indirectPointer : .direct
-            let device: RemoteMouseDevice = type == .pencil ? .pencil
-                : type == .indirectPointer ? .indirectPointer : .finger
-            remotePointerScope = RemotePointerScope(token: input.token, generation: input.generation,
-                revision: input.revision, device: device)
+        if flags == 1 {
+            let device: RemoteMouseDevice = touches.contains { $0.type == .pencil } ? .pencil
+                : touches.contains { $0.type == .indirectPointer } ? .indirectPointer : .finger
+            guard prepareRemotePointerScope(device: device, input: input) else { return }
         }
         guard let scope = remotePointerScope, current(scope, input: input) else { return }
         let matching = touches.filter {
@@ -1226,7 +1268,8 @@ public class PencilUIKitView: UIView {
     }
 
     func configureDirectTouch(active: Bool, generation: UInt64) {
-        if directTouchGeneration != generation || !active { retireDirectTouch() }
+        if directTouchGeneration != generation || !active { retirePencil(); retireDirectTouch() }
+        pencilInputEnabled = active
         directTouchGeneration = generation
         directTouchEnabled = active
     }
@@ -1252,6 +1295,7 @@ public class PencilUIKitView: UIView {
     }
 
     func retireExternalPointer() {
+        discreteScrollScope = nil
         externalPinch.retire()
         endExternalScroll(phase: "retired")
         let active = externalPointer.enabled
@@ -1271,6 +1315,11 @@ public class PencilUIKitView: UIView {
         scroll.allowedTouchTypes = []
         scroll.cancelsTouchesInView = false
         addGestureRecognizer(scroll)
+        let wheel = UIPanGestureRecognizer(target: self, action: #selector(handleExternalPointerDiscreteScroll(_:)))
+        wheel.allowedScrollTypesMask = .discrete
+        wheel.allowedTouchTypes = []
+        wheel.cancelsTouchesInView = false
+        addGestureRecognizer(wheel)
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handleExternalPointerPinch(_:)))
         // The existing indirect-input opt-in supplies touch-free trackpad transform events.
         pinch.allowedTouchTypes = []
@@ -1280,8 +1329,17 @@ public class PencilUIKitView: UIView {
 
     @objc private func handleExternalPointerHover(_ recognizer: UIHoverGestureRecognizer) {
         if let input = remoteSessionInput, input.usesEnhancedPointer {
-            guard window != nil, input.pointerEnabled, remotePointerScope == nil else { return }
-            guard recognizer.state == .began || recognizer.state == .changed else { return }
+            guard window != nil, input.pointerEnabled else { return }
+            if recognizer.state == .ended || recognizer.state == .cancelled || recognizer.state == .failed {
+                let t = input.token, g = input.generation
+                input.pointer(token: t, generation: g) {
+                    $0.hoverEnded(cancelled: recognizer.state != .ended, token: t, generation: g)
+                }
+                if recognizer.state != .ended, remotePointerScope?.device == .indirectPointer { discardRemoteTouches() }
+                return
+            }
+            guard remotePointerScope == nil,
+                  recognizer.state == .began || recognizer.state == .changed else { return }
             let t = input.token, g = input.generation
             let point = recognizer.location(in: self)
             input.pointer(token: t, generation: g) { $0.hover(point: point, token: t, generation: g) }
@@ -1295,6 +1353,45 @@ public class PencilUIKitView: UIView {
         guard recognizer.state == .began || recognizer.state == .changed else { return }
         let point = contentViewport?.normalizedPoint(for: recognizer.location(in: self), in: bounds)
         emitExternal(externalPointer.hover(point: point, generation: generation))
+    }
+
+    @objc private func handleExternalPointerDiscreteScroll(_ recognizer: UIPanGestureRecognizer) {
+        let location = recognizer.location(in: self)
+        let translation = recognizer.translation(in: self)
+        if recognizer.state == .began {
+            discreteScrollScope = nil
+            discreteScrollTranslation = .zero
+            guard window != nil,
+                  contentViewport?.normalizedPoint(for: location, in: bounds) != nil else { return }
+            if let input = remoteSessionInput, input.usesEnhancedPointer {
+                guard input.pointerEnabled else { return }
+                discreteScrollScope = RemotePointerScope(token: input.token, generation: input.generation,
+                    revision: input.revision, device: .indirectPointer)
+            } else if let generation = externalPointer.generation {
+                discreteScrollScope = RemotePointerScope(token: 0, generation: generation,
+                    revision: generation, device: .indirectPointer)
+            }
+        }
+        guard recognizer.state == .began || recognizer.state == .changed || recognizer.state == .ended else {
+            discreteScrollScope = nil; return
+        }
+        defer { if recognizer.state == .ended { discreteScrollScope = nil } }
+        guard let scope = discreteScrollScope else { return }
+        let delta = CGPoint(x: translation.x - discreteScrollTranslation.x, y: translation.y - discreteScrollTranslation.y)
+        discreteScrollTranslation = translation
+        let points = ExternalWheelDelta.discretePoints(delta)
+        guard points != .zero,
+              let normalized = contentViewport?.normalizedPoint(for: location, in: bounds) else { return }
+        if let input = remoteSessionInput, input.usesEnhancedPointer {
+            guard current(scope, input: input) else { discreteScrollScope = nil; return }
+            input.pointer(token: scope.token, generation: scope.generation) {
+                $0.scrollPoints(points, token: scope.token, generation: scope.generation)
+            }
+        } else {
+            guard scope.generation == externalPointer.generation else { discreteScrollScope = nil; return }
+            _ = externalPointer.hover(point: normalized, generation: scope.generation)
+            for command in externalPointer.scroll(delta: points, generation: scope.generation) { emitExternal(command) }
+        }
     }
 
     @objc private func handleExternalPointerScroll(_ recognizer: UIPanGestureRecognizer) {
@@ -1477,8 +1574,42 @@ public class PencilUIKitView: UIView {
 
     // MARK: - Core packet builder
 
+    // Internal sample seam also used by UIKit. Terminal coordinates are retained
+    // normalized coordinates, never remapped through a replacement viewport.
+    func emitPencilSample(identifier: ObjectIdentifier, packet: PencilPacket) {
+        guard packet.xRatio.isFinite, packet.yRatio.isFinite, packet.pressure.isFinite else { return }
+        if packet.pointerFlags == 1 {
+            guard pencilInputEnabled, activeTouchIdentifier == nil || activeTouchIdentifier == identifier else { return }
+            activeTouchIdentifier = identifier
+        } else { guard activeTouchIdentifier == identifier else { return } }
+        let point = CGPoint(x: CGFloat(packet.xRatio.clamped(0, 1)), y: CGFloat(packet.yRatio.clamped(0, 1)))
+        lastNormalizedPoint = point
+        let type = touchEventType(for: packet.pointerFlags)
+        let x = UInt16(clamping: Int((point.x * 65535).rounded()))
+        let y = UInt16(clamping: Int((point.y * 65535).rounded()))
+        let pressure = UInt8(clamping: Int((packet.pressure.clamped(0, 1) * 255).rounded()))
+        if packet.pointerFlags == 4 { activeTouchIdentifier = nil; lastNormalizedPoint = nil }
+        onSendTouchEvent?(type, x, y, pressure)
+        onNetworkSend?(NetworkManager.mirrorPencilPayload(type: type, x: x, y: y, pressure: pressure))
+        onPencilInput?(packet)
+    }
+
+    func retirePencil() {
+        guard let identifier = activeTouchIdentifier, let point = lastNormalizedPoint else { return }
+        emitPencilSample(identifier: identifier, packet: PencilPacket(xRatio: Float(point.x), yRatio: Float(point.y),
+            pressure: 0, tiltX: 0, tiltY: 0, pointerFlags: 4))
+    }
+
     private func handlePencilTouches(_ touches: Set<UITouch>, flags: UInt8, event: UIEvent?) {
         guard let primaryTouch = touches.first else { return }
+        if flags == 4 {
+            guard activeTouchIdentifier == ObjectIdentifier(primaryTouch) else { return }
+            if let point = contentViewport?.normalizedPoint(for: primaryTouch.location(in: self), in: bounds) {
+                lastNormalizedPoint = point
+            }
+            retirePencil()
+            return
+        }
 
         // Consume all 240Hz coalesced samples — every intermediate Pencil position.
         let allTouches = flags == 4
@@ -1504,7 +1635,7 @@ public class PencilUIKitView: UIView {
             for: primaryLocation,
             in: bounds)
         if flags == 1 {
-            guard activeTouchIdentifier == nil, primaryMappedPoint != nil else {
+            guard pencilInputEnabled, activeTouchIdentifier == nil, primaryMappedPoint != nil else {
                 logRejectedTouchIfNeeded(
                     event: touchEventType(for: flags),
                     location: primaryLocation,
@@ -1558,7 +1689,6 @@ public class PencilUIKitView: UIView {
             // divides by 65535 and multiplies by its virtual screen resolution.
             let wireX        = UInt16(clamping: Int((xRatio       * 65535).rounded()))
             let wireY        = UInt16(clamping: Int((yRatio        * 65535).rounded()))
-            let wirePressure = UInt8 (clamping: Int((pressureFloat * 255  ).rounded()))
             let wireType     = touchEventType(for: flags)
 
             if let inputGeometryContext {
@@ -1583,32 +1713,9 @@ public class PencilUIKitView: UIView {
             }
 
             // ── Emit: typed callback (primary path) ───────────────────────────
-            onSendTouchEvent?(wireType, wireX, wireY, wirePressure)
-
-            // ── Emit: legacy raw-bytes callback ───────────────────────────────
-            // Now serialises the 8-byte TouchInputPacket instead of PencilPacket.
-            if onNetworkSend != nil {
-                var packet = Data(count: kTouchPacketSize)
-                packet.withUnsafeMutableBytes { buf in
-                    buf.storeBytes(of: kTouchMagic.littleEndian,   toByteOffset: 0, as: UInt16.self)
-                    buf.storeBytes(of: wireType.rawValue,           toByteOffset: 2, as: UInt8.self)
-                    buf.storeBytes(of: wirePressure,                toByteOffset: 3, as: UInt8.self)
-                    buf.storeBytes(of: wireX.littleEndian,          toByteOffset: 4, as: UInt16.self)
-                    buf.storeBytes(of: wireY.littleEndian,          toByteOffset: 6, as: UInt16.self)
-                }
-                onNetworkSend?(packet)
-            }
-
-            // ── Emit: legacy PencilPacket (for local tilt / rendering) ────────
-            var pencilPacket = PencilPacket(
-                xRatio:       xRatio,
-                yRatio:       yRatio,
-                pressure:     pressureFloat,
-                tiltX:        tiltX,
-                tiltY:        tiltY,
-                pointerFlags: flags
-            )
-            onPencilInput?(pencilPacket)
+            emitPencilSample(identifier: touchIdentifier, packet: PencilPacket(
+                xRatio: xRatio, yRatio: yRatio, pressure: pressureFloat,
+                tiltX: tiltX, tiltY: tiltY, pointerFlags: flags))
         }
 
         if flags == 4 {

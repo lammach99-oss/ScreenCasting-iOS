@@ -211,3 +211,57 @@ final class RemoteSessionInputTests: XCTestCase {
         XCTAssertEqual(pointers.map(\.button), [3, 3])
     }
 }
+
+extension RemoteSessionInputTests {
+    @MainActor func testInactiveRevisionRetiresKeyAndEveryPointerDeviceBeforeRebind() {
+        for device in RemoteMouseDevice.allCases {
+            let state = RemoteSessionInputState()
+            ready(state)
+            var keys: [RemoteScanKeyCommand] = [], pointers: [RemotePointerCommand] = []
+            var resets: [RemoteInputResetCommand] = []
+            state.sendKey = { key, g in XCTAssertEqual(g, 10); keys.append(key) }
+            state.sendPointer = { pointer, g in XCTAssertEqual(g, 10); pointers.append(pointer) }
+            state.sendReset = { reset, _ in resets.append(reset) }
+            _ = state.hardware(usage: 0xe0, phase: .began)
+            let sample = RemoteMouseSample(point: CGPoint(x: 100, y: 100), timestamp: 0,
+                touchCount: 1, tapCount: 2, device: device, buttons: .left)
+            state.pointer(token: 7, generation: 10) { $0.touchBegan(sample, token: 7, generation: 10) }
+            keys.removeAll(); pointers.removeAll()
+            ready(state, revision: 2, active: false)
+            XCTAssertEqual(keys.map(\.action), [1])
+            XCTAssertEqual(pointers.filter { $0.kind == 2 }.map(\.a), [1])
+            XCTAssertEqual(resets.count, 1)
+            _ = state.hardware(usage: 0x04, phase: .began)
+            state.pointer(token: 7, generation: 10) { $0.touchBegan(sample, token: 7, generation: 10) }
+            ready(state, revision: 2)
+            XCTAssertFalse(state.pointerEnabled)
+            XCTAssertEqual(keys.count, 1)
+            XCTAssertEqual(pointers.count, 1)
+        }
+    }
+}
+
+extension RemoteSessionInputTests {
+    @MainActor func testUIKitScopeGivesPencilPriorityInBothArrivalOrders() {
+        for pencilFirst in [false, true] {
+            let input = RemoteSessionInputState()
+            ready(input)
+            let view = PencilUIKitView(frame: CGRect(x: 0, y: 0, width: 500, height: 250))
+            view.remoteSessionInput = input
+            var events: [RemotePointerCommand] = []
+            input.sendPointer = { command, _ in events.append(command) }
+            let first: RemoteMouseDevice = pencilFirst ? .pencil : .finger
+            XCTAssertTrue(view.prepareRemotePointerScope(device: first, input: input))
+            input.pointer(token: 7, generation: 10) {
+                $0.touchBegan(RemoteMouseSample(point: CGPoint(x: 100, y: 100), timestamp: 0,
+                    touchCount: 1, tapCount: 2, device: first, buttons: []), token: 7, generation: 10)
+            }
+            XCTAssertEqual(view.prepareRemotePointerScope(device: pencilFirst ? .finger : .pencil, input: input), !pencilFirst)
+            if !pencilFirst { XCTAssertEqual(events.filter { $0.kind == 2 }.map(\.a), [0, 1]) }
+            XCTAssertTrue(view.prepareRemotePointerScope(device: .pencil, input: input))
+            XCTAssertFalse(view.prepareRemotePointerScope(device: .finger, input: input))
+            XCTAssertFalse(view.cancelRemotePointerScope(device: .finger, input: input))
+            XCTAssertTrue(view.prepareRemotePointerScope(device: .pencil, input: input), "a cancelled palm cannot retire Pencil")
+        }
+    }
+}

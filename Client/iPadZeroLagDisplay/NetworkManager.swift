@@ -294,6 +294,7 @@ public class NetworkManager: ObservableObject {
         didSet { if oldValue != usbListenerExplicitlyStarted { refreshAutoAcceptPolicyOnQueue() } }
     }
     private var usbScdpConnection: NWConnection?
+    private var legacyInputLifetime = InputLifetime()
     private var activeDirectTouchCommand: DirectTouchContactCommand?
     @Published private(set) var transferSnapshot = DataTransferManager.Snapshot()
     private var dataTransfers: DataTransferManager?
@@ -1232,8 +1233,9 @@ public class NetworkManager: ObservableObject {
     ///   - y:        Vertical position in logical pixels (0–65535 for normalised use).
     ///   - pressure: Normalised pressure mapped to 0–255 byte range.
     public func sendTouchEvent(type: TouchEventType, x: UInt16, y: UInt16, pressure: UInt8) {
-        guard mirrorControl.allowsLegacyVirtualInput else { return }
         let requestedGeneration = connectionGenerationClock.current
+        let requestedRevision = mirrorControl.gestureRevision
+        let mayStart = mirrorControl.allowsLegacyVirtualInput
         // Build the 8-byte packet inline — stack allocation, no heap alloc.
         var packet = Data(count: TouchWireProtocol.packetSize)
         packet.withUnsafeMutableBytes { buf in
@@ -1255,7 +1257,7 @@ public class NetworkManager: ObservableObject {
         }
 
         networkQueue.async { [weak self] in
-            guard let self, requestedGeneration == self.connectionGeneration, self.mirrorControl.allowsLegacyVirtualInput else { return }
+            guard let self, requestedGeneration == self.connectionGeneration else { return }
             let generation = requestedGeneration
             let isUsb = self.activeTransportKind == .usb
             let diagnostic = isUsb
@@ -1268,7 +1270,7 @@ public class NetworkManager: ObservableObject {
                 dropReason = "transport_state_\(self.transportState)"
             } else if !isCommittedGeneration {
                 dropReason = "generation_not_committed"
-            } else if self.displayRequestGate.isInputSuppressed {
+            } else if type != .up && self.displayRequestGate.isInputSuppressed {
                 dropReason = "input_suppressed"
             } else {
                 dropReason = nil
@@ -1282,6 +1284,9 @@ public class NetworkManager: ObservableObject {
                     reason: dropReason ?? "none")
             }
             guard dropReason == nil else { return }
+            guard self.legacyInputLifetime.accept(kind: .pencil, payload: packet,
+                generation: requestedGeneration, revision: 0,
+                mayStart: mayStart && requestedRevision == self.mirrorControl.gestureRevision && self.mirrorControl.allowsLegacyVirtualInput && !self.displayRequestGate.isInputSuppressed) else { return }
             let delivery = InputDeliveryPolicy.forEvent(type)
             if self.committedRealtimeMode == RealtimeTransportMode.wifiRTP,
                delivery == .unreliableLatest {
@@ -1373,10 +1378,11 @@ public class NetworkManager: ObservableObject {
     }
 
     public func sendKeyboardInput(_ command: KeyboardInputCommand) {
-        guard mirrorControl.allowsLegacyVirtualInput else { return }
         let requestedGeneration = connectionGenerationClock.current
+        let requestedRevision = mirrorControl.gestureRevision
+        let mayStart = mirrorControl.allowsLegacyVirtualInput
         networkQueue.async { [weak self] in
-            guard let self, requestedGeneration == self.connectionGeneration, self.mirrorControl.allowsLegacyVirtualInput else { return }
+            guard let self, requestedGeneration == self.connectionGeneration else { return }
             let generation = requestedGeneration
             guard self.transportState == .streaming,
                   self.committedTransportGeneration == generation,
@@ -1385,6 +1391,9 @@ public class NetworkManager: ObservableObject {
                     action: command.action,
                     inputSuppressed: self.displayRequestGate.isInputSuppressed) else { return }
             guard !self.remoteInputConnection || self.remoteFeatures.accepted & 1 == 0 else { return }
+            guard self.legacyInputLifetime.accept(kind: .keyboard, payload: command.encode(),
+                generation: requestedGeneration, revision: 0,
+                mayStart: mayStart && requestedRevision == self.mirrorControl.gestureRevision && self.mirrorControl.allowsLegacyVirtualInput && !self.displayRequestGate.isInputSuppressed) else { return }
             self.sendWireMessage(
                 type: .keyboardInput,
                 payload: command.encode(),
@@ -1560,6 +1569,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func resetDirectTouchSessionOnQueue() {
+        legacyInputLifetime = InputLifetime()
         activeDirectTouchCommand = nil
         let generation = connectionGenerationClock.current
         DispatchQueue.main.async { [weak self] in
@@ -1574,14 +1584,17 @@ public class NetworkManager: ObservableObject {
         guard transportState == .streaming, committedTransportGeneration == connectionGeneration else { return }
         let cancel = DirectTouchContactCommand(phase: .cancel, pressure: command.pressure,
             contactID: command.contactID, x: command.x, y: command.y)
+        _ = legacyInputLifetime.accept(kind: .directTouch, payload: cancel.encode(),
+            generation: connectionGeneration, revision: 0, mayStart: false)
         sendWireMessage(type: .directTouchContact, payload: cancel.encode(), sequence: 0)
     }
 
     public func sendDirectTouchContact(_ command: DirectTouchContactCommand) {
-        guard mirrorControl.allowsLegacyVirtualInput else { return }
         let requestedGeneration = connectionGenerationClock.current
+        let requestedRevision = mirrorControl.gestureRevision
+        let mayStart = mirrorControl.allowsLegacyVirtualInput
         networkQueue.async { [weak self] in
-            guard let self, requestedGeneration == self.connectionGeneration, self.mirrorControl.allowsLegacyVirtualInput,
+            guard let self, requestedGeneration == self.connectionGeneration,
                   self.transportState == .streaming,
                   self.committedTransportGeneration == requestedGeneration,
                   command.contactID != 0,
@@ -1589,21 +1602,24 @@ public class NetworkManager: ObservableObject {
                     inputSuppressed: self.displayRequestGate.isInputSuppressed) else { return }
             if command.phase == .down {
                 guard self.activeDirectTouchCommand == nil else { return }
-                self.activeDirectTouchCommand = command
             } else {
                 guard self.activeDirectTouchCommand?.contactID == command.contactID else { return }
-                self.activeDirectTouchCommand = command.phase == .up || command.phase == .cancel ? nil : command
             }
+            guard self.legacyInputLifetime.accept(kind: .directTouch, payload: command.encode(),
+                generation: requestedGeneration, revision: 0,
+                mayStart: mayStart && requestedRevision == self.mirrorControl.gestureRevision && self.mirrorControl.allowsLegacyVirtualInput && !self.displayRequestGate.isInputSuppressed) else { return }
+            self.activeDirectTouchCommand = command.phase == .up || command.phase == .cancel ? nil : command
             self.sendWireMessage(type: .directTouchContact, payload: command.encode(), sequence: 0,
                 movement: command.phase == .update)
         }
     }
 
     public func sendPointerInput(_ command: PointerInputCommand) {
-        guard mirrorControl.allowsLegacyVirtualInput else { return }
         let requestedGeneration = connectionGenerationClock.current
+        let requestedRevision = mirrorControl.gestureRevision
+        let mayStart = mirrorControl.allowsLegacyVirtualInput
         networkQueue.async { [weak self] in
-            guard let self, requestedGeneration == self.connectionGeneration, self.mirrorControl.allowsLegacyVirtualInput else { return }
+            guard let self, requestedGeneration == self.connectionGeneration else { return }
             let generation = requestedGeneration
             guard self.transportState == .streaming,
                   self.committedTransportGeneration == generation,
@@ -1613,6 +1629,9 @@ public class NetworkManager: ObservableObject {
                 return
             }
             guard !self.remoteInputConnection || self.remoteFeatures.accepted & 2 == 0 else { return }
+            guard self.legacyInputLifetime.accept(kind: .pointer, payload: command.encode(),
+                generation: requestedGeneration, revision: 0,
+                mayStart: mayStart && requestedRevision == self.mirrorControl.gestureRevision && self.mirrorControl.allowsLegacyVirtualInput && !self.displayRequestGate.isInputSuppressed) else { return }
             self.sendWireMessage(
                 type: .pointerInput,
                 payload: command.encode(),
@@ -6672,6 +6691,12 @@ struct RemoteSessionInputConfiguration: Equatable {
         let changedConnection = old?.generation != value.generation || old?.remote != value.remote
         let retired = changedConnection || old?.revision != value.revision || old?.context != value.context
             || old?.features != value.features || !value.connected || !value.ready
+        // A local pause can arrive together with a UI revision. Retire while
+        // the old token/context still owns the keys and every pointer device.
+        if !changedConnection && old?.context == value.context && old?.features == value.features
+            && value.connected && (!value.active || !value.ready) {
+            suspend(reason: 0)
+        }
         if retired {
             suppressedUsages.formUnion(hardwareUsages)
             hardwareUsages.removeAll()

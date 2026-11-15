@@ -138,6 +138,7 @@ public struct ScreenPickerSnapshot: Equatable {
     public let phase: Phase
     public let tiles: [ScreenPickerTile]
     public let control: Control
+    public var canType: Bool { control == .on }
     /// The Host can be asked to allow switching, and has not been asked yet.
     public let canAskPermission: Bool
     public let isSwitching: Bool
@@ -153,9 +154,18 @@ public struct ScreenPickerSnapshot: Equatable {
                      extendActive: kind == .castingExtend)
     }
 
+    private static func castingControl(state: MirrorControlState?, inputBlocked: Bool,
+                                       legacyInputAvailable: Bool) -> Control {
+        if state?.mode == .virtualDisplay || state == nil && legacyInputAvailable {
+            return inputBlocked ? .viewOnly : .on
+        }
+        guard state?.geometry != nil else { return .unavailable }
+        return state?.mode == .active && !inputBlocked ? .on : .viewOnly
+    }
+
     public static func make(catalogue: MirrorMonitorCatalogue?, state: MirrorControlState?, switchingTo: UInt64?,
-                            switchPending: Bool, pickerSupported: Bool, permissionAsked: Bool) -> Self {
-        let control: Control = state?.geometry == nil ? .unavailable : state?.mode == .active ? .on : .viewOnly
+                            switchPending: Bool, pickerSupported: Bool, permissionAsked: Bool, legacyInputAvailable: Bool = false) -> Self {
+        let control = castingControl(state: state, inputBlocked: switchPending, legacyInputAvailable: legacyInputAvailable)
         guard let catalogue else {
             return Self(phase: .loading, tiles: [], control: control, canAskPermission: false,
                         isSwitching: switchPending, currentLabel: nil)
@@ -181,10 +191,10 @@ public struct ScreenPickerSnapshot: Equatable {
     }
 
     public static func make(captureTargets: CaptureTargetState, state: MirrorControlState?,
-                            permissionAsked: Bool = false) -> Self {
+                            permissionAsked: Bool = false, legacyInputAvailable: Bool = false) -> Self {
         let current=captureTargets.unknownOutcome ? 0 : captureTargets.confirmedCurrentId
-        let control: Control = state?.geometry == nil ? .unavailable
-            : state?.mode == .active && !captureTargets.inputBlocked ? .on : .viewOnly
+        let control = castingControl(state: state, inputBlocked: captureTargets.inputBlocked,
+            legacyInputAvailable: legacyInputAvailable)
         guard let catalogue=captureTargets.catalogue else {
             return Self(phase: captureTargets.listUnavailable ? .locked : .loading, tiles: [], control: control,
                         canAskPermission: false, isSwitching: captureTargets.isSwitching, currentLabel: nil,

@@ -2518,14 +2518,21 @@ final class DirectTouchGestureStateMachineTests: XCTestCase {
         XCTAssertEqual(touchPhases(machine.end(id: 2, point: CGPoint(x: 4, y: 4), timestamp: 1.1)), [.down, .up])
     }
 
-    func testLargeScrollMoveEmitsOneAggregatedSignedWheelCommand() {
-        var machine = DirectTouchGestureStateMachine()
-        machine.begin(id: 1, point: .zero, timestamp: 0)
-        XCTAssertEqual(pointerActions(machine.move(id: 1, point: CGPoint(x: 0, y: 72), timestamp: 0.01)), [.verticalWheel])
-        for (time, y, units) in [(0.02, CGFloat(378), Int16(120)), (0.03, CGFloat(42), Int16(-120))] {
-            let output = machine.move(id: 1, point: CGPoint(x: 0, y: y), timestamp: time)
-            XCTAssertEqual(output, [.pointer(.verticalWheel, CGPoint(x: 0, y: y), units)])
-            XCTAssertTrue(touchPhases(output).isEmpty)
+    func testLargeScrollMoveKeepsOneNotchDrainButReversalDropsOppositeBacklog() {
+        for horizontal in [false, true] {
+            var machine = DirectTouchGestureStateMachine()
+            func point(_ distance: CGFloat) -> CGPoint {
+                horizontal ? CGPoint(x: distance, y: 0) : CGPoint(x: 0, y: distance)
+            }
+            let action: PointerInputAction = horizontal ? .horizontalWheel : .verticalWheel
+            let forward: Int16 = horizontal ? -120 : 120
+            machine.begin(id: 1, point: .zero, timestamp: 0)
+            XCTAssertEqual(machine.move(id: 1, point: point(72), timestamp: 0.01), [.pointer(action, point(72), forward)])
+            XCTAssertEqual(machine.move(id: 1, point: point(378), timestamp: 0.02), [.pointer(action, point(378), forward)])
+            // The retained 234 points must not emit a forward notch on reversal.
+            XCTAssertEqual(machine.move(id: 1, point: point(306), timestamp: 0.03), [.pointer(action, point(306), -forward)])
+            XCTAssertTrue(machine.move(id: 1, point: point(305), timestamp: 0.04).isEmpty)
+            XCTAssertEqual(machine.move(id: 1, point: point(234), timestamp: 0.05), [.pointer(action, point(234), -forward)])
         }
     }
 
@@ -8005,7 +8012,7 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         XCTAssertTrue(container.softwareTextView.deliveryEnabled)
     }
 
-    @MainActor func testFirstHardwareKeyCoexistsWithSoftwareAndIsDeliveredOnce() {
+    @MainActor func testHardwareTypingDelegatesWhileAcquiredSoftwareResponderOwnsComposition() {
         let container = ConnectedPresentationContainer(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
         container.configureRemoteKeyboard(active: true, generation: 1)
         container.applyRemoteKeyboardMode(.softwareOpen)
@@ -8014,17 +8021,18 @@ final class PointerV2FinalBoundaryTests: XCTestCase {
         var textCommits: [String] = []
         container.touchView.onKeyboardInput = { commands.append($0) }
         container.onTextCommit = { textCommits.append($0) }
-        XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardA, action: .keyDown))
+        container.touchView.softwareResponderOwnsInput = true
+        XCTAssertFalse(container.touchView.handleHardwareKey(.keyboardA, action: .keyDown))
         XCTAssertEqual(container.keyboardMode, .softwareOpen)
         XCTAssertFalse(container.keyboardButton.isHidden)
         XCTAssertTrue(container.softwareTextView.deliveryEnabled)
         XCTAssertNotNil(container.softwareTextView.markedTextRange)
         XCTAssertEqual(container.softwareTextView.text, "pending")
-        XCTAssertEqual(commands.map(\.action), [.keyDown])
-        XCTAssertEqual(commands.map(\.virtualKey), [0x41])
+        XCTAssertTrue(commands.isEmpty)
+        XCTAssertTrue(commands.isEmpty)
         XCTAssertTrue(textCommits.isEmpty)
-        XCTAssertTrue(container.touchView.handleHardwareKey(.keyboardA, action: .keyUp))
-        XCTAssertEqual(commands.map(\.action), [.keyDown, .keyUp])
+        XCTAssertFalse(container.touchView.handleHardwareKey(.keyboardA, action: .keyUp))
+        XCTAssertTrue(commands.isEmpty)
         container.hardwarePresenceChanged(false)
         XCTAssertEqual(container.keyboardMode, .softwareOpen)
         XCTAssertTrue(container.softwareTextView.deliveryEnabled)
@@ -8187,4 +8195,96 @@ private final class VisualCallbackRuntime {
     private var value: TimeInterval?
     func record(_ seconds: TimeInterval) { lock.lock(); value = seconds; lock.unlock() }
     var seconds: TimeInterval? { lock.lock(); defer { lock.unlock() }; return value }
+}
+
+final class H1PencilGeometryTests: XCTestCase {
+    @MainActor func testViewportAndLayoutRetirePencilUnderOldCoordinatesOnce() {
+        for layout in [false, true] {
+            let view = PencilUIKitView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+            let old = VideoContentViewport(rect: CGRect(x: 0, y: 0, width: 1, height: 1))
+            view.contentViewport = old
+            view.layoutSubviews()
+            let identity = NSObject()
+            var events: [TouchEventType] = []
+            var positions: [CGPoint] = []
+            var raw: [Data] = []
+            var flags: [UInt8] = []
+            view.onSendTouchEvent = { type, x, y, _ in
+                events.append(type); positions.append(CGPoint(x: CGFloat(x), y: CGFloat(y)))
+                if type == .up { XCTAssertEqual(view.contentViewport, old) }
+            }
+            view.onNetworkSend = { raw.append($0) }
+            view.onPencilInput = { flags.append($0.pointerFlags) }
+            view.emitPencilSample(identifier: ObjectIdentifier(identity), packet: PencilPacket(
+                xRatio: 0.25, yRatio: 0.75, pressure: 0.5, tiltX: 0, tiltY: 0, pointerFlags: 1))
+            if layout {
+                view.bounds.size = CGSize(width: 300, height: 400)
+                view.layoutSubviews(); view.layoutSubviews()
+            } else {
+                view.contentViewport = VideoContentViewport(rect: CGRect(x: 0.25, y: 0, width: 0.5, height: 1))
+            }
+            view.retireMirrorInputScope()
+            XCTAssertEqual(events, [.down, .up])
+            XCTAssertEqual(positions, [CGPoint(x: 16384, y: 49151), CGPoint(x: 16384, y: 49151)])
+            XCTAssertEqual(raw.map { $0[2] }, [1, 2])
+            XCTAssertEqual(flags, [1, 4])
+            view.emitPencilSample(identifier: ObjectIdentifier(identity), packet: PencilPacket(
+                xRatio: 0.5, yRatio: 0.5, pressure: 0.5, tiltX: 0, tiltY: 0, pointerFlags: 2))
+            XCTAssertEqual(events.count, 2, "a retired stroke cannot replay under new geometry")
+        }
+    }
+}
+
+final class H1DiscreteWheelTests: XCTestCase {
+    @MainActor func testInstalledRecognizerAdmitsWheelWithoutDuplicatingTrackpad() {
+        let view = PencilUIKitView(frame: .zero)
+        let pans = (view.gestureRecognizers ?? []).compactMap { $0 as? UIPanGestureRecognizer }
+        XCTAssertEqual(pans.filter { $0.allowedScrollTypesMask == .continuous }.count, 1)
+        XCTAssertEqual(pans.filter { $0.allowedScrollTypesMask == .discrete }.count, 1)
+        XCTAssertTrue(pans.allSatisfy { $0.allowedTouchTypes == [] && !$0.cancelsTouchesInView })
+    }
+
+    func testDiscreteNotchSignAndSizeMatchInCastingAndRemote() {
+        for delta in [CGPoint(x: 1, y: 3), CGPoint(x: -8, y: -1)] {
+            let points = ExternalWheelDelta.discretePoints(delta)
+            var casting = ExternalPointerInputState()
+            _ = casting.configure(active: true, generation: 7)
+            _ = casting.hover(point: CGPoint(x: 0.5, y: 0.5), generation: 7)
+            let commands = casting.scroll(delta: points, generation: 7)
+            XCTAssertEqual(commands.map(\.value), delta.x > 0 ? [-120, 120] : [120, -120])
+            let context = RemoteInputContextCommand(state: 1, desktop: 1, token: 9, desktopEpoch: 1,
+                left: 0, top: 0, width: 400, height: 300)
+            var remote = RemoteMouseInput(context: context, videoRect: CGRect(x: 0, y: 0, width: 400, height: 300), generation: 7)
+            let wheel = remote.scrollPoints(points, token: 9, generation: 7)
+            XCTAssertEqual(wheel.map(\.a), delta.y > 0 ? [120] : [-120])
+            XCTAssertEqual(wheel.map(\.b), delta.x > 0 ? [-120] : [120])
+        }
+        XCTAssertEqual(ExternalWheelDelta.discretePoints(.zero), .zero)
+    }
+}
+
+final class H1TextOwnershipTests: XCTestCase {
+    @MainActor func testCastingTextOwnerRetiresKeysAndDelegatesEveryPressPhase() {
+        let view = PencilUIKitView(frame: .zero)
+        view.keyboardCaptureEnabled = true
+        var keys: [KeyboardInputCommand] = []
+        view.onKeyboardInput = { keys.append($0) }
+        XCTAssertTrue(view.handleHardwareKey(.keyboardLeftControl, action: .keyDown))
+        view.softwareResponderOwnsInput = true
+        XCTAssertEqual(keys.map(\.action), [.keyDown, .keyUp])
+        XCTAssertFalse(view.handleHardwareKey(.keyboardA, action: .keyDown))
+        XCTAssertFalse(view.handleHardwareKey(.keyboardA, action: .keyUp))
+        #if targetEnvironment(simulator)
+        let press = UIPress()
+        view.hardwareKeyUsageForTesting = { _ in .keyboardA }
+        for phase in [RemoteHardwareKeyboard.Phase.began, .ended, .cancelled] {
+            let action: KeyboardInputAction = phase == .began ? .keyDown : .keyUp
+            XCTAssertEqual(view.unhandledHardwarePresses([press], action: action, phase: phase), [press])
+        }
+        #endif
+        XCTAssertEqual(keys.count, 2)
+        view.softwareResponderOwnsInput = false
+        XCTAssertTrue(view.handleHardwareKey(.keyboardLeftControl, action: .keyUp))
+        XCTAssertEqual(keys.count, 2, "retired hardware owners never replay")
+    }
 }

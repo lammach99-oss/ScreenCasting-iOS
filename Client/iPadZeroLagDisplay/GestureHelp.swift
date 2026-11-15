@@ -101,7 +101,7 @@ enum GestureGuideContent {
 
     static func helper(for mode: GestureGuideMode) -> String {
         switch mode {
-        case .casting: return "Fingers act like a mouse. Apple Pencil acts like a pen."
+        case .casting: return "Fingers control touch gestures. Apple Pencil sends a touch contact, with pressure where supported."
         case .remote: return "Touch controls the PC pointer. Direct sends mouse clicks, without pen pressure."
         }
     }
@@ -109,7 +109,8 @@ enum GestureGuideContent {
     static func pencil(for mode: GestureGuideMode) -> String {
         switch mode {
         case .casting:
-            return "Writes and clicks with pressure. Fingers are ignored while the Pencil touches the screen. " +
+            return "Sends a touch contact with pressure where supported, without Windows pen or tilt input. " +
+                "Fingers are ignored while the Pencil touches the screen. " +
                 "To open the keyboard after using the Pencil, tap the keyboard button with a finger."
         case .remote(let mouseMode):
             return mouseMode == .trackpad ? "Pencil and mouse move the pointer using Trackpad. Change this in More input."

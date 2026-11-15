@@ -441,34 +441,33 @@ final class PhysicalMirrorControlTests: XCTestCase {
         XCTAssertEqual(next.sequence, 2, "ordinal continues: the Host never reset its input floor")
     }
     func testPauseStillDeliversHeldInputReleasesOnly() throws {
+        let pairs: [(MirrorInputKind, Data, Data)] = [
+            (.keyboard, Data([1, 0, 65, 0]), Data([1, 1, 65, 0])),
+            (.pointer, PointerInputCommand(action: .leftDown, x: 1, y: 2).encode(),
+                PointerInputCommand(action: .leftUp, x: 1, y: 2).encode()),
+            (.directTouch, DirectTouchContactCommand(phase: .down, pressure: 1, contactID: 9, x: 1, y: 2).encode(),
+                DirectTouchContactCommand(phase: .cancel, pressure: 0, contactID: 9, x: 1, y: 2).encode()),
+            (.directTouch, DirectTouchContactCommand(phase: .down, pressure: 1, contactID: 9, x: 1, y: 2).encode(),
+                DirectTouchContactCommand(phase: .up, pressure: 0, contactID: 9, x: 1, y: 2).encode()),
+            (.pencil, NetworkManager.mirrorPencilPayload(type: .down, x: 1, y: 2, pressure: 1),
+                NetworkManager.mirrorPencilPayload(type: .up, x: 1, y: 2, pressure: 0))]
         for pause in 0..<2 {
-            let model = self.model(); let ticket = try active(model)
-            _ = try model.encodeInput(ticket: ticket, kind: .keyboard, payload: Data([1, 0, 65, 0]))
-            if pause == 0 { model.setForeground(false) } else { model.setSettingsPresented(true) }
-            // Retired gestures emit their terminal records with the ticket they were bound to.
-            let releases: [(MirrorInputKind, Data)] = [
-                (.keyboard, Data([1, 1, 65, 0])),
-                (.pointer, Data([1, 3, 0, 0, 0, 0, 0, 0])),
-                (.directTouch, Data([1, 3, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])),
-                (.directTouch, Data([1, 2, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])),
-                (.pencil, Data([0x49, 0x54, 2, 0, 0, 0, 0, 0]))]
-            var sequence: UInt64 = 1
-            for (kind, payload) in releases {
-                let sent = try MirrorControlCodec.decodeInput(model.encodeInput(ticket: ticket, kind: kind, payload: payload))
-                XCTAssertGreaterThan(sent.sequence, sequence); sequence = sent.sequence
-            }
-            let blocked: [(MirrorInputKind, Data)] = [
-                (.keyboard, Data([1, 0, 65, 0])),
-                (.pointer, Data([1, 0, 0, 0, 0, 0, 0, 0])),
-                (.pointer, Data([1, 2, 0, 0, 0, 0, 0, 0])),
-                (.directTouch, Data([1, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])),
-                (.pencil, Data([0x49, 0x54, 1, 0, 0, 0, 0, 0])),
-                (.text, Data([1, 1, 0, 65]))]
-            for (kind, payload) in blocked {
-                XCTAssertThrowsError(try model.encodeInput(ticket: ticket, kind: kind, payload: payload), "pause \(pause) \(kind)")
+            for (kind, down, up) in pairs {
+                let model = self.model(), ticket = try active(model)
+                XCTAssertThrowsError(try model.encodeInput(ticket: ticket, kind: kind, payload: up))
+                _ = try model.encodeInput(ticket: ticket, kind: kind, payload: down)
+                if pause == 0 { model.setForeground(false) } else { model.setSettingsPresented(true) }
+                XCTAssertThrowsError(try model.encodeInput(ticket: ticket, kind: kind, payload: down))
+                let sent = try MirrorControlCodec.decodeInput(model.encodeInput(ticket: ticket, kind: kind, payload: up))
+                XCTAssertEqual(sent.sequence, 2)
+                XCTAssertEqual(sent.payload, up)
+                XCTAssertThrowsError(try model.encodeInput(ticket: ticket, kind: kind, payload: up))
+                model.setForeground(true); model.setSettingsPresented(false)
+                XCTAssertThrowsError(try model.encodeInput(ticket: ticket, kind: kind, payload: down))
             }
         }
     }
+
     func testSettingsPauseKeepsGrantButExplicitReleaseStillRevokes() throws {
         let model = self.model(); let ticket = try active(model)
         model.setSettingsPresented(true); XCTAssertNil(model.captureTicket())
@@ -846,3 +845,86 @@ final class PhysicalMirrorControlTests: XCTestCase {
         XCTAssertThrowsError(try MirrorMonitorCatalogue.decode(text))
     }
 }
+
+// The same ownership lane backs Extend and non-enhanced remote input.
+extension PhysicalMirrorControlTests {
+    func testLegacyTerminalParityAfterAdmissionClosesAndNoReplay() {
+        let pairs: [(MirrorInputKind, Data, Data)] = [
+            (.keyboard, Data([1, 0, 17, 0]), Data([1, 1, 17, 0])),
+            (.pointer, PointerInputCommand(action: .leftDown, x: 3, y: 4).encode(),
+                PointerInputCommand(action: .leftUp, x: 3, y: 4).encode()),
+            (.directTouch, DirectTouchContactCommand(phase: .down, pressure: 1, contactID: 9, x: 3, y: 4).encode(),
+                DirectTouchContactCommand(phase: .cancel, pressure: 0, contactID: 9, x: 3, y: 4).encode()),
+            (.pencil, NetworkManager.mirrorPencilPayload(type: .down, x: 3, y: 4, pressure: 1),
+                NetworkManager.mirrorPencilPayload(type: .up, x: 3, y: 4, pressure: 0))]
+        for (kind, down, up) in pairs {
+            var lifetime = InputLifetime()
+            XCTAssertFalse(lifetime.accept(kind: kind, payload: up, generation: 7, revision: 1, mayStart: false))
+            XCTAssertTrue(lifetime.accept(kind: kind, payload: down, generation: 7, revision: 1, mayStart: true))
+            XCTAssertFalse(lifetime.accept(kind: kind, payload: down, generation: 7, revision: 2, mayStart: false))
+            XCTAssertFalse(lifetime.accept(kind: kind, payload: up, generation: 8, revision: 1, mayStart: false))
+            XCTAssertFalse(lifetime.accept(kind: kind, payload: up, generation: 7, revision: 2, mayStart: false))
+            XCTAssertTrue(lifetime.accept(kind: kind, payload: up, generation: 7, revision: 1, mayStart: false))
+            XCTAssertFalse(lifetime.accept(kind: kind, payload: up, generation: 7, revision: 1, mayStart: true))
+        }
+    }
+}
+
+#if targetEnvironment(simulator)
+extension PhysicalMirrorControlTests {
+    @MainActor func testExtendSerializedWireRetiresEveryOwnedDeviceAfterIneligibility() async throws {
+        let network = NetworkManager()
+        network.realtimeAudioPlaybackForTesting = { _ in XCTFail("input tests must never start audio") }
+        let downSent = expectation(description: "admitted downs"), upSent = expectation(description: "owned terminals")
+        downSent.expectedFulfillmentCount = 4; upSent.expectedFulfillmentCount = 4
+        var records: [Data] = []
+        network.controlSendForAudioTesting = { data, done in
+            let payload: Data
+            let kind: MirrorInputKind
+            if data.count == 8 { kind = .pencil; payload = data }
+            else if data.count >= 16, let inputKind = MirrorInputKind(rawValue: data[5]), inputKind != .text {
+                kind = inputKind; payload = Data(data.dropFirst(16))
+            } else { done(nil); return }
+            records.append(data)
+            if MirrorClientControl.isRelease(kind: kind, payload: payload) { upSent.fulfill() }
+            else { downSent.fulfill() }
+            done(nil)
+        }
+        let session = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        defer { network.stopForTesting() }
+        network.networkQueueForTesting.sync { network.beginMirrorControlForTesting(generation: session.generation) }
+        let extend = MirrorControlState(revision: 1, epoch: 1, source: 0, mode: .virtualDisplay,
+            token: zero, geometry: nil, firstFrame: nil, lastSent: nil)
+        network.receiveMirrorWireForTesting(type: .mirrorState, payload: try MirrorControlCodec.encodeState(extend),
+            generation: session.generation, connection: session.connection)
+        network.beginTransferWriterForTesting()
+        func downs() {
+            network.sendKeyboardInput(KeyboardInputCommand(action: .keyDown, virtualKey: 0x11))
+            network.sendPointerInput(PointerInputCommand(action: .leftDown, x: 100, y: 200))
+            network.sendDirectTouchContact(DirectTouchContactCommand(phase: .down, pressure: 255, contactID: 9, x: 100, y: 200))
+            network.sendTouchEvent(type: .down, x: 100, y: 200, pressure: 128)
+        }
+        func ups() {
+            network.sendKeyboardInput(KeyboardInputCommand(action: .keyUp, virtualKey: 0x11))
+            network.sendPointerInput(PointerInputCommand(action: .leftUp, x: 100, y: 200))
+            network.sendDirectTouchContact(DirectTouchContactCommand(phase: .cancel, pressure: 0, contactID: 9, x: 100, y: 200))
+            network.sendTouchEvent(type: .up, x: 100, y: 200, pressure: 0)
+        }
+        downs()
+        await fulfillment(of: [downSent], timeout: 1)
+        network.setMirrorInputForeground(false)
+        downs(); ups()
+        await fulfillment(of: [upSent], timeout: 1)
+        ups()
+        network.setMirrorInputForeground(true)
+        network.networkQueueForTesting.sync { XCTAssertEqual(records.count, 8) }
+        // A queued down cannot survive a complete pause/resume before queue admission.
+        network.networkQueueForTesting.sync {
+            network.sendKeyboardInput(KeyboardInputCommand(action: .keyDown, virtualKey: 0x41))
+            network.setMirrorInputForeground(false)
+            network.setMirrorInputForeground(true)
+        }
+        network.networkQueueForTesting.sync { XCTAssertEqual(records.count, 8) }
+    }
+}
+#endif

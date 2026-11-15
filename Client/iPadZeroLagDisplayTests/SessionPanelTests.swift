@@ -330,3 +330,50 @@ final class SessionPanelTests: XCTestCase {
         XCTAssertGreaterThan(b - r, 0.25, "one saturated accent for main actions")
     }
 }
+
+extension SessionPanelTests {
+    func testExtendWithoutMirrorGeometryShowsControlAndEnablesKeyboard() {
+        let extend = MirrorControlState(revision: 1, epoch: 1, source: 0, mode: .virtualDisplay,
+            token: MirrorToken(low: 0, high: 0), geometry: nil, firstFrame: nil, lastSent: nil)
+        let legacy = ScreenPickerSnapshot.make(catalogue: nil, state: extend, switchingTo: nil,
+            switchPending: false, pickerSupported: false, permissionAsked: false)
+        let typed = ScreenPickerSnapshot.make(captureTargets: CaptureTargetState(), state: extend)
+        for snapshot in [legacy, typed] {
+            XCTAssertEqual(snapshot.control, .on)
+            XCTAssertTrue(snapshot.canType)
+        }
+        let unknown = ScreenPickerSnapshot.make(catalogue: nil, state: nil, switchingTo: nil,
+            switchPending: false, pickerSupported: false, permissionAsked: false)
+        XCTAssertEqual(unknown.control, .unavailable)
+        XCTAssertFalse(unknown.canType)
+        let oldHost = ScreenPickerSnapshot.make(catalogue: nil, state: nil, switchingTo: nil,
+            switchPending: false, pickerSupported: false, permissionAsked: false, legacyInputAvailable: true)
+        XCTAssertEqual(oldHost.control, .on)
+        XCTAssertTrue(oldHost.canType)
+        var targets = CaptureTargetState(); targets.begin(generation: 7)
+        _ = targets.advertise(flags: 0x7c00, generation: 7)
+        let catalogue = CaptureTargetCatalogue(state: 1, allowed: true, owner: 2, revision: 1,
+            currentId: 1, epoch: 5, entries: [CaptureTargetEntry(id: 1, kind: .extend, name: "Extend iPad"),
+                CaptureTargetEntry(id: 4, kind: .physical, name: "Screen 1")])
+        _ = targets.receiveCatalogue(catalogue, session: targets.session)
+        _ = targets.select(4, catalogue: catalogue, session: targets.session)
+        let pending = ScreenPickerSnapshot.make(captureTargets: targets, state: extend)
+        XCTAssertEqual(pending.control, .viewOnly)
+        XCTAssertFalse(pending.canType)
+    }
+}
+
+extension SessionPanelTests {
+    func testPencilHelpMatchesTouchAndPointerCapabilities() {
+        let casting = GestureGuideContent.helper(for: .casting) + GestureGuideContent.pencil(for: .casting)
+        XCTAssertTrue(casting.contains("touch contact"))
+        XCTAssertTrue(casting.contains("where supported"))
+        XCTAssertTrue(casting.contains("Windows pen or tilt"))
+        XCTAssertFalse(casting.contains("acts like a pen"))
+        for mode in [RemoteMouseMode.auto, .direct, .trackpad] {
+            let remote = GestureGuideContent.helper(for: .remote(mode)) + GestureGuideContent.pencil(for: .remote(mode))
+            XCTAssertTrue(remote.contains("pointer"))
+            XCTAssertTrue(remote.contains("without pen pressure"))
+        }
+    }
+}
