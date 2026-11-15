@@ -4,6 +4,87 @@ import UIKit
 @testable import iPadCasting
 
 final class SecureDesktopRecoveryTests: XCTestCase {
+    func testDecoderFenceDropsCompletedOldOutputAndAllowsOnlyPostResumeReceipt() {
+        let decoder = DecoderManager(); decoder.beginSession(generation: 7)
+        var delivered: [UInt32] = [], fences: [UInt64] = []
+        decoder.onCaptureFenced = { fences.append($0) }
+        decoder.deliverCaptureOutput(sequence: 99, generation: 7) { delivered.append(99) }
+        decoder.fenceCaptureContinuation()
+        XCTAssertEqual(fences, [7])
+        decoder.deliverCaptureOutput(sequence: 100, generation: 7) { delivered.append(100) }
+        XCTAssertEqual(delivered, [99])
+        decoder.authorizeCaptureOutput(sequence: 101, generation: 7)
+        decoder.deliverCaptureOutput(sequence: 101, generation: 8) { delivered.append(999) }
+        decoder.deliverCaptureOutput(sequence: 101, generation: 7) { delivered.append(101) }
+        XCTAssertEqual(delivered, [99, 101])
+        decoder.beginSession(generation: 8)
+        XCTAssertEqual(fences, [7, 8], "a decoder re-anchor must preserve the suspension fence")
+        decoder.deliverCaptureOutput(sequence: 102, generation: 8) { delivered.append(102) }
+        XCTAssertEqual(delivered, [99, 101])
+        decoder.resetCaptureOutputFence()
+        decoder.deliverCaptureOutput(sequence: 103, generation: 8) { delivered.append(103) }
+        XCTAssertEqual(delivered, [99, 101, 103], "a disconnected generation cannot fence an old host forever")
+    }
+    func testRenderFenceRetiresQueuedAndTakenFramesButKeepsShownWatermark() throws {
+        var tracker = RenderFreshnessTracker(); tracker.beginSession(generation: 7)
+        _ = tracker.offer(99, generation: 7)
+        let shown = try XCTUnwrap(tracker.takePending())
+        XCTAssertTrue(tracker.markPresented(shown))
+        _ = tracker.offer(100, generation: 7)
+        let taken = try XCTUnwrap(tracker.takePending())
+        _ = tracker.offer(101, generation: 7)
+        tracker.fenceCaptureContinuation()
+        XCTAssertEqual(tracker.sessionGeneration, 7)
+        XCTAssertEqual(tracker.presentedSequence, 99)
+        XCTAssertNil(tracker.takePending())
+        XCTAssertFalse(tracker.isCurrent(taken)); XCTAssertFalse(tracker.markPresented(taken))
+        _ = tracker.offer(102, generation: 7)
+        let fresh = try XCTUnwrap(tracker.takePending())
+        XCTAssertEqual(tracker.commitDecision(for: fresh), .commit)
+    }
+
+    func testActiveClockPausesEveryRoutePhaseAndResumesItsRemainingBudget() throws {
+        for stage in 0...2 {
+            var clock = CaptureReadinessClock()
+            var state = ConnectionSwitchState(); state.begin(generation: 1)
+            _ = state.advertise(flags: 0x0200, authenticated: true, generation: 1)
+            _ = state.receive(try ConnectionSwitchStateTests.snapshot(), generation: 1, now: clock.now(at: 0))
+            XCTAssertNotNil(state.select(.usb, now: clock.now(at: 0)))
+            if stage > 0 {
+                _ = state.preparing(try ConnectionSwitchStateTests.prepare(), generation: 1, now: clock.now(at: 1))
+                _ = state.receive(try ConnectionSwitchStateTests.snapshot(revision: 3, hostState: .switching), generation: 1, now: clock.now(at: 1))
+                XCTAssertTrue(state.receive(try ConnectionSwitchStateTests.result(.accepted), generation: 1, now: clock.now(at: 1)))
+            }
+            if stage == 2 {
+                XCTAssertTrue(state.bindReplacement(generation: 2, route: .usb, authenticated: true, now: clock.now(at: 2)))
+                _ = state.advertise(flags: 0x0200, authenticated: true, generation: 2)
+                _ = state.receive(try ConnectionSwitchStateTests.snapshot(revision: 3, owner: 2, route: .usb), generation: 2, now: clock.now(at: 2))
+                XCTAssertTrue(state.receive(try ConnectionSwitchStateTests.result(.completed), generation: 2, now: clock.now(at: 4)))
+            }
+            clock.setSuspended(true, at: 4)
+            for wall in [100.0, 600, 900] {
+                state.tick(now: clock.now(at: wall))
+                XCTAssertNotNil(state.pending, "suspension must not expire any route phase")
+            }
+            // Remain paused through the resumed-picture wait, not merely wire state 0.
+            XCTAssertEqual(clock.now(at: 1000), 4)
+            clock.setSuspended(false, at: 1000)
+            let remaining = stage == 0 ? 11.0 : stage == 1 ? 71.0 : 5.0
+            state.tick(now: clock.now(at: 1000 + remaining - 0.01))
+            XCTAssertNotNil(state.pending)
+            state.tick(now: clock.now(at: 1000 + remaining))
+            XCTAssertNil(state.pending); XCTAssertTrue(state.offersReconnect)
+        }
+    }
+
+    func testDisconnectUnfreezesActiveClockWithoutBackwardsTimeForRetainedHandoff() {
+        var clock = CaptureReadinessClock()
+        clock.setSuspended(true, at: 10)
+        XCTAssertEqual(clock.now(at: 610), 10)
+        clock.setSuspended(false, at: 610)
+        XCTAssertEqual(clock.now(at: 615), 15)
+    }
+
     func testGoldenCodecsAndStrictWhitelist() {
         XCTAssertEqual(CaptureAvailabilityProtocol.hello, Data([1, 0, 0, 0]))
         let suspended = CaptureAvailabilityCommand(state: 1, reason: 1, sequence: 1)
@@ -60,7 +141,9 @@ final class SecureDesktopRecoveryTests: XCTestCase {
             _ = state.receive(CaptureAvailabilityCommand(state: 0, reason: 0, sequence: 2).encode(), flags: 0, generation: 7)
             XCTAssertTrue(state.inputBlocked)
             XCTAssertFalse(state.observeFrame(sequence: 9, decoder: 4, decoded: true, presented: true, generation: 7))
+            state.noteFrameReceived(sequence: 10)
             XCTAssertFalse(state.admitFrame(sequence: 10, decoder: 4, isIDR: false, generation: 7))
+            state.noteFrameReceived(sequence: 11)
             XCTAssertTrue(state.admitFrame(sequence: 11, decoder: 4, isIDR: true, generation: 7))
             XCTAssertFalse(state.observeFrame(sequence: 11, decoder: 4, decoded: !presentationFirst, presented: presentationFirst, generation: 7))
             XCTAssertTrue(state.inputBlocked)
@@ -69,27 +152,42 @@ final class SecureDesktopRecoveryTests: XCTestCase {
         }
     }
 
-    func testFreshPresentedIDRCanResumeBeforeLateControlMessageButOldCompletionsCannot() {
+    func testLatePrePauseIDRAndPreCapturingReceiptCannotProveResume() {
         var state = CaptureAvailabilityState(); state.begin(generation: 7)
         _ = state.hello(flags: 0x0040, authenticated: true, generation: 7)
+        state.noteFrameReceived(sequence: 100)
         XCTAssertTrue(state.admitFrame(sequence: 100, decoder: 4, isIDR: true, generation: 7))
         _ = state.receive(CaptureAvailabilityCommand(state: 1, reason: 2, sequence: 0).encode(), flags: 0, generation: 7)
         XCTAssertEqual(state.notice, "PC screen temporarily unavailable")
+        state.noteFrameReceived(sequence: 100)
         XCTAssertFalse(state.admitFrame(sequence: 100, decoder: 4, isIDR: true, generation: 7))
         XCTAssertFalse(state.observeFrame(sequence: 100, decoder: 4, decoded: true, presented: true, generation: 7))
+        state.noteFrameReceived(sequence: 101)
         XCTAssertTrue(state.admitFrame(sequence: 101, decoder: 4, isIDR: true, generation: 7))
         XCTAssertFalse(state.observeFrame(sequence: 101, decoder: 3, decoded: true, presented: true, generation: 7))
-        XCTAssertTrue(state.observeFrame(sequence: 101, decoder: 4, decoded: true, presented: true, generation: 7))
+        XCTAssertFalse(state.observeFrame(sequence: 101, decoder: 4, decoded: true, presented: true, generation: 7))
+        XCTAssertNotNil(state.notice)
+        state.noteFrameReceived(sequence: 102)
         _ = state.receive(CaptureAvailabilityCommand(state: 0, reason: 0, sequence: 1).encode(), flags: 0, generation: 7)
+        state.noteFrameReceived(sequence: 102)
+        XCTAssertTrue(state.admitFrame(sequence: 102, decoder: 4, isIDR: false, generation: 7))
+        XCTAssertFalse(state.observeFrame(sequence: 102, decoder: 4, decoded: true, presented: true, generation: 7))
+        state.noteFrameReceived(sequence: 103)
+        XCTAssertTrue(state.admitFrame(sequence: 103, decoder: 4, isIDR: false, generation: 7))
+        XCTAssertFalse(state.observeFrame(sequence: 103, decoder: 4, decoded: true, presented: false, generation: 7))
+        XCTAssertTrue(state.observeFrame(sequence: 103, decoder: 4, decoded: false, presented: true, generation: 7))
         XCTAssertNil(state.notice)
     }
 
     func testRouteSwitchRetainsSuspensionButNewAuthenticatedGenerationRequiresHelloAgain() {
         var state = suspended()
+        state.noteFrameReceived(sequence: 100)
         XCTAssertTrue(state.admitFrame(sequence: 100, decoder: 4, isIDR: true, generation: 7))
         state.resetMediaDomain()
         XCTAssertEqual(state.lastSequence, 1); XCTAssertTrue(state.negotiated); XCTAssertTrue(state.inputBlocked)
         XCTAssertFalse(state.observeFrame(sequence: 100, decoder: 4, decoded: true, presented: true, generation: 7))
+        _ = state.receive(CaptureAvailabilityCommand(state: 0, reason: 0, sequence: 2).encode(), flags: 0, generation: 7)
+        state.noteFrameReceived(sequence: 0)
         XCTAssertTrue(state.admitFrame(sequence: 0, decoder: 5, isIDR: true, generation: 7))
         XCTAssertTrue(state.observeFrame(sequence: 0, decoder: 5, decoded: true, presented: true, generation: 7))
         state.begin(generation: 8)
@@ -101,9 +199,11 @@ final class SecureDesktopRecoveryTests: XCTestCase {
     func testRepeatedSuspensionRetiresOncePerEpisodeAndFencesEarlierResumeEvidence() {
         var state = suspended()
         XCTAssertEqual(state.receive(CaptureAvailabilityCommand(state: 1, reason: 1, sequence: 2).encode(), flags: 0, generation: 7), .suspended(retireInput: false))
+        _ = state.receive(CaptureAvailabilityCommand(state: 0, reason: 0, sequence: 3).encode(), flags: 0, generation: 7)
+        state.noteFrameReceived(sequence: 1)
         XCTAssertTrue(state.admitFrame(sequence: 1, decoder: 4, isIDR: true, generation: 7))
         XCTAssertTrue(state.observeFrame(sequence: 1, decoder: 4, decoded: true, presented: true, generation: 7))
-        XCTAssertEqual(state.receive(CaptureAvailabilityCommand(state: 1, reason: 1, sequence: 3).encode(), flags: 0, generation: 7), .suspended(retireInput: true))
+        XCTAssertEqual(state.receive(CaptureAvailabilityCommand(state: 1, reason: 1, sequence: 4).encode(), flags: 0, generation: 7), .suspended(retireInput: true))
         XCTAssertFalse(state.observeFrame(sequence: 1, decoder: 4, decoded: true, presented: true, generation: 7))
         XCTAssertTrue(state.inputBlocked)
     }
@@ -224,6 +324,56 @@ final class SecureDesktopRecoveryTests: XCTestCase {
     }
 
     #if targetEnvironment(simulator)
+    @MainActor func testSourceTerminalDeadlinePausesThroughLongPromptAndPictureWait() async throws {
+        let network = NetworkManager()
+        var now: TimeInterval = 0
+        var timers: [(TimeInterval, () -> Void)] = []
+        network.connectionControlNowForTesting = { now }
+        network.captureTargetScheduleForTesting = { timers.append(($0, $1)) }
+        network.realtimeAudioPlaybackForTesting = { _ in XCTFail("no audio") }
+        network.controlSendForAudioTesting = { _, done in done(nil) }
+        let peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        defer { network.stopForTesting() }
+        network.beginTransferWriterForTesting()
+        func receive(_ type: WireMessageType, _ payload: Data, flags: UInt16 = 0) {
+            network.receiveCaptureTargetWireForTesting(type: type, payload: payload, flags: flags,
+                generation: peer.generation, connection: peer.connection)
+        }
+        receive(.displayCapabilities, CaptureTargetIntegrationTests.modes, flags: 0x7c40)
+        receive(.sourceCatalogue, CaptureTargetIntegrationTests.catalogue(revision: 3, current: 1))
+        await drain(network)
+        network.requestCaptureTarget(4, catalogue: try XCTUnwrap(network.captureTargetState.catalogue))
+        await drain(network)
+        let expire = try XCTUnwrap(timers.first { $0.0 == 65 }?.1)
+        now = 4
+        receive(.captureAvailability, CaptureAvailabilityCommand(state: 1, reason: 1, sequence: 1).encode())
+        await drain(network)
+        now = 600
+        network.networkQueueForTesting.sync { expire() }
+        await drain(network)
+        XCTAssertNotNil(network.captureTargetState.pending)
+        receive(.captureAvailability, CaptureAvailabilityCommand(state: 0, reason: 0, sequence: 2).encode())
+        await drain(network)
+        now = 900
+        network.networkQueueForTesting.sync { expire() }
+        await drain(network)
+        XCTAssertNotNil(network.captureTargetState.pending, "capturing alone cannot spend the picture-wait budget")
+        let decoder = network.decoder.currentSessionGeneration
+        network.networkQueueForTesting.sync {
+            network.captureContinuationForTesting(sequence: 1, decoder: decoder, isIDR: true)
+        }
+        network.decoder.onDecodeCompleted?(1, decoder, true)
+        network.recordCapturePresentation(sequence: 1, generation: decoder)
+        await drain(network)
+        XCTAssertFalse(network.captureInputBlocked)
+        now = 960.9
+        network.networkQueueForTesting.sync { expire() }
+        await drain(network); XCTAssertNotNil(network.captureTargetState.pending)
+        now = 961
+        network.networkQueueForTesting.sync { expire() }
+        await drain(network); XCTAssertNil(network.captureTargetState.pending)
+    }
+
     func testIntentionalSilenceDoesNotStartRecoveryOrSpendEpisodesAtAnyFakeTime() {
         let queue = DispatchQueue(label: "test.capture.availability.feedback")
         let receiver = WifiMediaReceiver(networkQueue: queue, decoder: { _, _, _, _ in },
@@ -315,6 +465,7 @@ final class SecureDesktopRecoveryTests: XCTestCase {
             for current in [false, true] {
                 var state = suspended()
                 _ = state.receive(CaptureAvailabilityCommand(state: 0, reason: 0, sequence: 2).encode(), flags: 0, generation: 7)
+                state.noteFrameReceived(sequence: 1)
                 XCTAssertTrue(state.admitFrame(sequence: 1, decoder: 4, isIDR: true, generation: 7))
                 let presented = CapturePresentationPolicy.simulatorCompleted(succeeded: succeeded, current: current)
                 XCTAssertFalse(state.observeFrame(sequence: 1, decoder: 4, decoded: false, presented: presented, generation: 7))
@@ -426,12 +577,18 @@ final class SecureDesktopRecoveryTests: XCTestCase {
             let before = writes.count
             network.sendKeyboardInput(KeyboardInputCommand(action: .keyDown, virtualKey: 65)); network.sendTextCommit("discard")
             if let ticket { network.sendMirrorInput(ticket: ticket, kind: .keyboard, payload: down.encode()) }
-            video(1, idr: false); await drain(network)
-            XCTAssertEqual(decoded.count, 1)
+            // A delayed complete pre-pause IDR may seed decode, never presentation/input.
+            video(1, idr: true); await drain(network)
+            XCTAssertEqual(decoded.count, 2)
+            network.decoder.onDecodeCompleted?(1, owner, true)
+            network.recordCapturePresentation(sequence: 1, generation: owner); await drain(network)
+            XCTAssertTrue(network.captureInputBlocked)
             XCTAssertFalse(writes.dropFirst(before).contains { $0[5] == 38 || $0[5] == 40 || $0[5] == 53 })
             receive(.captureAvailability, CaptureAvailabilityCommand(state: 0, reason: 0, sequence: 3).encode()); await drain(network)
             XCTAssertTrue(network.captureInputBlocked)
-            video(2, idr: true)
+            network.recordCapturePresentation(sequence: 1, generation: owner); await drain(network)
+            XCTAssertTrue(network.captureInputBlocked, "pre-capturing receipt cannot become causal retroactively")
+            video(2, idr: false)
             network.decoder.onDecodeCompleted?(2, owner, true); await drain(network)
             XCTAssertTrue(network.captureInputBlocked)
             network.recordRenderCompletion(sequence: 2, generation: owner); await drain(network)

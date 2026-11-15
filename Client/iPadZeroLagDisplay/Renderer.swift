@@ -345,6 +345,11 @@ struct RenderFreshnessTracker {
         pendingIdentity = nil
     }
 
+    mutating func fenceCaptureContinuation() {
+        mediaResetIdentity &+= 1
+        pendingIdentity = nil
+    }
+
     mutating func offer(
         _ sequence: UInt32,
         generation: UInt64
@@ -746,6 +751,18 @@ public class Renderer: NSObject, MTKViewDelegate {
                 self.onContentViewportChanged?(nil)
             }
         }
+    }
+
+    // Same lock as final authorization/present/commit. Do not reset geometry,
+    // the session, or the drawable already on screen.
+    func fenceCaptureContinuation(generation: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard freshness.sessionGeneration == generation else { return }
+        freshness.fenceCaptureContinuation()
+        officeHandoff.reset(); officeReadyFrame = nil; officeLookAheadFrame = nil
+        gameHandoff.reset(); gameReadyFrame = nil; gameLookAheadFrame = nil
+        pendingGeometryPublication = nil
     }
 
     func setPresentationMode(

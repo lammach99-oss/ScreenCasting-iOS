@@ -377,6 +377,7 @@ public class NetworkManager: ObservableObject {
     @Published public private(set) var captureTargetState = CaptureTargetState()
     private var captureTargets = CaptureTargetState()
     private var captureAvailability = CaptureAvailabilityState()
+    private var captureReadinessClock = CaptureReadinessClock()
     @Published public private(set) var captureAvailabilityNotice: String?
     @Published public private(set) var captureInputBlocked = false
     private var captureTargetVideo = CaptureTargetVideoBuffer()
@@ -532,6 +533,8 @@ public class NetworkManager: ObservableObject {
             mirrorControl.beginSession(wireAuthenticatedGeneration ?? 0)
             mirrorControl.setConnectionInputBlocked(connectionSwitch.inputBlocked)
             captureAvailability.begin(generation: wireAuthenticatedGeneration ?? 0)
+            captureReadinessClock.setSuspended(false, at: connectionControlNow())
+            decoder.resetCaptureOutputFence()
             wifiMediaReceiver.setCaptureSuspended(false)
             captureTargets.begin(generation: wireAuthenticatedGeneration ?? 0)
             captureTargetVideo.reset();captureTargetDecodeStarted=false
@@ -563,6 +566,7 @@ public class NetworkManager: ObservableObject {
             guard let self,
                   self.committedTransportGeneration == self.connectionGeneration,
                   self.committedRealtimeMode == RealtimeTransportMode.wifiRTP else { return }
+            self.captureAvailability.noteFrameReceived(sequence: sequence)
             if self.consumeConnectionVideoOnQueue(data, sequence: sequence, isIDR: isIDR,
                 lengthPrefixed: true, receivedAt: receivedAt, domain: .rtp) { return }
             if self.captureTargetOwnsPresentation {
@@ -3956,7 +3960,7 @@ public class NetworkManager: ObservableObject {
                 guard catalogue.revision>lastMirrorCatalogueRevision,
                       let source=mirrorControl.currentState,source.geometry != nil else {return}
                 lastMirrorCatalogueRevision=catalogue.revision
-                mirrorCatalogueReceivedAt=ProcessInfo.processInfo.systemUptime
+                mirrorCatalogueReceivedAt=captureReadinessNow()
                 currentMirrorCatalogue=catalogue
                 mirrorCatalogueSource=(source.epoch,source.source)
                 publishMirrorStateOnQueue()
@@ -3989,6 +3993,7 @@ public class NetworkManager: ObservableObject {
                 // exact host commit must arrive first on authenticated TLS.
                 return
             }
+            captureAvailability.noteFrameReceived(sequence: header.sequence)
             if consumeConnectionVideoOnQueue(payload, sequence: header.sequence,
                 isIDR: header.flags & WireProtocol.videoFlagIDR != 0,
                 lengthPrefixed: header.flags & WireProtocol.videoFlagLengthPrefixed != 0,
@@ -5216,6 +5221,7 @@ public class NetworkManager: ObservableObject {
             guard generation == connectionGeneration, activeControlConnection === owner,
                   wireAuthenticatedGeneration == generation, committedTransportGeneration == generation,
                   committedRealtimeMode == RealtimeTransportMode.wifiRTP else { return }
+            captureAvailability.noteFrameReceived(sequence: sequence)
             _=consumeCaptureTargetVideoOnQueue(data, sequence: sequence, isIDR: isIDR,
                                                lengthPrefixed: true, receivedAt: CACurrentMediaTime())
         }
@@ -5669,11 +5675,30 @@ public class NetworkManager: ObservableObject {
     }
     private func scheduleCaptureTargetCallback(_ seconds: TimeInterval, recovery: Bool = false,
                                                completion: @escaping () -> Void) {
+        let deadline = captureReadinessNow() + seconds
+        scheduleCaptureProgressCallback(seconds, deadline: deadline, recovery: recovery, completion: completion)
+    }
+    private func scheduleCaptureProgressCallback(_ seconds: TimeInterval, deadline: TimeInterval,
+                                                 recovery: Bool, recheck: Bool = false,
+                                                 completion: @escaping () -> Void) {
+        let generation = connectionGeneration
+        let recoveryToken = captureTargetRecoveryToken
+        let checked = { [weak self] in
+            guard let self, self.connectionGeneration == generation else { return }
+            if recovery && self.captureTargetRecoveryToken != recoveryToken { return }
+            let remaining = deadline - self.captureReadinessNow()
+            if self.captureAvailability.negotiated && (self.captureAvailability.inputBlocked || remaining > 0) {
+                self.scheduleCaptureProgressCallback(max(0.05, min(1, remaining)), deadline: deadline,
+                    recovery: recovery, recheck: true, completion: completion)
+                return
+            }
+            completion()
+        }
         #if targetEnvironment(simulator)
-        if let schedule=captureTargetScheduleForTesting { schedule(seconds, completion);return }
+        if let schedule=captureTargetScheduleForTesting { schedule(seconds, checked);return }
         #endif
-        let work=DispatchWorkItem(block: completion)
-        if recovery { captureTargetRecoveryWork.append(work) }
+        let work=DispatchWorkItem(block: checked)
+        if recovery && !recheck { captureTargetRecoveryWork.append(work) }
         networkQueue.asyncAfter(deadline: .now()+seconds, execute: work)
     }
     private func cancelCaptureTargetRecoveryOnQueue() {
@@ -5931,6 +5956,9 @@ public class NetworkManager: ObservableObject {
         #endif
         return ProcessInfo.processInfo.systemUptime
     }
+    private func captureReadinessNow() -> TimeInterval {
+        captureReadinessClock.now(at: connectionControlNow())
+    }
     private func connectionControlPacketIsCurrent(_ data: Data) -> Bool {
         if data.count == TouchWireProtocol.packetSize { return !connectionSwitch.inputBlocked }
         guard data.count >= 16 else { return true }
@@ -6029,7 +6057,7 @@ public class NetworkManager: ObservableObject {
     }
     private func connectionStatusTickOnQueue() {
         dispatchPrecondition(condition: .onQueue(networkQueue))
-        let now = connectionControlNow()
+        let now = captureReadinessNow()
         if expireConnectionControlOnQueue(now: now) { return }
         if let start = connectionListenerPreparationAt,
            now < start || now - start >= ConnectionControlProtocol.listenerWait {
@@ -6048,7 +6076,7 @@ public class NetworkManager: ObservableObject {
                       credential.secret == original.secret,
                       connectionAdvertisement & 0x0200 != 0,
                       connectionSwitch.bindReplacement(generation: connectionGeneration, route: committedConnectionRoute,
-                          authenticated: true, now: connectionControlNow()) else {
+                          authenticated: true, now: captureReadinessNow()) else {
                     if connectionAdvertisement & 0x0200 != 0 { failConnectionControlOnQueue(.identityUnavailable) }
                     return
                 }
@@ -6078,7 +6106,7 @@ public class NetworkManager: ObservableObject {
                 if let payload = self.connectionSwitch.refresh() { self.sendWireMessage(type: .connectionHello, payload: payload, sequence: 0) }
                 return
             }
-            guard let request = self.connectionSwitch.select(route, askPC: askPC, now: self.connectionControlNow()),
+            guard let request = self.connectionSwitch.select(route, askPC: askPC, now: self.captureReadinessNow()),
                   let payload = try? request.encode() else { self.publishConnectionControlOnQueue(); return }
             self.connectionSwitch.deferRequestSend()
             self.connectionSelectedCredential = self.trustedCredential
@@ -6090,8 +6118,8 @@ public class NetworkManager: ObservableObject {
             let send = { [weak self] in
                 guard let self, self.connectionOperation == operation, self.connectionGeneration == generation,
                       self.connectionSwitch.pending?.request == request else { return }
-                self.connectionSwitch.tick(now: self.connectionControlNow())
-                guard self.connectionSwitch.markRequestSent(transaction: request.transaction, now: self.connectionControlNow()) else {
+                self.connectionSwitch.tick(now: self.captureReadinessNow())
+                guard self.connectionSwitch.markRequestSent(transaction: request.transaction, now: self.captureReadinessNow()) else {
                     self.rejectConnectionPreflightOnQueue(.staleRevision); return
                 }
                 self.sendWireMessage(type: .connectionSelectRequest, payload: payload, sequence: 0)
@@ -6107,7 +6135,7 @@ public class NetworkManager: ObservableObject {
               generation == connectionGeneration, message.header.flags == 0 else {
             handleStreamError("Unnegotiated connection control message."); return
         }
-        let now = connectionControlNow()
+        let now = captureReadinessNow()
         if expireConnectionControlOnQueue(now: now) { return }
         do {
             if message.header.type == .connectionState {
@@ -6159,7 +6187,7 @@ public class NetworkManager: ObservableObject {
         if let listener = usbListener, case .ready = listener.state { ready(); return }
         guard connectionListenerCompletion == nil, activeTransportKind == .wifi else { return }
         connectionListenerCompletion = ready
-        connectionListenerPreparationAt = connectionControlNow()
+        connectionListenerPreparationAt = captureReadinessNow()
         if usbListener == nil {
             let port: UInt16
             #if targetEnvironment(simulator)
@@ -6293,7 +6321,7 @@ public class NetworkManager: ObservableObject {
                   decoder.configureH264(sps: sets[0], pps: sets[1]) else { failConnectionControlOnQueue(.startFailed); return }
         }
         connectionSwitch.expectDisplay(request: request, decoder: owner.decoder, generation: connectionGeneration)
-        connectionSwitch.displayReady(request: request, generation: connectionGeneration, now: connectionControlNow())
+        connectionSwitch.displayReady(request: request, generation: connectionGeneration, now: captureReadinessNow())
         connectionSwitch.observeIDR(sequence: root.sequence, domain: completed.frameDomain, decoder: owner.decoder, generation: connectionGeneration)
         connectionVideoStarted = true
         for frame in frames {
@@ -6334,6 +6362,11 @@ public class NetworkManager: ObservableObject {
     }
     var usbIdentityBoundForTesting: Bool { networkQueue.sync { pairedControlGeneration == connectionGeneration } }
     var connectionProofPresentForTesting: Bool { networkQueue.sync { connectionProof != nil } }
+    func captureContinuationForTesting(sequence: UInt32, decoder: UInt64, isIDR: Bool) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        captureAvailability.noteFrameReceived(sequence: sequence)
+        _ = admitCaptureContinuationOnQueue(sequence: sequence, decoder: decoder, isIDR: isIDR)
+    }
     func connectionStatusTickForTesting() { networkQueue.sync { connectionStatusTickOnQueue() } }
     #endif
     private func beginOwnedDecoderSession(networkGeneration generation: UInt64) {
@@ -6351,18 +6384,21 @@ public class NetworkManager: ObservableObject {
         decoder.beginSession(generation: owner.decoder)
     }
     private func receiveCaptureAvailabilityOnQueue(_ payload: Data, flags: UInt16, generation: UInt64) {
+        let wasWireSuspended = captureAvailability.wireSuspended
         switch captureAvailability.receive(payload, flags: flags, generation: generation) {
         case .ignored(let reason):
             recordDiagnosticLine("[CAPTURE_AVAILABILITY] ignored=\(reason)")
             return
         case .suspended(let retireInput):
+            captureReadinessClock.setSuspended(captureAvailability.inputBlocked, at: connectionControlNow())
             mirrorControl.setCaptureSuspended(captureAvailability.inputBlocked)
             wifiMediaReceiver.setCaptureSuspended(true)
-            cancelCaptureTargetRecoveryOnQueue()
             controlChannelWriter.discardPending(where: CaptureAvailabilityProtocol.isNewInputPacket)
-            if retireInput {
+            if !wasWireSuspended || retireInput {
                 captureTargetVideo.reset(); connectionVideo.reset()
                 decoder.fenceCaptureContinuation()
+            }
+            if retireInput {
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.connectionGenerationClock.current == generation else { return }
                     self.captureTargetRetireInput?()
@@ -6373,7 +6409,11 @@ public class NetworkManager: ObservableObject {
         publishMirrorStateOnQueue()
     }
     private func admitCaptureContinuationOnQueue(sequence: UInt32, decoder: UInt64, isIDR: Bool) -> Bool {
-        captureAvailability.admitFrame(sequence: sequence, decoder: decoder, isIDR: isIDR, generation: connectionGeneration)
+        let admitted = captureAvailability.admitFrame(sequence: sequence, decoder: decoder, isIDR: isIDR, generation: connectionGeneration)
+        if admitted, captureAvailability.mayPresent(sequence: sequence, decoder: decoder) {
+            self.decoder.authorizeCaptureOutput(sequence: sequence, generation: decoder)
+        }
+        return admitted
     }
     private func observeCaptureContinuationOnQueue(sequence: UInt32, decoder: UInt64, decoded: Bool, presented: Bool) {
         guard wireAuthenticatedGeneration == connectionGeneration,
@@ -6381,6 +6421,7 @@ public class NetworkManager: ObservableObject {
               captureAvailability.observeFrame(sequence: sequence, decoder: decoder, decoded: decoded,
                 presented: presented, generation: connectionGeneration) else { return }
         mirrorControl.setCaptureSuspended(false)
+        captureReadinessClock.setSuspended(false, at: connectionControlNow())
         wifiMediaReceiver.setCaptureSuspended(false)
         publishMirrorStateOnQueue()
     }
@@ -6477,7 +6518,7 @@ public class NetworkManager: ObservableObject {
                   !self.mirrorSwitchPending,let connection=self.activeControlConnection,
                   self.currentMirrorCatalogue==catalogue,
                   self.mirrorControl.hasPresentedCurrentSource,
-                  ProcessInfo.processInfo.systemUptime-self.mirrorCatalogueReceivedAt<30,
+                  self.captureReadinessNow()-self.mirrorCatalogueReceivedAt<30,
                   let payload=try? catalogue.switchRequest(id) else {return}
             // A consumed catalogue cannot submit another switch while its transaction is pending.
             self.currentMirrorCatalogue=nil
@@ -6516,7 +6557,11 @@ public class NetworkManager: ObservableObject {
             self.scheduleMirrorSwitchDeadlineOnQueue(attempt:attempt,generation:generation,connection:connection)
         }
     }
-    private func scheduleMirrorSwitchDeadlineOnQueue(attempt:UUID,generation:UInt64,connection:NWConnection) {
+    private func scheduleMirrorSwitchDeadlineOnQueue(attempt:UUID,generation:UInt64,connection:NWConnection,
+                                                    expiresAt: TimeInterval? = nil) {
+            let initial = expiresAt == nil
+            let expiresAt = expiresAt ?? captureReadinessNow() + 5
+            let delay: TimeInterval = initial ? 5 : max(0.05, min(5, expiresAt - captureReadinessNow()))
             let deadlineToken=UUID();mirrorSwitchDeadlineToken=deadlineToken
             let completion: () -> Void = { [weak self, weak connection] in
                 guard let self,let connection,self.mirrorSwitchAttempt==attempt,
@@ -6524,6 +6569,12 @@ public class NetworkManager: ObservableObject {
                       self.connectionGeneration==generation,self.wireAuthenticatedGeneration==generation,
                       self.committedTransportGeneration==generation,
                       self.activeControlConnection === connection else {return}
+                if self.captureAvailability.negotiated &&
+                    (self.captureAvailability.inputBlocked || self.captureReadinessNow() < expiresAt) {
+                    self.scheduleMirrorSwitchDeadlineOnQueue(attempt: attempt, generation: generation,
+                        connection: connection, expiresAt: expiresAt)
+                    return
+                }
                 // No response means unknown, never a selected monitor or renewed input grant.
                 self.mirrorSwitchAttempt=nil;self.mirrorSwitchPending=false
                 self.mirrorSwitchDeadlineToken=nil
@@ -6533,9 +6584,9 @@ public class NetworkManager: ObservableObject {
                 self.publishMirrorStateOnQueue()
             }
             #if targetEnvironment(simulator)
-            if let schedule=mirrorSwitchDeadlineForTesting {schedule(5,completion);return}
+            if let schedule=mirrorSwitchDeadlineForTesting {schedule(delay,completion);return}
             #endif
-            networkQueue.asyncAfter(deadline:.now()+5,execute:completion)
+            networkQueue.asyncAfter(deadline:.now()+delay,execute:completion)
     }
     private func advanceMirrorTerminalSwitchOnQueue() {
         dispatchPrecondition(condition:.onQueue(networkQueue))
@@ -6544,7 +6595,7 @@ public class NetworkManager: ObservableObject {
               connectionGeneration==pending.generation,wireAuthenticatedGeneration==pending.generation,
               committedTransportGeneration==pending.generation,
               activeControlConnection === pending.connection else {return}
-        guard ProcessInfo.processInfo.systemUptime-pending.catalogueReceivedAt<30 else {
+        guard captureReadinessNow()-pending.catalogueReceivedAt<30 else {
             mirrorControl.cancelTerminalSwitch();mirrorTerminalSend=nil;return
         }
         guard mirrorControl.takeTerminalSwitch(nonce:pending.nonce) else {return}
@@ -6603,7 +6654,7 @@ public class NetworkManager: ObservableObject {
             networkQueue.async { [weak self] in
                 guard let self, self.connectionGeneration == routeDecoder.network else { return }
                 self.connectionSwitch.rendered(sequence: sequence, domain: routeDecoder.domain,
-                    decoder: generation, generation: routeDecoder.network, now: self.connectionControlNow())
+                    decoder: generation, generation: routeDecoder.network, now: self.captureReadinessNow())
                 if self.connectionHandoffInProgress && !self.connectionSwitch.inputBlocked {
                     self.finishConnectionControlOnQueue()
                 }

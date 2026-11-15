@@ -366,6 +366,11 @@ public final class DecoderManager {
     public var onFrameDecoded: ((CVPixelBuffer, UInt32, UInt64) -> Void)?
     public var onDecodeCompleted: ((UInt32, UInt64, Bool) -> Void)?
     public var onSessionBegan: ((UInt64) -> Void)?
+    var onCaptureFenced: ((UInt64) -> Void)?
+    private let captureDeliveryLock = NSLock()
+    private var captureOutputFenced = false
+    private struct CaptureOutputKey: Hashable { let sequence: UInt32; let generation: UInt64 }
+    private var captureOutputs: Set<CaptureOutputKey> = []
     public var onDecodeLatency:
         ((UInt32, UInt64, TimeInterval, Double) -> Void)?
     public var onMailboxAge: ((UInt32, Double) -> Void)?
@@ -437,6 +442,9 @@ public final class DecoderManager {
     }
 
     public func beginSession(generation: UInt64) {
+        captureDeliveryLock.lock()
+        defer { captureDeliveryLock.unlock() }
+        captureOutputs.removeAll()
         #if targetEnvironment(simulator)
         testingLifecycleLock.lock()
         testingSessionBeganCount += 1
@@ -448,14 +456,41 @@ public final class DecoderManager {
         localSessionGeneration = generation
         mailboxStateLock.unlock()
         onSessionBegan?(generation)
+        if captureOutputFenced { onCaptureFenced?(generation) }
     }
 
     // Drop pre-suspension decode tickets without changing VT/session/renderer ownership.
     // The renderer keeps its last image; only a fresh IDR may restart the mailbox chain.
     func fenceCaptureContinuation() {
+        captureDeliveryLock.lock()
+        defer { captureDeliveryLock.unlock() }
+        captureOutputFenced = true; captureOutputs.removeAll()
         mailboxStateLock.lock()
         mailbox.beginSession(generation: localSessionGeneration)
+        let generation = localSessionGeneration
         mailboxStateLock.unlock()
+        onCaptureFenced?(generation)
+    }
+
+    func authorizeCaptureOutput(sequence: UInt32, generation: UInt64) {
+        captureDeliveryLock.lock()
+        defer { captureDeliveryLock.unlock() }
+        guard captureOutputFenced else { return }
+        if captureOutputs.count == 256 { captureOutputs.removeAll() }
+        captureOutputs.insert(CaptureOutputKey(sequence: sequence, generation: generation))
+    }
+
+    func resetCaptureOutputFence() {
+        captureDeliveryLock.lock()
+        captureOutputFenced = false; captureOutputs.removeAll()
+        captureDeliveryLock.unlock()
+    }
+
+    func deliverCaptureOutput(sequence: UInt32, generation: UInt64, delivery: () -> Void) {
+        captureDeliveryLock.lock()
+        defer { captureDeliveryLock.unlock() }
+        let key = CaptureOutputKey(sequence: sequence, generation: generation)
+        if !captureOutputFenced || captureOutputs.remove(key) != nil { delivery() }
     }
 
     /// Changes only the bounded decode age policy; never waits for the decoder queue.
@@ -939,10 +974,11 @@ public final class DecoderManager {
                 ticket.sessionGeneration,
                 decodeStartedAt,
                 (CACurrentMediaTime() - decodeStartedAt) * 1_000.0)
-            onFrameDecoded?(
-                imageBuffer,
-                lifetime.sequence,
-                ticket.sessionGeneration)
+            // Serialize enqueue with the synchronous render fence. A completion
+            // already past mailbox.complete must not slip behind that fence.
+            deliverCaptureOutput(sequence: lifetime.sequence, generation: ticket.sessionGeneration) {
+                onFrameDecoded?(imageBuffer, lifetime.sequence, ticket.sessionGeneration)
+            }
         }
         lifetime.finish()
         if let next = completion.next {

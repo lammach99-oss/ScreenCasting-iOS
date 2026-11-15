@@ -1,5 +1,20 @@
 import Foundation
 
+// A monotonic progress domain shared by every capture-dependent deadline.
+// Keep its offset across generations: a retained route handoff must not see time go backwards.
+struct CaptureReadinessClock {
+    private var pausedAt: TimeInterval?
+    private var excluded: TimeInterval = 0
+    func now(at wall: TimeInterval) -> TimeInterval { (pausedAt ?? wall) - excluded }
+    mutating func setSuspended(_ suspended: Bool, at wall: TimeInterval) {
+        if suspended {
+            if pausedAt == nil { pausedAt = wall }
+        } else if let start = pausedAt {
+            excluded += max(0, wall - start); pausedAt = nil
+        }
+    }
+}
+
 // DisplayCapabilities only; independent of Ping/Pong feature flags.
 enum CaptureAvailabilityProtocol {
     static let advertisementFlag: UInt16 = 0x0040
@@ -52,8 +67,10 @@ struct CaptureAvailabilityState {
     private(set) var wireSuspended = false
     private(set) var notice: String?
     private struct FrameKey: Hashable { let sequence: UInt32; let decoder: UInt64 }
-    private struct Frame { let isIDR: Bool; var decoded = false; var presented = false }
+    private struct Frame { let receivedAfterResume: Bool; var decoded = false; var presented = false }
     private var frames: [FrameKey: Frame] = [:]
+    private var receivedAfterResume: [UInt32: Bool] = [:]
+    private var receiptOrder: [UInt32] = []
     private var frameOrder: [FrameKey] = []
     private var lastAdmitted: UInt32?
     private var suspensionFloor: UInt32?
@@ -82,6 +99,7 @@ struct CaptureAvailabilityState {
             let retire = !inputBlocked
             if !wireSuspended || retire {
                 frames.removeAll(); frameOrder.removeAll(); freshRoot = false
+                receivedAfterResume.removeAll(); receiptOrder.removeAll()
                 suspensionFloor = lastAdmitted
             }
             wireSuspended = true
@@ -96,7 +114,20 @@ struct CaptureAvailabilityState {
     // A route may reset wire frame sequences without ending the authenticated session.
     mutating func resetMediaDomain() {
         frames.removeAll(); frameOrder.removeAll(); freshRoot = false
+        receivedAfterResume.removeAll(); receiptOrder.removeAll()
         lastAdmitted = nil; suspensionFloor = nil
+    }
+
+    // Called at transport receipt, before source/route buffers can delay admission.
+    mutating func noteFrameReceived(sequence: UInt32) {
+        guard inputBlocked, receivedAfterResume[sequence] == nil else { return }
+        if receiptOrder.count == 256 { receivedAfterResume.removeValue(forKey: receiptOrder.removeFirst()) }
+        receivedAfterResume[sequence] = !wireSuspended; receiptOrder.append(sequence)
+    }
+
+    func mayPresent(sequence: UInt32, decoder: UInt64) -> Bool {
+        guard !wireSuspended else { return false }
+        return !inputBlocked || frames[FrameKey(sequence: sequence, decoder: decoder)]?.receivedAfterResume == true
     }
 
     mutating func admitFrame(sequence: UInt32, decoder: UInt64, isIDR: Bool, generation: UInt64) -> Bool {
@@ -109,7 +140,8 @@ struct CaptureAvailabilityState {
         let key = FrameKey(sequence: sequence, decoder: decoder)
         guard frames[key] == nil else { return false }
         if frameOrder.count == 64 { frames.removeValue(forKey: frameOrder.removeFirst()) }
-        frames[key] = Frame(isIDR: isIDR); frameOrder.append(key)
+        frames[key] = Frame(receivedAfterResume: receivedAfterResume[sequence] ?? false)
+        frameOrder.append(key)
         return true
     }
 
@@ -120,7 +152,7 @@ struct CaptureAvailabilityState {
         guard var frame = frames[key] else { return false }
         frame.decoded = frame.decoded || decoded; frame.presented = frame.presented || presented
         frames[key] = frame
-        guard frame.decoded && frame.presented, !wireSuspended || frame.isIDR else { return false }
+        guard !wireSuspended, frame.receivedAfterResume, frame.decoded && frame.presented else { return false }
         notice = nil; wireSuspended = false
         frames.removeAll(); frameOrder.removeAll()
         return true

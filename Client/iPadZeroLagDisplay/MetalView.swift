@@ -104,6 +104,9 @@ public struct MetalView: UIViewRepresentable {
             networkManager.decoder.onSessionBegan = { [weak renderer] generation in
                 renderer?.beginSession(generation: generation)
             }
+            networkManager.decoder.onCaptureFenced = { [weak renderer] generation in
+                renderer?.fenceCaptureContinuation(generation: generation)
+            }
             networkManager.decoder.onFrameDecoded = {
                 [weak renderer] pixelBuffer, sequence, generation in
                 renderer?.updateFrame(
@@ -1004,6 +1007,9 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
 
         networkManager.decoder.onSessionBegan = { [weak renderer] generation in
             renderer?.beginSession(generation: generation)
+        }
+        networkManager.decoder.onCaptureFenced = { [weak renderer] generation in
+            renderer?.fenceCaptureContinuation(generation: generation)
         }
         networkManager.decoder.onFrameDecoded = { [weak renderer] pixelBuffer, sequence, generation in
             renderer?.updateFrame(
