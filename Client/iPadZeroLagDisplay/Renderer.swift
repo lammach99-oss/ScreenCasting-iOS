@@ -1028,19 +1028,10 @@ public class Renderer: NSObject, MTKViewDelegate {
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         encoder.endEncoding()
 
-        lock.lock()
-        let commitDecision: RenderCommitDecision =
-            freshness.isCurrent(identity) ? .commit : .superseded
-        guard commitDecision == .commit else {
-            lock.unlock()
-            recordCadence(
-                .precommitSuperseded,
-                generation: identity.generation)
-            return
-        }
-
         let presentedDrawableSize = CGSize(width: drawable.texture.width, height: drawable.texture.height)
         #if !targetEnvironment(simulator)
+        // Prepare the callback before final authorization. Registration does not
+        // submit the drawable; its eventual callback checks identity separately.
         // On device, availability needs display evidence independently of GPU completion
         // telemetry. A dropped drawable reports zero presentedTime.
         drawable.addPresentedHandler { [weak self] (presented: MTLDrawable) in
@@ -1052,6 +1043,20 @@ public class Renderer: NSObject, MTKViewDelegate {
             self.onFramePresented?(identity.sequence, identity.generation)
         }
         #endif
+
+        // Keep final authorization and CPU submission atomic with beginSession.
+        // Neither callback execution nor GPU completion is awaited under this lock.
+        lock.lock()
+        let commitDecision: RenderCommitDecision =
+            freshness.isCurrent(identity) ? .commit : .superseded
+        guard commitDecision == .commit else {
+            lock.unlock()
+            recordCadence(
+                .precommitSuperseded,
+                generation: identity.generation)
+            return
+        }
+
         commandBuffer.present(drawable)
         let retainedPixelBuffer = pixelBuffer
         commandBuffer.addCompletedHandler { [weak self] (completedBuffer: MTLCommandBuffer) in
