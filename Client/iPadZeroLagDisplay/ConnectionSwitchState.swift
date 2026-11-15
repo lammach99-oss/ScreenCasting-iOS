@@ -141,7 +141,7 @@ public struct ConnectionSwitchState: Equatable {
             terminalMessage = "Already using " + value.current.label
         case .permissionRequired:
             guard !operation.accepted else { return false }
-            pending = nil; inputBlocked = false; phase = .permissionRequired; issue = value.reason
+            pending = nil; inputBlocked = false; phase = .permissionRequired; issue = .permissionMissing
         case .denied, .unavailable, .busy:
             guard !operation.accepted else { return false }
             pending = nil; inputBlocked = false; phase = .declined; issue = value.reason
@@ -196,6 +196,7 @@ public struct ConnectionSwitchState: Equatable {
     }
     private func deadlineExpired(now: TimeInterval) -> Bool {
         guard let operation = pending, operation.sent else { return false }
+        if !operation.accepted { return now >= operation.started + ConnectionControlProtocol.preflightWait }
         if let completedAt = operation.completedAt { return now >= min(completedAt + 5, operation.started + 80) }
         return now >= operation.started + 75
     }
@@ -214,6 +215,9 @@ public struct ConnectionSwitchState: Equatable {
     }
     mutating func preflightFailed(reason: ConnectionReason) {
         guard let pending, !pending.accepted else { cancel(reason: reason); return }
+        // Once 78 is sent there is no cancellation handshake. Keep correlation
+        // and the input fence until a host terminal result or the 15-second cap.
+        guard !pending.sent else { return }
         terminalMessage = reason.text(target: pending.request.target)
         self.pending = nil; phase = .declined; inputBlocked = false; issue = reason
         resetPresentation()
@@ -249,7 +253,7 @@ public struct ConnectionSwitchState: Equatable {
         case .preparingUSB: return "Preparing USB..."
         case .permissionRequired: return "Allow connection changes on the PC"
         case .switching: return pending?.request.target == .usb ? "Switching to USB..." : "Switching to Wi-Fi..."
-        case .waitingPeer: return "Connecting over Wi-Fi..."
+        case .waitingPeer: return pending?.request.target == .usb ? "Connecting over USB..." : "Connecting over Wi-Fi..."
         case .waitingDisplay: return "Preparing display..."
         case .waitingFrame: return "Waiting for picture..."
         case .failed: return "Connection change failed"

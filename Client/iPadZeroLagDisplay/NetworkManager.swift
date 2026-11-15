@@ -445,6 +445,7 @@ public class NetworkManager: ObservableObject {
     private var connectionLastInputFence = false
     private var connectionStatusTimer: DispatchSourceTimer?
     private var usbIdentity = USBSessionIdentityProof()
+    private var usbReadinessPongWrittenGeneration: UInt64?
     private var usbIdentityDeadline: DispatchWorkItem?
     private var connectionListenerCompletion: (() -> Void)?
     private var connectionListenerPreparationAt: TimeInterval?
@@ -851,7 +852,8 @@ public class NetworkManager: ObservableObject {
         guard transportState == .idle || isDisconnectedOnQueue else { return }
         committedConnectionRoute = .wifi
         pairedControlGeneration = nil; trustedProofGeneration = nil; connectionAdvertisement = 0
-        usbIdentity = USBSessionIdentityProof(); usbIdentityDeadline?.cancel(); usbIdentityDeadline = nil
+        usbIdentity = USBSessionIdentityProof(); usbReadinessPongWrittenGeneration = nil
+        usbIdentityDeadline?.cancel(); usbIdentityDeadline = nil
         if !connectionHandoffInProgress { resetConnectionControlOnQueue() }
         connectionSelectedEndpoint = endpoint
 
@@ -2085,7 +2087,8 @@ public class NetworkManager: ObservableObject {
     private func installUsbCandidate(_ candidate: NWConnection, preserveContinuation: Bool = false) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         if !preserveContinuation { resetConnectionControlOnQueue() }
-        usbIdentity = USBSessionIdentityProof(); usbIdentityDeadline?.cancel(); usbIdentityDeadline = nil
+        usbIdentity = USBSessionIdentityProof(); usbReadinessPongWrittenGeneration = nil
+        usbIdentityDeadline?.cancel(); usbIdentityDeadline = nil
         pairedControlGeneration = nil; connectionAdvertisement = 0
         committedConnectionRoute = .usb
         _ = connectionGenerationClock.advance()
@@ -5771,26 +5774,46 @@ public class NetworkManager: ObservableObject {
     private func receiveUsbIdentityOnQueue(_ message: WireMessage, generation: UInt64) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         let header = message.header
-        usbIdentity.tick(now: connectionControlNow())
+        let receivedAt = connectionControlNow()
+        usbIdentity.tick(now: receivedAt)
         if header.type == .ping, message.payload.count == 16 {
             let credential = header.flags & USBSessionIdentityProof.offerFlag != 0 ? selectedUsbCredentialOnQueue() : nil
-            let flags = usbIdentity.offer(flags: header.flags, credential: credential, now: connectionControlNow())
+            let flags = usbIdentity.offer(flags: header.flags, credential: credential, now: receivedAt)
+            if flags == USBSessionIdentityProof.optInFlag {
+                // Start at receipt, including credential lookup and Pong write time.
+                let deadline = DispatchWorkItem { [weak self] in
+                    guard let self, generation == self.connectionGeneration,
+                          self.wireAuthenticatedGeneration == nil else { return }
+                    let pongPending = self.usbReadinessPongWrittenGeneration != generation
+                    guard pongPending || self.usbIdentity.pending else { return }
+                    let remaining = self.usbIdentity.remainingBudget(now: self.connectionControlNow())
+                    if remaining > 0, let deadline = self.usbIdentityDeadline {
+                        // Recheck the injected monotonic clock; an early timer
+                        // cannot shorten the original receipt-based budget.
+                        self.networkQueue.asyncAfter(deadline: .now() + remaining, execute: deadline)
+                        return
+                    }
+                    self.usbIdentity.abandon()
+                    if pongPending { self.handleStreamError("USB readiness Pong write timed out.") }
+                    else { self.finishUsbIdentityOnQueue(generation: generation, identified: false) }
+                }
+                usbIdentityDeadline = deadline
+                networkQueue.asyncAfter(deadline: .now() + max(0, receivedAt + 5 - connectionControlNow()), execute: deadline)
+            }
             sendWireMessage(type: .pong, payload: message.payload, sequence: header.sequence, flags: flags) { [weak self] error in
                 guard let self, generation == self.connectionGeneration,
                       self.wireAuthenticatedGeneration == nil else { return }
-                guard error == nil else { self.usbIdentity.abandon(); return }
+                guard error == nil else {
+                    self.usbIdentity.abandon()
+                    self.handleStreamError("USB readiness Pong write failed."); return
+                }
+                self.usbReadinessPongWrittenGeneration = generation
                 if flags == USBSessionIdentityProof.optInFlag {
-                    guard let hello = self.usbIdentity.clientHello(name: "iPad", now: self.connectionControlNow()) else {
+                    guard self.usbIdentity.remainingBudget(now: self.connectionControlNow()) > 0,
+                          let hello = self.usbIdentity.clientHello(name: "iPad", now: self.connectionControlNow()) else {
                         self.finishUsbIdentityOnQueue(generation: generation, identified: false); return
                     }
                     self.sendWireMessage(type: .clientHello, payload: hello, sequence: 0)
-                    let deadline = DispatchWorkItem { [weak self] in
-                        guard let self, generation == self.connectionGeneration, self.usbIdentity.pending else { return }
-                        self.usbIdentity.abandon()
-                        self.finishUsbIdentityOnQueue(generation: generation, identified: false)
-                    }
-                    self.usbIdentityDeadline = deadline
-                    self.networkQueue.asyncAfter(deadline: .now() + self.usbIdentity.remainingBudget(now: self.connectionControlNow()), execute: deadline)
                 } else if !self.usbIdentity.pending {
                     self.finishUsbIdentityOnQueue(generation: generation, identified: false)
                 }
@@ -5825,6 +5848,7 @@ public class NetworkManager: ObservableObject {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard generation == connectionGeneration, wireAuthenticatedGeneration == nil,
               wireReceiveActiveGeneration == generation,
+              usbReadinessPongWrittenGeneration == generation,
               let current = connection, current === usbScdpConnection else { return }
         usbIdentityDeadline?.cancel(); usbIdentityDeadline = nil
         if !identified { usbIdentity.abandon() }
@@ -5916,7 +5940,8 @@ public class NetworkManager: ObservableObject {
         connectionHandoffInProgress = false; connectionExpectedRetirement = false
         pairedControlGeneration = nil; trustedProofGeneration = nil; connectionAdvertisement = 0
         connectionSelectedCredential = nil
-        usbIdentity = USBSessionIdentityProof(); usbIdentityDeadline?.cancel(); usbIdentityDeadline = nil
+        usbIdentity = USBSessionIdentityProof(); usbReadinessPongWrittenGeneration = nil
+        usbIdentityDeadline?.cancel(); usbIdentityDeadline = nil
         connectionVideo.reset(); connectionCompleted = nil; connectionVideoStarted = false
         connectionDisplayRequest = nil; connectionDisplayReady = false
         connectionReadyDisplay = nil
@@ -5931,25 +5956,26 @@ public class NetworkManager: ObservableObject {
         timer.schedule(deadline: .now() + 0.25, repeating: 0.25)
         timer.setEventHandler { [weak self] in
             guard let self, self.connectionOperation == operation else { return }
-            let now = self.connectionControlNow(), hadPending = self.connectionSwitch.pending != nil
-            self.connectionSwitch.tick(now: now)
-            if hadPending && self.connectionSwitch.pending == nil && self.connectionSwitch.offersReconnect {
-                self.failConnectionControlOnQueue(.deadlineExceeded, retainMessage: true)
-                return
-            }
-            if let pending = self.connectionSwitch.pending, pending.sent, !pending.accepted,
-               now >= pending.started + ConnectionControlProtocol.preflightWait {
-                self.rejectConnectionPreflightOnQueue(.peerTimeout)
-                return
-            }
-            if let start = self.connectionListenerPreparationAt,
-               now < start || now - start >= 5 {
-                self.rejectConnectionPreflightOnQueue(.peerTimeout)
-                return
-            }
-            self.publishConnectionControlOnQueue()
+            self.connectionStatusTickOnQueue()
         }
         connectionStatusTimer = timer; timer.resume()
+    }
+    private func expireConnectionControlOnQueue(now: TimeInterval) -> Bool {
+        let hadPending = connectionSwitch.pending != nil
+        connectionSwitch.tick(now: now)
+        guard hadPending && connectionSwitch.pending == nil && connectionSwitch.offersReconnect else { return false }
+        failConnectionControlOnQueue(.deadlineExceeded, retainMessage: true)
+        return true
+    }
+    private func connectionStatusTickOnQueue() {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        let now = connectionControlNow()
+        if expireConnectionControlOnQueue(now: now) { return }
+        if let start = connectionListenerPreparationAt,
+           now < start || now - start >= ConnectionControlProtocol.listenerWait {
+            rejectConnectionPreflightOnQueue(.peerTimeout); return
+        }
+        publishConnectionControlOnQueue()
     }
     private func negotiateConnectionControlOnQueue() {
         guard !remoteInputConnection, wireAuthenticatedGeneration == connectionGeneration,
@@ -6021,15 +6047,17 @@ public class NetworkManager: ObservableObject {
               generation == connectionGeneration, message.header.flags == 0 else {
             handleStreamError("Unnegotiated connection control message."); return
         }
+        let now = connectionControlNow()
+        if expireConnectionControlOnQueue(now: now) { return }
         do {
             if message.header.type == .connectionState {
                 let value = try ConnectionControlState.decode(message.payload)
                 if value.phase == .snapshot {
-                    if connectionSwitch.receive(value, generation: generation, now: connectionControlNow()) {
+                    if connectionSwitch.receive(value, generation: generation, now: now) {
                         recordDiagnosticLine("[CONNECTION_CONTROL] event=state revision=\(value.revision) route=\(value.current.rawValue)")
                     }
                 } else {
-                    guard connectionSwitch.preparing(value, generation: generation, now: connectionControlNow()) else { return }
+                    guard connectionSwitch.preparing(value, generation: generation, now: now) else { return }
                     guard connectionProof == nil else { return } // never refresh an active proof/deadline
                     let target: ConnectionRoute = value.phase == .prepareUSB ? .usb : .wifi
                     connectionProof = ConnectionProofContext(target: target, transaction: value.transaction, owner: value.owner,
@@ -6038,7 +6066,7 @@ public class NetworkManager: ObservableObject {
                 }
             } else {
                 let value = try ConnectionSelectResult.decode(message.payload)
-                guard connectionSwitch.receive(value, generation: generation, now: connectionControlNow()) else { return }
+                guard connectionSwitch.receive(value, generation: generation, now: now) else { return }
                 recordDiagnosticLine("[CONNECTION_CONTROL] event=result status=\(value.status.rawValue) reason=\(value.reason.rawValue)")
                 switch value.status {
                 case .accepted:
@@ -6088,6 +6116,9 @@ public class NetworkManager: ObservableObject {
             closeRoutePreparationOnQueue(); eraseConnectionProofOnQueue(); return
         }
         if pending.accepted { failConnectionControlOnQueue(reason); return }
+        // A local preflight error cannot withdraw an already sent 78. Retain
+        // proof and input ownership until the host answers or the state expires.
+        guard !pending.sent else { return }
         guard pending.originGeneration == connectionGeneration, let incumbent = connection,
               wireAuthenticatedGeneration == connectionGeneration,
               committedTransportGeneration == connectionGeneration, transportState == .streaming else {
@@ -6221,7 +6252,7 @@ public class NetworkManager: ObservableObject {
         networkQueue.sync {
             committedConnectionRoute = .usb; usbListenerExplicitlyStarted = true
             usbScdpConnection = connection; pairedControlGeneration = nil
-            usbIdentity = USBSessionIdentityProof(); connectionAdvertisement = 0
+            usbIdentity = USBSessionIdentityProof(); usbReadinessPongWrittenGeneration = nil; connectionAdvertisement = 0
             wireAuthenticatedGeneration = nil; committedTransportGeneration = nil
         }
     }
@@ -6240,6 +6271,8 @@ public class NetworkManager: ObservableObject {
         }
     }
     var usbIdentityBoundForTesting: Bool { networkQueue.sync { pairedControlGeneration == connectionGeneration } }
+    var connectionProofPresentForTesting: Bool { networkQueue.sync { connectionProof != nil } }
+    func connectionStatusTickForTesting() { networkQueue.sync { connectionStatusTickOnQueue() } }
     #endif
     private func beginOwnedDecoderSession(networkGeneration generation: UInt64) {
         if !connectionHandoffInProgress {

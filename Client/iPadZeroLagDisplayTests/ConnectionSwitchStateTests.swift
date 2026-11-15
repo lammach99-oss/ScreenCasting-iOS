@@ -33,6 +33,63 @@ final class ConnectionSwitchStateTests: XCTestCase {
         XCTAssertTrue(state.receive(try Self.snapshot(allowed: allowed), generation: 1, now: 0))
         return state
     }
+    func testAcceptedFromTenPointOneThroughFourteenPointNineSecondsContinuesToOwnedRender() throws {
+        for arrival in [10.1, 12, 14.9] {
+            var state = try ready(); _ = state.select(.usb, now: 0)
+            XCTAssertTrue(state.preparing(try Self.prepare(), generation: 1, now: 1))
+            state.tick(now: 10)
+            XCTAssertNotNil(state.pending); XCTAssertTrue(state.inputBlocked)
+            XCTAssertTrue(state.receive(try Self.snapshot(revision: 3, hostState: .switching), generation: 1, now: arrival))
+            XCTAssertTrue(state.receive(try Self.result(.accepted), generation: 1, now: arrival))
+            XCTAssertTrue(state.bindReplacement(generation: 2, route: .usb, authenticated: true, now: arrival + 1))
+            _ = state.advertise(flags: 0x0200, authenticated: true, generation: 2)
+            _ = state.receive(try Self.snapshot(revision: 3, owner: 2, route: .usb), generation: 2, now: arrival + 1)
+            XCTAssertTrue(state.receive(try Self.result(.completed), generation: 2, now: arrival + 2))
+            state.expectDisplay(request: 7, decoder: 11, generation: 2)
+            state.displayReady(request: 7, generation: 2, now: arrival + 2)
+            state.observeIDR(sequence: 0, domain: .scst, decoder: 11, generation: 2)
+            state.rendered(sequence: 0, domain: .scst, decoder: 11, generation: 2, now: arrival + 2)
+            XCTAssertEqual(state.phase, .completed); XCTAssertFalse(state.inputBlocked)
+        }
+    }
+    func testPreflightAtFifteenSecondsIsUnknownAndLateResultsCannotRestoreInput() throws {
+        var state = try ready(); _ = state.select(.usb, now: 0)
+        _ = state.preparing(try Self.prepare(), generation: 1, now: 1)
+        state.preflightFailed(reason: .listenerClosed)
+        XCTAssertNotNil(state.pending); XCTAssertTrue(state.inputBlocked)
+        state.tick(now: 14.9)
+        XCTAssertNotNil(state.pending); XCTAssertFalse(state.offersReconnect)
+        state.tick(now: 15)
+        XCTAssertNil(state.pending); XCTAssertEqual(state.actualRoute, .unknown)
+        XCTAssertEqual(state.phase, .failed); XCTAssertTrue(state.inputBlocked)
+        XCTAssertTrue(state.offersReconnect); XCTAssertEqual(state.message, "Connection change timed out")
+        XCTAssertNotNil(ConnectScreenStatus.connectionChange(state))
+        _ = state.receive(try Self.snapshot(revision: 3, hostState: .switching), generation: 1, now: 15)
+        XCTAssertFalse(state.receive(try Self.result(.accepted), generation: 1, now: 15))
+        XCTAssertFalse(state.receive(try Self.result(.completed), generation: 1, now: 16))
+        state.tick(now: 20); XCTAssertTrue(state.inputBlocked)
+        state.begin(generation: 2); XCTAssertFalse(state.inputBlocked)
+    }
+    func testPreflightBudgetStartsAtSendAndWaitingPeerCopyUsesTarget() throws {
+        var state = try ready(); _ = state.select(.usb, now: 0); state.deferRequestSend()
+        XCTAssertTrue(state.markRequestSent(transaction: 1, now: 4))
+        state.tick(now: 18.9); XCTAssertNotNil(state.pending)
+        state.tick(now: 19); XCTAssertTrue(state.offersReconnect); XCTAssertTrue(state.inputBlocked)
+        for target in [ConnectionRoute.usb, .wifi] {
+            state = try ready()
+            if target == .wifi { _ = state.receive(try Self.snapshot(revision: 3, route: .usb), generation: 1, now: 0) }
+            _ = state.select(target, now: 0)
+            var prepare = Array(try Self.prepare().encode())
+            if target == .wifi { prepare[2] = 2; prepare[7] = 2; prepare[8] = 3 }
+            _ = state.preparing(try ConnectionControlState.decode(Data(prepare)), generation: 1, now: 1)
+            _ = state.receive(try Self.snapshot(revision: 4, route: target == .usb ? .wifi : .usb, hostState: .switching), generation: 1, now: 1)
+            var accepted = Array(try Self.result(.accepted).encode()); accepted[24] = 4
+            if target == .wifi { accepted[2] = 1; accepted[3] = 2 }
+            XCTAssertTrue(state.receive(try ConnectionSelectResult.decode(Data(accepted)), generation: 1, now: 1))
+            state.waitingForPeer()
+            XCTAssertEqual(state.message, target == .usb ? "Connecting over USB..." : "Connecting over Wi-Fi...")
+        }
+    }
     func testOldHostSilenceAndReplacementNegotiationReset() {
         var state = ConnectionSwitchState(); state.begin(generation: 1)
         XCTAssertNil(state.advertise(flags: 0, authenticated: true, generation: 1))
@@ -55,7 +112,7 @@ final class ConnectionSwitchStateTests: XCTestCase {
         XCTAssertNil(state.select(.usb, now: 1))
         let first = try XCTUnwrap(state.select(.usb, askPC: true, now: 1))
         XCTAssertTrue(state.receive(try Self.snapshot(revision: 3, allowed: false, hostState: .awaitingPermission), generation: 1, now: 1))
-        XCTAssertTrue(state.receive(try Self.result(.permissionRequired, reason: .permissionMissing), generation: 1, now: 1))
+        XCTAssertTrue(state.receive(try Self.result(.permissionRequired), generation: 1, now: 1))
         XCTAssertEqual(state.message, "Allow connection changes on the PC"); XCTAssertNil(state.pending)
         XCTAssertTrue(state.receive(try Self.snapshot(revision: 4), generation: 1, now: 2))
         XCTAssertNil(state.pending)
@@ -69,8 +126,8 @@ final class ConnectionSwitchStateTests: XCTestCase {
         XCTAssertTrue(state.receive(try ConnectionSelectResult.decode(Data(bytes)), generation: 1, now: 1))
         XCTAssertEqual(state.message, "Already using Wi-Fi")
         state = try ready(); XCTAssertNotNil(state.select(.usb, now: 1))
-        XCTAssertFalse(state.receive(try Self.result(.alreadyActive, reason: .duplicateTransaction), generation: 1, now: 2))
-        XCTAssertFalse(state.receive(try Self.result(.denied, transaction: 99, reason: .replay), generation: 1, now: 2))
+        XCTAssertFalse(state.receive(try Self.result(.busy, reason: .duplicateTransaction), generation: 1, now: 2))
+        XCTAssertFalse(state.receive(try Self.result(.denied, transaction: 99, reason: .notOwner), generation: 1, now: 2))
         XCTAssertNotNil(state.pending)
     }
     func accepted() throws -> ConnectionSwitchState {

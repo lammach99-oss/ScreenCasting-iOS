@@ -164,13 +164,47 @@ final class ConnectionControlProtocolTests: XCTestCase {
             XCTAssertEqual(failures, 1); XCTAssertEqual(parser.allocatedPayloadBytes, 0)
         }
     }
+    func testZeroResumeProofAndZeroPreparationSecretsReject() throws {
+        for frame in [Self.resumeUSB, Self.resumeWiFi] {
+            var bytes = Data(frame.dropFirst(16)); bytes.replaceSubrange(48..<80, with: Data(count: 32))
+            XCTAssertThrowsError(try ConnectionHello.decode(bytes))
+        }
+        for range in [64..<96, 96..<128] {
+            var bytes = try ConnectionSwitchStateTests.prepare().encode()
+            bytes.replaceSubrange(range, with: Data(count: 32))
+            XCTAssertThrowsError(try ConnectionControlState.decode(bytes))
+        }
+    }
+    func testPreparationRequiresOppositeCurrentRoute() throws {
+        for phase in [UInt8(1), 2] {
+            for route in [UInt8(0), 1, 2] {
+                var bytes = try ConnectionSwitchStateTests.prepare().encode(); bytes[7] = phase; bytes[2] = route
+                if route == (phase == 1 ? 1 : 2) { XCTAssertNoThrow(try ConnectionControlState.decode(bytes)) }
+                else { XCTAssertThrowsError(try ConnectionControlState.decode(bytes)) }
+            }
+        }
+    }
+    func testEveryStatusReasonPairMatchesCoordinatorDecision() throws {
+        // Independent numeric table: all eight statuses by every existing reason.
+        let allowed: [[UInt8]] = [[0], [0], [6, 2], [0], [14, 9, 10, 13, 24, 8, 3], [7, 23], [16, 25, 11, 15, 17, 18, 19, 8, 20], [0]]
+        for status in UInt8(0)...7 {
+            for reason in UInt8(0)...25 {
+                var b = Array(Self.accepted.dropFirst(16)); b[1] = status; b[4] = reason
+                if status == 7 { b[3] = 2; b[6] = 1; b[32] = 2; b[60] = 1 }
+                else if status != 0 { b.replaceSubrange(40..<56, with: repeatElement(UInt8(0), count: 16)); b[6] = status == 3 ? 3 : 1 }
+                if status == 1 { b[2] = 1 }
+                if allowed[Int(status)].contains(reason) { XCTAssertNoThrow(try ConnectionSelectResult.decode(Data(b)), "status=\(status) reason=\(reason)") }
+                else { XCTAssertThrowsError(try ConnectionSelectResult.decode(Data(b)), "status=\(status) reason=\(reason)") }
+            }
+        }
+    }
     func testSemanticStatusReasonCombinationsReject() throws {
         var bytes = Array(Self.accepted.dropFirst(16))
         bytes[1] = 3; bytes[4] = 9; bytes[6] = 3
         bytes.replaceSubrange(40..<56, with: repeatElement(UInt8(0), count: 16))
-        XCTAssertThrowsError(try ConnectionSelectResult.decode(Data(bytes)), "PermissionRequired must carry PermissionMissing")
+        XCTAssertThrowsError(try ConnectionSelectResult.decode(Data(bytes)), "PermissionRequired must carry None")
         bytes[1] = 5; bytes[4] = 5
-        XCTAssertThrowsError(try ConnectionSelectResult.decode(Data(bytes)), "Busy must carry LocalOperation")
+        XCTAssertThrowsError(try ConnectionSelectResult.decode(Data(bytes)), "Busy only allows LocalOperation or DuplicateTransaction")
         bytes[1] = 2; bytes[4] = 9
         XCTAssertThrowsError(try ConnectionSelectResult.decode(Data(bytes)), "NoDevice is Unavailable, not Denied")
         bytes[1] = 1; bytes[4] = 0; bytes[6] = 1

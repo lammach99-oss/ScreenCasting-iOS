@@ -4056,6 +4056,26 @@ final class USBListenerLifetimeTests: XCTestCase {
     }
 
     func testDedicatedUsbProbesDeferForcedTelemetryAndRejectedCandidateCannotPromote() throws {
+        // Exercise real PCM ownership without starting AVAudioEngine on a
+        // simulator whose audio graph intentionally has no native route.
+        let audio = AudioManager.shared
+        var engineStarts = 0
+        audio.reset()
+        audio.clearInterruptionOwnershipForTesting()
+        let previousAudioHooks = audio.audioQueueForTesting.sync {
+            let previous = (audio.engineStartForTesting, audio.engineRunningForTesting)
+            audio.engineStartForTesting = { engineStarts += 1 }
+            audio.engineRunningForTesting = { false }
+            return previous
+        }
+        defer {
+            manager.stopForTesting()
+            audio.reset()
+            audio.audioQueueForTesting.sync {
+                audio.engineStartForTesting = previousAudioHooks.0
+                audio.engineRunningForTesting = previousAudioHooks.1
+            }
+        }
         manager.manualUsbCandidateDeadlineForTesting = true
         let incumbent = try connect()
         let probe = LegacyPcmProbe()
@@ -4085,8 +4105,16 @@ final class USBListenerLifetimeTests: XCTestCase {
         let freshCount = probe.pings.count
         XCTAssertNil(manager.sendTelemetryPingForTesting(), "PCM freshness proof owns the probe lane")
         XCTAssertEqual(probe.pings.count, freshCount)
+        XCTAssertTrue(manager.networkQueueForTesting.sync { manager.isLegacyPcmFreshFencePingForTesting(
+            ConnectionControlProtocol.frame(type: WireMessageType.ping.rawValue, payload: freshness)) })
+        XCTAssertEqual(audio.legacyOwnershipForTesting.suspended, generation)
+        XCTAssertEqual(audio.audioQueueForTesting.sync { engineStarts }, 0,
+                       "Forced telemetry cannot satisfy the PCM freshness fence")
         manager.receiveUsbWireForTesting(type: .pong, payload: freshness,
                                         generation: generation, connection: incumbent)
+        XCTAssertEqual(audio.audioQueueForTesting.sync { engineStarts }, 1,
+                       "Only the matching freshness Pong requests playback")
+        XCTAssertNil(audio.legacyOwnershipForTesting.suspended)
         let telemetryNonce = try XCTUnwrap(manager.sendTelemetryPingForTesting(), "Ordinary telemetry resumes after the proof")
         _ = try waitForPing(telemetryNonce)
         probe.clearPings()
@@ -4099,9 +4127,12 @@ final class USBListenerLifetimeTests: XCTestCase {
         // The PCM fence is already open, so only candidate ownership can defer it.
         XCTAssertNil(manager.sendTelemetryPingForTesting(), "Candidate liveness owns the probe lane")
         XCTAssertEqual(probe.pings.count, challengedCount)
+        XCTAssertEqual(audio.audioQueueForTesting.sync { engineStarts }, 1)
         manager.receiveUsbWireForTesting(type: .pong, payload: challenge,
                                         generation: generation, connection: incumbent)
         XCTAssertNil(manager.usbCandidateArbitrationForTesting)
+        XCTAssertEqual(audio.audioQueueForTesting.sync { engineStarts }, 1,
+                       "Candidate liveness Pong is independent of PCM freshness")
         XCTAssertNil(candidate.stateUpdateHandler)
         try deliver(.failed(.posix(.ECONNRESET)), to: incumbent)
         XCTAssertNil(manager.usbSessionSnapshot().connection)

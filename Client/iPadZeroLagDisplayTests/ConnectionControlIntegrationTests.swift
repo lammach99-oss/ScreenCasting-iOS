@@ -10,6 +10,30 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         var snapshot: [Data] { lock.lock(); defer { lock.unlock() }; return storage }
     }
     #if targetEnvironment(simulator)
+    private var previousEngineStart: (() -> Void)?
+    private var previousEngineRunning: (() -> Bool)?
+    override func setUp() {
+        super.setUp()
+        let audio = AudioManager.shared
+        audio.audioQueueForTesting.sync {
+            previousEngineStart = audio.engineStartForTesting
+            previousEngineRunning = audio.engineRunningForTesting
+            // These tests exchange control only. Even an unexpected PCM resume
+            // must report a test failure instead of starting a native engine.
+            audio.engineStartForTesting = { XCTFail("Control-only fixture unexpectedly requested audio playback") }
+            audio.engineRunningForTesting = { false }
+        }
+    }
+    override func tearDown() {
+        let audio = AudioManager.shared
+        audio.reset()
+        audio.audioQueueForTesting.sync {
+            audio.engineStartForTesting = previousEngineStart
+            audio.engineRunningForTesting = previousEngineRunning
+        }
+        previousEngineStart = nil; previousEngineRunning = nil
+        super.tearDown()
+    }
     @MainActor private func drain(_ network: NetworkManager) async {
         for _ in 0..<4 {
             network.networkQueueForTesting.sync {}
@@ -55,6 +79,107 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         XCTAssertEqual(network.connectionSwitchState.actualRoute, .wifi)
         XCTAssertTrue(writes.snapshot.contains { $0[5] == 78 })
         XCTAssertFalse(writes.snapshot.contains { $0[5] == 76 && (1...3).contains($0[17]) })
+    }
+    @MainActor func testNetworkPreflightRetainsProofAndFenceUntilFifteenSeconds() async throws {
+        for accepts in [false, true] {
+            let network = NetworkManager(); let writes = Writes(); var now: TimeInterval = 0
+            network.connectionControlNowForTesting = { now }
+            network.controlSendForAudioTesting = { bytes, done in writes.append(bytes); done(nil) }
+            network.connectionListenerPortForTesting = 0
+            _ = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+            network.beginTransferWriterForTesting(); network.setConnectionIdentityForTesting(verified: true)
+            network.receiveIdentityWireForTesting(type: .displayCapabilities, payload: CaptureTargetIntegrationTests.modes, flags: 0x0200)
+            network.receiveIdentityWireForTesting(type: .connectionState, payload: try ConnectionSwitchStateTests.snapshot().encode())
+            await drain(network)
+            let ready = expectation(description: "USB listener ready")
+            network.connectionListenerReadyForTesting = { ready.fulfill() }
+            network.requestConnectionRoute(.usb)
+            await fulfillment(of: [ready], timeout: 3); await drain(network)
+            XCTAssertEqual(writes.snapshot.filter { $0[5] == 78 }.count, 1)
+            network.receiveIdentityWireForTesting(type: .connectionState, payload: try ConnectionSwitchStateTests.prepare().encode())
+            for elapsed in [10.1, 14.9] {
+                network.networkQueueForTesting.sync { now = elapsed }
+                network.connectionStatusTickForTesting(); await drain(network)
+                XCTAssertNotNil(network.connectionSwitchState.pending)
+                XCTAssertTrue(network.connectionProofPresentForTesting)
+                XCTAssertTrue(network.connectionSwitchState.inputBlocked)
+            }
+            network.receiveIdentityWireForTesting(type: .connectionState,
+                payload: try ConnectionSwitchStateTests.snapshot(revision: 3, hostState: .switching).encode())
+            if accepts {
+                network.receiveIdentityWireForTesting(type: .connectionSelectResult, payload: try ConnectionSwitchStateTests.result(.accepted).encode())
+                await drain(network)
+                XCTAssertEqual(network.connectionSwitchState.pending?.accepted, true)
+                network.retireConnectionRouteForTesting(); await drain(network)
+                XCTAssertEqual(network.connectionSwitchState.phase, .waitingPeer)
+                XCTAssertEqual(network.connectionSwitchState.message, "Connecting over USB...")
+            } else {
+                network.networkQueueForTesting.sync { now = 15 }
+                network.connectionStatusTickForTesting(); await drain(network)
+                XCTAssertNil(network.connectionSwitchState.pending); XCTAssertFalse(network.connectionProofPresentForTesting)
+                XCTAssertTrue(network.connectionSwitchState.inputBlocked); XCTAssertTrue(network.connectionSwitchState.offersReconnect)
+                network.receiveIdentityWireForTesting(type: .connectionSelectResult, payload: try ConnectionSwitchStateTests.result(.accepted).encode())
+                await drain(network); XCTAssertNil(network.connectionSwitchState.pending)
+            }
+            network.stopForTesting()
+        }
+    }
+    @MainActor func testUsbProofClockStartsAtPingReceiptNotDelayedPongCompletion() async throws {
+        for answerAt in [14.9, 15.0] {
+            let network = NetworkManager(); let writes = Writes(); var now: TimeInterval = 10
+            var finishPong: ((NWError?) -> Void)?
+            network.connectionControlNowForTesting = { now }
+            network.usbIdentityCredentialLoadForTesting = { ConnectionControlProtocolTests.usbCredential }
+            network.controlSendForAudioTesting = { bytes, done in
+                writes.append(bytes)
+                if bytes[5] == 7 { finishPong = done } else { done(nil) }
+            }
+            _ = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+            network.beginTransferWriterForTesting(); network.configureUsbIdentityForTesting()
+            network.receiveIdentityWireForTesting(type: .ping, payload: Data(0..<16), flags: 0x0100)
+            await drain(network)
+            network.networkQueueForTesting.sync { now = 13 }
+            try XCTUnwrap(finishPong)(nil); await drain(network)
+            network.networkQueueForTesting.sync { now = answerAt }
+            network.receiveIdentityWireForTesting(type: .trustedDeviceChallenge, payload: ConnectionControlProtocolTests.usbChallenge)
+            await drain(network)
+            XCTAssertEqual(writes.snapshot.contains { $0[5] == 24 }, answerAt < 15)
+            network.receiveIdentityWireForTesting(type: .trustedAuthResult, payload: Data([1]))
+            await drain(network); XCTAssertEqual(network.usbIdentityBoundForTesting, answerAt < 15)
+            network.stopForTesting()
+        }
+    }
+    @MainActor func testFailedUsbPongWriteFailsConnectionWithoutLegacyCommit() async {
+        for flags in [UInt16(0), 0x0100] {
+            let network = NetworkManager(); let writes = Writes()
+            network.usbIdentityCredentialLoadForTesting = { ConnectionControlProtocolTests.usbCredential }
+            network.controlSendForAudioTesting = { bytes, done in writes.append(bytes); done(.posix(.EIO)) }
+            _ = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+            network.beginTransferWriterForTesting(); network.configureUsbIdentityForTesting()
+            network.receiveIdentityWireForTesting(type: .ping, payload: Data(0..<16), flags: flags)
+            await drain(network)
+            XCTAssertNil(network.usbSessionSnapshot().connection)
+            XCTAssertNil(network.usbSessionSnapshot().authenticatedGeneration)
+            XCTAssertNil(network.usbSessionSnapshot().committedGeneration)
+            XCTAssertFalse(writes.snapshot.contains { $0[5] == 21 || (76...79).contains($0[5]) })
+            network.stopForTesting()
+        }
+    }
+    @MainActor func testPrematureUsbCredentialsCannotCommitBeforeOfferedPongWriteCompletes() async throws {
+        let network = NetworkManager(); var finishPong: ((NWError?) -> Void)?
+        network.usbIdentityCredentialLoadForTesting = { ConnectionControlProtocolTests.usbCredential }
+        network.controlSendForAudioTesting = { _, done in finishPong = done }
+        _ = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        network.beginTransferWriterForTesting(); network.configureUsbIdentityForTesting()
+        network.receiveIdentityWireForTesting(type: .ping, payload: Data(0..<16), flags: 0x0100)
+        await drain(network)
+        network.receiveIdentityWireForTesting(type: .trustedAuthResult, payload: Data([1]))
+        await drain(network)
+        XCTAssertNil(network.usbSessionSnapshot().authenticatedGeneration)
+        XCTAssertNil(network.usbSessionSnapshot().committedGeneration)
+        try XCTUnwrap(finishPong)(.posix(.EIO)); await drain(network)
+        XCTAssertNil(network.usbSessionSnapshot().connection)
+        network.stopForTesting()
     }
     @MainActor func testRawUsbIdentitySuccessBindsBeforeExtensionOptIn() async throws {
         let network = NetworkManager(); let writes = Writes()

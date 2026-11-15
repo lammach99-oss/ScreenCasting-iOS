@@ -50,7 +50,7 @@ public enum ConnectionControlError: Error { case malformed }
 
 public enum ConnectionControlProtocol {
     public static let advertisementFlag: UInt16 = 0x0200
-    public static let preflightWait: TimeInterval = 10
+    public static let preflightWait: TimeInterval = 15
     public static let listenerWait: TimeInterval = 5
     public static let outcomeWait: TimeInterval = 75
     public static let presentationWait: TimeInterval = 5
@@ -118,7 +118,7 @@ public struct ConnectionHello: Equatable {
                 ConnectionControlProtocol.zero(value.token) && ConnectionControlProtocol.zero(value.proof))
         } else {
             try ConnectionControlProtocol.require(value.owner != 0 && value.revision != 0 && !ConnectionControlProtocol.zero(value.token) &&
-                target != .unknown && value.transaction != 0)
+                !ConnectionControlProtocol.zero(value.proof) && target != .unknown && value.transaction != 0)
         }
         return value
     }
@@ -171,7 +171,8 @@ public struct ConnectionControlState: Equatable {
         case .snapshot:
             try ConnectionControlProtocol.require(value.transaction == 0 && ConnectionControlProtocol.zero(Data(b[48..<160])))
         case .prepareUSB, .prepareWiFi:
-            try ConnectionControlProtocol.require(!ConnectionControlProtocol.zero(value.token) && ConnectionControlProtocol.zero(value.reserved) &&
+            try ConnectionControlProtocol.require(!ConnectionControlProtocol.zero(value.token) &&
+                !ConnectionControlProtocol.zero(value.challenge) && !ConnectionControlProtocol.zero(value.secret) && ConnectionControlProtocol.zero(value.reserved) &&
                 current == (phase == .prepareUSB ? .wifi : .usb) && value.transaction != 0)
         }
         return value
@@ -220,19 +221,22 @@ public struct ConnectionSelectResult: Equatable {
             token: Data(b[40..<56]), firstFrame: UInt32(ConnectionControlProtocol.read(b, 56, 4)), frameDomain: domain)
         try ConnectionControlProtocol.require(value.transaction != 0 && value.originOwner != 0 && value.revision != 0 &&
             ((current == .unknown) == (value.routeOwner == 0)))
-        let success = status == .accepted || status == .completed || status == .alreadyActive
-        try ConnectionControlProtocol.require(success ? (reason == .none || status == .alreadyActive && reason == .duplicateTransaction) : reason != .none && reason != .duplicateTransaction)
         switch status {
-        case .permissionRequired: try ConnectionControlProtocol.require(reason == .permissionMissing)
-        case .busy: try ConnectionControlProtocol.require(reason == .localOperation)
+        case .accepted, .alreadyActive, .completed, .permissionRequired:
+            try ConnectionControlProtocol.require(reason == .none)
+        case .busy:
+            // LocalOperation covers both lifecycle ownership and a switch already pending.
+            try ConnectionControlProtocol.require([ConnectionReason.localOperation, .duplicateTransaction].contains(reason))
         case .denied:
-            try ConnectionControlProtocol.require([ConnectionReason.notRunning, .notOwner, .staleRevision, .replay, .permissionDenied, .identityUnavailable].contains(reason))
+            try ConnectionControlProtocol.require([ConnectionReason.permissionDenied, .notOwner].contains(reason))
         case .unavailable:
-            try ConnectionControlProtocol.require([ConnectionReason.noDevice, .multipleDevices, .wrongDevice, .listenerClosed, .tunnelUnavailable, .proofFailed, .peerTimeout, .deadlineExceeded].contains(reason))
-        case .alreadyActive:
-            try ConnectionControlProtocol.require(reason == .duplicateTransaction || current == target && state == .ready)
-        case .accepted, .completed, .failed: break
+            try ConnectionControlProtocol.require([ConnectionReason.tunnelUnavailable, .noDevice, .multipleDevices,
+                .listenerClosed, .identityUnavailable, .stoppedOnPC, .staleRevision].contains(reason))
+        case .failed:
+            try ConnectionControlProtocol.require([ConnectionReason.peerTimeout, .deadlineExceeded, .wrongDevice,
+                .proofFailed, .teardownFailed, .startFailed, .firstFrameTimeout, .stoppedOnPC, .connectionLost].contains(reason))
         }
+        if status == .alreadyActive { try ConnectionControlProtocol.require(current == target && state == .ready) }
         if status == .completed {
             try ConnectionControlProtocol.require(current == target && state == .ready && value.routeOwner != value.originOwner && domain != .none && !ConnectionControlProtocol.zero(value.token))
         } else {
