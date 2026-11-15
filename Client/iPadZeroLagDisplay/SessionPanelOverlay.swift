@@ -881,43 +881,114 @@ struct SessionActionLayout: Layout {
     }
 }
 
-/// Same metrics, labels and semantic type in the open panel and standalone HUD.
+/// Formatting only: these are rendered FPS, local receive-stage timing and received video throughput.
+/// Zero rates remain real rates; an absent or unrepresentable receive timing is never displayed as zero.
+struct SessionTelemetryPresentation: Equatable {
+    let fpsValue: String
+    let frameReceiveValue: String
+    let videoRxValue: String
+    let isIdle: Bool
+    private static let locale = Locale(identifier: "en_US_POSIX")
+
+    init(fps: Double, frameReceiveMs: Double, videoRxMbps: Double) {
+        let hasFrames = fps.isFinite && fps > 0
+        let hasTraffic = videoRxMbps.isFinite && videoRxMbps > 0
+        let idle = !hasFrames && !hasTraffic
+        isIdle = idle
+        fpsValue = Self.formatFPS(fps)
+        videoRxValue = Self.decimal(videoRxMbps, maximum: 9999.9, limit: "9999.9+")
+        let timing = !idle && frameReceiveMs > 0
+            ? Self.decimal(frameReceiveMs, maximum: 999.9, limit: "999.9+") : "-"
+        frameReceiveValue = timing == "0.0" ? "-" : timing
+    }
+
+    var visibleText: String { "\(fpsValue) FPS  \(frameReceiveValue) ms  \(videoRxValue) Mbps" }
+    var accessibilityLabel: String {
+        let frames = fpsValue == "-" ? "Frame rate, unavailable" : Self.spoken(fpsValue, unit: "frames per second")
+        return "\(frames). Frame receive, \(Self.spoken(frameReceiveValue, unit: "milliseconds")). " +
+            "Video RX, \(Self.spoken(videoRxValue, unit: "megabits per second"))."
+    }
+
+    private static func formatFPS(_ value: Double) -> String {
+        guard value.isFinite && value >= 0 else { return "-" }
+        if value == 0 { return "0" }
+        if value.rounded() > 999 { return "999+" }
+        if value < 10 && (value * 10).rounded() < 100 {
+            return String(format: "%.1f", locale: locale, value)
+        }
+        return String(format: "%.0f", locale: locale, value)
+    }
+
+    private static func decimal(_ value: Double, maximum: Double, limit: String) -> String {
+        guard value.isFinite && value >= 0 else { return "-" }
+        if value > maximum { return limit }
+        return String(format: "%.1f", locale: locale, value)
+    }
+
+    private static func spoken(_ value: String, unit: String) -> String {
+        if value == "-" { return "unavailable" }
+        if value.hasSuffix("+") { return "over \(value.dropLast()) \(unit)" }
+        return "\(value) \(unit)"
+    }
+}
+
+/// One text-only component for casting, whole-PC remote and the open panel's existing header slot.
 struct SessionPerformanceReadout: View {
     let fps: Double
     let frameReceiveMs: Double
     let videoRxMbps: Double
-    @Environment(\.dynamicTypeSize) private var typeSize
+    private var presentation: SessionTelemetryPresentation {
+        SessionTelemetryPresentation(fps: fps, frameReceiveMs: frameReceiveMs, videoRxMbps: videoRxMbps)
+    }
 
     var body: some View {
-        Group {
-            if typeSize.isAccessibilitySize {
-                VStack(alignment: .leading, spacing: 8) { metrics }
-            } else {
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 8) { metrics }.fixedSize(horizontal: true, vertical: false)
-                    VStack(alignment: .leading, spacing: 8) { metrics }
-                }
+        SessionPerformanceLine(presentation: presentation)
+            .dynamicTypeSize(...DynamicTypeSize.xLarge)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(presentation.accessibilityLabel)
+            .accessibilityIdentifier("session.performance")
+            .allowsHitTesting(false)
+    }
+}
+
+private struct SessionPerformanceLine: View {
+    let presentation: SessionTelemetryPresentation
+    @Environment(\.colorSchemeContrast) private var contrast
+    @ScaledMetric(relativeTo: .caption2) private var pointSize: CGFloat = 11
+    private var digitWidth: CGFloat { pointSize * 0.64 }
+
+    init(presentation: SessionTelemetryPresentation) { self.presentation = presentation }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            field(presentation.fpsValue, unit: "FPS", columns: 4)
+            field(presentation.frameReceiveValue, unit: "ms", columns: 6)
+            field(presentation.videoRxValue, unit: "Mbps", columns: 7)
+        }
+        .font(.system(size: pointSize, weight: .semibold, design: .monospaced))
+        .monospacedDigit()
+        .fixedSize(horizontal: true, vertical: true)
+        // Opaque, sub-point glyph shadows work with Reduce Transparency too. No material or panel blur.
+        .shadow(color: Color(ink: SessionInk.canvas), radius: 0.5, x: 0, y: 0)
+        .shadow(color: Color(ink: SessionInk.canvas), radius: 0.5, x: 0, y: 1)
+        .animation(nil, value: presentation)
+    }
+
+    private func field(_ value: String, unit: String, columns: Int) -> some View {
+        HStack(spacing: 3) {
+            inkText(value, secondary: presentation.isIdle)
+                .frame(width: digitWidth * CGFloat(columns), alignment: .trailing)
+            inkText(unit, secondary: true).fontWeight(.medium)
+        }
+    }
+
+    private func inkText(_ text: String, secondary: Bool) -> some View {
+        Text(text)
+            .foregroundStyle(Color(ink: secondary && contrast != .increased ? SessionInk.secondary : SessionInk.text))
+            .background {
+                // Increase Contrast permits backing behind this text run only, never its field or row.
+                if contrast == .increased { Color(ink: SessionInk.canvas) }
             }
-        }
-        .font(.caption.monospacedDigit())
-        .foregroundStyle(Color(ink: SessionInk.text))
-        .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("session.performance")
-    }
-
-    private var metrics: some View {
-        Group {
-            Text(String(format: "%.1f FPS", fps))
-            metric("Frame receive", value: String(format: "%.1f ms", frameReceiveMs))
-            metric("Video RX", value: String(format: "%.1f Mbps", videoRxMbps))
-        }
-    }
-
-    private func metric(_ label: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(value).fontWeight(.semibold)
-            Text(label).foregroundStyle(Color(ink: SessionInk.secondary))
-        }
     }
 }
 

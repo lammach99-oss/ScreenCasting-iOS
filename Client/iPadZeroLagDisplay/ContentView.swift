@@ -1027,25 +1027,26 @@ public struct ContentView: View {
 
     private var streamingHUD: some View {
         GeometryReader { proxy in
+            let safeArea = presentationGeometry?.safeAreaInsets ?? .zero
+            let safeTop = max(proxy.safeAreaInsets.top, safeArea.top)
+            let safeTrailing = max(proxy.safeAreaInsets.trailing, safeArea.right)
             if isHudVisible && !isSessionPanelOpen {
                 VStack {
                     HStack {
                         Spacer(minLength: 0)
                         SessionPerformanceReadout(fps: Double(streamManager.currentFPS),
                             frameReceiveMs: Double(streamManager.frameReceiveMs), videoRxMbps: networkManager.hudTelemetry.videoRxMbps)
-                            .padding(12)
-                            .background(Color(uiColor: SessionInk.surface).opacity(0.94),
-                                in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                            .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
-                                .stroke(Color(uiColor: SessionInk.hairline), lineWidth: 0.5))
                     }
                     Spacer(minLength: 0)
                 }
-                // The draggable pill can occupy the full top row. Stats always sit below that row.
-                .padding(.top, sessionPillHeight + 24).padding(.horizontal, 12)
+                // Clear both the safe-area top and the measured expanded bar / collapsed grabber.
+                .padding(.top, max(safeTop + 8, sessionPillHeight + 24))
+                .padding(.trailing, safeTrailing + 8)
+                .padding(.leading, max(proxy.safeAreaInsets.leading, safeArea.left) + 8)
                 .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
                 .allowsHitTesting(false)
             }
         }
+        .allowsHitTesting(false)
     }
 }

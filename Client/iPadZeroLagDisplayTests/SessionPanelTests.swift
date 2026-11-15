@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import SwiftUI
 @testable import iPadCasting
 
 /// The session pill is the one visible handle for every session: what it says, and how Disconnect is confirmed.
@@ -110,8 +111,87 @@ final class SessionPanelTests: XCTestCase {
         XCTAssertTrue(content.contains("performance: isHudVisible ? SessionPerformanceReadout"))
         XCTAssertTrue(content.contains("sessionPillHeight + 24"))
         XCTAssertTrue(panel.contains("if let performance { performance }"))
-        XCTAssertTrue(panel.contains("metric(\"Frame receive\""))
-        XCTAssertTrue(panel.contains("metric(\"Video RX\""))
+        XCTAssertTrue(panel.contains("Frame receive, "))
+        XCTAssertTrue(panel.contains("Video RX, "))
+    }
+
+    func testTelemetryFormatsEachFieldWithAtMostOneDecimal() {
+        let normal = SessionTelemetryPresentation(fps: 112.0, frameReceiveMs: 6, videoRxMbps: 151.4)
+        XCTAssertEqual(normal.fpsValue, "112")
+        XCTAssertEqual(normal.frameReceiveValue, "6.0")
+        XCTAssertEqual(normal.videoRxValue, "151.4")
+        XCTAssertEqual(normal.visibleText, "112 FPS  6.0 ms  151.4 Mbps")
+        XCTAssertEqual(SessionTelemetryPresentation(fps: 8.36, frameReceiveMs: 6.26, videoRxMbps: 9.96).visibleText,
+                       "8.4 FPS  6.3 ms  10.0 Mbps")
+        XCTAssertEqual(SessionTelemetryPresentation(fps: 9.99, frameReceiveMs: 1, videoRxMbps: 1).fpsValue, "10")
+        XCTAssertEqual(SessionTelemetryPresentation(fps: 59.8, frameReceiveMs: 1, videoRxMbps: 1).fpsValue, "60")
+    }
+
+    func testTelemetryIdleAndInvalidValuesNeverPresentUnavailableTimingAsZero() {
+        let idle = SessionTelemetryPresentation(fps: 0, frameReceiveMs: 0, videoRxMbps: 0)
+        XCTAssertTrue(idle.isIdle)
+        XCTAssertEqual(idle.visibleText, "0 FPS  - ms  0.0 Mbps")
+        XCTAssertEqual(SessionTelemetryPresentation(fps: 0, frameReceiveMs: 6, videoRxMbps: 0).frameReceiveValue, "-")
+        for invalid in [Double.nan, .infinity, -.infinity, -1] {
+            let values = SessionTelemetryPresentation(fps: invalid, frameReceiveMs: invalid, videoRxMbps: invalid)
+            XCTAssertEqual(values.visibleText, "- FPS  - ms  - Mbps")
+            XCTAssertTrue(values.isIdle)
+            XCTAssertEqual(SessionTelemetryPresentation(fps: 112, frameReceiveMs: invalid,
+                videoRxMbps: 151.4).frameReceiveValue, "-")
+        }
+        XCTAssertEqual(SessionTelemetryPresentation(fps: 112, frameReceiveMs: 0, videoRxMbps: 151.4).frameReceiveValue, "-")
+    }
+
+    func testTelemetryAccessibilityUsesFullMetricNamesAndUnavailableWording() {
+        XCTAssertEqual(SessionTelemetryPresentation(fps: 112, frameReceiveMs: 6, videoRxMbps: 151.4).accessibilityLabel,
+            "112 frames per second. Frame receive, 6.0 milliseconds. Video RX, 151.4 megabits per second.")
+        XCTAssertEqual(SessionTelemetryPresentation(fps: 0, frameReceiveMs: 0, videoRxMbps: 0).accessibilityLabel,
+            "0 frames per second. Frame receive, unavailable. Video RX, 0.0 megabits per second.")
+    }
+
+    func testTelemetryOverflowStaysWithinItsFixedNumberFields() {
+        let huge = SessionTelemetryPresentation(fps: 1200, frameReceiveMs: 1200, videoRxMbps: 12000)
+        XCTAssertEqual(huge.visibleText, "999+ FPS  999.9+ ms  9999.9+ Mbps")
+        XCTAssertEqual(SessionTelemetryPresentation(fps: .greatestFiniteMagnitude,
+            frameReceiveMs: .greatestFiniteMagnitude, videoRxMbps: .greatestFiniteMagnitude), huge)
+    }
+
+    @MainActor func testTelemetryIntrinsicSizeDoesNotShiftWithValuesAndDynamicTypeIsCapped() {
+        var cappedSizes: [CGSize] = []
+        for typeSize in [DynamicTypeSize.large, .xxxLarge, .accessibility5] {
+            var sizes: [CGSize] = []
+            for (fps, ms, mbps) in [(0.0, 0.0, 0.0), (9.9, 9.9, 9.9), (112, 6, 151.4), (1200, 1200, 12000)] {
+                let controller = UIHostingController(rootView: SessionPerformanceReadout(fps: fps,
+                    frameReceiveMs: ms, videoRxMbps: mbps).environment(\.dynamicTypeSize, typeSize))
+                sizes.append(controller.sizeThatFits(in: CGSize(width: 500, height: 100)))
+            }
+            for size in sizes.dropFirst() {
+                XCTAssertEqual(size.width, sizes[0].width, accuracy: 0.5)
+                XCTAssertEqual(size.height, sizes[0].height, accuracy: 0.5)
+            }
+            XCTAssertLessThan(sizes[0].height, 32, "One compact line even at accessibility sizes")
+            if typeSize != .large { cappedSizes.append(sizes[0]) }
+        }
+        XCTAssertEqual(cappedSizes[0].width, cappedSizes[1].width, accuracy: 0.5)
+        XCTAssertEqual(cappedSizes[0].height, cappedSizes[1].height, accuracy: 0.5)
+    }
+
+    func testTelemetryHasNoPanelDecorationAndNeverInterceptsInput() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let panel = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/SessionPanelOverlay.swift"), encoding: .utf8)
+        let content = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/ContentView.swift"), encoding: .utf8)
+        let readout = try XCTUnwrap(panel.components(separatedBy: "struct SessionPerformanceReadout: View").last?
+            .components(separatedBy: "private struct SessionPillHeightKey:").first)
+        XCTAssertTrue(readout.contains(".allowsHitTesting(false)"))
+        XCTAssertTrue(readout.contains(".accessibilityLabel(presentation.accessibilityLabel)"))
+        XCTAssertTrue(readout.contains(".accessibilityElement(children: .ignore)"))
+        XCTAssertFalse(readout.contains("RoundedRectangle")); XCTAssertFalse(readout.contains("Capsule"))
+        XCTAssertFalse(readout.contains("Divider")); XCTAssertFalse(readout.contains("Image("))
+        XCTAssertTrue(readout.contains("if contrast == .increased"))
+        let hud = try XCTUnwrap(content.components(separatedBy: "private var streamingHUD:").last)
+        XCTAssertFalse(hud.contains(".background(")); XCTAssertFalse(hud.contains(".overlay("))
+        XCTAssertTrue(hud.contains(".allowsHitTesting(false)"))
+        XCTAssertTrue(hud.contains("presentationGeometry?.safeAreaInsets"))
     }
 
     func testLegacyKeyboardRemainsAvailableWithoutScanNegotiation() throws {
