@@ -318,6 +318,13 @@ struct ClientPerformanceFeedback: Equatable {
     }
 }
 
+// Shared by the raw touch writer and capture-suspension queue classifier.
+// This packet is separate from the framed SCDP header below.
+enum TouchWireProtocol {
+    static let magic: UInt16 = 0x5449
+    static let packetSize = 8
+}
+
 enum WireProtocol {
     static let magic: UInt32 = 0x54534353
     static let version: UInt8 = 1

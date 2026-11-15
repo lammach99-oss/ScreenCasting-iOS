@@ -310,6 +310,31 @@ final class SecureDesktopRecoveryTests: XCTestCase {
         XCTAssertTrue(CapturePresentationPolicy.confirmed(time: 1))
     }
 
+    func testSimulatorCompletionFallbackCannotResumeFailedOrSupersededFrameOrSkipDecode() {
+        for succeeded in [false, true] {
+            for current in [false, true] {
+                var state = suspended()
+                _ = state.receive(CaptureAvailabilityCommand(state: 0, reason: 0, sequence: 2).encode(), flags: 0, generation: 7)
+                XCTAssertTrue(state.admitFrame(sequence: 1, decoder: 4, isIDR: true, generation: 7))
+                let presented = CapturePresentationPolicy.simulatorCompleted(succeeded: succeeded, current: current)
+                XCTAssertFalse(state.observeFrame(sequence: 1, decoder: 4, decoded: false, presented: presented, generation: 7))
+                XCTAssertTrue(state.inputBlocked, "GPU completion alone cannot skip decode evidence")
+                XCTAssertEqual(state.observeFrame(sequence: 1, decoder: 4, decoded: true, presented: false, generation: 7), succeeded && current)
+                XCTAssertEqual(state.inputBlocked, !(succeeded && current))
+            }
+        }
+    }
+
+    func testSharedRawTouchLayoutPurgesStartsButKeepsOwnedTerminalLane() {
+        XCTAssertEqual(TouchWireProtocol.magic, 0x5449)
+        XCTAssertEqual(TouchWireProtocol.packetSize, 8)
+        let down = NetworkManager.mirrorPencilPayload(type: .down, x: 3, y: 4, pressure: 1)
+        let up = NetworkManager.mirrorPencilPayload(type: .up, x: 3, y: 4, pressure: 0)
+        XCTAssertEqual(down.count, TouchWireProtocol.packetSize)
+        XCTAssertTrue(CaptureAvailabilityProtocol.isNewInputPacket(down))
+        XCTAssertFalse(CaptureAvailabilityProtocol.isNewInputPacket(up))
+    }
+
     func testParserDrainsMalformedAvailabilityAndContinues() {
         let parser = WireStreamParser(generation: 7)
         var failures = 0, discarded = 0, messages = 0

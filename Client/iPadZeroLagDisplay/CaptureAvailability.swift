@@ -140,4 +140,10 @@ struct CaptureAvailabilityAnnouncement {
 
 enum CapturePresentationPolicy {
     static func confirmed(time: TimeInterval) -> Bool { time.isFinite && time > 0 }
+
+    // Simulator has no drawable presentation feedback. Successful completion of
+    // a current command buffer containing present is its best available proxy.
+    static func simulatorCompleted(succeeded: Bool, current: Bool) -> Bool {
+        succeeded && current
+    }
 }

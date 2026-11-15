@@ -141,11 +141,6 @@ private final class RemoteMonitorControlAuthority {
 //   [4-5]  UInt16  X          logical pixel column  (or 0–65535 normalised)
 //   [6-7]  UInt16  Y          logical pixel row     (or 0–65535 normalised)
 
-private enum TouchWireProtocol {
-    static let magic: UInt16 = 0x5449   // 'T','I'
-    static let packetSize    = 8
-}
-
 /// Touch event kinds — mirrors C# `TouchEventType` enum byte-for-byte.
 public enum TouchEventType: UInt8 {
     case move  = 0
@@ -6589,7 +6584,8 @@ public class NetworkManager: ObservableObject {
         return Data(bytes)
     }
 
-    // Called only after CAMetalDrawable confirms a nonzero onscreen presentation time.
+    // Device: positive drawable presentation time. Simulator: successful current
+    // present command completion (the Simulator SDK omits presentation handlers).
     func recordCapturePresentation(sequence: UInt32, generation: UInt64) {
         networkQueue.async { [weak self] in
             self?.observeCaptureContinuationOnQueue(sequence: sequence, decoder: generation, decoded: false, presented: true)

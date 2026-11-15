@@ -1040,9 +1040,10 @@ public class Renderer: NSObject, MTKViewDelegate {
         }
 
         let presentedDrawableSize = CGSize(width: drawable.texture.width, height: drawable.texture.height)
-        // Availability needs actual display evidence, independently of GPU completion
+        #if !targetEnvironment(simulator)
+        // On device, availability needs display evidence independently of GPU completion
         // telemetry. A dropped drawable reports zero presentedTime.
-        drawable.addPresentedHandler { [weak self] presented in
+        drawable.addPresentedHandler { [weak self] (presented: MTLDrawable) in
             guard let self, CapturePresentationPolicy.confirmed(time: presented.presentedTime) else { return }
             self.lock.lock()
             let current = self.freshness.isCurrent(identity)
@@ -1050,9 +1051,10 @@ public class Renderer: NSObject, MTKViewDelegate {
             guard current else { return }
             self.onFramePresented?(identity.sequence, identity.generation)
         }
+        #endif
         commandBuffer.present(drawable)
         let retainedPixelBuffer = pixelBuffer
-        commandBuffer.addCompletedHandler { [weak self] completedBuffer in
+        commandBuffer.addCompletedHandler { [weak self] (completedBuffer: MTLCommandBuffer) in
             _ = yTextureRef
             _ = uvTextureRef
             _ = retainedPixelBuffer
@@ -1084,6 +1086,14 @@ public class Renderer: NSObject, MTKViewDelegate {
             }
             self.lock.unlock()
             guard isCurrent else { return }
+            #if targetEnvironment(simulator)
+            // Simulator SDKs omit addPresentedHandler/presentedTime. Completion
+            // after present is a proxy, not confirmation of physical display scanout.
+            if CapturePresentationPolicy.simulatorCompleted(
+                succeeded: RenderCommandCompletionPolicy.succeeded(completedBuffer.status), current: isCurrent) {
+                self.onFramePresented?(identity.sequence, identity.generation)
+            }
+            #endif
             self.publishGeometrySnapshot(for: view, identity: identity,
                 decodedFrameSize: decodedFrameSize, drawableSize: presentedDrawableSize,
                 contentViewport: contentViewport)
