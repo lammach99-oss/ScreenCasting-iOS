@@ -286,6 +286,9 @@ public final class ConnectedPresentationContainer: UIView {
     private let hardwareMonitor = HardwareKeyboardMonitor()
     private var keyboardObservers: [NSObjectProtocol] = []
     private var fadeTask: Task<Void, Never>?
+    /// Inject the delay and observe its owned task without racing two real-time sleeps in tests.
+    var keyboardFadeSleepForTesting: (@MainActor (UInt64) async throws -> Void)?
+    var keyboardFadeTaskForTesting: Task<Void, Never>? { fadeTask }
     private var keyboardFrame: CGRect?
     private(set) var keyboardMode: RemoteKeyboardMode = .none
     private var keyboardActive = false
@@ -605,8 +608,10 @@ public final class ConnectedPresentationContainer: UIView {
     private func restartKeyboardFade() {
         fadeTask?.cancel()
         keyboardButton.alpha = 1
+        let sleep = keyboardFadeSleepForTesting
         fadeTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            if let sleep { try? await sleep(3_000_000_000) }
+            else { try? await Task.sleep(nanoseconds: 3_000_000_000) }
             guard !Task.isCancelled, let self else { return }
             self.keyboardButton.alpha = FloatingKeyboardPlacement.dimOpacity
         }

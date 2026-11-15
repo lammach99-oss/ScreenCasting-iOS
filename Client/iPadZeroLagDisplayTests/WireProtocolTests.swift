@@ -6578,17 +6578,86 @@ final class KeyboardV2Tests: XCTestCase {
         XCTAssertTrue(container.hitTest(point,with:nil) === button)
         XCTAssertTrue(container.hitTest(CGPoint(x:300,y:300),with:nil) === container.touchView)
     }
+    /// Like the audio clock/tick fixtures above, advance time only after the real owner has scheduled work.
+    @MainActor private final class KeyboardFadeClock {
+        private(set) var now: UInt64 = 0
+        private(set) var scheduledSleeps = 0
+        private(set) var requestedDelays: [UInt64] = []
+        private var sleepers: [(deadline: UInt64, continuation: CheckedContinuation<Void, Never>)] = []
+        private var registrations: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+        var pendingSleeps: Int { sleepers.count }
+
+        func sleep(nanoseconds: UInt64) async throws {
+            // Deliberately finish cancelled sleeps too: the production cancellation guard must reject them.
+            await withCheckedContinuation { continuation in
+                sleepers.append((now + nanoseconds, continuation))
+                requestedDelays.append(nanoseconds)
+                scheduledSleeps += 1
+                let ready = registrations.filter { $0.count <= scheduledSleeps }
+                registrations.removeAll { $0.count <= scheduledSleeps }
+                ready.forEach { $0.continuation.resume() }
+            }
+        }
+
+        func waitForSleeps(_ count: Int) async {
+            guard scheduledSleeps < count else { return }
+            await withCheckedContinuation { registrations.append((count, $0)) }
+        }
+
+        func advance(to nanoseconds: UInt64) {
+            precondition(nanoseconds >= now)
+            now = nanoseconds
+            let ready = sleepers.filter { $0.deadline <= now }
+            sleepers.removeAll { $0.deadline <= now }
+            ready.forEach { $0.continuation.resume() }
+        }
+    }
+
     @MainActor func testKeyboardFadeRemainsOneTapAndCancellationRestoresOpacity() async throws {
+        let clock = KeyboardFadeClock()
         let container = ConnectedPresentationContainer(frame:CGRect(x:0,y:0,width:1000,height:800))
+        container.keyboardFadeSleepForTesting = { try await clock.sleep(nanoseconds: $0) }
+        defer { container.retireRemoteKeyboard() }
         container.applyRemoteKeyboardMode(.softwareAvailable)
+        let firstFade = try XCTUnwrap(container.keyboardFadeTaskForTesting)
+        await clock.waitForSleeps(1)
+        XCTAssertEqual(clock.requestedDelays, [3_000_000_000])
         XCTAssertEqual(container.keyboardButton.alpha, 1)
-        try await Task.sleep(nanoseconds: 3_100_000_000)
+        clock.advance(to: 2_999_999_999)
+        XCTAssertEqual(clock.pendingSleeps, 1, "The fade sleep has not completed before its deadline")
+        XCTAssertEqual(container.keyboardButton.alpha, 1, "No fade before the three-second idle deadline")
+        clock.advance(to: 3_000_000_000)
+        await firstFade.value
         XCTAssertEqual(container.keyboardButton.alpha, 0.30, accuracy:0.001)
+        container.layoutIfNeeded()
+        let button = container.keyboardButton
+        XCTAssertTrue(container.hitTest(CGPoint(x: button.frame.midX, y: button.frame.midY), with: nil) === button,
+                      "A dim keyboard still owns its one-tap hit target")
+        XCTAssertTrue(button.isUserInteractionEnabled)
+
         container.applyRemoteKeyboardMode(.none)
         container.applyRemoteKeyboardMode(.softwareAvailable)
         XCTAssertEqual(container.keyboardButton.alpha, 1)
+        let cancelledFade = try XCTUnwrap(container.keyboardFadeTaskForTesting)
+        await clock.waitForSleeps(2)
+        clock.advance(to: 4_000_000_000)
+        container.applyRemoteKeyboardMode(.none)
+        XCTAssertTrue(cancelledFade.isCancelled)
+        container.applyRemoteKeyboardMode(.softwareAvailable)
+        let replacementFade = try XCTUnwrap(container.keyboardFadeTaskForTesting)
+        await clock.waitForSleeps(3)
+        XCTAssertEqual(clock.requestedDelays, [3_000_000_000, 3_000_000_000, 3_000_000_000])
+        XCTAssertEqual(container.keyboardButton.alpha, 1)
+
+        clock.advance(to: 6_000_000_000)
+        await cancelledFade.value
+        XCTAssertEqual(container.keyboardButton.alpha, 1, "A cancelled fade cannot dim the replacement button")
+        clock.advance(to: 6_999_999_999)
+        XCTAssertEqual(container.keyboardButton.alpha, 1, "Replacement owns a fresh idle deadline")
+        clock.advance(to: 7_000_000_000)
+        await replacementFade.value
+        XCTAssertEqual(container.keyboardButton.alpha, 0.30, accuracy:0.001)
         XCTAssertTrue(container.keyboardButton.isUserInteractionEnabled)
-        container.retireRemoteKeyboard()
     }
     @MainActor func testGenerationAndLifecycleDoNotReplaySoftwareIntent() {
         let container = ConnectedPresentationContainer(frame:CGRect(x:0,y:0,width:1000,height:800))
