@@ -3,7 +3,7 @@ import Foundation
 // Only admitted downs acquire ownership. Local eligibility may close before their
 // terminal callback; neither a new registration nor a new session inherits it.
 struct InputLifetime {
-    private enum Identity: Hashable { case key(UInt16), button, touch(UInt64), pencil }
+    private enum Identity: Hashable { case key(UInt16), v2button(UInt8), button, touch(UInt64), pencil }
     private struct Owner: Equatable { let generation: UInt64; let revision: UInt64 }
     private var owners: [Identity: Owner] = [:]
 
@@ -21,6 +21,10 @@ struct InputLifetime {
             guard p.count == 8 else { return false }
             identity = p[1] == PointerInputAction.leftDown.rawValue || p[1] == PointerInputAction.leftUp.rawValue ? .button : nil
             down = p[1] == PointerInputAction.leftDown.rawValue
+        case .iPadPointerV2:
+            guard let command = IPadPointerV2Command.decode(payload) else { return false }
+            identity = command.kind == 2 ? .v2button(command.button) : nil
+            down = command.kind == 2 && command.a == 0
         case .directTouch:
             guard let contact = DirectTouchContactCommand.decode(payload) else { return false }
             identity = .touch(contact.contactID); down = contact.phase == .down
@@ -375,6 +379,7 @@ public final class MirrorClientControl {
         case .pointer:return p[1]==PointerInputAction.leftUp.rawValue
         case .directTouch:return p[1]==DirectTouchPhase.up.rawValue || p[1]==DirectTouchPhase.cancel.rawValue
         case .pencil:return p[2]==TouchEventType.up.rawValue
+        case .iPadPointerV2:return IPadPointerV2Command.decode(payload)?.terminal == true
         case .text:return false
         }
     }

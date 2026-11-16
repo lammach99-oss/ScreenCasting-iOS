@@ -340,7 +340,7 @@ public class NetworkManager: ObservableObject {
     }
     var remoteKeyboardGeneration: UInt64 { connectionGenerationClock.current }
     private var remoteInputConnection = false
-    private var remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: 7)
+    private var remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: 0x1f)
     private var remoteMonitors = RemoteMonitorState()
     private let remoteMonitorControl = RemoteMonitorControlAuthority()
     private var remoteMonitorAdmission: (requestId: UInt64, inputRevision: UInt64, controlRevision: UInt64)?
@@ -380,6 +380,9 @@ public class NetworkManager: ObservableObject {
     private var captureReadinessClock = CaptureReadinessClock()
     @Published public private(set) var captureAvailabilityNotice: String?
     @Published public private(set) var captureInputBlocked = false
+    @Published private(set) var iPadPointerV2Supported = false
+    @Published private(set) var iPadPointerV2Generation: UInt64 = 0
+    private var remoteDirectLifetime = InputLifetime()
     private var captureTargetVideo = CaptureTargetVideoBuffer()
     private var captureTargetMirrorRevisionAtTap: UInt64 = 0
     private var captureTargetDecodeStarted = false
@@ -469,7 +472,7 @@ public class NetworkManager: ObservableObject {
                 completion(.posix(.ECANCELED))
                 return
             }
-            if self.captureAvailability.inputBlocked && CaptureAvailabilityProtocol.isNewInputPacket(data) {
+            if self.captureAvailability.inputBlocked && (CaptureAvailabilityProtocol.isNewInputPacket(data) || self.isNewRemoteV2InputPacket(data)) {
                 completion(nil); return
             }
             if !self.remoteInputPacketIsCurrent(data) || !self.captureTargetPacketIsCurrent(data) || !self.connectionControlPacketIsCurrent(data) {
@@ -1440,7 +1443,7 @@ public class NetworkManager: ObservableObject {
         }
     }
     private func resetRemoteInputOnQueue() {
-        remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: 7); remoteFeaturesPingNonce = nil
+        remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: 0x1f); remoteFeaturesPingNonce = nil
         remoteMonitors.begin(session: UUID(), acceptedFeatures: 0)
         remoteMonitorControl.update(generation: 0, context: nil, enabled: false)
         remoteMonitorAdmission = nil
@@ -1487,7 +1490,8 @@ public class NetworkManager: ObservableObject {
         return remoteMonitors.mayWriteSelection(request, session: remoteMonitors.session,
             inputReady: inputReady, controlEnabled: remoteMonitorControlEnabled(control))
     }
-    public func requestRemoteMonitor(_ id: UInt64, catalogue: RemoteMonitorCatalogueCommand) {
+    @MainActor public func requestRemoteMonitor(_ id: UInt64, catalogue: RemoteMonitorCatalogueCommand) {
+        captureTargetRetireInput?()
         let generation = connectionGenerationClock.current, session = remoteMonitorState.session
         networkQueue.async { [weak self] in
             guard let self, self.connectionGeneration == generation, self.remoteMonitors.session == session,
@@ -1524,9 +1528,28 @@ public class NetworkManager: ObservableObject {
         }
     }
 
+    func retireIPadInputScope(expectedGeneration: UInt64) {
+        networkQueue.async { [weak self] in
+            guard let self, self.connectionGeneration == expectedGeneration else { return }
+            self.controlChannelWriter.discardPending { data in
+                CaptureAvailabilityProtocol.isNewInputPacket(data) || self.isNewRemoteV2InputPacket(data)
+            }
+        }
+    }
+
+    private func isNewRemoteV2InputPacket(_ data: Data) -> Bool {
+        guard data.count >= 16 else { return false }
+        let payload = Data(data.dropFirst(16))
+        if data[5] == WireMessageType.remoteDirectTouch.rawValue { return RemoteDirectTouchCommand.decode(payload)?.terminal != true }
+        if data[5] == WireMessageType.remotePointer.rawValue { return RemotePointerCommand.decode(payload).map { !($0.kind == 2 && $0.a == 1) } ?? true }
+        if data[5] == WireMessageType.remoteScanKey.rawValue { return RemoteScanKeyCommand.decode(payload)?.action != 1 }
+        if data[5] == WireMessageType.remoteCommittedText.rawValue { return true }
+        return false
+    }
+
     private func remoteInputPacketIsCurrent(_ data: Data) -> Bool {
         guard data.count >= 16, let type = WireMessageType(rawValue: data[5]) else { return true }
-        if !remoteInputConnection { return !(61...71).contains(type.rawValue) }
+        if !remoteInputConnection { return !(61...71).contains(type.rawValue) && type != .remoteDirectTouch }
         let payload = Data(data.dropFirst(16))
         switch type {
         case .remoteMonitorCatalogueRequest:
@@ -1546,7 +1569,10 @@ public class NetworkManager: ObservableObject {
             return remoteFeatures.maySend(feature: 1, token: key.token)
         case .remotePointer:
             guard let pointer = RemotePointerCommand.decode(payload) else { return false }
-            return remoteFeatures.maySend(feature: 2, token: pointer.token)
+            return remoteFeatures.maySend(feature: pointer.kind == 4 ? 0x12 : 2, token: pointer.token)
+        case .remoteDirectTouch:
+            guard let contact = RemoteDirectTouchCommand.decode(payload) else { return false }
+            return remoteFeatures.maySend(feature: 8, token: contact.token) && remoteFeatures.context?.desktop == 1
         case .remoteCommittedText:
             guard let text = RemoteCommittedTextCommand.decode(payload) else { return false }
             return remoteFeatures.maySend(feature: 1, token: text.token)
@@ -1570,7 +1596,7 @@ public class NetworkManager: ObservableObject {
             guard let self, self.remoteInputConnection, self.connectionGeneration == expectedGeneration,
                   self.transportState == .streaming, self.committedTransportGeneration == expectedGeneration,
                   (command.kind == 2 && command.a == 1 || !self.displayRequestGate.isInputSuppressed),
-                  self.remoteFeatures.maySend(feature: 2, token: command.token), let payload = command.encode() else { return }
+                  self.remoteFeatures.maySend(feature: command.kind == 4 ? 0x12 : 2, token: command.token), let payload = command.encode() else { return }
             // Preserve relative deltas, wheels and move-before-button ordering.
             self.sendWireMessage(type: .remotePointer, payload: payload, sequence: 0)
         }
@@ -1587,6 +1613,7 @@ public class NetworkManager: ObservableObject {
 
     private func resetDirectTouchSessionOnQueue() {
         legacyInputLifetime = InputLifetime()
+        remoteDirectLifetime = InputLifetime()
         activeDirectTouchCommand = nil
         let generation = connectionGenerationClock.current
         DispatchQueue.main.async { [weak self] in
@@ -1604,6 +1631,35 @@ public class NetworkManager: ObservableObject {
         _ = legacyInputLifetime.accept(kind: .directTouch, payload: cancel.encode(),
             generation: connectionGeneration, revision: 0, mayStart: false)
         sendWireMessage(type: .directTouchContact, payload: cancel.encode(), sequence: 0)
+    }
+
+    func sendIPadPointerV2(_ command: IPadPointerV2Command, expectedGeneration: UInt64, revision: UInt64) {
+        networkQueue.async { [weak self] in
+            guard let self, self.connectionGeneration == expectedGeneration,
+                  self.wireAuthenticatedGeneration == expectedGeneration,
+                  self.committedTransportGeneration == expectedGeneration, self.transportState == .streaming,
+                  !self.remoteInputConnection, self.connectionAdvertisement & IPadPointerV2Command.capability != 0,
+                  let payload = command.encode(),
+                  command.terminal || !self.displayRequestGate.isInputSuppressed,
+                  self.legacyInputLifetime.accept(kind: .iPadPointerV2, payload: payload,
+                    generation: expectedGeneration, revision: 0,
+                    mayStart: revision == self.mirrorControl.gestureRevision && self.mirrorControl.allowsLegacyVirtualInput && !self.captureAvailability.inputBlocked) else { return }
+            self.sendWireMessage(type: .iPadPointerV2, payload: payload, sequence: 0)
+        }
+    }
+
+    func sendRemoteDirectTouch(_ command: RemoteDirectTouchCommand, expectedGeneration: UInt64) {
+        networkQueue.async { [weak self] in
+            guard let self, self.remoteInputConnection, self.connectionGeneration == expectedGeneration,
+                  self.transportState == .streaming, self.committedTransportGeneration == expectedGeneration,
+                  self.remoteFeatures.maySend(feature: 8, token: command.token), self.remoteFeatures.context?.desktop == 1,
+                  command.terminal || (!self.displayRequestGate.isInputSuppressed && !self.captureAvailability.inputBlocked),
+                  let payload = command.encode() else { return }
+            let identity = DirectTouchContactCommand(phase: command.phase, pressure: 255, contactID: command.contactID, x: command.x,y: command.y)
+            guard self.remoteDirectLifetime.accept(kind: .directTouch, payload: identity.encode(),
+                generation: expectedGeneration, revision: command.token, mayStart: !self.captureAvailability.inputBlocked) else { return }
+            self.sendWireMessage(type: .remoteDirectTouch, payload: payload, sequence: 0)
+        }
     }
 
     public func sendDirectTouchContact(_ command: DirectTouchContactCommand) {
@@ -3812,6 +3868,12 @@ public class NetworkManager: ObservableObject {
                     authenticated: wireAuthenticatedGeneration == generation, generation: generation) {
                 sendWireMessage(type: .captureAvailabilityHello, payload: hello, sequence: 0)
             }
+            let pointerV2 = header.flags & IPadPointerV2Command.capability != 0
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.connectionGenerationClock.current == generation else { return }
+                self.iPadPointerV2Supported = pointerV2
+                self.iPadPointerV2Generation = generation
+            }
             connectionAdvertisement = header.flags
             negotiateConnectionControlOnQueue()
             if let hello = mirrorControl.helloIfAdvertised(session: generation, flags: header.flags) {
@@ -3983,7 +4045,7 @@ public class NetworkManager: ObservableObject {
         case .mirrorHello, .mirrorInput, .mirrorSwitchRequest:
             handleStreamError("Invalid physical-source control direction.")
             return
-        case .directTouchContact, .pointerInput, .keyboardInput, .textCommit:
+        case .remoteDirectTouch, .iPadPointerV2, .directTouchContact, .pointerInput, .keyboardInput, .textCommit:
             return
 
         case .video:
@@ -5962,7 +6024,11 @@ public class NetworkManager: ObservableObject {
     private func connectionControlPacketIsCurrent(_ data: Data) -> Bool {
         if data.count == TouchWireProtocol.packetSize { return !connectionSwitch.inputBlocked }
         guard data.count >= 16 else { return true }
-        if connectionSwitch.inputBlocked && [UInt8(37), 38, 40, 41, 53].contains(data[5]) { return false }
+        if connectionSwitch.inputBlocked && [UInt8(37), 38, 40, 41, 53, 64, 65, 67, 82, 83].contains(data[5]) {
+            // Ownership was checked when the terminal was encoded. New input may
+            // never leak out of the reliable queue after route admission closes.
+            return !CaptureAvailabilityProtocol.isNewInputPacket(data) && !isNewRemoteV2InputPacket(data)
+        }
         guard (76...79).contains(data[5]) else { return true }
         guard connectionSwitch.enabled, pairedControlGeneration == connectionGeneration else { return false }
         let payload = Data(data.dropFirst(16))
@@ -6490,11 +6556,12 @@ public class NetworkManager: ObservableObject {
         }
     }
     /// Explicit Release control: revokes the Host grant.
-    public func releaseMirrorControl() {
+    @MainActor public func releaseMirrorControl() {
+        captureTargetRetireInput?()
         let generation = connectionGenerationClock.current
-        let action = mirrorControl.suspendInput()
         networkQueue.async { [weak self] in
             guard let self, generation == self.connectionGeneration else { return }
+            let action = self.mirrorControl.suspendInput()
             self.mirrorTerminalSend=nil
             if let action, self.wireAuthenticatedGeneration == generation {
                 self.sendWireMessage(type: .mirrorAction, payload: action, sequence: 0)
@@ -6510,7 +6577,8 @@ public class NetworkManager: ObservableObject {
             self.sendWireMessage(type: .mirrorAction, payload: action, sequence: 0)
         }
     }
-    public func requestMirrorMonitor(_ id:UInt64, catalogue:MirrorMonitorCatalogue) {
+    @MainActor public func requestMirrorMonitor(_ id:UInt64, catalogue:MirrorMonitorCatalogue) {
+        captureTargetRetireInput?()
         let generation=connectionGenerationClock.current
         networkQueue.async { [weak self] in
             guard let self,generation==self.connectionGeneration,
@@ -6622,6 +6690,7 @@ public class NetworkManager: ObservableObject {
                   self.wireAuthenticatedGeneration == ticket.session,
                   self.committedTransportGeneration == ticket.session,
                   self.transportState == .streaming,
+                  (kind != .iPadPointerV2 || self.connectionAdvertisement & IPadPointerV2Command.capability != 0),
                   let envelope = try? self.mirrorControl.encodeInput(ticket: ticket, kind: kind, payload: payload) else { return }
             // Existing bounded reliable lane. No UDP/raw fallback, no terminal coalescing.
             self.sendWireMessage(type: .mirrorInput, payload: envelope, sequence: 0, movement: false)

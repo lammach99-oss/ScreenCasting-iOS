@@ -931,9 +931,11 @@ final class ExternalPointerInputTests: XCTestCase {
         let boundary = try XCTUnwrap(source.range(of: "struct ExternalPointerInputState"))
         let digest = SHA256.hash(data: Data(source[..<boundary.lowerBound].utf8))
         // H1 fix 6: discard opposite-sign wheel remainder on reversal. This is
-        // the only edit in the qualified helper prefix; keep the one-notch drain.
+        // an audited edit in the qualified helper prefix; keep the one-notch drain.
+        // Input v2 binding override: side-specific physical Command = Control,
+        // sharing the same side with physical Ctrl. No direct-touch helper changed.
         XCTAssertEqual(digest.map { String(format: "%02x", $0) }.joined(),
-                       "965699d609e9f04dbfd878381e761093cfcf8dd430255bb19792f574786d0056")
+                       "783466bd608c667b357f00a5a12629b679b9cd7e1c4321c5dd297445d2be0ba7")
     }
 
     func testInactiveSettingsAndDismantleRetireBothPointerPaths() throws {
@@ -6337,7 +6339,7 @@ final class RemoteKeyboardV1Tests: XCTestCase {
             (0x33, 0xBA), (0x34, 0xDE), (0x35, 0xC0), (0x36, 0xBC), (0x37, 0xBE), (0x38, 0xBF),
             (0x39, 0x14), (0x49, 0x2D), (0x4A, 0x24), (0x4B, 0x21), (0x4C, 0x2E),
             (0x4D, 0x23), (0x4E, 0x22), (0x4F, 0x27), (0x50, 0x25), (0x51, 0x28), (0x52, 0x26),
-            (0xE0, 0xA3), (0xE4, 0xA3), (0xE3, 0xA2), (0xE7, 0xA2),
+            (0xE0, 0xA2), (0xE4, 0xA3), (0xE3, 0xA2), (0xE7, 0xA3),
             (0xE1, 0xA0), (0xE5, 0xA1), (0xE2, 0xA4), (0xE6, 0xA5)
         ]
         for (hid, vk) in pairs {

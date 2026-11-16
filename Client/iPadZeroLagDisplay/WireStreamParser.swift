@@ -338,6 +338,8 @@ final class WireStreamParser {
             fixedLength = KeyboardInputCommand.encodedSize
         case .clientPerformanceFeedback:
             fixedLength = 24
+        case .remoteDirectTouch, .iPadPointerV2:
+            fixedLength = 24
         case .directTouchContact:
             fixedLength = DirectTouchContactCommand.encodedSize
         case .cursorOwnership:

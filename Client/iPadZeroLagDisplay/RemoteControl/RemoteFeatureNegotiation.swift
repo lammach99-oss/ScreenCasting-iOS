@@ -74,6 +74,7 @@ public struct RemotePointerCommand: Equatable {
         switch d[1] {
         case 0: guard d[3] == 0, (0...65535).contains(a), (0...65535).contains(b) else { return nil }
         case 1, 3: guard d[3] == 0, (-32767...32767).contains(a), (-32767...32767).contains(b) else { return nil }
+        case 4: guard d[3] == 0, a != 0, (-32767...32767).contains(a) else { return nil }
         case 2: guard (1...5).contains(d[3]), (0...1).contains(a), b == 0 else { return nil }
         default: return nil
         }
@@ -116,9 +117,9 @@ public struct RemoteCommittedTextCommand: Equatable {
 /// Connection-scoped, networkQueue owned. No unknown ID is sent until marked Pong.
 struct RemoteFeatureNegotiation {
     static let supportedFlag: UInt16 = 0x4000
-    static let knownFeatures: UInt64 = 7
+    static let knownFeatures: UInt64 = 0x1f
     private let requestedFeatures: UInt64
-    // Input-only callers retain their mask; remote sessions explicitly request 7.
+    // Input-only callers retain their mask; remote sessions explicitly request 0x1f.
     init(requestedFeatures: UInt64 = 3) { self.requestedFeatures = requestedFeatures }
     private enum Phase { case initial, pong, result, legacy, complete }
     private var phase: Phase = .initial

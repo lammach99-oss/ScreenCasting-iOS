@@ -36,4 +36,31 @@ final class GestureHelpTests: XCTestCase {
         XCTAssertEqual(GestureHint.drag.toastText, "Dragging")
         XCTAssertEqual(GestureHint.zoom.toastText, "Zoom")
     }
+
+    func testDirectAndTrackpadExplainNativeTouchAndMouseDifferences() throws {
+        func result(_ gesture: String, mode: IPadTouchMode) throws -> String {
+            try XCTUnwrap(GestureGuideContent.items(for: .input(mode)).first { $0.gesture == gesture }?.result)
+        }
+        XCTAssertEqual(try result("Tap", mode: .direct), "Touch tap")
+        XCTAssertEqual(try result("Tap", mode: .trackpad), "Left click")
+        XCTAssertEqual(try result("Stationary hold", mode: .direct), "Native Windows press-and-hold; no extra right click")
+        XCTAssertEqual(try result("Stationary hold", mode: .trackpad), "Right click; cancels the left tap")
+        XCTAssertTrue(try result("Drag control", mode: .direct).contains("touch"))
+        XCTAssertTrue(try result("Drag control", mode: .trackpad).contains("left mouse"))
+        for mode in [IPadTouchMode.direct, .trackpad] {
+            XCTAssertEqual(try result("Next tap while dragging", mode: mode), "Release only; no extra click")
+            XCTAssertTrue(try result("Three/four fingers or system gestures", mode: mode).contains("No new PC shortcut"))
+        }
+    }
+
+    func testHelpExplainsCommandAndTextSourceWithoutRetiredControls() {
+        for mode in [IPadTouchMode.direct, .trackpad] {
+            let helper = GestureGuideContent.helper(for: .input(mode))
+            XCTAssertTrue(helper.contains("Command = Ctrl"))
+            XCTAssertTrue(helper.contains("Hardware keyboard uses the PC input method"))
+            XCTAssertTrue(helper.contains("on-screen keyboard uses the iPad input method"))
+            XCTAssertFalse(helper.contains("Local IME"))
+            XCTAssertFalse(helper.contains("Send"))
+        }
+    }
 }

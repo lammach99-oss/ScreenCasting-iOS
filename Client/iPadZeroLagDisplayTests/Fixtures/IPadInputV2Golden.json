@@ -1,0 +1,319 @@
+{
+  "schemaVersion": 1,
+  "vectors": [
+    {
+      "name": "features-1f",
+      "transport": "scst",
+      "messageType": 61,
+      "hex": "01000000000000001f00000000000000",
+      "valid": true
+    },
+    {
+      "name": "features-result-1f",
+      "transport": "scst",
+      "messageType": 62,
+      "hex": "01000000000000001f00000000000000",
+      "valid": true
+    },
+    {
+      "name": "remote-touch-down",
+      "transport": "scst",
+      "messageType": 82,
+      "hex": "0100ff00080706050403020101000000000000000080ffff",
+      "valid": true
+    },
+    {
+      "name": "casting-relative",
+      "transport": "scst",
+      "messageType": 83,
+      "hex": "010100000000000000000000fdffffff0500000000000000",
+      "valid": true
+    },
+    {
+      "name": "casting-middle-down",
+      "transport": "scst",
+      "messageType": 83,
+      "hex": "010200030000000000000000000000000000000000000000",
+      "valid": true
+    },
+    {
+      "name": "casting-middle-up",
+      "transport": "scst",
+      "messageType": 83,
+      "hex": "010200030000000000000000010000000000000000000000",
+      "valid": true
+    },
+    {
+      "name": "remote-zoom",
+      "transport": "scst",
+      "messageType": 65,
+      "hex": "010400000807060504030201780000000080004000000000",
+      "valid": true
+    },
+    {
+      "name": "remote-zoom-high-bit",
+      "transport": "scst",
+      "messageType": 65,
+      "hex": "01040000080706050403020178000000008000c000000000",
+      "valid": true
+    },
+    {
+      "name": "casting-zoom-high-bit",
+      "transport": "scst",
+      "messageType": 83,
+      "hex": "01040000000000000000000078000000008000c000000000",
+      "valid": true
+    },
+    {
+      "name": "ipc-touch-down",
+      "transport": "ipc",
+      "messageType": 28,
+      "hex": "09000000000000000100ff0001000000000000000080ffff",
+      "valid": true
+    },
+    {
+      "name": "ipc-zoom",
+      "transport": "ipc",
+      "messageType": 17,
+      "hex": "0900000000000000040000007800000000800040",
+      "valid": true
+    },
+    {
+      "name": "ipc-zoom-high-bit",
+      "transport": "ipc",
+      "messageType": 17,
+      "hex": "09000000000000000400000078000000008000c0",
+      "valid": true
+    },
+    {
+      "name": "remote-left-win-down",
+      "transport": "scst",
+      "messageType": 64,
+      "hex": "010001005b0000000807060504030201",
+      "valid": true,
+      "source": "on-screen"
+    },
+    {
+      "name": "casting-left-win-down",
+      "transport": "scst",
+      "messageType": 38,
+      "hex": "01005b00",
+      "valid": true,
+      "source": "on-screen"
+    },
+    {
+      "name": "remote-command-left-ctrl-down",
+      "transport": "scst",
+      "messageType": 64,
+      "hex": "010000001d0000000807060504030201",
+      "valid": true,
+      "source": "hardware-command",
+      "virtualKey": 162,
+      "hidUsage": 227
+    },
+    {
+      "name": "casting-command-left-ctrl-down",
+      "transport": "scst",
+      "messageType": 38,
+      "hex": "0100a200",
+      "valid": true,
+      "source": "hardware-command",
+      "virtualKey": 162,
+      "hidUsage": 227
+    },
+    {
+      "name": "committed-e-circumflex-acute",
+      "transport": "scst",
+      "messageType": 40,
+      "hex": "010300e1babf",
+      "valid": true
+    },
+    {
+      "name": "remote-touch-header",
+      "transport": "scst-header",
+      "messageType": 82,
+      "hex": "53435354015200001800000001000000",
+      "valid": true
+    },
+    {
+      "name": "casting-pointer-header",
+      "transport": "scst-header",
+      "messageType": 83,
+      "hex": "53435354015300001800000001000000",
+      "valid": true
+    },
+    {
+      "name": "remote-touch-cancel",
+      "transport": "scst",
+      "messageType": 82,
+      "hex": "0103ff00080706050403020101000000000000000080ffff",
+      "valid": true
+    }
+  ],
+  "malformed": [
+    {
+      "name": "remote-touch-down-short",
+      "vector": "remote-touch-down",
+      "hex": "0100ff00080706050403020101000000000000000080ff",
+      "valid": false
+    },
+    {
+      "name": "remote-touch-down-long",
+      "vector": "remote-touch-down",
+      "hex": "0100ff00080706050403020101000000000000000080ffff00",
+      "valid": false
+    },
+    {
+      "name": "casting-relative-short",
+      "vector": "casting-relative",
+      "hex": "010100000000000000000000fdffffff05000000000000",
+      "valid": false
+    },
+    {
+      "name": "casting-relative-long",
+      "vector": "casting-relative",
+      "hex": "010100000000000000000000fdffffff050000000000000000",
+      "valid": false
+    },
+    {
+      "name": "remote-zoom-short",
+      "vector": "remote-zoom",
+      "hex": "0104000008070605040302017800000000800040000000",
+      "valid": false
+    },
+    {
+      "name": "remote-zoom-long",
+      "vector": "remote-zoom",
+      "hex": "01040000080706050403020178000000008000400000000000",
+      "valid": false
+    },
+    {
+      "name": "ipc-touch-down-short",
+      "vector": "ipc-touch-down",
+      "hex": "09000000000000000100ff0001000000000000000080ff",
+      "valid": false
+    },
+    {
+      "name": "ipc-touch-down-long",
+      "vector": "ipc-touch-down",
+      "hex": "09000000000000000100ff0001000000000000000080ffff00",
+      "valid": false
+    },
+    {
+      "name": "ipc-zoom-short",
+      "vector": "ipc-zoom",
+      "hex": "09000000000000000400000078000000008000",
+      "valid": false
+    },
+    {
+      "name": "ipc-zoom-long",
+      "vector": "ipc-zoom",
+      "hex": "090000000000000004000000780000000080004000",
+      "valid": false
+    },
+    {
+      "name": "remote-touch-down-version",
+      "vector": "remote-touch-down",
+      "hex": "0200ff00080706050403020101000000000000000080ffff",
+      "valid": false
+    },
+    {
+      "name": "remote-touch-down-reserved",
+      "vector": "remote-touch-down",
+      "hex": "0100ff01080706050403020101000000000000000080ffff",
+      "valid": false
+    },
+    {
+      "name": "remote-touch-down-phase",
+      "vector": "remote-touch-down",
+      "hex": "0104ff00080706050403020101000000000000000080ffff",
+      "valid": false
+    },
+    {
+      "name": "casting-relative-version",
+      "vector": "casting-relative",
+      "hex": "020100000000000000000000fdffffff0500000000000000",
+      "valid": false
+    },
+    {
+      "name": "casting-relative-reserved",
+      "vector": "casting-relative",
+      "hex": "010101000000000000000000fdffffff0500000000000000",
+      "valid": false
+    },
+    {
+      "name": "casting-relative-token",
+      "vector": "casting-relative",
+      "hex": "010100000100000000000000fdffffff0500000000000000",
+      "valid": false
+    },
+    {
+      "name": "casting-relative-tail",
+      "vector": "casting-relative",
+      "hex": "010100000000000000000000fdffffff0500000001000000",
+      "valid": false
+    },
+    {
+      "name": "remote-zoom-button",
+      "vector": "remote-zoom",
+      "hex": "010400010807060504030201780000000080004000000000",
+      "valid": false
+    },
+    {
+      "name": "ipc-touch-down-reserved",
+      "vector": "ipc-touch-down",
+      "hex": "09000000000000000100ff0101000000000000000080ffff",
+      "valid": false
+    },
+    {
+      "name": "remote-touch-down-zero-scope",
+      "vector": "remote-touch-down",
+      "hex": "0100ff00000000000000000001000000000000000080ffff",
+      "valid": false
+    },
+    {
+      "name": "remote-zoom-zero-scope",
+      "vector": "remote-zoom",
+      "hex": "010400000000000000000000780000000080004000000000",
+      "valid": false
+    },
+    {
+      "name": "ipc-touch-down-zero-scope",
+      "vector": "ipc-touch-down",
+      "hex": "00000000000000000100ff0001000000000000000080ffff",
+      "valid": false
+    },
+    {
+      "name": "zero-contact",
+      "vector": "remote-touch-down",
+      "hex": "0100ff00080706050403020100000000000000000080ffff",
+      "valid": false
+    }
+  ],
+  "stateCases": [
+    {
+      "name": "stale-token",
+      "valid": false
+    },
+    {
+      "name": "duplicate-down",
+      "valid": false
+    },
+    {
+      "name": "wrong-contact-id",
+      "valid": false
+    },
+    {
+      "name": "old-source-terminal",
+      "valid": false
+    },
+    {
+      "name": "raw-mirror-bypass",
+      "valid": false
+    },
+    {
+      "name": "missing-capability",
+      "valid": false
+    }
+  ]
+}

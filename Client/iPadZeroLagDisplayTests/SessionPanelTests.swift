@@ -45,13 +45,40 @@ final class SessionPanelTests: XCTestCase {
         XCTAssertEqual(locked.reason, "Screen switching is off on the PC.")
     }
 
-    func testTouchChoicesPreserveAutomaticAndForcedAllDeviceTrackpad() {
-        XCTAssertTrue(RemoteTouchPresentation(mode: .auto).trackpadSelected)
-        XCTAssertTrue(RemoteTouchPresentation(mode: .trackpad).trackpadSelected)
-        XCTAssertFalse(RemoteTouchPresentation(mode: .direct).trackpadSelected)
-        XCTAssertEqual(RemoteTouchPresentation.trackpadChoice, .auto)
-        XCTAssertEqual(RemoteTouchPresentation.advancedChoice(enabled: true), .trackpad)
-        XCTAssertEqual(RemoteTouchPresentation.advancedChoice(enabled: false), .auto)
+    func testTouchChoicesNeverPresentUnsupportedDirectAsSelected() {
+        let unsupported = RemoteTouchPresentation(mode: .direct, canPoint: true, canDirect: false)
+        XCTAssertFalse(unsupported.directSelected)
+        XCTAssertFalse(unsupported.enabled(.direct))
+        XCTAssertTrue(unsupported.enabled(.trackpad))
+        let denied = RemoteTouchPresentation(mode: .trackpad, canPoint: false, canDirect: true)
+        XCTAssertFalse(denied.enabled(.direct))
+        XCTAssertFalse(denied.enabled(.trackpad))
+        XCTAssertTrue(RemoteTouchPresentation(mode: .direct, canPoint: true, canDirect: true).directSelected)
+        XCTAssertEqual(unsupported.helper, "Direct sends Windows touch. Trackpad moves the PC mouse pointer.")
+    }
+
+    func testSharedInputControlsAreNotGatedOnRemoteNegotiation() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let panel = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/SessionPanelOverlay.swift"), encoding: .utf8)
+        let touch = try XCTUnwrap(panel.components(separatedBy: "private var touchSection:").last?
+            .components(separatedBy: "private var connectionPicker:").first)
+        XCTAssertTrue(touch.contains("RemoteMouseControls()"))
+        XCTAssertTrue(touch.contains("AccessiblePointerControls()"))
+        XCTAssertTrue(touch.contains("RemoteMouseExtras()"))
+        XCTAssertTrue(touch.contains("Scroll inertia"))
+        XCTAssertTrue(touch.contains("Reverse scroll direction"))
+        XCTAssertFalse(touch.contains("usesEnhancedPointer"))
+        XCTAssertFalse(touch.contains("usesScanKeyboard"))
+        XCTAssertFalse(panel.contains("emitKey("))
+        XCTAssertTrue(panel.contains("inputSession.showSoftwareKeyboard()"))
+        XCTAssertTrue(panel.contains("SessionInputBar("))
+    }
+
+    func testUnavailableDirectPrefersTheSessionsSpecificExplanation() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let controls = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/RemoteControl/RemoteMouseControls.swift"), encoding: .utf8)
+        XCTAssertTrue(controls.contains("if !inputSession.canDirect && inputSession.unavailableReason == nil"))
+        XCTAssertTrue(controls.contains("inputSession.unavailableReason ?? RemoteTouchPresentation.directUnavailable"))
     }
 
     func testActionsReflowByAvailableWidthAndAccessibilityTextSize() {
@@ -63,18 +90,15 @@ final class SessionPanelTests: XCTestCase {
         }
     }
 
-    func testGestureHelpFollowsTheActualEngineAndDoesNotAdvertiseRemotePenPressure() {
-        for mode in [RemoteMouseMode.auto, .trackpad, .direct] {
-            let guide = GestureGuideContent.items(for: .remote(mode))
-            XCTAssertTrue(guide.contains { $0.gesture == "Double-tap and hold" })
-            XCTAssertTrue(guide.contains { $0.gesture == "Move two fingers" && $0.result == "Scroll" })
-            XCTAssertTrue(guide.contains { $0.gesture == "Two-finger tap" && $0.result == "Right-click" })
-            XCTAssertFalse(guide.contains { $0.gesture == "Pinch" || $0.gesture == "Three-finger tap" || $0.gesture == "Swipe one finger" })
+    func testGestureHelpDescribesSharedModesWithoutPromisingPenPressure() {
+        for mode in [IPadTouchMode.trackpad, .direct] {
+            let guide = GestureGuideContent.items(for: .input(mode))
+            XCTAssertTrue(guide.contains { $0.gesture == "Double-tap then move" })
+            XCTAssertTrue(guide.contains { $0.gesture == "Two-finger pan" && $0.result.contains("wheel") })
+            XCTAssertTrue(guide.contains { $0.gesture == "Two-finger tap" && $0.result.contains("Right click") })
+            XCTAssertTrue(guide.contains { $0.gesture == "Pinch" && $0.result.contains("Ctrl-wheel") })
+            XCTAssertTrue(GestureGuideContent.pencil(for: .input(mode)).contains("No Windows pen, pressure or tilt"))
         }
-        XCTAssertTrue(GestureGuideContent.items(for: .casting).contains { $0.gesture == "Swipe one finger" })
-        XCTAssertTrue(GestureGuideContent.items(for: .casting).contains { $0.gesture == "Pinch" })
-        XCTAssertTrue(GestureGuideContent.pencil(for: .remote(.direct)).contains("do not send pen pressure"))
-        XCTAssertTrue(GestureGuideContent.pencil(for: .remote(.trackpad)).contains("Trackpad"))
     }
 
     func testLegacyModeChoiceShowsKnownModeWithoutInventingTypedRequests() {
@@ -194,10 +218,13 @@ final class SessionPanelTests: XCTestCase {
         XCTAssertTrue(hud.contains("presentationGeometry?.safeAreaInsets"))
     }
 
-    func testLegacyKeyboardRemainsAvailableWithoutScanNegotiation() throws {
+    func testKeyboardAvailabilityComesFromSharedSessionWithoutScanNegotiation() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         let panel = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/SessionPanelOverlay.swift"), encoding: .utf8)
-        XCTAssertTrue(panel.contains("!remoteInput.usesScanKeyboard || remoteInput.keyboardEnabled"))
+        let tools = try XCTUnwrap(panel.components(separatedBy: "private var tools:").last?
+            .components(separatedBy: "private var touchSection:").first)
+        XCTAssertTrue(tools.contains("let canType = inputSession.canType"))
+        XCTAssertFalse(tools.contains("usesScanKeyboard"))
     }
 
     func testMissingLegacyCurrentNeverClaimsToStillShowAStaleScreen() throws {
@@ -365,15 +392,12 @@ extension SessionPanelTests {
 
 extension SessionPanelTests {
     func testPencilHelpMatchesTouchAndPointerCapabilities() {
-        let casting = GestureGuideContent.helper(for: .casting) + GestureGuideContent.pencil(for: .casting)
+        let casting = GestureGuideContent.helper(for: .input(.direct)) + GestureGuideContent.pencil(for: .input(.direct))
         XCTAssertTrue(casting.contains("touch contact"))
-        XCTAssertTrue(casting.contains("where supported"))
-        XCTAssertTrue(casting.contains("Windows pen or tilt"))
+        XCTAssertTrue(casting.contains("No Windows pen, pressure or tilt"))
         XCTAssertFalse(casting.contains("acts like a pen"))
-        for mode in [RemoteMouseMode.auto, .direct, .trackpad] {
-            let remote = GestureGuideContent.helper(for: .remote(mode)) + GestureGuideContent.pencil(for: .remote(mode))
-            XCTAssertTrue(remote.contains("pointer"))
-            XCTAssertTrue(remote.contains("without pen pressure"))
-        }
+        let trackpad = GestureGuideContent.pencil(for: .input(.trackpad))
+        XCTAssertTrue(trackpad.contains("relative mouse"))
+        XCTAssertTrue(trackpad.contains("No Windows pen, pressure or tilt"))
     }
 }

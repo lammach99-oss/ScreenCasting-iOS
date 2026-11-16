@@ -335,6 +335,10 @@ public final class ConnectedPresentationContainer: UIView {
             switch emission {
             case .text(let text): self.onTextCommit?(text)
             case .key(let vk):
+                if let session = self.touchView.inputSession {
+                    let usages: [UInt16: UInt16] = [0x08: 0x2a, 0x09: 0x2b, 0x0d: 0x28, 0x25: 0x50, 0x26: 0x52, 0x27: 0x4f, 0x28: 0x51]
+                    if let hid = usages[vk] { session.engine.tapKey(hid) }; return
+                }
                 self.touchView.onKeyboardInput?(KeyboardInputCommand(action: .keyDown, virtualKey: vk))
                 self.touchView.onKeyboardInput?(KeyboardInputCommand(action: .keyUp, virtualKey: vk))
             }
@@ -468,6 +472,10 @@ public final class ConnectedPresentationContainer: UIView {
         updateKeyboardAuthority()
     }
     func hardwarePresenceChanged(_ present: Bool) {
+        if !present {
+            touchView.inputSession?.clearTextHistory?()
+            touchView.inputSession?.engine.hardwareDisconnected()
+        }
         applyRemoteKeyboardMode(RemoteKeyboardMode.resolve(active: keyboardActive && UIApplication.shared.applicationState == .active, hardware: present, requested: softwareRequested))
     }
     private func updateKeyboardAuthority() {
@@ -515,6 +523,9 @@ public final class ConnectedPresentationContainer: UIView {
     @objc private func toggleSoftwareKeyboard(_ sender: UIButton, forEvent event: UIEvent?) {
         toggleSoftwareKeyboard(source: KeyboardTapSource(touchType: event?.allTouches?.first?.type))
     }
+    func showSoftwareKeyboardFromInputBar() {
+        if !softwareRequested { toggleSoftwareKeyboard(source: .panel) }
+    }
     private func toggleSoftwareKeyboard(source: KeyboardTapSource) {
         lastKeyboardTapSource = source
         guard keyboardMode != .none else {
@@ -528,6 +539,7 @@ public final class ConnectedPresentationContainer: UIView {
             restartKeyboardFade()
             return
         }
+        touchView.inputSession?.releaseAll()
         softwareRequested = !softwareRequested
         softwareNativeSuppressed = false
        updateKeyboardAuthority()
@@ -633,6 +645,7 @@ public final class ConnectedPresentationContainer: UIView {
         defer { recordKeyboardAuthority(reason: note.name.rawValue) }
         if note.name == UIApplication.willResignActiveNotification {
             retireRemotePointerInputs()
+            touchView.inputSession?.releaseAll()
             touchView.remoteSessionInput?.suspend(reason: 0)
             touchView.discardRemoteTouches()
             softwareRequested = false; applyRemoteKeyboardMode(.none); return
@@ -713,6 +726,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     var onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)?
     var remoteKeyboardActive: Bool
     private var remoteInput: RemoteSessionInputState?
+    private var sharedInput: IPadInputSession?
     var onKeyboardInput: ((KeyboardInputCommand) -> Void)?
     var onTextCommit: ((String) -> Void)?
     var onDirectTouchContact: ((DirectTouchContactCommand) -> Void)?
@@ -754,6 +768,10 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         self.onOpenSettings = onOpenSettings
     }
 
+    func iPadInputSession(_ input: IPadInputSession) -> Self {
+        var copy = self; copy.sharedInput = input; return copy
+    }
+
     func remoteSessionInput(_ input: RemoteSessionInputState) -> Self {
         var copy = self
         copy.remoteInput = input
@@ -768,6 +786,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     }
 
     public static func dismantleUIView(_ uiView: ConnectedPresentationContainer, coordinator: Coordinator) {
+        uiView.touchView.inputSession?.releaseAll()
         uiView.touchView.remoteSessionInput?.suspend(reason: 0)
         uiView.touchView.discardRemoteTouches()
         uiView.retireRemotePointerInputs()
@@ -947,6 +966,14 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             coordinator?.onTouchBoundsChanged?(bounds)
         }
 
+        if let sharedInput {
+            touchView.inputSession = sharedInput
+            sharedInput.clearTextHistory = { [weak container] in container?.softwareTextView.clearCommittedHistory() }
+            sharedInput.requestSoftwareKeyboard = { [weak container] in container?.showSoftwareKeyboardFromInputBar() }
+            sharedInput.engine.openSettings = { [weak touchView] in touchView?.onOpenSettings?() }
+            sharedInput.bind(networkManager, active: remoteKeyboardActive)
+            container.softwareTextView.keySourceRoutingEnabled = true
+        }
         let metalView = container.metalView
         // ConnectedPresentationContainer owns drawable sizing from its shared
         // bounds so the Metal surface and the touch surface cannot diverge.

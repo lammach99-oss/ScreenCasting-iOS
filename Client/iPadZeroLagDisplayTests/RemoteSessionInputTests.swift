@@ -43,7 +43,7 @@ final class RemoteSessionInputTests: XCTestCase {
         XCTAssertFalse(state.hardware(usage: 0x15, phase: .began))
     }
 
-    @MainActor func testHardwareAndBarShareOwnershipAndCommandIsWin() {
+    @MainActor func testHardwareCommandIsCtrlAndOnscreenWinIsIndependent() {
         let state = RemoteSessionInputState()
         var keys: [RemoteScanKeyCommand] = []
         state.sendKey = { key, generation in XCTAssertEqual(generation, 10); keys.append(key) }
@@ -53,9 +53,9 @@ final class RemoteSessionInputTests: XCTestCase {
         _ = state.hardware(usage: 0x15, phase: .began)
         _ = state.hardware(usage: 0x15, phase: .cancelled)
         _ = state.hardware(usage: 0xe3, phase: .ended)
-        XCTAssertEqual(keys.map(\.scan), [0x5b, 0x13, 0x13])
-        XCTAssertEqual(keys.map(\.flags), [1, 0, 0])
-        XCTAssertEqual(keys.map(\.action), [0, 0, 1])
+        XCTAssertEqual(keys.map(\.scan), [0x5b, 0x1d, 0x13, 0x13, 0x1d])
+        XCTAssertEqual(keys.map(\.flags), [1, 0, 0, 0, 0])
+        XCTAssertEqual(keys.map(\.action), [0, 0, 0, 1, 1])
     }
 
     @MainActor func testLifecycleResetReleasesAndWaitsForNewToken() {

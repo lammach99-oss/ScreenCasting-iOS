@@ -571,8 +571,8 @@ enum RemoteKeyboardKeyMapper {
         case 0xE5: return 0xA1
         case 0xE2: return 0xA4
         case 0xE6: return 0xA5
-        case 0xE3, 0xE7: return 0xA2 // Command -> left Ctrl
-        case 0xE0, 0xE4: return 0xA3 // Control -> right Ctrl
+        case 0xE0, 0xE3: return 0xA2 // Left Control / Command -> left Ctrl
+        case 0xE4, 0xE7: return 0xA3 // Right Control / Command -> right Ctrl
         default: return nil
         }
     }
@@ -855,6 +855,10 @@ enum ExternalWheelDelta {
 
 public class PencilUIKitView: UIView {
 
+    weak var inputSession: IPadInputSession?
+    private var v2IDs: [ObjectIdentifier: UInt64] = [:]
+    private var v2ScrollTranslation = CGPoint.zero
+    private var v2PinchScale: CGFloat = 1
     var remoteSessionInput: RemoteSessionInputState?
     private struct RemotePointerScope {
         let token: UInt64
@@ -881,8 +885,8 @@ public class PencilUIKitView: UIView {
     }
     var softwareResponderOwnsInput = false {
         didSet {
-            if softwareResponderOwnsInput && !oldValue { releaseActiveRemoteKeys() }
-            if softwareResponderOwnsInput && !oldValue,
+            if inputSession == nil && softwareResponderOwnsInput && !oldValue { releaseActiveRemoteKeys() }
+            if inputSession == nil && softwareResponderOwnsInput && !oldValue,
                let input = remoteSessionInput, input.usesScanKeyboard,
                !input.keyboard.heldKeys.isEmpty { input.suspend(reason: 0) }
             updateKeyboardCapture()
@@ -926,6 +930,7 @@ public class PencilUIKitView: UIView {
         super.didMoveToWindow()
         updateKeyboardCapture()
         if window == nil {
+            inputSession?.releaseAll()
             remoteSessionInput?.suspend(reason: 0)
             discardRemoteTouches()
             retirePencil(); retireDirectTouch(); directTouchEnabled = false; pencilInputEnabled = false
@@ -937,6 +942,14 @@ public class PencilUIKitView: UIView {
     // deterministically without synthesizing UIKit hardware events.
     @discardableResult
     func handleHardwareKey(_ usage: UIKeyboardHIDUsage, action: KeyboardInputAction) -> Bool {
+        if let session = inputSession {
+            if action == .keyDown && hardwareKeyActivityEnabled { onHardwareKeyActivity?() }
+            session.clearTextHistory?()
+            session.engine.hardware(usage: UInt16(clamping: usage.rawValue), down: action == .keyDown)
+            // Source, not responder ownership, selects PC keys. Unknown page-07
+            // usages are consumed too, preventing a duplicate Unicode insertion.
+            return true
+        }
         if softwareResponderOwnsInput {
             // Key activity can synchronously reconcile responder ownership. The
             // owner at entry still receives this event through UIKit.
@@ -969,6 +982,18 @@ public class PencilUIKitView: UIView {
 
     func unhandledHardwarePresses(_ presses: Set<UIPress>, action: KeyboardInputAction,
                                   phase: RemoteHardwareKeyboard.Phase? = nil) -> Set<UIPress> {
+        if inputSession != nil {
+            let ordered = presses.sorted {
+                let a = hardwareKeyUsage(for: $0)?.rawValue ?? 0
+                let b = hardwareKeyUsage(for: $1)?.rawValue ?? 0
+                let am = (0xe0...0xe7).contains(a), bm = (0xe0...0xe7).contains(b)
+                return am != bm ? (action == .keyDown ? am : !am) : a < b
+            }
+            return Set(ordered.filter { press in
+                guard let usage = hardwareKeyUsage(for: press) else { return true }
+                return !handleHardwareKey(usage, action: action)
+            })
+        }
         if softwareResponderOwnsInput {
             if action == .keyDown && !presses.isEmpty && hardwareKeyActivityEnabled { onHardwareKeyActivity?() }
             return presses
@@ -1032,7 +1057,7 @@ public class PencilUIKitView: UIView {
     /// A right-click, drag, pinch or scroll was recognised; drives the first-use toasts.
     var onGestureHint: ((GestureHint) -> Void)?
     public var contentViewport: VideoContentViewport? {
-        willSet { if newValue != contentViewport { retirePencil(); retireDirectTouch(); retireExternalPointer() } }
+        willSet { if newValue != contentViewport { inputSession?.releaseAll(); retirePencil(); retireDirectTouch(); retireExternalPointer() } }
         didSet { updateRemoteVideoRect() }
     }
     private var directTouchEnabled = false
@@ -1042,6 +1067,7 @@ public class PencilUIKitView: UIView {
     public var onBoundsChanged: ((CGRect) -> Void)?
 
     func retireMirrorInputScope() {
+        inputSession?.releaseAll()
         retirePencil()
         retireDirectTouch(); retireExternalPointer(); releaseActiveRemoteKeys()
     }
@@ -1076,7 +1102,7 @@ public class PencilUIKitView: UIView {
     override public func layoutSubviews() {
         super.layoutSubviews()
         guard bounds != lastReportedBounds else { return }
-        if lastReportedBounds != nil { retirePencil(); retireDirectTouch(); retireExternalPointer() }
+        if lastReportedBounds != nil { inputSession?.releaseAll(); retirePencil(); retireDirectTouch(); retireExternalPointer() }
         lastReportedBounds = bounds
         updateRemoteVideoRect()
         onBoundsChanged?(bounds)
@@ -1106,6 +1132,10 @@ public class PencilUIKitView: UIView {
         event: UIEvent?,
         cancelled: Bool = false
     ) {
+        if let session = inputSession {
+            routeV2Touches(touches, flags: flags, event: event, cancelled: cancelled, session: session)
+            return
+        }
         if let input = remoteSessionInput, input.usesEnhancedPointer {
             routeRemoteTouches(touches, flags: flags, event: event, cancelled: cancelled, input: input)
             return
@@ -1175,6 +1205,61 @@ public class PencilUIKitView: UIView {
             }
             emit(outputs)
             if flags == 4 { directTouchIDs.end(key) }
+        }
+    }
+
+    private func updateV2RelativeScale(_ session: IPadInputSession) {
+        guard let rect = contentViewport?.contentRect(in: bounds), rect.width > 0, rect.height > 0,
+              let size = session.sourceSize ?? inputGeometryContext?.frameSize else { return }
+        session.engine.relativeScale = CGPoint(x: size.width/rect.width,y: size.height/rect.height)
+    }
+
+    private func routeV2Touches(_ touches: Set<UITouch>, flags: UInt8, event: UIEvent?, cancelled: Bool, session: IPadInputSession) {
+        updateV2RelativeScale(session)
+        if flags == 2 {
+            let samples = (event?.allTouches ?? touches).compactMap { touch -> (id: UInt64, point: CGPoint, normalized: CGPoint)? in
+                guard touch.type == .direct || touch.type == .pencil, let id = v2IDs[ObjectIdentifier(touch)] else { return nil }
+                let point = touch.location(in: self)
+                guard let mapped = contentViewport?.normalizedPoint(for: point,in: bounds) else {
+                    session.engine.end(id: id,point: point,normalized: .zero,cancelled: true)
+                    v2IDs.removeValue(forKey: ObjectIdentifier(touch)); return nil
+                }
+                return (id,point,mapped)
+            }
+            session.engine.moveBatch(samples)
+            // External indirect touches still need their complete button mask below.
+            if touches.allSatisfy({ $0.type != .indirectPointer }) { return }
+        }
+        // Pencil first even when UIKit delivers contacts in the same unordered set.
+        let ordered = touches.sorted {
+            if ($0.type == .pencil) != ($1.type == .pencil) { return $0.type == .pencil }
+            return $0.timestamp < $1.timestamp
+        }
+        for touch in ordered {
+            if flags == 2 && touch.type != .indirectPointer { continue }
+            let point = touch.location(in: self)
+            let mapped = contentViewport?.normalizedPoint(for: point, in: bounds)
+            if touch.type == .indirectPointer {
+                guard let mapped else { session.engine.hoverExited(); continue }
+                session.clearTextHistory?()
+                session.engine.external(point: point, normalized: mapped, buttons: UInt(truncatingIfNeeded: event?.buttonMask.rawValue ?? 0))
+                if cancelled { session.engine.hoverExited() }
+                continue
+            }
+            guard touch.type == .direct || touch.type == .pencil else { continue }
+            let key = ObjectIdentifier(touch)
+            if flags == 1 {
+                guard window != nil, let mapped else { continue }
+                session.clearTextHistory?()
+                let id = session.engine.allocateContactID(); v2IDs[key] = id
+                session.engine.begin(id: id,pencil: touch.type == .pencil,point: point,normalized: mapped,tapCount: touch.tapCount)
+            } else if let id = v2IDs[key] {
+                if flags == 4 {
+                    session.engine.end(id: id,point: point,normalized: mapped ?? .zero,cancelled: cancelled || mapped == nil)
+                    v2IDs.removeValue(forKey: key)
+                } else if let mapped { session.engine.move(id: id,point: point,normalized: mapped) }
+                else { session.engine.end(id: id,point: point,normalized: .zero,cancelled: true); v2IDs.removeValue(forKey: key) }
+            }
         }
     }
 
@@ -1334,6 +1419,15 @@ public class PencilUIKitView: UIView {
     }
 
     @objc private func handleExternalPointerHover(_ recognizer: UIHoverGestureRecognizer) {
+        if let session = inputSession {
+            updateV2RelativeScale(session)
+            let point = recognizer.location(in: self)
+            guard window != nil, recognizer.state == .began || recognizer.state == .changed,
+                  let mapped = contentViewport?.normalizedPoint(for: point,in: bounds) else {
+                session.engine.hoverExited(); return
+            }
+            session.engine.external(point: point,normalized: mapped,buttons: UInt(truncatingIfNeeded: recognizer.buttonMask.rawValue)); return
+        }
         if let input = remoteSessionInput, input.usesEnhancedPointer {
             guard window != nil, input.pointerEnabled else { return }
             if recognizer.state == .ended || recognizer.state == .cancelled || recognizer.state == .failed {
@@ -1361,7 +1455,23 @@ public class PencilUIKitView: UIView {
         emitExternal(externalPointer.hover(point: point, generation: generation))
     }
 
+    private func routeV2Scroll(_ recognizer: UIPanGestureRecognizer, discrete: Bool) -> Bool {
+        guard let session = inputSession else { return false }
+        guard window != nil, contentViewport?.normalizedPoint(for: recognizer.location(in: self),in: bounds) != nil else {
+            session.engine.cancelInertia(); return true
+        }
+        if recognizer.state == .began { v2ScrollTranslation = .zero; session.clearTextHistory?(); session.engine.beginExternalScroll() }
+        guard recognizer.state == .began || recognizer.state == .changed || recognizer.state == .ended else { v2ScrollTranslation = .zero; session.engine.endExternalScroll(); return true }
+        let p = recognizer.translation(in: self)
+        let delta = CGPoint(x: p.x-v2ScrollTranslation.x,y: p.y-v2ScrollTranslation.y)
+        v2ScrollTranslation = p
+        session.engine.externalScroll(delta,discrete: discrete)
+        if recognizer.state == .ended { session.engine.endExternalScroll() }
+        return true
+    }
+
     @objc private func handleExternalPointerDiscreteScroll(_ recognizer: UIPanGestureRecognizer) {
+        if routeV2Scroll(recognizer,discrete: true) { return }
         let location = recognizer.location(in: self)
         let translation = recognizer.translation(in: self)
         if recognizer.state == .began {
@@ -1401,6 +1511,7 @@ public class PencilUIKitView: UIView {
     }
 
     @objc private func handleExternalPointerScroll(_ recognizer: UIPanGestureRecognizer) {
+        if routeV2Scroll(recognizer,discrete: false) { return }
         if let input = remoteSessionInput, input.usesEnhancedPointer {
             let translation = recognizer.translation(in: self)
             switch recognizer.state {
@@ -1455,6 +1566,16 @@ public class PencilUIKitView: UIView {
     }
 
     @objc private func handleExternalPointerPinch(_ recognizer: UIPinchGestureRecognizer) {
+        if let session = inputSession {
+            if recognizer.state == .began { v2PinchScale = recognizer.scale; session.clearTextHistory?(); session.engine.beginExternalTransform() }
+            if recognizer.state == .changed, v2PinchScale > 0,
+               let mapped = contentViewport?.normalizedPoint(for: recognizer.location(in: self),in: bounds) {
+                session.engine.zoom(scale: recognizer.scale/v2PinchScale,at: mapped)
+                v2PinchScale = recognizer.scale
+            }
+            if recognizer.state == .ended || recognizer.state == .cancelled || recognizer.state == .failed { session.engine.endExternalTransform() }
+            return
+        }
         if remoteSessionInput?.usesEnhancedPointer == true { return }
         guard window != nil, recognizer.numberOfTouches == 0,
               let generation = externalPointer.generation else { return }
@@ -1832,6 +1953,8 @@ final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate, UISc
     var onPreservedSystemResponderLoss: (() -> Void)?
     var onHardwarePresses: ((Set<UIPress>, KeyboardInputAction) -> Set<UIPress>)?
     var onHardwareCancellation: ((Set<UIPress>) -> Set<UIPress>)?
+    var keySourceRoutingEnabled = false
+    func clearCommittedHistory() { discardBuffer() }
     private var consuming = false
     private var committedShadow = SoftwareKeyboardCommittedShadow()
     override init(frame: CGRect, textContainer: NSTextContainer?) {
@@ -1888,6 +2011,11 @@ final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate, UISc
             emit(emission)
         }
         guard deliveryEnabled else { return }
+        // Retain correction history only for the current uninterrupted word.
+        // Focus/pointer/hardware/lifecycle changes discard it through the session.
+        if keySourceRoutingEnabled && committed.contains(where: { $0.isWhitespace || $0.isPunctuation || $0.isSymbol }) {
+            text = ""; committedShadow.reset(); return
+        }
         committedShadow.commit(committed)
         if Array(committed.utf8) != Array(committedShadow.text.utf8) { text = committedShadow.text }
         selectedRange = NSRange(location: committedShadow.text.utf16.count, length: 0)

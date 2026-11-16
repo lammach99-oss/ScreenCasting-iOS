@@ -251,6 +251,7 @@ public struct ContentView: View {
     @StateObject private var streamManager: StreamManager
     @StateObject private var discoveryManager = DiscoveryManager()
     @StateObject private var remoteInput = RemoteSessionInputState()
+    @StateObject private var inputSession = IPadInputSession()
 
     // PIN State
     @State private var enteredPIN: String = ""
@@ -305,6 +306,7 @@ public struct ContentView: View {
             // LAYER 2: Foreground UI
             foregroundLayer
         }
+        .environmentObject(inputSession)
         .ignoresSafeArea()
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
@@ -333,7 +335,9 @@ public struct ContentView: View {
             networkManager.setDesiredPipelineMode(
                 enabled ? .game : .office)
         }
+        .onChange(of: isSessionPanelOpen) { _, _ in inputSession.releaseAll() }
         .onDisappear {
+            inputSession.releaseAll()
             UIApplication.shared.isIdleTimerDisabled = false
             setWifiBrowsing(false)
         }
@@ -382,6 +386,7 @@ public struct ContentView: View {
             if !streamManager.isConnected { UIAccessibility.post(notification: .announcement, argument: text) }
         }
         .onChange(of: remoteInputConfiguration) { _, value in
+            inputSession.releaseAll()
             remoteInput.bind(networkManager)
             remoteInput.configure(value)
         }
@@ -391,9 +396,11 @@ public struct ContentView: View {
                 networkManager.applicationDidBecomeActive()
                 updateDisplayOrientation(for: rootSurfaceSize)
             case .inactive:
+                inputSession.releaseAll()
                 remoteInput.suspend(reason: 0)
                 networkManager.applicationWillResignActive()
             case .background:
+                inputSession.releaseAll()
                 remoteInput.suspend(reason: 2)
                 networkManager.applicationDidEnterBackground()
             @unknown default:
@@ -533,6 +540,7 @@ public struct ContentView: View {
                     isSessionPanelOpen = true
                 })
                 .remoteSessionInput(remoteInput)
+                .iPadInputSession(inputSession)
                 .gestureHints { hint in showGestureToast(hint) }
                 .frame(width: frame.width, height: frame.height)
                 .offset(x: frame.minX, y: frame.minY)
@@ -649,7 +657,7 @@ public struct ContentView: View {
                 .allowsHitTesting(false)
                 .animation(.easeOut(duration: 0.2), value: gestureToast)
                 if showGestureGuide {
-                    GestureGuideCard(mode: remoteInput.usesEnhancedPointer ? .remote(remoteInput.mouseMode) : .casting, onDone: {
+                    GestureGuideCard(mode: .input(inputSession.touchMode), onDone: {
                         gestureGuideSeen = true
                         showGestureGuide = false
                     })

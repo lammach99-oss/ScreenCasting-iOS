@@ -49,7 +49,8 @@ final class RemoteHardwareKeyboardTests: XCTestCase {
         check(0xe0, 0x1d); check(0xe4, 0x1d, 1)
         check(0xe1, 0x2a); check(0xe5, 0x36)
         check(0xe2, 0x38); check(0xe6, 0x38, 1)
-        check(0xe3, 0x5b, 1); check(0xe7, 0x5c, 1)
+        // Input v2 binding override: hardware Command is Ctrl; Win is onscreen only.
+        check(0xe3, 0x1d); check(0xe7, 0x1d, 1)
         for usage in 0xe0...0xe7 {
             XCTAssertTrue(RemoteHardwareKeyboard.key(forUsage: usage)!.isModifier)
         }

@@ -4,7 +4,7 @@ import Foundation
 // Frozen raw 37/38/40/41 payloads are inner records and remain byte-identical.
 public enum MirrorControlError: Error { case malformed, stale, denied, sequenceExhausted }
 public enum MirrorControlMode: UInt8 { case unavailable=0, viewOnly=1, awaitingPresentation=2, active=3, faulted=4, virtualDisplay=5 }
-public enum MirrorInputKind: UInt8 { case pencil=1, pointer=37, keyboard=38, text=40, directTouch=41 }
+public enum MirrorInputKind: UInt8 { case pencil=1, pointer=37, keyboard=38, text=40, directTouch=41, iPadPointerV2=83 }
 public struct MirrorToken: Equatable { public let low:UInt64, high:UInt64; public var isEmpty:Bool {low==0 && high==0} }
 public struct MirrorPoint: Equatable { public let x:Int32, y:Int32 }
 public struct MirrorRect: Equatable { public let left:Int, top:Int, width:Int, height:Int }
@@ -127,6 +127,7 @@ public enum MirrorControlCodec {
         case .pointer:return p.count==8 && p[0]==1 && p[1]<=7 && (p[1]>4 || read(p,6,2)==0)
         case .keyboard:return p.count==4 && p[0]==1 && p[1]<=1 && read(p,2,2)>0
         case .directTouch:return p.count==16 && p[0]==1 && p[1]<=3 && p[3]==0 && read(p,4,8)>0
+        case .iPadPointerV2:return IPadPointerV2Command.decode(payload) != nil
         case .text:
             guard (4...maxPayloadBytes).contains(p.count),p[0]==1,read(p,1,2)==UInt64(p.count-3),
                   let text=String(data:Data(p.dropFirst(3)),encoding:.utf8) else {return false}

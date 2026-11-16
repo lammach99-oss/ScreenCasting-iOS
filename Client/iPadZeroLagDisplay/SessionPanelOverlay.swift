@@ -42,6 +42,7 @@ private extension Color {
 /// One session shell: current Screen, route and control, then the same ordered panel sections.
 /// Touches on the panel stay on the iPad.
 @MainActor struct SessionPanelOverlay: View {
+    @EnvironmentObject private var inputSession: IPadInputSession
     @ObservedObject var networkManager: NetworkManager
     let hostLabel: String
     @Binding var isOpen: Bool
@@ -54,6 +55,7 @@ private extension Color {
     let onGestures: () -> Void
 
     @State private var moreInputExpanded = false
+    @State private var inputBarVisible = false
     @State private var rememberedPhysical = ConfirmedPhysicalScreen()
     @State private var requestedScreen: UInt64?
     @State private var pillHeight: CGFloat = 44
@@ -151,7 +153,8 @@ private extension Color {
                     })
                     if isOpen {
                         // Sized to its content; only very large text or many screens reach the cap and scroll.
-                        panel(width: min(420, proxy.size.width - 24), maxHeight: max(120, proxy.size.height - pillHeight - 34))
+                        panel(width: min(420, proxy.size.width - 24),
+                              maxHeight: max(120, proxy.size.height - pillHeight - 34 - (inputSession.dragState == .latched ? 80 : 0)))
                             .transition(.opacity.combined(with: .move(edge: .top)))
                     }
                 }
@@ -159,6 +162,17 @@ private extension Color {
                 .padding(.top, 12)
             }
             .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
+            .overlay(alignment: .bottom) {
+                VStack(spacing: 8) {
+                    SessionDraggingChip()
+                    if inputBarVisible && !isOpen {
+                        SessionInputBar(onClose: { inputBarVisible = false })
+                            .frame(maxHeight: max(44, proxy.size.height * 0.45))
+                    }
+                }
+                .frame(maxWidth: min(620, max(0, proxy.size.width - 24)))
+                .padding(.bottom, max(12, proxy.safeAreaInsets.bottom))
+            }
         }
         .environment(\.colorScheme, .dark)
         .tint(Color(ink: SessionInk.accent))
@@ -555,15 +569,16 @@ private extension Color {
     }
 
     private var tools: some View {
-        let canType = !networkManager.captureInputBlocked && (networkManager.isRemoteControlSession
-            ? (!remoteInput.usesScanKeyboard || remoteInput.keyboardEnabled) : picker.canType)
+        let canType = inputSession.canType && !networkManager.captureInputBlocked
         return VStack(alignment: .leading, spacing: 8) {
             sectionTitle("Tools")
             SessionActionLayout(accessibility: typeSize.isAccessibilitySize) {
                 actionButton("Keyboard", icon: "keyboard", enabled: canType,
-                             hint: canType ? nil : "Ask for control first to type on the PC") {
+                             hint: canType ? nil : (inputSession.unavailableReason ?? "Ask for control first to type on the PC")) {
+                    guard inputSession.canType, !networkManager.captureInputBlocked else { return }
                     close()
-                    DispatchQueue.main.async { NotificationCenter.default.post(name: .sessionPanelToggleKeyboard, object: nil) }
+                    inputBarVisible = true
+                    inputSession.showSoftwareKeyboard()
                 }
                 actionButton("Files", icon: "arrow.left.arrow.right") { close(); onFiles() }
                 actionButton("Settings", icon: "gearshape") { close(); onSettings() }
@@ -574,16 +589,8 @@ private extension Color {
     private var touchSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             sectionTitle("Touch")
-            if remoteInput.usesEnhancedPointer {
-                RemoteMouseControls(mode: remoteInput.mouseMode,
-                    onModeChange: { remoteInput.changeMouseMode($0) }, enabled: remoteInput.pointerEnabled)
-            } else {
-                Text(networkManager.isRemoteControlSession ? "Use touch to point and click on the PC."
-                     : "Tap to click. Swipe one finger to scroll. Hold, then move to drag. Use Pencil to write.")
-                    .font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if remoteInput.usesScanKeyboard || remoteInput.usesEnhancedPointer { moreInput }
+            RemoteMouseControls()
+            moreInput
         }
     }
 
@@ -602,26 +609,20 @@ private extension Color {
             .accessibilityValue(moreInputExpanded ? "Expanded" : "Collapsed")
             .accessibilityIdentifier("session.more-input")
             if moreInputExpanded {
-                if remoteInput.usesScanKeyboard { specialKeys }
-                if remoteInput.usesEnhancedPointer {
-                    RemoteMouseExtras(mode: remoteInput.mouseMode,
-                        onModeChange: { remoteInput.changeMouseMode($0) },
-                        onMiddleClick: { remoteInput.middleClick() }, enabled: remoteInput.pointerEnabled)
-                }
+                Toggle("Scroll inertia", isOn: Binding(get: { inputSession.scrollInertiaEnabled },
+                                                       set: { inputSession.setScrollInertia($0) }))
+                    .font(.subheadline).frame(minHeight: 44).disabled(!inputSession.canPoint)
+                Toggle("Reverse scroll direction", isOn: Binding(get: { inputSession.reverseScrollEnabled },
+                                                                  set: { inputSession.setReverseScroll($0) }))
+                    .font(.subheadline).frame(minHeight: 44).disabled(!inputSession.canPoint)
+                Text("Inertia affects finger wheel scrolling. Reverse affects wheel direction. Windows controls native one-finger touch pan.")
+                    .font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
+                    .fixedSize(horizontal: false, vertical: true)
+                actionButton("Gesture help", icon: "hand.draw") { close(); onGestures() }
+                AccessiblePointerControls()
+                RemoteMouseExtras()
             }
         }
-    }
-
-    private var specialKeys: some View {
-        let generation = remoteInput.generation
-        return RemoteSpecialKeyBar(keyboard: Binding(
-            get: { remoteInput.keyboard },
-            set: { value in
-                if remoteInput.keyboardEnabled && value.token == remoteInput.token { remoteInput.keyboard = value }
-            }), sendKey: { remoteInput.emitKey($0, generation: generation) },
-            releaseKeys: { remoteInput.suspend(reason: 4) })
-            .disabled(!remoteInput.keyboardEnabled)
-            .opacity(remoteInput.keyboardEnabled ? 1 : 0.45)
     }
 
     private var connectionPicker: some View {

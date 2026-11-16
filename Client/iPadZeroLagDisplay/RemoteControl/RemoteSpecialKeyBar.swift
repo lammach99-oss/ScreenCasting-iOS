@@ -1,148 +1,71 @@
 import SwiftUI
-import UIKit
 
-/// RI-F owns the binding shared with RemoteHardwareKeyboard and readiness gating.
-/// sendKey must capture the originating connection generation; reset handling must
-/// also send RemoteInputReset through the negotiated context when the link is up.
-struct RemoteSpecialKeyBar: View {
-    @Binding var keyboard: RemoteKeyboardState
-    let sendKey: (RemoteScanKeyCommand) -> Void
-    let releaseKeys: () -> Void
+struct SessionSpecialKey: Identifiable {
+    let title: String
+    let label: String
+    let usage: UInt16
+    var id: UInt16 { usage }
 
-    @State private var functionsExpanded = false
+    static let standard: [Self] = [
+        .init(title: "Esc", label: "Escape", usage: 0x29),
+        .init(title: "Tab", label: "Tab", usage: 0x2b),
+        .init(title: "Enter", label: "Enter", usage: 0x28),
+        .init(title: "Backspace", label: "Backspace", usage: 0x2a),
+        .init(title: "Left", label: "Left arrow", usage: 0x50),
+        .init(title: "Up", label: "Up arrow", usage: 0x52),
+        .init(title: "Down", label: "Down arrow", usage: 0x51),
+        .init(title: "Right", label: "Right arrow", usage: 0x4f),
+        .init(title: "Home", label: "Home", usage: 0x4a),
+        .init(title: "End", label: "End", usage: 0x4d),
+        .init(title: "Page up", label: "Page up", usage: 0x4b),
+        .init(title: "Page down", label: "Page down", usage: 0x4e),
+        .init(title: "Delete", label: "Delete forward", usage: 0x4c)
+    ]
+    static let functions: [Self] = (1...12).map {
+        Self(title: "F\($0)", label: "F\($0)", usage: UInt16(0x39 + $0))
+    }
+}
+
+/// Reuses the panel's key styling; all keyboard ownership belongs to IPadInputSession.
+@MainActor struct RemoteSpecialKeyBar: View {
+    @EnvironmentObject private var inputSession: IPadInputSession
     @Environment(\.dynamicTypeSize) private var typeSize
+    @State private var expanded = false
+    @State private var functionsExpanded = false
 
     private var columns: [GridItem] {
-        [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? 140 : 76), spacing: 8)]
+        [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? 180 : 100), spacing: 8)]
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Special keys").font(.subheadline.weight(.semibold))
-                .accessibilityAddTraits(.isHeader)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    LazyVGrid(columns: columns, spacing: 8) {
-                        keyButton("Esc", label: "Escape", usage: 0x29)
-                        keyButton("Tab", label: "Tab", usage: 0x2b)
-                        ForEach(RemoteKeyboardState.Modifier.allCases, id: \.self) { modifier in
-                            modifierButton(modifier)
-                        }
-                        keyButton("Left", label: "Left arrow", usage: 0x50)
-                        keyButton("Up", label: "Up arrow", usage: 0x52)
-                        keyButton("Down", label: "Down arrow", usage: 0x51)
-                        keyButton("Right", label: "Right arrow", usage: 0x4f)
-                    }
-
-                    Button { functionsExpanded.toggle() } label: {
-                        Label("F1-F12", systemImage: "chevron.down")
-                            .font(.footnote.weight(.medium))
-                            .frame(maxWidth: .infinity, minHeight: 44)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Function keys F1 through F12")
-                    .accessibilityValue(functionsExpanded ? "Expanded" : "Collapsed")
-                    .accessibilityHint("Shows or hides function keys")
-                    .accessibilityAddTraits(.isButton)
-
-                    if functionsExpanded {
-                        LazyVGrid(columns: columns, spacing: 8) {
-                            ForEach(1...12, id: \.self) { number in
-                                keyButton("F\(number)", label: "F\(number)", usage: 0x39 + number)
-                            }
-                        }
-                    }
-
-                    ViewThatFits(in: .horizontal) {
-                        HStack(spacing: 8) { commandButtons }
-                        VStack(spacing: 8) { commandButtons }
-                    }
+        DisclosureGroup(isExpanded: $expanded) {
+            VStack(alignment: .leading, spacing: 8) {
+                LazyVGrid(columns: columns, spacing: 8) {
+                    ForEach(SessionSpecialKey.standard) { key in keyButton(key) }
                 }
-                .padding(12)
+                DisclosureGroup(isExpanded: $functionsExpanded) {
+                    LazyVGrid(columns: columns, spacing: 8) {
+                        ForEach(SessionSpecialKey.functions) { key in keyButton(key) }
+                    }
+                } label: {
+                    Text("F1-F12").font(.subheadline).frame(minHeight: 44)
+                }
+                .accessibilityLabel("Function keys F1 through F12")
             }
-            .scrollBounceBehavior(.basedOnSize)
-            .frame(maxHeight: 280)
-            .background(Color(uiColor: SessionInk.surface),
-                        in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .stroke(Color(uiColor: SessionInk.hairline), lineWidth: 0.5))
+        } label: {
+            Text("Special keys").font(.subheadline.weight(.semibold)).frame(minHeight: 44)
         }
         .foregroundStyle(Color(uiColor: SessionInk.text))
-        .environment(\.colorScheme, .dark)
     }
 
-    private func keyButton(_ title: String, label: String, usage: Int) -> some View {
+    private func keyButton(_ key: SessionSpecialKey) -> some View {
         Button {
-            guard let key = RemoteHardwareKeyboard.key(forUsage: usage) else { return }
-            keyboard.tapKey(key).forEach(sendKey)
-        } label: {
-            keyLabel(title)
-        }
+            guard inputSession.canType else { return }
+            inputSession.tapKey(hidUsage: key.usage)
+        } label: { SessionInputControlLabel(title: key.title) }
         .buttonStyle(.plain)
-        .accessibilityLabel(label)
-        .accessibilityHint("Sends \(label) to the remote PC")
-        .accessibilityAddTraits(.isButton)
-    }
-
-    private func modifierButton(_ modifier: RemoteKeyboardState.Modifier) -> some View {
-        let state = keyboard.modifierState(modifier)
-        return Button {
-            keyboard.tapModifier(modifier, at: ProcessInfo.processInfo.systemUptime).forEach(sendKey)
-            UIAccessibility.post(notification: .announcement,
-                                 argument: "\(modifier.rawValue), \(keyboard.modifierState(modifier).rawValue)")
-        } label: {
-            VStack(spacing: 4) {
-                Text(modifier.rawValue).font(.footnote.weight(.medium))
-                Text(state.rawValue).font(.caption)
-            }
-            .fixedSize(horizontal: false, vertical: true)
-            .multilineTextAlignment(.center)
-            .padding(8)
-            .frame(minWidth: 44, maxWidth: .infinity, minHeight: 60)
-            .background(Color(uiColor: state == .off ? SessionInk.raised : SessionInk.accent)
-                .opacity(state == .off ? 1 : 0.16),
-                        in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color(uiColor: state == .off ? SessionInk.hairline : SessionInk.accent),
-                        lineWidth: state == .off ? 0.5 : 1.5))
-            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(modifier == .win ? "Windows modifier" : "\(modifier.rawValue) modifier")
-        .accessibilityValue(state.rawValue)
-        .accessibilityHint("Tap for the next key. Double tap within 300 milliseconds to lock. Tap again to release.")
-        .accessibilityAddTraits(.isButton)
-        .accessibilityAddTraits(state == .off ? [] : .isSelected)
-        .accessibilityAction(named: Text("Lock modifier")) {
-            keyboard.lockModifier(modifier).forEach(sendKey)
-            UIAccessibility.post(notification: .announcement, argument: "\(modifier.rawValue), Locked")
-        }
-    }
-
-    private var commandButtons: some View {
-        Group {
-            Button {
-                releaseKeys()
-            } label: {
-                keyLabel("Release keys")
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Release keys")
-            .accessibilityHint("Releases all held remote keys and clears sticky modifiers")
-            .accessibilityAddTraits(.isButton)
-        }
-    }
-
-    private func keyLabel(_ title: String) -> some View {
-        Text(title)
-            .font(.footnote.weight(.medium))
-            .multilineTextAlignment(.center)
-            .fixedSize(horizontal: false, vertical: true)
-            .padding(8)
-            .frame(minWidth: 44, maxWidth: .infinity, minHeight: 44)
-            .background(Color(uiColor: SessionInk.raised),
-                        in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .disabled(!inputSession.canType).opacity(inputSession.canType ? 1 : 0.45)
+        .accessibilityLabel(key.label)
+        .accessibilityHint("Sends \(key.label) to the PC")
     }
 }
