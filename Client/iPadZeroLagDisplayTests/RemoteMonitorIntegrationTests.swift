@@ -241,7 +241,16 @@ final class RemoteMonitorIntegrationTests: XCTestCase {
     func testProductionRoutingAndRetirementAreConnectionScoped() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         let source = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/NetworkManager.swift"), encoding: .utf8)
-        XCTAssertTrue(source.contains("RemoteFeatureNegotiation(requestedFeatures: 7)"))
+        XCTAssertTrue(source.contains("RemoteFeatureNegotiation(requestedFeatures: 0x1f)"))
+        // Input-v2 adds negotiated bits; authority still comes from the captured
+        // connection generation/context, never from the latest state at send time.
+        let routing = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/Input/IPadInputRouting.swift"), encoding: .utf8)
+        for required in ["let generation = network.remoteKeyboardGeneration", "let context = network.remoteInputContext",
+                         "let ticket = network.mirrorTicketAtRegistration", "network.remoteKeyboardGeneration == generation",
+                         "expectedGeneration: generation", "engine.beginConnection(generation)"] {
+            XCTAssertTrue(routing.contains(required), required)
+        }
+        XCTAssertTrue(source.contains("self.connectionGeneration == expectedGeneration"))
         XCTAssertTrue(source.contains("remoteMonitors.begin(session: UUID(), acceptedFeatures:"))
         XCTAssertTrue(source.contains("remoteMonitors.session == session"))
         XCTAssertTrue(source.contains("case .remoteMonitorCatalogueRequest:"))

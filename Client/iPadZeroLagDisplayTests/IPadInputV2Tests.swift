@@ -8,6 +8,8 @@ final class IPadInputV2Tests: XCTestCase {
         let schemaVersion: Int
         let vectors: [Vector]
         let malformed: [Vector]
+        struct StateCase: Decodable { let name: String; let valid: Bool }
+        let stateCases: [StateCase]?
     }
     private func bytes(_ hex: String) throws -> Data {
         let chars = Array(hex); XCTAssertEqual(chars.count % 2, 0)
@@ -33,14 +35,33 @@ final class IPadInputV2Tests: XCTestCase {
         let f = try JSONDecoder().decode(Fixture.self,from: Data(contentsOf: url))
         XCTAssertEqual(f.schemaVersion,1)
         var tested = 0
+        let supportedTypes: Set<UInt8> = [38,40,61,62,64,65,82,83]
         for v in f.vectors where v.transport == "scst" {
-            let type = try XCTUnwrap(v.messageType), data = try bytes(v.hex)
+            guard let type = v.messageType, supportedTypes.contains(type) else { continue }
+            let data = try bytes(v.hex)
             XCTAssertEqual(roundTrip(type,data),data,v.name); tested += 1
         }
         XCTAssertGreaterThanOrEqual(tested,12)
         let byName = Dictionary(uniqueKeysWithValues: f.vectors.map { ($0.name,$0) })
+        // Load amended cases by stable name; added fixture entries remain compatible.
+        let middleDownVector = try XCTUnwrap(byName["casting-middle-down"])
+        let middleUpVector = try XCTUnwrap(byName["casting-middle-up"])
+        let middleDown = IPadPointerV2Command.decode(try bytes(middleDownVector.hex))
+        let middleUp = IPadPointerV2Command.decode(try bytes(middleUpVector.hex))
+        XCTAssertEqual(try XCTUnwrap(middleDown).transaction,1)
+        XCTAssertEqual(middleUp?.transaction,middleDown?.transaction)
+        let malformedByName = Dictionary(uniqueKeysWithValues: f.malformed.map { ($0.name,$0) })
+        for name in ["casting-button-zero-transaction", "casting-kind-0-transaction", "casting-kind-1-transaction", "casting-kind-3-transaction", "casting-kind-4-transaction"] {
+            let v = try XCTUnwrap(malformedByName[name],name)
+            XCTAssertNil(IPadPointerV2Command.decode(try bytes(v.hex)),name)
+        }
+        let stateByName = Dictionary(uniqueKeysWithValues: (f.stateCases ?? []).map { ($0.name,$0) })
+        for name in ["old-up-after-retirement-and-successor-down", "nonincreasing-button-down-transaction", "transaction-survives-mode-and-capture-retirement"] {
+            let c = try XCTUnwrap(stateByName[name],name)
+            XCTAssertFalse(c.valid); try assertAmendedTransactionState(c.name)
+        } // Other workers may add independent state cases.
         for v in f.malformed {
-            guard let parent = v.vector.flatMap({ byName[$0] }), parent.transport == "scst", let type = parent.messageType else { continue }
+            guard let parent = v.vector.flatMap({ byName[$0] }), parent.transport == "scst", let type = parent.messageType, supportedTypes.contains(type) else { continue }
             XCTAssertNil(roundTrip(type,try bytes(v.hex)),v.name)
         }
         for v in f.vectors where v.transport == "scst-header" {
@@ -65,8 +86,8 @@ final class IPadInputV2Tests: XCTestCase {
         XCTAssertEqual(n.accepted,3)
     }
     func testV2TerminalOwnershipIsGenerationBound() throws {
-        let down = try XCTUnwrap(IPadPointerV2Command(kind: 2,button: 3,a: 0,b: 0).encode())
-        let up = try XCTUnwrap(IPadPointerV2Command(kind: 2,button: 3,a: 1,b: 0).encode())
+        let down = try XCTUnwrap(IPadPointerV2Command(kind: 2,button: 3,a: 0,b: 0,transaction: 1).encode())
+        let up = try XCTUnwrap(IPadPointerV2Command(kind: 2,button: 3,a: 1,b: 0,transaction: 1).encode())
         for revision: UInt64 in [1,8,99] {
             var lifetime = InputLifetime()
             XCTAssertFalse(lifetime.accept(kind: .iPadPointerV2,payload: down,generation: 7,revision: revision,mayStart: false))
@@ -106,8 +127,8 @@ final class IPadInputV2Tests: XCTestCase {
         now += 0.499; e.tick(); XCTAssertTrue(out.isEmpty)
         now += 0.002; e.tick()
         e.end(id: 2, point: .zero, normalized: .zero, cancelled: false)
-        XCTAssertEqual(out.filter { if case .pointer(2, 2, 0, 0) = $0 { return true }; return false }.count, 1)
-        XCTAssertFalse(out.contains(.pointer(2, 1, 0, 0)))
+        XCTAssertEqual(out.filter { if case .button(2, 0, _) = $0 { return true }; return false }.count, 1)
+        XCTAssertFalse(out.contains(.button(1, 0, 1)))
     }
     func testCommandAndControlShareFirstDownLastUp() {
         let e = IPadInputEngine(clock: { 0 }); e.typeEnabled = true
@@ -155,7 +176,7 @@ final class IPadInputV2Tests: XCTestCase {
         let e = IPadInputEngine(clock: { 0 }); e.enabled = true; e.mode = .trackpad
         var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
         e.external(point: .zero, normalized: .zero, buttons: 0x1f)
-        XCTAssertEqual(out.filter { if case .pointer(2, _, 0, 0) = $0 { return true }; return false }.count,5)
+        XCTAssertEqual(out.filter { if case .button(_, 0, _) = $0 { return true }; return false }.count,5)
         e.hoverExited(); let n = out.count
         e.external(point: .init(x: 900,y: 0),normalized: .zero,buttons: 1)
         XCTAssertEqual(out.count,n)
@@ -198,10 +219,10 @@ extension IPadInputEngineTests {
         e.setModifier(.shift,.oneShot); e.armDrag()
         e.begin(id: 1,pencil: false,point: .zero,normalized: .zero)
         e.end(id: 1,point: .zero,normalized: .zero,cancelled: false)
-        XCTAssertEqual(e.drag,.latched); XCTAssertEqual(out,[.key(0xe1,0),.pointer(2,1,0,0)])
+        XCTAssertEqual(e.drag,.latched); XCTAssertEqual(out,[.key(0xe1,0),.button(1,0,1)])
         e.begin(id: 2,pencil: false,point: .zero,normalized: .zero)
         e.end(id: 2,point: .zero,normalized: .zero,cancelled: false)
-        XCTAssertEqual(e.drag,.idle); XCTAssertEqual(Array(out.suffix(2)),[.pointer(2,1,1,0),.key(0xe1,1)])
+        XCTAssertEqual(e.drag,.idle); XCTAssertEqual(Array(out.suffix(2)),[.button(1,1,1),.key(0xe1,1)])
     }
     func testNativeDragLeaseFinalCoordinatesAndNoWheelWithPan() {
         var now: TimeInterval = 0; let e = IPadInputEngine(clock: { now }); e.enabled = true; e.directAvailable = true
@@ -327,11 +348,11 @@ extension IPadInputEngineTests {
         e.external(point: .zero,normalized: .zero,buttons: 4)
         let before = out.count; e.click(3,at: .zero); XCTAssertEqual(out.count,before)
         e.external(point: .zero,normalized: .zero,buttons: 0)
-        XCTAssertEqual(out.last,.pointer(2,3,1,0))
+        XCTAssertEqual(out.last,.button(3,1,1))
         e.armDrag(); e.begin(id: 1,pencil: false,point: .zero,normalized: .zero)
         e.end(id: 1,point: .zero,normalized: .zero,cancelled: false); XCTAssertEqual(e.drag,.latched)
         out.removeAll(); e.begin(id: 2,pencil: true,point: .zero,normalized: .zero)
-        XCTAssertEqual(out.first,.pointer(2,1,1,0)); XCTAssertEqual(out.last,.pointer(2,1,0,0)); XCTAssertEqual(e.drag,.idle)
+        XCTAssertEqual(out.first,.button(1,1,2)); XCTAssertEqual(out.last,.button(1,0,3)); XCTAssertEqual(e.drag,.idle)
     }
 }
 
@@ -450,7 +471,209 @@ extension IPadInputEngineTests {
             if mode == .direct {
                 XCTAssertEqual(out.last,.touch(.up,1,.init(x: 0.8,y: 0.7),255))
                 XCTAssertFalse(out.contains { if case .pointer = $0 { return true }; return false })
-            } else { XCTAssertEqual(out.last,.pointer(2,1,1,0)) }
+            } else { XCTAssertEqual(out.last,.button(1,1,1)) }
         }
+    }
+}
+
+extension IPadInputV2Tests {
+    func testAmendedButtonTransactionCodecRejectsWrongKindAndReservedBytes() throws {
+        let down = IPadPointerV2Command(kind: 2,button: 3,a: 0,b: 0,transaction: 1)
+        let encoded = try XCTUnwrap(down.encode())
+        XCTAssertEqual(Array(encoded),[1,2,0,3,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0])
+        XCTAssertEqual(IPadPointerV2Command.decode(encoded),down)
+        XCTAssertNil(IPadPointerV2Command(kind: 2,button: 3,a: 0,b: 0,transaction: 0).encode())
+        for kind: UInt8 in [0,1,3,4] {
+            XCTAssertNil(IPadPointerV2Command(kind: kind,button: 0,a: 120,b: 0,transaction: 1).encode())
+        }
+        var reserved = encoded; reserved[8] = 1; XCTAssertNil(IPadPointerV2Command.decode(reserved))
+    }
+}
+
+extension IPadInputEngineTests {
+    func testTransactionsSurviveScopeRetirementAndResetOnlyOnNewConnection() {
+        let e = IPadInputEngine(clock: { 0 }); e.enabled = true
+        var events: [IPadInputEvent] = []; e.emit = { events.append($0) }
+        e.beginConnection(7)
+        e.external(point: .zero,normalized: .zero,buttons: 0)
+        e.external(point: .zero,normalized: .zero,buttons: 4)
+        e.retire(); XCTAssertEqual(Array(events.suffix(2)),[.button(3,0,1),.button(3,1,1)])
+        events.removeAll(); e.beginConnection(7)
+        e.external(point: .zero,normalized: .zero,buttons: 0)
+        e.external(point: .zero,normalized: .zero,buttons: 4)
+        XCTAssertEqual(events.last,.button(3,0,2))
+        events.removeAll(); e.beginConnection(8)
+        XCTAssertEqual(events.last,.button(3,1,2))
+        e.external(point: .zero,normalized: .zero,buttons: 0)
+        e.external(point: .zero,normalized: .zero,buttons: 4)
+        XCTAssertEqual(events.last,.button(3,0,1))
+    }
+    func testStandaloneWindowsShortcutAndChordsUseExplicitWinOwnership() {
+        let e = IPadInputEngine(clock: { 0 }); e.typeEnabled = true
+        var events: [IPadInputEvent] = []; e.emit = { events.append($0) }
+        e.shortcut(0,shift: false)
+        XCTAssertEqual(events,[.key(0x100,0),.key(0x100,1)])
+        events.removeAll(); e.shortcut(0x16,shift: true)
+        XCTAssertEqual(events,[.key(0x100,0),.key(0xe1,0),.key(0x16,0),.key(0x16,1),.key(0xe1,1),.key(0x100,1)])
+    }
+}
+
+extension IPadInputV2Tests {
+    private func assertAmendedTransactionState(_ name: String) throws {
+        func payload(_ action: Int32, _ transaction: UInt32) throws -> Data {
+            try XCTUnwrap(IPadPointerV2Command(kind: 2,button: 3,a: action,b: 0,transaction: transaction).encode())
+        }
+        var lifetime = InputLifetime()
+        XCTAssertTrue(lifetime.accept(kind: .iPadPointerV2,payload: try payload(0,1),generation: 7,revision: 1,mayStart: true))
+        // Retirement terminal keeps the old transaction, even after eligibility closes.
+        XCTAssertTrue(lifetime.accept(kind: .iPadPointerV2,payload: try payload(1,1),generation: 7,revision: 1,mayStart: false))
+        if name == "nonincreasing-button-down-transaction" {
+            XCTAssertFalse(lifetime.accept(kind: .iPadPointerV2,payload: try payload(0,1),generation: 7,revision: 2,mayStart: true))
+        } else {
+            XCTAssertTrue(lifetime.accept(kind: .iPadPointerV2,payload: try payload(0,2),generation: 7,revision: 2,mayStart: true))
+            XCTAssertFalse(lifetime.accept(kind: .iPadPointerV2,payload: try payload(1,1),generation: 7,revision: 2,mayStart: false))
+            XCTAssertTrue(lifetime.accept(kind: .iPadPointerV2,payload: try payload(1,2),generation: 7,revision: 2,mayStart: false))
+        }
+    }
+    func testTransactionOwnershipRejectsLateUpAndNonIncreasingDown() throws {
+        try assertAmendedTransactionState("old-up-after-retirement-and-successor-down")
+        try assertAmendedTransactionState("nonincreasing-button-down-transaction")
+    }
+}
+
+extension IPadInputEngineTests {
+    func testWindowsModifierMaterializesForKeysAndPointerInAllSessionTypes() throws {
+        let context = RemoteInputContextCommand(state: 1,desktop: 1,token: 7,desktopEpoch: 8,left: 0,top: 0,width: 1920,height: 1080)
+        let ticket = MirrorInputTicket(session: 5,uiRevision: 6,epoch: 7,source: 8,token: MirrorToken(low: 3,high: 4))
+        for routeKind in 0...2 {
+            for locked in [false,true] {
+                for pointer in [false,true] {
+                    let e = IPadInputEngine(clock: { 0 }); e.enabled = true; e.typeEnabled = true
+                    let route = IPadInputRoute(generation: 5,revision: 6,remote: routeKind == 2,features: 0x1f,context: context,ticket: routeKind == 1 ? ticket : nil,pointerV2: true)
+                    var packets: [IPadInputRoute.Packet] = []; e.emit = { if let p = route.encode($0) { packets.append(p) } }
+                    e.setModifier(.win,locked ? .locked : .oneShot)
+                    if pointer { e.click(1,at: .zero) } else { e.tapKey(4) }
+                    if locked { e.setModifier(.win,.off) }
+                    let first = try XCTUnwrap(packets.first), last = try XCTUnwrap(packets.last)
+                    if routeKind == 2 {
+                        XCTAssertEqual(first.type,.remoteScanKey); XCTAssertEqual(last.type,.remoteScanKey)
+                        XCTAssertEqual(RemoteScanKeyCommand.decode(first.payload)?.scan,0x5b)
+                        XCTAssertEqual(RemoteScanKeyCommand.decode(first.payload)?.flags,1)
+                        XCTAssertEqual(RemoteScanKeyCommand.decode(first.payload)?.action,0)
+                        XCTAssertEqual(RemoteScanKeyCommand.decode(last.payload)?.action,1)
+                    } else {
+                        XCTAssertEqual(first.type,.keyboardInput); XCTAssertEqual(last.type,.keyboardInput)
+                        XCTAssertEqual(KeyboardInputCommand.decode(first.payload)?.virtualKey,0x5b)
+                        XCTAssertEqual(KeyboardInputCommand.decode(first.payload)?.action,.keyDown)
+                        XCTAssertEqual(KeyboardInputCommand.decode(last.payload)?.action,.keyUp)
+                        if routeKind == 1 {
+                            for p in packets {
+                                let kind = try XCTUnwrap(MirrorInputKind(rawValue: p.type.rawValue))
+                                let envelope = MirrorInputEnvelope(epoch: ticket.epoch,source: ticket.source,token: ticket.token,sequence: 1,kind: kind,payload: p.payload)
+                                XCTAssertEqual(try MirrorControlCodec.decodeInput(MirrorControlCodec.encodeInput(envelope)).token,ticket.token)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    func testTransactionsAreSharedByButtonsAndPreservedByRetirement() throws {
+        let e = IPadInputEngine(clock: { 0 }); e.enabled = true; e.typeEnabled = true
+        var events: [IPadInputEvent] = []; e.emit = { events.append($0) }
+        e.beginConnection(4); e.external(point: .zero,normalized: .zero,buttons: 0)
+        e.external(point: .zero,normalized: .zero,buttons: 0x1f)
+        XCTAssertEqual(events.filter { if case .button(_,0,_) = $0 { return true }; return false },
+                       [.button(1,0,1),.button(2,0,2),.button(3,0,3),.button(4,0,4),.button(5,0,5)])
+        events.removeAll(); e.retire()
+        XCTAssertEqual(events,[.button(1,1,1),.button(2,1,2),.button(3,1,3),.button(4,1,4),.button(5,1,5)])
+        events.removeAll(); e.click(3,at: .zero)
+        XCTAssertEqual(Array(events.suffix(2)),[.button(3,0,6),.button(3,1,6)])
+    }
+}
+
+extension IPadInputEngineTests {
+    func testStandaloneWindowsConventionAcrossAllProductionPacketRoutes() throws {
+        let context = RemoteInputContextCommand(state: 1,desktop: 1,token: 7,desktopEpoch: 8,left: 0,top: 0,width: 1920,height: 1080)
+        let ticket = MirrorInputTicket(session: 5,uiRevision: 6,epoch: 7,source: 8,token: MirrorToken(low: 3,high: 4))
+        for kind in 0...2 {
+            let defaults = UserDefaults(suiteName: "InputV2." + UUID().uuidString)!
+            let session = IPadInputSession(defaults: defaults,clock: { 0 },automaticallyTicks: false)
+            let route = IPadInputRoute(generation: 5,revision: 6,remote: kind == 2,features: 0x1f,context: context,ticket: kind == 1 ? ticket : nil,pointerV2: true)
+            var packets: [IPadInputRoute.Packet] = []
+            session.configure(identity: "win",point: true,type: true,direct: true,zoom: true,reason: nil) { if let p = route.encode($0) { packets.append(p) } }
+            session.tapWindowsShortcut(hidUsage: 0,shift: false)
+            XCTAssertEqual(packets.count,2)
+            let first = try XCTUnwrap(packets.first), last = try XCTUnwrap(packets.last)
+            if kind == 2 {
+                XCTAssertEqual(RemoteScanKeyCommand.decode(first.payload),RemoteScanKeyCommand(action: 0,flags: 1,scan: 0x5b,token: 7))
+                XCTAssertEqual(RemoteScanKeyCommand.decode(last.payload),RemoteScanKeyCommand(action: 1,flags: 1,scan: 0x5b,token: 7))
+            } else {
+                XCTAssertEqual(KeyboardInputCommand.decode(first.payload),KeyboardInputCommand(action: .keyDown,virtualKey: 0x5b))
+                XCTAssertEqual(KeyboardInputCommand.decode(last.payload),KeyboardInputCommand(action: .keyUp,virtualKey: 0x5b))
+                if kind == 1 {
+                    let envelope = MirrorInputEnvelope(epoch: ticket.epoch,source: ticket.source,token: ticket.token,sequence: 1,kind: .keyboard,payload: first.payload)
+                    XCTAssertEqual(try MirrorControlCodec.decodeInput(MirrorControlCodec.encodeInput(envelope)).payload,first.payload)
+                }
+            }
+            session.releaseAll()
+        }
+    }
+    func testRawAndMirrorShareCounterAndNeverRewriteAnOldTerminal() throws {
+        let e = IPadInputEngine(clock: { 0 }); e.enabled = true
+        let raw = IPadInputRoute(generation: 5,revision: 6,remote: false,features: 0,context: nil,ticket: nil,pointerV2: true)
+        let ticket = MirrorInputTicket(session: 5,uiRevision: 7,epoch: 8,source: 9,token: MirrorToken(low: 3,high: 4))
+        let mirror = IPadInputRoute(generation: 5,revision: 7,remote: false,features: 0,context: nil,ticket: ticket,pointerV2: true)
+        var events: [IPadInputEvent] = []; e.emit = { events.append($0) }; e.beginConnection(5)
+        e.external(point: .zero,normalized: .zero,buttons: 0)
+        e.external(point: .zero,normalized: .zero,buttons: 4); e.retire()
+        let oldUp = try XCTUnwrap(events.last)
+        let oldRaw = try XCTUnwrap(raw.encode(oldUp))
+        events.removeAll(); e.beginConnection(5)
+        e.external(point: .zero,normalized: .zero,buttons: 0)
+        e.external(point: .zero,normalized: .zero,buttons: 4)
+        let successor = try XCTUnwrap(mirror.encode(try XCTUnwrap(events.last)))
+        XCTAssertEqual(IPadPointerV2Command.decode(oldRaw.payload)?.transaction,1)
+        XCTAssertEqual(IPadPointerV2Command.decode(successor.payload)?.transaction,2)
+        XCTAssertEqual(IPadPointerV2Command.decode(try XCTUnwrap(mirror.encode(oldUp)).payload)?.transaction,1)
+        let envelope = MirrorInputEnvelope(epoch: ticket.epoch,source: ticket.source,token: ticket.token,sequence: 1,kind: .iPadPointerV2,payload: successor.payload)
+        XCTAssertEqual(try MirrorControlCodec.decodeInput(MirrorControlCodec.encodeInput(envelope)).payload,successor.payload)
+    }
+    func testSameSideAndBothSideHardwareOwnersAcrossSharedEngine() {
+        for side in [UInt16(0),UInt16(4)] {
+            let e = IPadInputEngine(clock: { 0 }); e.typeEnabled = true
+            var events: [IPadInputEvent] = []; e.emit = { events.append($0) }
+            let ctrl: UInt16 = 0xe0+side, command: UInt16 = 0xe3+side
+            e.hardware(usage: command,down: true); e.hardware(usage: ctrl,down: true)
+            e.hardware(usage: command,down: false); e.hardware(usage: command,down: false)
+            XCTAssertEqual(events,[.key(ctrl,0)])
+            e.hardwareDisconnected(); XCTAssertEqual(events,[.key(ctrl,0),.key(ctrl,1)])
+        }
+        let e = IPadInputEngine(clock: { 0 }); e.typeEnabled = true
+        var events: [IPadInputEvent] = []; e.emit = { events.append($0) }
+        e.hardware(usage: 0xe3,down: true); e.hardware(usage: 0xe7,down: true)
+        e.hardware(usage: 0xe3,down: false); e.hardware(usage: 0xe7,down: false)
+        XCTAssertEqual(events,[.key(0xe0,0),.key(0xe4,0),.key(0xe0,1),.key(0xe4,1)])
+    }
+}
+
+extension IPadInputEngineTests {
+    func testModeAndCaptureRetirementDoNotResetConnectionTransaction() {
+        let name = "InputV2." + UUID().uuidString
+        let defaults = UserDefaults(suiteName: name)!
+        defer { defaults.removePersistentDomain(forName: name) }
+        defaults.set("direct",forKey: IPadInputSession.touchModeKey)
+        let session = IPadInputSession(defaults: defaults,clock: { 0 },automaticallyTicks: false)
+        var events: [IPadInputEvent] = []
+        let sink: (IPadInputEvent) -> Void = { events.append($0) }
+        session.configure(identity: "connection",point: true,type: true,direct: true,zoom: true,reason: nil,sink: sink)
+        session.engine.beginConnection(7); session.click(.middle)
+        session.selectTouchMode(.trackpad); session.click(.middle)
+        session.configure(identity: "connection",point: false,type: false,direct: true,zoom: false,reason: "paused",sink: sink)
+        session.configure(identity: "connection",point: true,type: true,direct: true,zoom: true,reason: nil,sink: sink)
+        session.click(.middle)
+        let downs = events.filter { if case .button(_,0,_) = $0 { return true }; return false }
+        XCTAssertEqual(downs,[.button(3,0,1),.button(3,0,2),.button(3,0,3)])
+        session.releaseAll()
     }
 }

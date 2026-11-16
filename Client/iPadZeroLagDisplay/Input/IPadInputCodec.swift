@@ -4,8 +4,13 @@ struct IPadPointerV2Command: Equatable {
     static let capability: UInt16 = 0x0020
     let kind: UInt8, button: UInt8
     let a: Int32, b: Int32
+    let transaction: UInt32
+    init(kind: UInt8, button: UInt8, a: Int32, b: Int32, transaction: UInt32 = 0) {
+        self.kind = kind; self.button = button; self.a = a; self.b = b; self.transaction = transaction
+    }
     func encode() -> Data? {
         var d = Data(count: 24); d[0] = 1; d[1] = kind; d[3] = button
+        d.storeLittleEndian(transaction, at: 4)
         d.storeLittleEndian(a, at: 12); d.storeLittleEndian(b, at: 16)
         return Self.decode(d) == nil ? nil : d
     }
@@ -20,11 +25,13 @@ struct IPadPointerV2Command: Equatable {
     }
     static func decode(_ payload: Data) -> Self? {
         let d = Data(payload)
-        guard d.count == 24, d[0] == 1, d[2] == 0, d[4..<12].allSatisfy({ $0 == 0 }),
+        guard d.count == 24, d[0] == 1, d[2] == 0, d[8..<12].allSatisfy({ $0 == 0 }),
               d[20..<24].allSatisfy({ $0 == 0 }) else { return nil }
         let a = d.loadLittleEndian(Int32.self, at: 12), b = d.loadLittleEndian(Int32.self, at: 16)
-        guard valid(kind: d[1], button: d[3], a: a, b: b) else { return nil }
-        return Self(kind: d[1], button: d[3], a: a, b: b)
+        let transaction = d.loadLittleEndian(UInt32.self, at: 4)
+        guard d[1] == 2 ? transaction != 0 : transaction == 0,
+              valid(kind: d[1], button: d[3], a: a, b: b) else { return nil }
+        return Self(kind: d[1], button: d[3], a: a, b: b, transaction: transaction)
     }
     var terminal: Bool { kind == 2 && a == 1 }
 }

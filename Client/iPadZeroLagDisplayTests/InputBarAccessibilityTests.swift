@@ -51,7 +51,7 @@ final class InputBarAccessibilityTests: XCTestCase {
     func testWindowsShortcutsOfferStartAndBalancedChordsWithoutLockPC() {
         XCTAssertEqual(SessionWindowsShortcut.all.map(\.title),
                        ["Win", "Win+Tab", "Win+D", "Win+E", "Win+R", "Win+Space", "Win+H", "Win+Shift+S"])
-        XCTAssertEqual(SessionWindowsShortcut.all.map(\.usage), [0xe3, 0x2b, 0x07, 0x08, 0x15, 0x2c, 0x0b, 0x16])
+        XCTAssertEqual(SessionWindowsShortcut.all.map(\.usage), [0, 0x2b, 0x07, 0x08, 0x15, 0x2c, 0x0b, 0x16])
         XCTAssertEqual(SessionWindowsShortcut.all.filter(\.shift).map(\.title), ["Win+Shift+S"])
         XCTAssertFalse(SessionWindowsShortcut.all.contains { $0.usage == 0x0f })
     }

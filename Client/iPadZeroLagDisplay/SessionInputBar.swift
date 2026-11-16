@@ -8,7 +8,7 @@ struct SessionWindowsShortcut: Identifiable {
     var id: String { title }
 
     static let all: [Self] = [
-        .init(title: "Win", label: "Use Windows modifier once", usage: 0xe3),
+        .init(title: "Win", label: "Windows Start", usage: 0),
         .init(title: "Win+Tab", label: "Windows task view", usage: 0x2b),
         .init(title: "Win+D", label: "Show desktop", usage: 0x07),
         .init(title: "Win+E", label: "Open File Explorer", usage: 0x08),
@@ -84,13 +84,7 @@ struct SessionWindowsShortcut: Identifiable {
     private func shortcutButton(_ shortcut: SessionWindowsShortcut) -> some View {
         Button {
             guard inputSession.canType else { return }
-            if shortcut.usage == 0xe3 {
-                // The frozen surface has no standalone Win tap. Do not send hardware Command's
-                // HID usage here: it maps to Ctrl. Keep a compile-safe one-shot Win fallback.
-                inputSession.setModifier(.win, .oneShot)
-            } else {
-                inputSession.tapWindowsShortcut(hidUsage: shortcut.usage, shift: shortcut.shift)
-            }
+            inputSession.tapWindowsShortcut(hidUsage: shortcut.usage, shift: shortcut.shift)
         } label: { SessionInputControlLabel(title: shortcut.title) }
         .buttonStyle(.plain)
         .disabled(!inputSession.canType).opacity(inputSession.canType ? 1 : 0.45)

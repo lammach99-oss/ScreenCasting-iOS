@@ -33,14 +33,14 @@
       "name": "casting-middle-down",
       "transport": "scst",
       "messageType": 83,
-      "hex": "010200030000000000000000000000000000000000000000",
+      "hex": "010200030100000000000000000000000000000000000000",
       "valid": true
     },
     {
       "name": "casting-middle-up",
       "transport": "scst",
       "messageType": 83,
-      "hex": "010200030000000000000000010000000000000000000000",
+      "hex": "010200030100000000000000010000000000000000000000",
       "valid": true
     },
     {
@@ -147,6 +147,20 @@
       "transport": "scst",
       "messageType": 82,
       "hex": "0103ff00080706050403020101000000000000000080ffff",
+      "valid": true
+    },
+    {
+      "name": "casting-absolute",
+      "transport": "scst",
+      "messageType": 83,
+      "hex": "010000000000000000000000000000000000000000000000",
+      "valid": true
+    },
+    {
+      "name": "casting-wheel",
+      "transport": "scst",
+      "messageType": 83,
+      "hex": "010300000000000000000000000000000000000000000000",
       "valid": true
     }
   ],
@@ -288,6 +302,42 @@
       "vector": "remote-touch-down",
       "hex": "0100ff00080706050403020100000000000000000080ffff",
       "valid": false
+    },
+    {
+      "name": "casting-button-zero-transaction",
+      "vector": "casting-middle-down",
+      "hex": "010200030000000000000000000000000000000000000000",
+      "valid": false
+    },
+    {
+      "name": "casting-button-reserved-high",
+      "vector": "casting-middle-down",
+      "hex": "010200030100000001000000000000000000000000000000",
+      "valid": false
+    },
+    {
+      "name": "casting-kind-0-transaction",
+      "vector": "casting-absolute",
+      "hex": "010000000100000000000000000000000000000000000000",
+      "valid": false
+    },
+    {
+      "name": "casting-kind-1-transaction",
+      "vector": "casting-relative",
+      "hex": "010100000100000000000000fdffffff0500000000000000",
+      "valid": false
+    },
+    {
+      "name": "casting-kind-3-transaction",
+      "vector": "casting-wheel",
+      "hex": "010300000100000000000000000000000000000000000000",
+      "valid": false
+    },
+    {
+      "name": "casting-kind-4-transaction",
+      "vector": "casting-zoom-high-bit",
+      "hex": "01040000010000000000000078000000008000c000000000",
+      "valid": false
     }
   ],
   "stateCases": [
@@ -313,6 +363,18 @@
     },
     {
       "name": "missing-capability",
+      "valid": false
+    },
+    {
+      "name": "old-up-after-retirement-and-successor-down",
+      "valid": false
+    },
+    {
+      "name": "nonincreasing-button-down-transaction",
+      "valid": false
+    },
+    {
+      "name": "transaction-survives-mode-and-capture-retirement",
       "valid": false
     }
   ]

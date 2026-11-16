@@ -3,9 +3,11 @@ import Foundation
 // Only admitted downs acquire ownership. Local eligibility may close before their
 // terminal callback; neither a new registration nor a new session inherits it.
 struct InputLifetime {
-    private enum Identity: Hashable { case key(UInt16), v2button(UInt8), button, touch(UInt64), pencil }
+    private enum Identity: Hashable { case key(UInt16), v2button(UInt8, UInt32), button, touch(UInt64), pencil }
     private struct Owner: Equatable { let generation: UInt64; let revision: UInt64 }
     private var owners: [Identity: Owner] = [:]
+    private var lastV2Transaction: UInt32 = 0
+    private var v2buttons: [UInt8: UInt32] = [:]
 
     mutating func accept(kind: MirrorInputKind, payload: Data, generation: UInt64,
                          revision: UInt64, mayStart: Bool) -> Bool {
@@ -23,7 +25,7 @@ struct InputLifetime {
             down = p[1] == PointerInputAction.leftDown.rawValue
         case .iPadPointerV2:
             guard let command = IPadPointerV2Command.decode(payload) else { return false }
-            identity = command.kind == 2 ? .v2button(command.button) : nil
+            identity = command.kind == 2 ? .v2button(command.button, command.transaction) : nil
             down = command.kind == 2 && command.a == 0
         case .directTouch:
             guard let contact = DirectTouchContactCommand.decode(payload) else { return false }
@@ -36,12 +38,20 @@ struct InputLifetime {
         let owner = Owner(generation: generation, revision: revision)
         if MirrorClientControl.isRelease(kind: kind, payload: payload) {
             guard let identity, owners[identity] == owner else { return false }
+            if case let .v2button(button, transaction) = identity {
+                guard v2buttons[button] == transaction else { return false }
+                v2buttons.removeValue(forKey: button)
+            }
             owners.removeValue(forKey: identity)
             return true
         }
         guard mayStart else { return false }
         if let identity {
             if down {
+                if case let .v2button(button, transaction) = identity {
+                    guard transaction > lastV2Transaction, v2buttons[button] == nil else { return false }
+                    lastV2Transaction = transaction; v2buttons[button] = transaction
+                }
                 guard owners[identity] == nil || owners[identity] == owner else { return false }
                 owners[identity] = owner
             } else if owners[identity] != owner { return false }

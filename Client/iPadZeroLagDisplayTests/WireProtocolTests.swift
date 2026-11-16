@@ -6310,12 +6310,33 @@ final class RemoteKeyboardV1Tests: XCTestCase {
         view.handleHardwareKey(.keyboardLeftGUI, action: .keyDown)
         view.handleHardwareKey(.keyboardLeftGUI, action: .keyUp)
         view.handleHardwareKey(.keyboardLeftGUI, action: .keyUp)
-        XCTAssertEqual(commands.map(\.action), [.keyDown, .keyDown, .keyDown])
-        view.handleHardwareKey(.keyboardRightGUI, action: .keyUp)
+        // The two Command keys own DIFFERENT PC modifiers; only the repeated
+        // left Down repeats. Releasing left must not wait for right.
         XCTAssertEqual(commands.map(\.action), [.keyDown, .keyDown, .keyDown, .keyUp])
-        XCTAssertEqual(commands.map(\.virtualKey), [0xA2, 0xA2, 0xA2, 0xA2])
+        view.handleHardwareKey(.keyboardRightGUI, action: .keyUp)
+        XCTAssertEqual(commands.map(\.action), [.keyDown, .keyDown, .keyDown, .keyUp, .keyUp])
+        XCTAssertEqual(commands.map(\.virtualKey), [0xA2, 0xA3, 0xA2, 0xA2, 0xA3])
         view.keyboardCaptureEnabled = false
-        XCTAssertEqual(commands.count, 4)
+        XCTAssertEqual(commands.count, 5)
+    }
+
+    @MainActor func testSameSideControlAndCommandShareFirstDownLastUp() {
+        let sides: [[UIKeyboardHIDUsage]] = [[.keyboardLeftControl,.keyboardLeftGUI], [.keyboardRightControl,.keyboardRightGUI]]
+        for usages in sides {
+            for reversed in [false,true] {
+                let view = PencilUIKitView(frame: .zero)
+                var commands: [KeyboardInputCommand] = []
+                view.onKeyboardInput = { commands.append($0) }; view.keyboardCaptureEnabled = true
+                let first = usages[reversed ? 1 : 0], second = usages[reversed ? 0 : 1]
+                view.handleHardwareKey(first,action: .keyDown); view.handleHardwareKey(second,action: .keyDown)
+                view.handleHardwareKey(first,action: .keyUp); view.handleHardwareKey(first,action: .keyUp)
+                XCTAssertEqual(commands.count,1)
+                view.handleHardwareKey(second,action: .keyUp); view.keyboardCaptureEnabled = false
+                let vk: UInt16 = usages[0] == .keyboardLeftControl ? 0xA2 : 0xA3
+                XCTAssertEqual(commands.map(\.virtualKey),[vk,vk])
+                XCTAssertEqual(commands.map(\.action),[.keyDown,.keyUp])
+            }
+        }
     }
 
     @MainActor func testCaptureDisableReleasesOneUpPerSharedVirtualKey() {
@@ -6399,8 +6420,9 @@ final class RemoteKeyboardV1Tests: XCTestCase {
         XCTAssertTrue(view.handleHardwareKey(.keyboardLeftGUI, action: .keyUp))
         XCTAssertTrue(view.handleHardwareKey(.keyboardLeftGUI, action: .keyUp))
         view.keyboardCaptureEnabled = false
-        XCTAssertEqual(commands.map(\.virtualKey), [0xA2, 0xA3, 0xA2, 0xA3])
-        XCTAssertEqual(commands.map(\.action), [.keyDown, .keyDown, .keyUp, .keyUp])
+        // Left Ctrl and left Command are two owners of ONE LCtrl.
+        XCTAssertEqual(commands.map(\.virtualKey), [0xA2, 0xA2])
+        XCTAssertEqual(commands.map(\.action), [.keyDown, .keyUp])
     }
 }
 

@@ -4,6 +4,7 @@ import CoreGraphics
 enum IPadInputEvent: Equatable {
     case touch(DirectTouchPhase, UInt64, CGPoint, UInt8)
     case pointer(UInt8, UInt8, Int32, Int32)
+    case button(UInt8, UInt8, UInt32)
     // Canonical HID usage; 0x100 is the explicit Windows key (never physical Command).
     case key(UInt16, UInt8)
 }
@@ -35,6 +36,15 @@ enum IPadInputEvent: Equatable {
     private var native: (id: UInt64, point: CGPoint, pressure: UInt8)?
     private var lastLease: TimeInterval = 0
     private var buttons: Set<UInt8> = []
+    private var buttonTransactions: [UInt8: UInt32] = [:]
+    private var buttonConnection: UInt64?
+    private var lastButtonTransaction: UInt32 = 0
+    /// Scope retirement preserves the counter. Only a new connection resets it.
+    func beginConnection(_ generation: UInt64) {
+        guard buttonConnection != generation else { return }
+        retire() // Emit old terminals with their old transactions before resetting.
+        buttonConnection = generation; lastButtonTransaction = 0
+    }
     private var externalButtons: Set<UInt8> = []
     private var keys: [UInt16: Set<String>] = [:]
     private var physical: Set<UInt16> = []
@@ -128,12 +138,18 @@ enum IPadInputEvent: Equatable {
     func shortcut(_ key: UInt16, shift: Bool) {
         guard typeEnabled else { return }; beginAction()
         own(0x100, "shortcut", true); if shift { own(0xe1, "shortcut", true) }
-        if key != 0xe3 && key != 0xe7 { own(key, "tap", true); own(key, "tap", false) }
+        if key != 0 && key != 0xe3 && key != 0xe7 { own(key, "tap", true); own(key, "tap", false) }
         if shift { own(0xe1, "shortcut", false) }; own(0x100, "shortcut", false); endAction()
     }
     private func button(_ b: UInt8, _ down: Bool) {
-        if down { if buttons.insert(b).inserted { send(.pointer(2, b, 0, 0)) } }
-        else if buttons.remove(b) != nil { send(.pointer(2, b, 1, 0)) }
+        if down {
+            guard !buttons.contains(b), lastButtonTransaction < UInt32.max else { return }
+            lastButtonTransaction += 1
+            buttons.insert(b); buttonTransactions[b] = lastButtonTransaction
+            send(.button(b, 0, lastButtonTransaction))
+        } else if buttons.remove(b) != nil, let transaction = buttonTransactions.removeValue(forKey: b) {
+            send(.button(b, 1, transaction))
+        }
     }
     func accessibleMove(to p: CGPoint) {
         guard enabled else { return }; cancelInertia()

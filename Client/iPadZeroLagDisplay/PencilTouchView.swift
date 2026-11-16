@@ -963,8 +963,10 @@ public class PencilUIKitView: UIView {
               let virtualKey = RemoteKeyboardKeyMapper.virtualKey(for: usage) else { return false }
         if action == .keyDown {
             if activeRemotePhysicalKeys[usage] == nil {
+                let alreadyOwned = remoteVirtualKeyOwnerCounts[virtualKey, default: 0] > 0
                 activeRemotePhysicalKeys[usage] = virtualKey
                 remoteVirtualKeyOwnerCounts[virtualKey, default: 0] += 1
+                if alreadyOwned { return true }
             }
             // UIKit repeats still travel remotely without acquiring another owner.
         } else {

@@ -33,9 +33,12 @@ extension IPadInputSession {
                   reason: !available ? "Input is temporarily unavailable" : (!remote && !pointerV2 ? "Trackpad and enhanced pointer actions require an updated PC host" : nil)) { [weak self, weak network] event in
             guard let self, let network, network.remoteKeyboardGeneration == generation else { return }
             guard let packet = route.encode(event) else {
-                if case let .pointer(kind,button,a,b) = event,
-                   (remote && features & 2 == 0) || (!remote && !pointerV2) {
-                    self.sendLegacyPointer(network,ticket: ticket,kind: kind,button: button,a: a,b: b)
+                if (remote && features & 2 == 0) || (!remote && !pointerV2) {
+                    switch event {
+                    case let .pointer(kind,button,a,b): self.sendLegacyPointer(network,ticket: ticket,kind: kind,button: button,a: a,b: b)
+                    case let .button(button,action,_): self.sendLegacyPointer(network,ticket: ticket,kind: 2,button: button,a: Int32(action),b: 0)
+                    default: break
+                    }
                 }
                 return
             }
@@ -58,6 +61,7 @@ extension IPadInputSession {
             default: break
             }
         }
+        engine.beginConnection(generation)
         retireQueuedInput = { [weak network] in network?.retireIPadInputScope(expectedGeneration: generation) }
     }
     private static func coordinate(_ p: CGFloat) -> UInt16 { UInt16((min(1,max(0,p))*65535).rounded()) }
@@ -110,6 +114,14 @@ struct IPadInputRoute {
                 return packet(.remoteDirectTouch,RemoteDirectTouchCommand(phase: phase,token: context.token,contactID: id,x: x,y: y).encode())
             }
             return packet(.directTouchContact,DirectTouchContactCommand(phase: phase,pressure: 255,contactID: id,x: x,y: y).encode())
+        case let .button(button,action,transaction):
+            if remote {
+                guard features & 2 != 0, let context, context.state == 1 else { return nil }
+                // Message 65 retains its token and byte layout; transaction is casting-only.
+                return packet(.remotePointer,RemotePointerCommand(kind: 2,button: button,token: context.token,a: Int32(action),b: 0).encode())
+            }
+            guard pointerV2 else { return nil }
+            return packet(.iPadPointerV2,IPadPointerV2Command(kind: 2,button: button,a: Int32(action),b: 0,transaction: transaction).encode())
         case let .pointer(kind,button,a,b):
             if remote {
                 guard features & 2 != 0, let context, context.state == 1, kind != 4 || features & 0x10 != 0 else { return nil }
