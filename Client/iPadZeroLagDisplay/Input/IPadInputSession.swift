@@ -112,19 +112,27 @@ enum IPadNudgeDirection { case up, down, left, right }
     }
     func click(_ button: IPadPointerButton) {
         guard canPoint else { return }; clearTextHistory?()
-        engine.click(button == .left ? 1 : button == .right ? 2 : 3, at: accessibleTarget)
+        engine.withoutCommandRestoration {
+            engine.click(button == .left ? 1 : button == .right ? 2 : 3, at: accessibleTarget)
+        }
     }
-    func beginDrag() { guard canPoint, touchMode != .direct || canDirect else { return }; clearTextHistory?(); engine.armDrag() }
+    func beginDrag() {
+        guard canPoint, touchMode != .direct || canDirect else { return }; clearTextHistory?()
+        engine.withoutCommandRestoration { engine.armDrag() }
+    }
     func releaseDrag() { engine.releaseDrag() }
     func releaseAll() {
         tickTimer?.invalidate(); tickTimer = nil
         clearTextHistory?(); retireQueuedInput?(); engine.retire()
         objectWillChange.send(); modifiers.removeAll(); dragState = .idle
     }
-    func tapKey(hidUsage: UInt16) { guard canType else { return }; clearTextHistory?(); engine.tapKey(hidUsage) }
+    func tapKey(hidUsage: UInt16) {
+        guard canType else { return }; clearTextHistory?()
+        engine.withoutCommandRestoration { engine.tapKey(hidUsage) }
+    }
     func tapWindowsShortcut(hidUsage: UInt16, shift: Bool) {
         guard canType else { return }; clearTextHistory?()
-        engine.shortcut(hidUsage, shift: shift)
+        engine.withoutCommandRestoration { engine.shortcut(hidUsage, shift: shift) }
     }
     func moveAccessibleTarget(_ direction: IPadNudgeDirection, coarse: Bool) {
         guard canPoint else { return }; clearTextHistory?()
@@ -136,7 +144,7 @@ enum IPadNudgeDirection { case up, down, left, right }
         case .right: accessibleTarget.x += step
         }
         accessibleTarget.x = min(1, max(0, accessibleTarget.x)); accessibleTarget.y = min(1, max(0, accessibleTarget.y))
-        engine.accessibleMove(to: accessibleTarget)
+        engine.withoutCommandRestoration { engine.accessibleMove(to: accessibleTarget) }
     }
     func showSoftwareKeyboard() { guard canType else { return }; requestSoftwareKeyboard?() }
     static func preview() -> IPadInputSession { IPadInputSession(automaticallyTicks: false) }

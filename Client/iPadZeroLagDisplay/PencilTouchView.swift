@@ -1018,6 +1018,11 @@ public class PencilUIKitView: UIView {
                 return am != bm ? (action == .keyDown ? am : !am) : a < b
             }
             return Set(ordered.filter { press in
+                // Every observed press, including Up/unknown usages, can prove
+                // Command is absent without changing physical Ctrl/Shift/Alt.
+                if hardwareModifierFlags(for: press)?.contains(.command) == false {
+                    inputSession?.engine.withPointerCommand(false) {}
+                }
                 guard let usage = hardwareKeyUsage(for: press) else { return true }
                 if action == .keyDown && !(0xe0...0xe7).contains(usage.rawValue) {
                     refreshHardwareModifiers(from: press)
@@ -1460,11 +1465,11 @@ public class PencilUIKitView: UIView {
         if let session = inputSession {
             updateV2RelativeScale(session)
             let point = recognizer.location(in: self)
-            guard window != nil, recognizer.state == .began || recognizer.state == .changed,
-                  let mapped = contentViewport?.normalizedPoint(for: point,in: bounds) else {
-                session.engine.hoverExited(); return
-            }
             session.engine.withPointerCommand(recognizer.modifierFlags.contains(.command)) {
+                guard window != nil, recognizer.state == .began || recognizer.state == .changed,
+                      let mapped = contentViewport?.normalizedPoint(for: point,in: bounds) else {
+                    session.engine.hoverExited(); return
+                }
                 session.engine.external(point: point,normalized: mapped,buttons: UInt(truncatingIfNeeded: recognizer.buttonMask.rawValue))
             }
             return

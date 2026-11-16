@@ -9,6 +9,141 @@ import UIKit
         e.physicalKeyIsDown = { _ in nil }
         return e
     }
+    func testUncertaintyReleaseCannotRestoreCommandForAnUnmodifiedClick() {
+        for command: UInt16 in [0xe3,0xe7] {
+            var now: TimeInterval = 0; let e = engine { now }
+            let ctrl: UInt16 = command == 0xe3 ? 0xe0 : 0xe4
+            var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+            e.hardware(usage: command,down: true)
+            e.hardware(usage: 6,down: true); e.hardware(usage: 6,down: false)
+            XCTAssertEqual(out.last,.key(ctrl,1)); out.removeAll()
+            now = 3; e.click(1,at: .zero)
+            XCTAssertEqual(out,[.pointer(0,0,0,0),.button(1,0,1),.button(1,1,1)])
+        }
+    }
+    func testMoveOnlyCommandFlagsCannotModifyALaterUnflaggedAction() {
+        let e = engine(); var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.withPointerCommand(true) { e.external(point: .zero,normalized: .zero,buttons: 0) }
+        out.removeAll(); e.click(1,at: .zero)
+        XCTAssertEqual(out,[.pointer(0,0,0,0),.button(1,0,1),.button(1,1,1)])
+    }
+    func testPanelAndBarActionsNeverRestoreAnUncertainCommandEvenWithAQuery() {
+        for query: Bool? in [nil,true] {
+            for action in ["click","key","shortcut","drag","nudge"] {
+                let name = "CurrentCommand." + UUID().uuidString
+                let defaults = UserDefaults(suiteName: name)!
+                defer { defaults.removePersistentDomain(forName: name) }
+                defaults.set("trackpad",forKey: IPadInputSession.touchModeKey)
+                let session = IPadInputSession(defaults: defaults,clock: { 0 },automaticallyTicks: false)
+                var out: [IPadInputEvent] = []
+                session.configure(identity: "open-panel",point: true,type: true,direct: true,zoom: true,reason: nil) { out.append($0) }
+                session.engine.physicalKeyIsDown = { _ in nil }
+                session.engine.hardware(usage: 0xe7,down: true)
+                session.engine.hardware(usage: 6,down: true); session.engine.hardware(usage: 6,down: false)
+                XCTAssertEqual(out.last,.key(0xe4,1)); out.removeAll()
+                session.engine.physicalKeyIsDown = { _ in query }
+                switch action {
+                case "click": session.click(.left)
+                case "key": session.tapKey(hidUsage: 0x50)
+                case "shortcut": session.tapWindowsShortcut(hidUsage: 7,shift: false)
+                case "drag": session.beginDrag(); session.click(.left); session.releaseDrag()
+                default: session.moveAccessibleTarget(.right,coarse: false)
+                }
+                XCTAssertFalse(out.contains(.key(0xe0,0)),action)
+                XCTAssertFalse(out.contains(.key(0xe4,0)),action)
+                XCTAssertFalse(out.isEmpty,action)
+                session.releaseAll()
+            }
+        }
+    }
+    func testCurrentExternalMouseFlagsRestoreReleasedCommandBeforeButtonDown() {
+        for command: UInt16 in [0xe3,0xe7] {
+            let e = engine(); let ctrl: UInt16 = command == 0xe3 ? 0xe0 : 0xe4
+            var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+            e.hardware(usage: command,down: true)
+            e.hardware(usage: 6,down: true); e.hardware(usage: 6,down: false)
+            out.removeAll()
+            e.withPointerCommand(true) { e.external(point: .zero,normalized: .zero,buttons: 1) }
+            e.withPointerCommand(true) { e.external(point: .zero,normalized: .zero,buttons: 0) }
+            XCTAssertEqual(out,[.pointer(0,0,0,0),.key(ctrl,0),.button(1,0,1),
+                                .pointer(0,0,0,0),.button(1,1,1),.key(ctrl,1)])
+            out.removeAll(); e.click(1,at: .zero)
+            XCTAssertFalse(out.contains(.key(ctrl,0))) // Prior event flags are not current.
+        }
+    }
+    func testUncertaintyThenTouchWithoutCommandIsPlainAndCannotSeedALaterClick() {
+        let e = engine(); e.mode = .trackpad
+        var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.hardware(usage: 0xe3,down: true)
+        e.hardware(usage: 6,down: true); e.hardware(usage: 6,down: false)
+        out.removeAll()
+        e.withPointerCommand(false) { e.begin(id: 1,pencil: false,point: .zero,normalized: .zero) }
+        e.withPointerCommand(false) { e.end(id: 1,point: .zero,normalized: .zero,cancelled: false) }
+        XCTAssertEqual(out,[.button(1,0,1),.button(1,1,1)])
+        out.removeAll(); e.click(1,at: .zero)
+        XCTAssertFalse(out.contains { if case .key = $0 { return true }; return false })
+    }
+    func testIdleUncertaintyAlsoCannotSeedAnUnflaggedClick() {
+        var now: TimeInterval = 0; let e = engine { now }
+        var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.hardware(usage: 0xe7,down: true); now = 2; e.tick()
+        XCTAssertEqual(out,[.key(0xe4,0),.key(0xe4,1)])
+        out.removeAll(); e.click(1,at: .zero)
+        XCTAssertFalse(out.contains { if case .key = $0 { return true }; return false })
+    }
+    func testPanelAndBarKeepExplicitOneShotAndLockedModifiers() {
+        for state in [IPadModifierState.oneShot,.locked] {
+            for action in ["click","key"] {
+                let name = "CurrentCommand." + UUID().uuidString
+                let defaults = UserDefaults(suiteName: name)!
+                defer { defaults.removePersistentDomain(forName: name) }
+                let session = IPadInputSession(defaults: defaults,clock: { 0 },automaticallyTicks: false)
+                var out: [IPadInputEvent] = []
+                session.configure(identity: "controls",point: true,type: true,direct: true,zoom: true,reason: nil) { out.append($0) }
+                session.engine.physicalKeyIsDown = { _ in nil }
+                session.engine.hardware(usage: 0xe7,down: true)
+                session.engine.hardware(usage: 6,down: true); session.engine.hardware(usage: 6,down: false)
+                out.removeAll(); session.setModifier(.control,state)
+                if action == "click" { session.click(.left) } else { session.tapKey(hidUsage: 6) }
+                XCTAssertEqual(out.first,.key(0xe0,0))
+                XCTAssertFalse(out.contains(.key(0xe4,0)))
+                XCTAssertEqual(out.contains(.key(0xe0,1)),state == .oneShot)
+                session.releaseAll()
+                XCTAssertEqual(out.filter { $0 == .key(0xe0,1) }.count,1)
+            }
+        }
+    }
+    func testCurrentPointerFlagsSurviveContactPreemptionOnlyWithinThatEvent() {
+        let e = engine(); var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.hardware(usage: 0xe7,down: true)
+        e.begin(id: 1,pencil: false,point: .zero,normalized: .zero)
+        out.removeAll()
+        e.withPointerCommand(true) { e.begin(id: 2,pencil: true,point: .zero,normalized: .zero) }
+        XCTAssertEqual(out,[.touch(.cancel,1,.zero,255),.key(0xe4,1),.key(0xe4,0),.touch(.down,2,.zero,255)])
+        e.end(id: 2,point: .zero,normalized: .zero,cancelled: false)
+        out.removeAll(); e.click(1,at: .zero)
+        XCTAssertFalse(out.contains(.key(0xe4,0)))
+    }
+    #if targetEnvironment(simulator)
+    func testHardwareUpWithoutCommandFlagsClearsCommandEvenForUnknownUsage() {
+        let name = "CurrentCommand." + UUID().uuidString
+        let defaults = UserDefaults(suiteName: name)!
+        defer { defaults.removePersistentDomain(forName: name) }
+        let session = IPadInputSession(defaults: defaults,clock: { 0 },automaticallyTicks: false)
+        var out: [IPadInputEvent] = []
+        session.configure(identity: "keys",point: true,type: true,direct: true,zoom: true,reason: nil) { out.append($0) }
+        session.engine.physicalKeyIsDown = { _ in nil }
+        session.engine.hardware(usage: 0xe3,down: true)
+        let view = PencilUIKitView(); view.inputSession = session
+        view.hardwareKeyUsageForTesting = { _ in nil }
+        view.hardwareModifierFlagsForTesting = { _ in [] }
+        let press = UIPress()
+        XCTAssertEqual(view.unhandledHardwarePresses([press],action: .keyUp),[press])
+        XCTAssertEqual(out,[.key(0xe0,0),.key(0xe0,1)])
+        out.removeAll(); session.click(.left)
+        XCTAssertFalse(out.contains(.key(0xe0,0))); session.releaseAll()
+    }
+    #endif
     func testPhysicalControlShiftAndAltSurviveShortcutIdleAndPointerUntilTheirOwnUp() {
         for modifier: UInt16 in [0xe0,0xe4,0xe1,0xe5,0xe2,0xe6] {
             var now: TimeInterval = 0; let e = engine { now }
@@ -72,18 +207,21 @@ import UIKit
                 var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
                 e.hardware(usage: command,down: true); e.hardware(usage: 6,down: true); e.hardware(usage: 6,down: false)
                 XCTAssertEqual(out.last,.key(ctrl,1)); out.removeAll()
-                switch action {
-                case "direct","pencil":
-                    e.begin(id: 1,pencil: action == "pencil",point: .zero,normalized: .zero)
-                    XCTAssertTrue(out.contains(.touch(.down,1,.zero,255)))
-                    e.end(id: 1,point: .zero,normalized: .zero,cancelled: false)
-                case "trackpad":
-                    e.mode = .trackpad; e.begin(id: 1,pencil: false,point: .zero,normalized: .zero)
-                    e.end(id: 1,point: .zero,normalized: .zero,cancelled: false)
-                case "button": e.external(point: .zero,normalized: .zero,buttons: 1); e.hoverExited()
-                case "wheel": e.externalScroll(.init(x: 0,y: 24),discrete: true)
-                case "zoom": e.zoom(scale: 1.1,at: .zero)
-                default: e.click(1,at: .zero)
+                // Round eleven: restoration needs flags on this triggering event.
+                e.withPointerCommand(true) {
+                    switch action {
+                    case "direct","pencil":
+                        e.begin(id: 1,pencil: action == "pencil",point: .zero,normalized: .zero)
+                        XCTAssertTrue(out.contains(.touch(.down,1,.zero,255)))
+                        e.end(id: 1,point: .zero,normalized: .zero,cancelled: false)
+                    case "trackpad":
+                        e.mode = .trackpad; e.begin(id: 1,pencil: false,point: .zero,normalized: .zero)
+                        e.end(id: 1,point: .zero,normalized: .zero,cancelled: false)
+                    case "button": e.external(point: .zero,normalized: .zero,buttons: 1); e.hoverExited()
+                    case "wheel": e.externalScroll(.init(x: 0,y: 24),discrete: true)
+                    case "zoom": e.zoom(scale: 1.1,at: .zero)
+                    default: e.click(1,at: .zero)
+                    }
                 }
                 let controlDown = out.firstIndex(of: .key(ctrl,0))
                 let pointerDown = out.firstIndex {

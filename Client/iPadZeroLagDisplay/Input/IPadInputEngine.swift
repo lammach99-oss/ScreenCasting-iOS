@@ -62,6 +62,8 @@ enum IPadInputEvent: Equatable {
     private var commandEvidence: Set<UInt16> = []
     private var preferredCommandSide: UInt16 = 0xe3
     private var currentPointerCommand: Bool?
+    private var currentPointerCommandSides: Set<UInt16> = []
+    private var commandRestorationEnabled = true
     private var suppressedTap = false, longPressed = false, moved = false
     private var maximumFingers = 0
     private var gestureCancelled = false
@@ -143,12 +145,13 @@ enum IPadInputEvent: Equatable {
         !contacts.isEmpty || native != nil || !buttons.isEmpty || drag != .idle || externalScrolling ||
             isExternalTransforming || inertiaStarted != nil || actionOwners.contains { isPointerAction($0) }
     }
-    /// Current event flags override cached/query state. Queries identify sides;
-    /// without current flags, nil falls back to remembered press evidence.
+    /// Current event flags or a positive keyboard query authorize restoration.
+    /// Remembered press evidence chooses sides only; nil never authorizes Down.
     /// Scoped flags are never stored as a deferred pointer action.
     func withPointerCommand<T>(_ down: Bool?, _ body: () -> T) -> T {
-        let previous = currentPointerCommand; currentPointerCommand = down
-        defer { currentPointerCommand = previous }
+        let previous = currentPointerCommand, previousSides = currentPointerCommandSides
+        currentPointerCommand = down; currentPointerCommandSides.removeAll()
+        defer { currentPointerCommand = previous; currentPointerCommandSides = previousSides }
         if let down {
             if down && enabled && typeEnabled {
                 var possibleSides: [UInt16] = []
@@ -164,6 +167,7 @@ enum IPadInputEvent: Equatable {
                 if commandEvidence.isEmpty {
                     commandEvidence.insert(side)
                 }
+                currentPointerCommandSides = commandEvidence
             } else if !down {
                 commandEvidence.removeAll()
                 for key: UInt16 in [0xe3,0xe7] { uncertainModifiers.remove(key); releasePhysical(key) }
@@ -171,12 +175,19 @@ enum IPadInputEvent: Equatable {
         }
         return body()
     }
+    /// SwiftUI controls have no hardware event. They may use explicit bar
+    /// modifiers and existing owners, but cannot acquire a new Command owner.
+    func withoutCommandRestoration<T>(_ body: () -> T) -> T {
+        let previous = commandRestorationEnabled; commandRestorationEnabled = false
+        defer { commandRestorationEnabled = previous }
+        return body()
+    }
     private func restorePointerCommand() {
-        guard enabled, typeEnabled else { return }
+        guard enabled, typeEnabled, commandRestorationEnabled else { return }
         for key: UInt16 in [0xe3,0xe7] {
             let query = physicalKeyIsDown?(key)
-            let down = currentPointerCommand.map { $0 && commandEvidence.contains(key) }
-                ?? query ?? commandEvidence.contains(key)
+            let down = currentPointerCommand.map { $0 && currentPointerCommandSides.contains(key) }
+                ?? query ?? false
             if down {
                 commandEvidence.insert(key); preferredCommandSide = key
                 guard physical.insert(key).inserted else { continue }
@@ -190,7 +201,7 @@ enum IPadInputEvent: Equatable {
         }
     }
     private func releasePhysical(_ original: UInt16, uncertain: Bool = false) {
-        if isCommand(original) && !uncertain { commandEvidence.remove(original) }
+        if isCommand(original) { commandEvidence.remove(original) }
         guard physical.remove(original) != nil else { return }
         physicalEvidence.removeValue(forKey: original)
         if uncertain { uncertainModifiers.insert(original) }
@@ -257,7 +268,7 @@ enum IPadInputEvent: Equatable {
         }
         for key in ordered { releasePhysical(key) }
         uncertainModifiers.removeAll(); physicalEvidence.removeAll(); actionPhysicalEvidence.removeAll()
-        commandEvidence.removeAll(); preferredCommandSide = 0xe3; currentPointerCommand = nil
+        commandEvidence.removeAll(); preferredCommandSide = 0xe3; currentPointerCommand = nil; currentPointerCommandSides.removeAll()
     }
     func tapKey(_ key: UInt16) {
         guard typeEnabled else { return }; beginAction("tap")
@@ -600,7 +611,7 @@ enum IPadInputEvent: Equatable {
         keys.removeAll(); physical.removeAll(); externalButtons.removeAll(); modifierStates.removeAll(); actionModifiers.removeAll()
         actionOwners.removeAll(); actionModifierOwners.removeAll()
         physicalEvidence.removeAll(); actionPhysicalEvidence.removeAll(); uncertainModifiers.removeAll()
-        commandEvidence.removeAll(); preferredCommandSide = 0xe3; currentPointerCommand = nil
+        commandEvidence.removeAll(); preferredCommandSide = 0xe3; currentPointerCommand = nil; currentPointerCommandSides.removeAll()
         lastPointerActionEnd = clock()
         pencil = nil; palmUntil = 0; drag = .idle
         hoverAnchor = nil; neutralRequired = true; resetGesture()
