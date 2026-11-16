@@ -1169,7 +1169,9 @@ public class PencilUIKitView: UIView {
         cancelled: Bool = false
     ) {
         if let session = inputSession {
-            routeV2Touches(touches, flags: flags, event: event, cancelled: cancelled, session: session)
+            session.engine.withPointerCommand(event.map { $0.modifierFlags.contains(.command) }) {
+                routeV2Touches(touches, flags: flags, event: event, cancelled: cancelled, session: session)
+            }
             return
         }
         if let input = remoteSessionInput, input.usesEnhancedPointer {
@@ -1462,7 +1464,10 @@ public class PencilUIKitView: UIView {
                   let mapped = contentViewport?.normalizedPoint(for: point,in: bounds) else {
                 session.engine.hoverExited(); return
             }
-            session.engine.external(point: point,normalized: mapped,buttons: UInt(truncatingIfNeeded: recognizer.buttonMask.rawValue)); return
+            session.engine.withPointerCommand(recognizer.modifierFlags.contains(.command)) {
+                session.engine.external(point: point,normalized: mapped,buttons: UInt(truncatingIfNeeded: recognizer.buttonMask.rawValue))
+            }
+            return
         }
         if let input = remoteSessionInput, input.usesEnhancedPointer {
             if recognizer.state == .ended || recognizer.state == .cancelled || recognizer.state == .failed {
@@ -1493,8 +1498,11 @@ public class PencilUIKitView: UIView {
     }
 
     private func routeV2Scroll(_ recognizer: UIPanGestureRecognizer, discrete: Bool) -> Bool {
-        routeV2Scroll(state: recognizer.state,point: recognizer.location(in: self),
-            translation: recognizer.translation(in: self),discrete: discrete)
+        guard let session = inputSession else { return false }
+        return session.engine.withPointerCommand(recognizer.modifierFlags.contains(.command)) {
+            routeV2Scroll(state: recognizer.state,point: recognizer.location(in: self),
+                translation: recognizer.translation(in: self),discrete: discrete)
+        }
     }
 
     // The same adapter is used by recognizers and deterministic terminal tests.
@@ -1620,13 +1628,15 @@ public class PencilUIKitView: UIView {
 
     @objc private func handleExternalPointerPinch(_ recognizer: UIPinchGestureRecognizer) {
         if let session = inputSession {
-            if recognizer.state == .began { v2PinchScale = recognizer.scale; session.clearTextHistory?(); session.engine.beginExternalTransform() }
-            if recognizer.state == .changed, session.engine.isExternalTransforming, v2PinchScale > 0,
-               let mapped = contentViewport?.normalizedPoint(for: recognizer.location(in: self),in: bounds) {
-                session.engine.zoom(scale: recognizer.scale/v2PinchScale,at: mapped)
-                v2PinchScale = recognizer.scale
+            session.engine.withPointerCommand(recognizer.modifierFlags.contains(.command)) {
+                if recognizer.state == .began { v2PinchScale = recognizer.scale; session.clearTextHistory?(); session.engine.beginExternalTransform() }
+                if recognizer.state == .changed, session.engine.isExternalTransforming, v2PinchScale > 0,
+                   let mapped = contentViewport?.normalizedPoint(for: recognizer.location(in: self),in: bounds) {
+                    session.engine.zoom(scale: recognizer.scale/v2PinchScale,at: mapped)
+                    v2PinchScale = recognizer.scale
+                }
+                if recognizer.state == .ended || recognizer.state == .cancelled || recognizer.state == .failed { session.engine.endExternalTransform() }
             }
-            if recognizer.state == .ended || recognizer.state == .cancelled || recognizer.state == .failed { session.engine.endExternalTransform() }
             return
         }
         if remoteSessionInput?.usesEnhancedPointer == true { return }

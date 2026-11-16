@@ -9,6 +9,192 @@ import UIKit
         e.physicalKeyIsDown = { _ in nil }
         return e
     }
+    func testPhysicalControlShiftAndAltSurviveShortcutIdleAndPointerUntilTheirOwnUp() {
+        for modifier: UInt16 in [0xe0,0xe4,0xe1,0xe5,0xe2,0xe6] {
+            var now: TimeInterval = 0; let e = engine { now }
+            var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+            e.hardware(usage: modifier,down: true)
+            e.hardware(usage: 6,down: true); e.hardware(usage: 6,down: false)
+            XCTAssertFalse(out.contains(.key(modifier,1)))
+            now = 3; e.tick(); e.click(1,at: .zero)
+            XCTAssertFalse(out.contains(.key(modifier,1)))
+            XCTAssertTrue(out.contains(.button(1,0,1)))
+            e.hardware(usage: modifier,down: false)
+            XCTAssertEqual(out.last,.key(modifier,1))
+            XCTAssertEqual(out.filter { $0 == .key(modifier,0) }.count,1)
+        }
+    }
+    func testAggregateFlagsCannotReleasePhysicalControlShiftOrAlt() {
+        for modifier: UInt16 in [0xe0,0xe4,0xe1,0xe5,0xe2,0xe6] {
+            let e = engine(); var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+            e.hardware(usage: modifier,down: true)
+            e.hardwareModifiers(command: false,control: false,alt: false,shift: false)
+            XCTAssertEqual(out,[.key(modifier,0)])
+            e.hardwareDisconnected(); XCTAssertEqual(out.last,.key(modifier,1))
+        }
+    }
+    func testExplicitFalseQueryStillReleasesEveryPhysicalModifier() {
+        for modifier: UInt16 in [0xe0,0xe4,0xe1,0xe5,0xe2,0xe6,0xe3,0xe7] {
+            let e = engine(); var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+            e.hardware(usage: modifier,down: true); e.physicalKeyIsDown = { _ in false }; e.tick()
+            let pc: UInt16 = modifier == 0xe3 ? 0xe0 : modifier == 0xe7 ? 0xe4 : modifier
+            XCTAssertEqual(out,[.key(pc,0),.key(pc,1)])
+        }
+    }
+    func testUnknownCommandReleaseKeepsSameSidePhysicalControlOwner() {
+        let e = engine(); var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.hardware(usage: 0xe0,down: true); e.hardware(usage: 0xe3,down: true)
+        e.hardware(usage: 6,down: true); e.hardware(usage: 6,down: false)
+        XCTAssertEqual(out,[.key(0xe0,0),.key(6,0),.key(6,1)])
+        e.hardware(usage: 0xe0,down: false); XCTAssertEqual(out.last,.key(0xe0,1))
+    }
+    func testCommandDragKeepsControlForFiveSecondsThroughContactAndLatchEnd() {
+        for command: UInt16 in [0xe3,0xe7] {
+            for latch in [false,true] {
+                var now: TimeInterval = 0; let e = engine { now }; e.mode = latch ? .trackpad : .direct
+                let ctrl: UInt16 = command == 0xe3 ? 0xe0 : 0xe4
+                var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+                e.hardware(usage: command,down: true)
+                if latch { e.armDrag(); e.click(1,at: .zero) }
+                else { e.begin(id: 1,pencil: false,point: .zero,normalized: .zero) }
+                now = 5; e.tick(); XCTAssertFalse(out.contains(.key(ctrl,1)))
+                if latch { e.releaseDrag() }
+                else { e.end(id: 1,point: .zero,normalized: .zero,cancelled: false) }
+                XCTAssertEqual(out.last,.key(ctrl,1))
+            }
+        }
+    }
+    func testCommandShortcutThenEveryPointerActionRestoresSameSideBeforeDown() {
+        for command: UInt16 in [0xe3,0xe7] {
+            for action in ["direct","pencil","trackpad","click","button","wheel","zoom"] {
+                let e = engine(); e.zoomAvailable = true
+                let ctrl: UInt16 = command == 0xe3 ? 0xe0 : 0xe4
+                var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+                e.hardware(usage: command,down: true); e.hardware(usage: 6,down: true); e.hardware(usage: 6,down: false)
+                XCTAssertEqual(out.last,.key(ctrl,1)); out.removeAll()
+                switch action {
+                case "direct","pencil":
+                    e.begin(id: 1,pencil: action == "pencil",point: .zero,normalized: .zero)
+                    XCTAssertTrue(out.contains(.touch(.down,1,.zero,255)))
+                    e.end(id: 1,point: .zero,normalized: .zero,cancelled: false)
+                case "trackpad":
+                    e.mode = .trackpad; e.begin(id: 1,pencil: false,point: .zero,normalized: .zero)
+                    e.end(id: 1,point: .zero,normalized: .zero,cancelled: false)
+                case "button": e.external(point: .zero,normalized: .zero,buttons: 1); e.hoverExited()
+                case "wheel": e.externalScroll(.init(x: 0,y: 24),discrete: true)
+                case "zoom": e.zoom(scale: 1.1,at: .zero)
+                default: e.click(1,at: .zero)
+                }
+                let controlDown = out.firstIndex(of: .key(ctrl,0))
+                let pointerDown = out.firstIndex {
+                    switch $0 {
+                    case .touch(.down,_,_,_), .button(_,0,_), .pointer(3,_,_,_), .pointer(4,_,_,_): return true
+                    default: return false
+                    }
+                }
+                XCTAssertNotNil(controlDown,action); XCTAssertNotNil(pointerDown,action)
+                if let controlDown, let pointerDown { XCTAssertLessThan(controlDown,pointerDown,action) }
+                XCTAssertEqual(out.last,.key(ctrl,1),action)
+                XCTAssertEqual(out.filter { $0 == .key(ctrl,0) }.count,1,action)
+                XCTAssertGreaterThan(out.count,2,action)
+            }
+        }
+    }
+    func testCommandIdleClockRestartsAfterLastPointerActionEnds() {
+        for action in ["contact","button","drag","scroll","zoom"] {
+            var now: TimeInterval = 0; let e = engine { now }
+            var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+            e.hardware(usage: 0xe3,down: true)
+            switch action {
+            case "contact": e.begin(id: 1,pencil: false,point: .zero,normalized: .zero)
+            case "button": e.external(point: .zero,normalized: .zero,buttons: 1)
+            case "drag": e.mode = .trackpad; e.armDrag(); e.click(1,at: .zero)
+            case "scroll": e.beginExternalScroll()
+            default: e.beginExternalTransform()
+            }
+            now = 1; e.hardware(usage: 0xe3,down: true) // Fresh evidence during the action.
+            now = 5; e.tick(); XCTAssertFalse(out.contains(.key(0xe0,1)),action)
+            switch action {
+            case "contact": e.end(id: 1,point: .zero,normalized: .zero,cancelled: false)
+            case "button": e.hoverExited()
+            case "drag": e.releaseDrag()
+            case "scroll": e.endExternalScroll()
+            default: e.endExternalTransform()
+            }
+            XCTAssertFalse(out.contains(.key(0xe0,1)),action)
+            now = 6.999; e.tick(); XCTAssertFalse(out.contains(.key(0xe0,1)),action)
+            now = 7; e.tick(); XCTAssertEqual(out.last,.key(0xe0,1),action)
+        }
+    }
+    func testCurrentPointerFlagsOverrideStaleCommandCacheAndLifecycleClearsIt() {
+        let e = engine(); var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.hardware(usage: 0xe7,down: true); e.hardware(usage: 6,down: true); e.hardware(usage: 6,down: false)
+        out.removeAll(); e.withPointerCommand(false) { e.click(1,at: .zero) }
+        XCTAssertFalse(out.contains { if case .key = $0 { return true }; return false })
+        e.hardware(usage: 0xe7,down: true); e.hardwareDisconnected(); out.removeAll()
+        e.click(1,at: .zero)
+        XCTAssertFalse(out.contains { if case .key = $0 { return true }; return false })
+    }
+    func testPointerCommandCanBeRestoredFromEventFlagsOrRightSideKeyboardQuery() {
+        let e = engine(); var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.withPointerCommand(true) { e.click(1,at: .zero) }
+        XCTAssertEqual(out.first,.key(0xe0,0)); XCTAssertEqual(out.last,.key(0xe0,1))
+        e.retire(); out.removeAll(); e.physicalKeyIsDown = { $0 == 0xe7 }
+        e.click(1,at: .zero)
+        XCTAssertEqual(out.first,.key(0xe4,0)); XCTAssertFalse(out.contains(.key(0xe0,0)))
+        e.physicalKeyIsDown = { _ in false }; e.tick(); XCTAssertEqual(out.last,.key(0xe4,1))
+        e.retire(); out.removeAll(); e.physicalKeyIsDown = { $0 == 0xe7 }
+        e.withPointerCommand(true) { e.click(1,at: .zero) }
+        XCTAssertEqual(out.first,.key(0xe4,0)); XCTAssertFalse(out.contains(.key(0xe0,0)))
+        e.retire(); out.removeAll(); e.physicalKeyIsDown = { $0 == 0xe3 ? false : nil }
+        e.withPointerCommand(true) { e.click(1,at: .zero) }
+        XCTAssertEqual(out.first,.key(0xe4,0)); XCTAssertEqual(out.last,.key(0xe4,1))
+        e.retire(); out.removeAll(); e.physicalKeyIsDown = { _ in false }
+        e.withPointerCommand(true) { e.click(1,at: .zero) }
+        // Current event evidence outranks a contradictory controller snapshot.
+        XCTAssertEqual(out.first,.key(0xe0,0)); XCTAssertEqual(out.last,.key(0xe0,1))
+        e.retire(); out.removeAll()
+        e.click(1,at: .zero) // Without current flags, explicit false is authoritative.
+        XCTAssertFalse(out.contains { if case .key = $0 { return true }; return false })
+    }
+    func testExplicitCommandUpStillReleasesDuringAnActivePointerAction() {
+        var now: TimeInterval = 0; let e = engine { now }
+        var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.hardware(usage: 0xe3,down: true); e.begin(id: 1,pencil: false,point: .zero,normalized: .zero)
+        now = 1; e.hardware(usage: 0xe3,down: false)
+        XCTAssertEqual(out.last,.key(0xe0,1))
+        now = 5; e.tick(); e.end(id: 1,point: .zero,normalized: .zero,cancelled: false)
+        XCTAssertEqual(out.filter { $0 == .key(0xe0,0) }.count,1)
+        XCTAssertEqual(out.filter { $0 == .key(0xe0,1) }.count,1)
+    }
+    func testArmedDragPausesCommandIdleAndRestartsOnRelease() {
+        var now: TimeInterval = 0; let e = engine { now }
+        var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.hardware(usage: 0xe3,down: true); e.armDrag()
+        now = 5; e.tick(); XCTAssertEqual(out,[.key(0xe0,0)])
+        e.releaseDrag(); now = 6.999; e.tick(); XCTAssertEqual(out,[.key(0xe0,0)])
+        now = 7; e.tick(); XCTAssertEqual(out.last,.key(0xe0,1))
+    }
+    func testSuppressedContactFinalLiftRestartsCommandIdleClock() {
+        var now: TimeInterval = 0; let e = engine { now }
+        var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.hardware(usage: 0xe3,down: true)
+        e.begin(id: 1,pencil: false,point: .zero,normalized: .zero)
+        e.begin(id: 2,pencil: false,point: .zero,normalized: .zero)
+        now = 1; e.hardware(usage: 0xe3,down: true)
+        now = 5; e.end(id: 1,point: .zero,normalized: .zero,cancelled: true)
+        e.tick(); XCTAssertFalse(out.contains(.key(0xe0,1)))
+        now = 9; e.end(id: 2,point: .zero,normalized: .zero,cancelled: false)
+        now = 10.999; e.tick(); XCTAssertFalse(out.contains(.key(0xe0,1)))
+        now = 11; e.tick(); XCTAssertEqual(out.last,.key(0xe0,1))
+    }
+    func testBlockedPointerFlagsCannotRehydrateCommandAfterAdmissionReturns() {
+        let e = engine(); e.enabled = false; e.typeEnabled = false
+        var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.withPointerCommand(true) { e.click(1,at: .zero) }; XCTAssertTrue(out.isEmpty)
+        e.enabled = true; e.typeEnabled = true; e.click(1,at: .zero)
+        XCTAssertFalse(out.contains { if case .key = $0 { return true }; return false })
+    }
     func testUnknownCommandReleasesAfterShortcutWithoutItsUp() {
         let e = engine(); var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
         e.hardware(usage: 0xe3,down: true)
