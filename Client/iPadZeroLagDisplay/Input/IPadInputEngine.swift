@@ -50,15 +50,25 @@ enum IPadInputEvent: Equatable {
     private var physical: Set<UInt16> = []
     private var modifierStates: [IPadModifier: IPadModifierState] = [:]
     private var actionModifiers: Set<IPadModifier> = []
-    private var actionActive = false
+    // Idempotent scopes: a nested key tap cannot finish an admitted contact.
+    private var actionOwners: Set<String> = []
+    private var actionModifierOwners: [IPadModifier: Set<String>] = [:]
+    private var physicalEvidence: [UInt16: UInt64] = [:]
+    private var actionPhysicalEvidence: [UInt16: UInt64] = [:]
+    private var uncertainModifiers: Set<UInt16> = []
+    private var evidenceSequence: UInt64 = 0
+    private var lastHardwareEvent: TimeInterval = 0
     private var suppressedTap = false, longPressed = false, moved = false
     private var maximumFingers = 0
+    private var gestureCancelled = false
     private var gestureBegan: TimeInterval = 0
     private var settingsCandidate = false
     private var twoOrigin: CGPoint?, twoPrevious: CGPoint?
     private var pinchDistance: CGFloat?, pinchPrevious: CGFloat?
     private var pinching = false, scrolling = false
     private var externalScrolling = false
+    var isExternalScrolling: Bool { externalScrolling }
+    var isExternalTransforming: Bool { actionOwners.contains("transform") }
     private var hoverAnchor: CGPoint?
     private var neutralRequired = false
     private var fractional = CGPoint.zero
@@ -90,37 +100,91 @@ enum IPadInputEvent: Equatable {
         modifierStates[m] = state
         own(usage(m), "bar", state == .locked && typeEnabled)
         if state != .oneShot, actionModifiers.remove(m) != nil {
+            actionModifierOwners.removeValue(forKey: m)
             own(usage(m), "action", false)
         }
     }
-    private func beginAction() {
-        guard !actionActive else { return }; actionActive = true
+    private func beginAction(_ owner: String = "pointer") {
+        guard actionOwners.insert(owner).inserted else { return }
+        if actionOwners.count == 1 { actionPhysicalEvidence = physicalEvidence }
         for m in IPadModifier.allCases where typeEnabled && modifierStates[m] == .oneShot {
+            actionModifierOwners[m,default: []].insert(owner)
             actionModifiers.insert(m); own(usage(m), "action", true)
         }
     }
-    private func endAction() {
-        guard actionActive else { return }; actionActive = false
+    private func endAction(_ owner: String = "pointer") {
+        guard actionOwners.remove(owner) != nil else { return }
         for m in IPadModifier.allCases where actionModifiers.contains(m) {
+            actionModifierOwners[m]?.remove(owner)
+            guard actionModifierOwners[m]?.isEmpty == true else { continue }
+            actionModifierOwners.removeValue(forKey: m); actionModifiers.remove(m)
             own(usage(m), "action", false)
             if modifierStates[m] == .oneShot { modifierStates[m] = .off; consumedModifier?(m) }
         }
-        actionModifiers.removeAll()
+        if actionOwners.isEmpty {
+            releaseUnknownActionModifiers()
+            actionPhysicalEvidence.removeAll()
+        }
+    }
+    private func canonicalPhysical(_ original: UInt16) -> UInt16 {
+        original == 0xe3 ? 0xe0 : original == 0xe7 ? 0xe4 : original
+    }
+    private func releasePhysical(_ original: UInt16, uncertain: Bool = false) {
+        guard physical.remove(original) != nil else { return }
+        physicalEvidence.removeValue(forKey: original)
+        if uncertain { uncertainModifiers.insert(original) }
+        own(canonicalPhysical(original), "physical\(original)", false)
+        if original < 0xe0 { endAction("hardware\(original)") }
+    }
+    private func releaseUnknownActionModifiers() {
+        for key in physical.sorted() where (0xe0...0xe7).contains(key) {
+            let state = physicalKeyIsDown?(key)
+            if state == false || (state == nil && physicalEvidence[key] == actionPhysicalEvidence[key]) {
+                releasePhysical(key,uncertain: state == nil)
+            }
+        }
     }
     func hardware(usage original: UInt16, down: Bool) {
-        let canonical: UInt16 = original == 0xe3 ? 0xe0 : original == 0xe7 ? 0xe4 : original
-        let owner = "physical\(original)"
+        lastHardwareEvent = clock()
+        let canonical = canonicalPhysical(original)
         if down {
             guard typeEnabled else { return }
             cancelInertia()
+            if (0xe0...0xe7).contains(original) {
+                evidenceSequence &+= 1; physicalEvidence[original] = evidenceSequence
+                if !actionOwners.isEmpty && actionPhysicalEvidence[original] == nil {
+                    actionPhysicalEvidence[original] = evidenceSequence
+                }
+                uncertainModifiers.remove(original)
+            }
             if physical.contains(original) {
                 if canonical < 0xe0 { send(.key(canonical, 2)) }; return
             }
-            physical.insert(original); if canonical < 0xe0 { beginAction() }; own(canonical, owner, true)
+            physical.insert(original)
+            if canonical < 0xe0 { beginAction("hardware\(original)") }
+            own(canonical, "physical\(original)", true)
         } else {
-            guard physical.remove(original) != nil else { return }
-            own(canonical, owner, false)
-            if physical.allSatisfy({ (0xe0...0xe7).contains($0) }) && contacts.isEmpty && drag == .idle { endAction() }
+            uncertainModifiers.remove(original)
+            releasePhysical(original)
+        }
+    }
+    /// Called before an ordinary Down, or for pressesChanged. Aggregate flags
+    /// restore remembered sides after uncertainty; no Command ever becomes Win.
+    func hardwareModifiers(command: Bool, control: Bool, alt: Bool, shift: Bool, fresh: Bool = false) {
+        lastHardwareEvent = clock()
+        for (held, left, right) in [(command, UInt16(0xe3), UInt16(0xe7)),
+                                   (control, 0xe0, 0xe4), (alt, 0xe2, 0xe6), (shift, 0xe1, 0xe5)] {
+            let sides: [UInt16] = [left,right]
+            if !held {
+                for key in sides { uncertainModifiers.remove(key); releasePhysical(key) }
+            } else {
+                let remembered = sides.filter { uncertainModifiers.contains($0) }
+                for key in remembered { hardware(usage: key,down: true) }
+                if !sides.contains(where: { physical.contains($0) }) { hardware(usage: left,down: true) }
+                else if fresh {
+                    for key in sides where physical.contains(key) { hardware(usage: key,down: true) }
+                }
+            }
         }
     }
     func hardwareDisconnected() {
@@ -128,18 +192,19 @@ enum IPadInputEvent: Equatable {
             let am = (0xe0...0xe7).contains($0), bm = (0xe0...0xe7).contains($1)
             return am != bm ? !am : $0 < $1
         }
-        for key in ordered { hardware(usage: key,down: false) }
+        for key in ordered { releasePhysical(key) }
+        uncertainModifiers.removeAll(); physicalEvidence.removeAll(); actionPhysicalEvidence.removeAll()
     }
     func tapKey(_ key: UInt16) {
-        guard typeEnabled else { return }; beginAction()
+        guard typeEnabled else { return }; beginAction("tap")
         let canonical: UInt16 = key == 0xe3 || key == 0xe7 ? 0x100 : key
-        own(canonical, "tap", true); own(canonical, "tap", false); endAction()
+        own(canonical, "tap", true); own(canonical, "tap", false); endAction("tap")
     }
     func shortcut(_ key: UInt16, shift: Bool) {
-        guard typeEnabled else { return }; beginAction()
+        guard typeEnabled else { return }; beginAction("shortcut")
         own(0x100, "shortcut", true); if shift { own(0xe1, "shortcut", true) }
         if key != 0 && key != 0xe3 && key != 0xe7 { own(key, "tap", true); own(key, "tap", false) }
-        if shift { own(0xe1, "shortcut", false) }; own(0x100, "shortcut", false); endAction()
+        if shift { own(0xe1, "shortcut", false) }; own(0x100, "shortcut", false); endAction("shortcut")
     }
     private func button(_ b: UInt8, _ down: Bool) {
         if down {
@@ -160,21 +225,24 @@ enum IPadInputEvent: Equatable {
     func click(_ b: UInt8, at p: CGPoint) {
         guard enabled else { return }
         if b == 1 && drag == .latched { releaseDrag(); return }
-        guard !buttons.contains(b) else { return }; cancelInertia(); beginAction()
+        guard !buttons.contains(b) else { return }; cancelInertia()
+        let owner = b == 1 && drag == .armed ? "pointer" : "click"
+        beginAction(owner)
         if b == 1 && drag == .armed {
             if mode == .direct && directAvailable { touch(.down,id: allocateContactID(),at: p) }
             else if mode == .trackpad { accessibleMove(to: p); button(1,true) }
-            else { endAction(); return }
+            else { endAction(owner); return }
             drag = .latched; return
         }
-        accessibleMove(to: p); button(b, true); button(b, false); endAction()
+        accessibleMove(to: p); button(b, true); button(b, false); endAction(owner)
     }
     func armDrag() {
         guard enabled else { return }; cancelInertia()
         quarantine.formUnion(contacts.keys); contacts.removeAll(); pencil = nil
         cancelNative(); for b in buttons.sorted() { button(b,false) }
         externalButtons.removeAll(); hoverAnchor = nil; neutralRequired = true
-        drag = .idle; endAction(); resetGesture(); drag = .armed
+        drag = .idle; endAction(); endAction("externalButtons")
+        endExternalScroll(); endExternalTransform(); resetGesture(); drag = .armed
     }
     func releaseDrag() {
         guard drag != .idle else { return }
@@ -198,7 +266,8 @@ enum IPadInputEvent: Equatable {
             quarantine.formUnion(contacts.keys); contacts.removeAll()
             cancelNative(); for b in buttons.sorted() { button(b, false) }
             externalButtons.removeAll(); hoverAnchor = nil; neutralRequired = true
-            drag = .idle; endAction(); resetGesture(); pencil = id
+            drag = .idle; endAction(); endAction("externalButtons")
+            endExternalScroll(); endExternalTransform(); resetGesture(); pencil = id
         } else if pencil != nil || clock() < palmUntil || quarantine.contains(id) {
             quarantine.insert(id); return
         }
@@ -207,6 +276,7 @@ enum IPadInputEvent: Equatable {
         hoverAnchor = nil
         if contacts.isEmpty { resetGesture(); beginAction() }
         contacts[id] = Contact(pencil: isPencil, start: point, began: clock(), point: point, normalized: p)
+        if !isPencil && gestureCancelled { return }
         if isPencil {
             if mode == .direct && directAvailable { touch(.down, id: id, at: p, pressure: 255) }
             else if mode == .trackpad { button(1, true) }
@@ -230,13 +300,13 @@ enum IPadInputEvent: Equatable {
         return (center, c.count == 2 ? distance(c[0].point,c[1].point) : 0)
     }
     private func resetGesture() {
-        suppressedTap = false; longPressed = false; moved = false; maximumFingers = 0
+        suppressedTap = false; longPressed = false; moved = false; maximumFingers = 0; gestureCancelled = false
         gestureBegan = clock(); settingsCandidate = false
         twoOrigin = nil; twoPrevious = nil; pinchDistance = nil; pinchPrevious = nil
         pinching = false; scrolling = false; history.removeAll(); wheelFraction = .zero; fractional = .zero
     }
     func move(id: UInt64, point: CGPoint, normalized p: CGPoint, pressure: UInt8 = 255) {
-        guard enabled, var c = contacts[id], !quarantine.contains(id) else { return }
+        guard enabled, !gestureCancelled, var c = contacts[id], !quarantine.contains(id) else { return }
         let previous = c.point; c.point = point; c.normalized = p; contacts[id] = c
         if distance(c.start,point) > 8 { moved = true }
         if c.pencil {
@@ -286,6 +356,13 @@ enum IPadInputEvent: Equatable {
     func end(id: UInt64, point: CGPoint, normalized p: CGPoint, cancelled: Bool) {
         if quarantine.remove(id) != nil { return }
         guard let c = contacts[id] else { return }
+        if cancelled && !c.pencil && maximumFingers >= 2 {
+            // Cancellation belongs to the whole gesture, even if UIKit lifts the
+            // remaining contacts normally or adds a finger before the final lift.
+            gestureCancelled = true; suppressedTap = true; settingsCandidate = false
+            scrolling = false; stopInertia(); cancelNative(); button(1,false)
+            drag = .idle; endAction()
+        }
         // Always finish with the final location under the old coordinate contract.
         if !cancelled { move(id: id,point: point,normalized: p) }
         contacts.removeValue(forKey: id)
@@ -302,11 +379,11 @@ enum IPadInputEvent: Equatable {
             else if mode == .trackpad && !moved && !suppressedTap && !longPressed { button(1,true); button(1,false) }
         }
         if contacts.isEmpty {
-            if maximumFingers == 3 && settingsCandidate && !moved && !cancelled && clock()-gestureBegan <= 0.300 {
+            if !gestureCancelled && maximumFingers == 3 && settingsCandidate && !moved && !cancelled && clock()-gestureBegan <= 0.300 {
                 openSettings?()
             }
-            if maximumFingers == 2 && !suppressedTap && !cancelled { button(2,true); button(2,false) }
-            if scrolling && !cancelled { startInertia() }
+            if !gestureCancelled && maximumFingers == 2 && !suppressedTap && !cancelled { button(2,true); button(2,false) }
+            if scrolling && !cancelled && !gestureCancelled { startInertia() }
             if drag == .idle && inertiaStarted == nil { endAction() }
         }
     }
@@ -328,10 +405,10 @@ enum IPadInputEvent: Equatable {
         hoverAnchor = point
         for b in UInt8(1)...UInt8(5) {
             let down = mask & (1 << UInt(b-1)) != 0
-            if down && externalButtons.insert(b).inserted { beginAction(); button(b,true) }
+            if down && externalButtons.insert(b).inserted { beginAction("externalButtons"); button(b,true) }
             else if !down && externalButtons.remove(b) != nil { button(b,false) }
         }
-        if buttons.isEmpty && drag == .idle { endAction() }
+        if externalButtons.isEmpty { endAction("externalButtons") }
     }
     func hover(point: CGPoint, normalized p: CGPoint) {
         guard enabled, contacts.isEmpty, pencil == nil, drag == .idle else { return }
@@ -342,7 +419,7 @@ enum IPadInputEvent: Equatable {
     func hoverExited() {
         for b in externalButtons.sorted() { button(b,false) }; externalButtons.removeAll()
         hoverAnchor = nil; fractional = .zero
-        neutralRequired = true; if contacts.isEmpty && drag == .idle { endAction() }
+        neutralRequired = true; endAction("externalButtons")
     }
     func zoom(scale: CGFloat, at p: CGPoint) {
         guard enabled, pencil == nil, zoomAvailable, scale.isFinite, scale > 0 else { return }
@@ -356,23 +433,26 @@ enum IPadInputEvent: Equatable {
         guard enabled, pencil == nil else { return }; cancelInertia(); cancelNative()
         for b in buttons.sorted() { button(b,false) }
         quarantine.formUnion(contacts.keys); contacts.removeAll(); drag = .idle
-        externalScrolling = true; beginAction()
+        externalButtons.removeAll(); hoverAnchor = nil; neutralRequired = true
+        externalScrolling = true; beginAction("scroll"); endAction(); endAction("externalButtons"); endExternalTransform()
     }
-    func endExternalScroll() { externalScrolling = false; endAction() }
+    func endExternalScroll() { externalScrolling = false; endAction("scroll") }
     func beginExternalTransform() {
         guard enabled, pencil == nil else { return }; cancelInertia(); cancelNative()
         for b in buttons.sorted() { button(b,false) }
         quarantine.formUnion(contacts.keys); contacts.removeAll(); drag = .idle
-        endAction(); beginAction()
+        externalButtons.removeAll(); hoverAnchor = nil; neutralRequired = true
+        beginAction("transform"); endAction(); endAction("externalButtons"); endExternalScroll()
     }
-    func endExternalTransform() { endAction() }
+    func endExternalTransform() { endAction("transform") }
     func externalScroll(_ delta: CGPoint, discrete: Bool) {
         guard enabled, pencil == nil else { return }
         if inertiaStarted != nil { cancelInertia() }
         // UIKit owns continuous scrolling AND its momentum. Never start client inertia here.
         let x = discrete ? (delta.x == 0 ? 0 : delta.x > 0 ? 120.0 : -120.0) : Double(delta.x * 5)
         let y = discrete ? (delta.y == 0 ? 0 : delta.y > 0 ? 120.0 : -120.0) : Double(delta.y * 5)
-        beginAction(); wheel(CGPoint(x: x,y: y)); if !externalScrolling { endAction() }
+        if !externalScrolling { beginAction("wheel") }
+        wheel(CGPoint(x: x,y: y)); if !externalScrolling { endAction("wheel") }
     }
     private func wheel(_ raw: CGPoint) {
         let d = reverseScroll ? CGPoint(x: -raw.x,y: -raw.y) : raw
@@ -410,7 +490,10 @@ enum IPadInputEvent: Equatable {
     func tick() {
         let now = clock()
         for key in physical.sorted() where physicalKeyIsDown?(key) == false {
-            hardware(usage: key,down: false)
+            releasePhysical(key)
+        }
+        if now-lastHardwareEvent >= 2.0 && physical.allSatisfy({ (0xe0...0xe7).contains($0) }) {
+            for key in physical.sorted() where physicalKeyIsDown?(key) == nil { releasePhysical(key,uncertain: true) }
         }
         guard enabled else { return }
         if let n = native, now-lastLease >= 1.0 / 30 { touch(.update,id: n.id,at: n.point,pressure: n.pressure) }
@@ -438,7 +521,9 @@ enum IPadInputEvent: Equatable {
         for key in keys.keys.sorted() where key < 0xe0 { send(.key(key,1)) }
         for key in keys.keys.sorted() where key >= 0xe0 { send(.key(key,1)) }
         keys.removeAll(); physical.removeAll(); externalButtons.removeAll(); modifierStates.removeAll(); actionModifiers.removeAll()
-        actionActive = false; pencil = nil; palmUntil = 0; drag = .idle
+        actionOwners.removeAll(); actionModifierOwners.removeAll()
+        physicalEvidence.removeAll(); actionPhysicalEvidence.removeAll(); uncertainModifiers.removeAll()
+        pencil = nil; palmUntil = 0; drag = .idle
         hoverAnchor = nil; neutralRequired = true; resetGesture()
     }
 }

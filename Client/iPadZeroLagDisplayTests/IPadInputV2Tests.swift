@@ -2,6 +2,235 @@ import XCTest
 import UIKit
 @testable import iPadCasting
 
+@MainActor final class InputLifetimeRegressionTests: XCTestCase {
+    private func engine(_ clock: @escaping () -> TimeInterval = { 0 }) -> IPadInputEngine {
+        let e = IPadInputEngine(clock: clock)
+        e.enabled = true; e.typeEnabled = true; e.directAvailable = true
+        e.physicalKeyIsDown = { _ in nil }
+        return e
+    }
+    func testUnknownCommandReleasesAfterShortcutWithoutItsUp() {
+        let e = engine(); var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.hardware(usage: 0xe3,down: true)
+        e.hardware(usage: 6,down: true); e.hardware(usage: 6,down: false)
+        XCTAssertEqual(out,[.key(0xe0,0),.key(6,0),.key(6,1),.key(0xe0,1)])
+    }
+    func testFreshModifierEvidenceDefersUnknownReleaseUntilIdleBound() {
+        var now: TimeInterval = 0; let e = engine { now }
+        var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.hardware(usage: 0xe7,down: true); e.hardware(usage: 6,down: true)
+        now = 0.1; e.hardware(usage: 0xe7,down: true) // Repeat/pressesChanged evidence.
+        e.hardware(usage: 6,down: false)
+        XCTAssertFalse(out.contains(.key(0xe4,1)))
+        now = 2.099; e.tick(); XCTAssertFalse(out.contains(.key(0xe4,1)))
+        now = 2.1; e.tick(); XCTAssertEqual(out.last,.key(0xe4,1))
+    }
+    func testKnownHeldModifierSurvivesActionsAndIdle() {
+        var now: TimeInterval = 0; let e = engine { now }; e.physicalKeyIsDown = { _ in true }
+        var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.hardware(usage: 0xe3,down: true); e.hardware(usage: 6,down: true); e.hardware(usage: 6,down: false)
+        now = 10; e.tick(); XCTAssertFalse(out.contains(.key(0xe0,1)))
+        e.hardwareDisconnected(); XCTAssertEqual(out.last,.key(0xe0,1))
+    }
+    func testUnknownIdleModifierExpiresButNotDuringHeldOrdinaryKey() {
+        var now: TimeInterval = 0; let e = engine { now }
+        var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.hardware(usage: 0xe3,down: true); e.hardware(usage: 6,down: true)
+        now = 10; e.tick(); XCTAssertFalse(out.contains(.key(0xe0,1)))
+        e.hardware(usage: 6,down: false); XCTAssertEqual(out.last,.key(0xe0,1))
+        e.hardware(usage: 0xe3,down: true)
+        now = 11.999; e.tick(); XCTAssertEqual(out.last,.key(0xe0,0))
+        now = 12; e.tick(); XCTAssertEqual(out.last,.key(0xe0,1))
+    }
+    func testSuccessiveShortcutsRestoreRememberedCommandSideBeforeOrdinaryDown() {
+        for command in [UInt16(0xe3),UInt16(0xe7)] {
+            let e = engine(); var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+            let ctrl: UInt16 = command == 0xe3 ? 0xe0 : 0xe4
+            e.hardware(usage: command,down: true)
+            e.hardware(usage: 6,down: true); e.hardware(usage: 6,down: false)
+            e.hardwareModifiers(command: true,control: false,alt: false,shift: false)
+            e.hardware(usage: 25,down: true); e.hardware(usage: 25,down: false)
+            XCTAssertEqual(out,[.key(ctrl,0),.key(6,0),.key(6,1),.key(ctrl,1),
+                                .key(ctrl,0),.key(25,0),.key(25,1),.key(ctrl,1)])
+        }
+    }
+    func testCancellationAndFocusLossRetireUnknownHardwareButKeepBarLock() {
+        let e = engine(); e.setModifier(.control,.locked)
+        var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.hardware(usage: 0xe3,down: true); e.hardware(usage: 6,down: true)
+        e.hardwareDisconnected(); e.hardwareDisconnected()
+        XCTAssertEqual(out,[.key(6,0),.key(6,1)])
+        e.setModifier(.control,.off); XCTAssertEqual(out.last,.key(0xe0,1))
+    }
+    func testScrollTerminalOutsideVideoReleasesOnceForEveryTerminalPhase() {
+        for state in [UIGestureRecognizer.State.ended,.cancelled,.failed] {
+            let defaults = UserDefaults(suiteName: "InputLifetime." + UUID().uuidString)!
+            let session = IPadInputSession(defaults: defaults,clock: { 0 },automaticallyTicks: false)
+            var out: [IPadInputEvent] = []
+            session.configure(identity: "test",point: true,type: true,direct: true,zoom: true,reason: nil) { out.append($0) }
+            let view = PencilUIKitView(frame: .init(x: 0,y: 0,width: 100,height: 100)); view.inputSession = session
+            session.setModifier(.control,.oneShot); session.engine.beginExternalScroll()
+            XCTAssertEqual(out,[.key(0xe0,0)])
+            for _ in 0..<2 {
+                XCTAssertTrue(view.routeV2Scroll(state: state,point: .init(x: -1,y: -1),translation: .zero,discrete: false))
+            }
+            XCTAssertEqual(out,[.key(0xe0,0),.key(0xe0,1)])
+            session.releaseAll()
+        }
+    }
+    func testCancelledMultiFingerGestureSuppressesSurvivorsAndNewFingersUntilAllLift() {
+        for mode in [IPadTouchMode.direct,.trackpad] {
+            let e = engine(); e.mode = mode
+            var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+            e.setModifier(.shift,.oneShot)
+            e.begin(id: 1,pencil: false,point: .zero,normalized: .zero)
+            e.begin(id: 2,pencil: false,point: .zero,normalized: .zero)
+            e.end(id: 1,point: .zero,normalized: .zero,cancelled: true)
+            XCTAssertEqual(out.last,.key(0xe1,1))
+            out.removeAll()
+            e.begin(id: 3,pencil: false,point: .zero,normalized: .zero)
+            e.move(id: 2,point: .init(x: 30,y: 0),normalized: .zero)
+            e.end(id: 2,point: .zero,normalized: .zero,cancelled: false)
+            e.end(id: 3,point: .zero,normalized: .zero,cancelled: false)
+            XCTAssertTrue(out.isEmpty)
+            e.begin(id: 4,pencil: false,point: .zero,normalized: .zero)
+            e.end(id: 4,point: .zero,normalized: .zero,cancelled: false)
+            XCTAssertFalse(out.isEmpty) // A genuinely new gesture is admitted.
+        }
+    }
+    func testOneShotArmedDuringExistingContactBelongsOnlyToNestedTap() {
+        let e = engine(); var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.begin(id: 1,pencil: false,point: .zero,normalized: .zero)
+        e.setModifier(.shift,.oneShot); e.tapKey(0x50)
+        XCTAssertEqual(Array(out.suffix(4)),[.key(0xe1,0),.key(0x50,0),.key(0x50,1),.key(0xe1,1)])
+        e.end(id: 1,point: .zero,normalized: .zero,cancelled: false)
+        XCTAssertEqual(out.filter { $0 == .key(0xe1,1) }.count,1)
+    }
+    func testSurfaceCancellationWithoutMatchingPressAndResponderChangeReleasePhysicalOwners() {
+        let defaults = UserDefaults(suiteName: "InputLifetime." + UUID().uuidString)!
+        let session = IPadInputSession(defaults: defaults,clock: { 0 },automaticallyTicks: false)
+        var out: [IPadInputEvent] = []
+        session.configure(identity: "test",point: true,type: true,direct: true,zoom: true,reason: nil) { out.append($0) }
+        session.engine.physicalKeyIsDown = { _ in true }
+        let view = PencilUIKitView(); view.inputSession = session
+        view.handleHardwareKey(.keyboardLeftGUI,action: .keyDown)
+        XCTAssertTrue(view.unhandledHardwarePresses([],action: .keyUp,phase: .cancelled).isEmpty)
+        XCTAssertEqual(out,[.key(0xe0,0),.key(0xe0,1)])
+        view.handleHardwareKey(.keyboardLeftGUI,action: .keyDown)
+        view.softwareResponderOwnsInput = true
+        XCTAssertEqual(Array(out.suffix(2)),[.key(0xe0,0),.key(0xe0,1)])
+        session.releaseAll()
+    }
+    func testTerminalEntryPointsReleaseOnceAfterAdmissionCloses() {
+        for action in ["contact","scroll","transform","button"] {
+            let e = engine(); var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+            e.setModifier(.shift,.oneShot)
+            switch action {
+            case "contact": e.begin(id: 1,pencil: false,point: .zero,normalized: .zero)
+            case "scroll": e.beginExternalScroll()
+            case "transform": e.beginExternalTransform()
+            default: e.external(point: .zero,normalized: .zero,buttons: 1)
+            }
+            e.enabled = false; e.typeEnabled = false
+            for _ in 0..<2 {
+                switch action {
+                case "contact": e.end(id: 1,point: .zero,normalized: .zero,cancelled: true)
+                case "scroll": e.endExternalScroll()
+                case "transform": e.endExternalTransform()
+                default: e.hoverExited()
+                }
+            }
+            XCTAssertEqual(out.last,.key(0xe1,1),action)
+            XCTAssertEqual(out.filter { $0 == .key(0xe1,1) }.count,1,action)
+        }
+    }
+    func testOverlappingHardwareKeysAndScrollKeepOneShotUntilLastOwnerEnds() {
+        let e = engine(); var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.setModifier(.shift,.oneShot); e.beginExternalScroll()
+        e.hardware(usage: 6,down: true); e.hardware(usage: 25,down: true)
+        e.tapKey(0x50); e.endExternalScroll(); e.hardware(usage: 6,down: false)
+        XCTAssertFalse(out.contains(.key(0xe1,1)))
+        e.hardware(usage: 25,down: false); XCTAssertEqual(out.last,.key(0xe1,1))
+    }
+    #if targetEnvironment(simulator)
+    func testUIKitModifierFlagsRestoreRightCommandBeforeSuccessiveShortcut() {
+        let defaults = UserDefaults(suiteName: "InputLifetime." + UUID().uuidString)!
+        let session = IPadInputSession(defaults: defaults,clock: { 0 },automaticallyTicks: false)
+        var out: [IPadInputEvent] = []
+        session.configure(identity: "test",point: true,type: true,direct: true,zoom: true,reason: nil) { out.append($0) }
+        session.engine.physicalKeyIsDown = { _ in nil }
+        let view = PencilUIKitView(); view.inputSession = session
+        let press = UIPress(); var usage = UIKeyboardHIDUsage.keyboardC
+        view.hardwareKeyUsageForTesting = { _ in usage }
+        view.hardwareModifierFlagsForTesting = { _ in .command }
+        view.handleHardwareKey(.keyboardRightGUI,action: .keyDown)
+        XCTAssertTrue(view.unhandledHardwarePresses([press],action: .keyDown).isEmpty)
+        XCTAssertTrue(view.unhandledHardwarePresses([press],action: .keyUp).isEmpty)
+        usage = .keyboardV
+        XCTAssertTrue(view.unhandledHardwarePresses([press],action: .keyDown).isEmpty)
+        XCTAssertTrue(view.unhandledHardwarePresses([press],action: .keyUp).isEmpty)
+        XCTAssertEqual(out,[.key(0xe4,0),.key(6,0),.key(6,1),.key(0xe4,1),
+                            .key(0xe4,0),.key(25,0),.key(25,1),.key(0xe4,1)])
+        session.releaseAll()
+    }
+    func testUIKitChangedEvidenceReachesEngineThroughSoftwareResponder() {
+        var now: TimeInterval = 0
+        let defaults = UserDefaults(suiteName: "InputLifetime." + UUID().uuidString)!
+        let session = IPadInputSession(defaults: defaults,clock: { now },automaticallyTicks: false)
+        var out: [IPadInputEvent] = []
+        session.configure(identity: "test",point: true,type: true,direct: true,zoom: true,reason: nil) { out.append($0) }
+        session.engine.physicalKeyIsDown = { _ in nil }
+        let view = PencilUIKitView(); view.inputSession = session
+        view.hardwareModifierFlagsForTesting = { _ in .command }
+        let text = RemoteSoftwareKeyboardTextView(); text.keySourceRoutingEnabled = true
+        text.onHardwareChanged = { view.hardwarePressesChanged($0) }
+        text.onHardwareFocusLost = { session.engine.hardwareDisconnected() }
+        session.engine.hardware(usage: 0xe3,down: true); session.engine.hardware(usage: 6,down: true)
+        text.pressesChanged([UIPress()],with: nil)
+        session.engine.hardware(usage: 6,down: false)
+        XCTAssertFalse(out.contains(.key(0xe0,1)))
+        now = 2; session.engine.tick(); XCTAssertEqual(out.last,.key(0xe0,1))
+        session.engine.hardware(usage: 0xe3,down: true)
+        text.textViewDidEndEditing(text); XCTAssertEqual(out.last,.key(0xe0,1))
+        session.releaseAll()
+    }
+    #endif
+    func testPencilPreemptionAndScrollTransformReplacementLeaveNoActionOwnerBehind() {
+        for transform in [false,true] {
+            let e = engine(); var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+            e.setModifier(.shift,.oneShot)
+            if transform { e.beginExternalTransform(); e.beginExternalScroll() }
+            else { e.beginExternalScroll(); e.beginExternalTransform() }
+            e.begin(id: 1,pencil: true,point: .zero,normalized: .zero)
+            e.end(id: 1,point: .zero,normalized: .zero,cancelled: false)
+            XCTAssertEqual(out.filter { $0 == .key(0xe1,1) }.count,1)
+            out.removeAll(); e.setModifier(.control,.oneShot); e.tapKey(6)
+            XCTAssertEqual(out,[.key(0xe0,0),.key(6,0),.key(6,1),.key(0xe0,1)])
+        }
+    }
+    func testNestedKeyAndShortcutKeepDirectContactOneShotUntilTouchUp() {
+        for shortcut in [false,true] {
+            let e = engine(); var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+            e.setModifier(.shift,.oneShot)
+            e.begin(id: 1,pencil: false,point: .zero,normalized: .zero)
+            if shortcut { e.shortcut(0x50,shift: true) } else { e.tapKey(0x50) }
+            XCTAssertFalse(out.contains(.key(0xe1,1)))
+            e.end(id: 1,point: .zero,normalized: .zero,cancelled: false)
+            XCTAssertEqual(out.last,.key(0xe1,1))
+            XCTAssertEqual(out.filter { $0 == .key(0xe1,1) }.count,1)
+        }
+    }
+    func testNestedHardwareKeyKeepsLatchedDragOneShotUntilRelease() {
+        let e = engine(); e.mode = .trackpad
+        var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
+        e.setModifier(.control,.oneShot); e.armDrag(); e.click(1,at: .zero)
+        e.hardware(usage: 6,down: true); e.hardware(usage: 6,down: false)
+        e.tapKey(0x50); e.shortcut(7,shift: false)
+        XCTAssertFalse(out.contains(.key(0xe0,1)))
+        e.releaseDrag(); XCTAssertEqual(out.last,.key(0xe0,1))
+    }
+}
+
 final class IPadInputV2Tests: XCTestCase {
     private struct Fixture: Decodable {
         struct Vector: Decodable { let name: String; let transport: String?; let messageType: UInt8?; let hex: String; let vector: String? }

@@ -363,6 +363,12 @@ public final class ConnectedPresentationContainer: UIView {
         softwareTextView.onHardwareCancellation = { [weak self] presses in
             self?.touchView.unhandledHardwarePresses(presses, action: .keyUp, phase: .cancelled) ?? presses
         }
+        softwareTextView.onHardwareChanged = { [weak self] presses in
+            self?.touchView.hardwarePressesChanged(presses)
+        }
+        softwareTextView.onHardwareFocusLost = { [weak self] in
+            self?.touchView.inputSession?.engine.hardwareDisconnected()
+        }
         for name in [UIResponder.keyboardWillShowNotification, UIResponder.keyboardWillChangeFrameNotification, UIResponder.keyboardWillHideNotification,
                      UIResponder.keyboardDidHideNotification, UIResponder.keyboardDidShowNotification,
                      UIApplication.willResignActiveNotification, UIApplication.didBecomeActiveNotification] {
