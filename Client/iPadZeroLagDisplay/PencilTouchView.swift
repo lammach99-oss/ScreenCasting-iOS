@@ -1142,7 +1142,13 @@ public class PencilUIKitView: UIView, UIPencilInteractionDelegate {
         pencilHover.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
         pencilHover.cancelsTouchesInView = false
         addGestureRecognizer(pencilHover)
-        addInteraction(UIPencilInteraction(delegate: self))
+        if #available(iOS 17.5, *) {
+            addInteraction(UIPencilInteraction(delegate: self))
+        } else {
+            let interaction = UIPencilInteraction()
+            interaction.delegate = self
+            addInteraction(interaction)
+        }
         pencilArmedLabel.text = "Pencil: next touch right-click"
         pencilArmedLabel.font = .preferredFont(forTextStyle: .caption1)
         pencilArmedLabel.adjustsFontForContentSizeCategory = true
