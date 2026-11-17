@@ -108,7 +108,7 @@ enum GestureGuideContent {
                   result: direct ? "Arm/latch a native touch contact" : "Latch the left mouse button"),
             .init(symbol: "hand.tap", gesture: "Next tap while dragging", result: "Release only; no extra click"),
             .init(symbol: "applepencil", gesture: "Pencil",
-                  result: direct ? "Priority single-contact touch" : "Priority relative mouse pointing"),
+                  result: "Precise absolute mouse; tip drags with left button"),
             .init(symbol: "computermouse", gesture: "External pointer",
                   result: direct ? "Absolute mouse; real buttons" : "Relative mouse; real buttons"),
             .init(symbol: "hand.raised", gesture: "Three/four fingers or system gestures",
@@ -125,10 +125,11 @@ enum GestureGuideContent {
     }
 
     static func pencil(for mode: GestureGuideMode) -> String {
-        let pointing = mode.touchMode == .direct
-            ? "Pencil sends one native touch contact. "
-            : "Pencil uses Trackpad relative mouse pointing. "
-        return pointing + "No Windows pen, pressure or tilt. Pencil takes priority; resting fingers stay ignored until lifted. " +
+        return "Pencil always points absolutely, in Direct and Trackpad. Hover moves the PC pointer; tip down/up holds/releases the left button. " +
+            "Double-tap or squeeze arms the next touch as right-click for 5 seconds; repeat to cancel. The armed notice appears over the picture. " +
+            "These gestures follow the enabled/disabled preference in iPad settings. " +
+            "No Windows pen, pressure or tilt. Hover or tip takes priority; fingers resume 400 ms after it leaves, and resting fingers must lift first. " +
+            "Requires an updated PC host with enhanced pointer support. " +
             "Open the software keyboard from session panel > Tools > Keyboard."
     }
 }

@@ -5643,7 +5643,8 @@ public class NetworkManager: ObservableObject {
     }
 
     func simulateCommittedWifiSessionForTesting(
-        mode: UInt8 = RealtimeTransportMode.wifiRTP
+        mode: UInt8 = RealtimeTransportMode.wifiRTP,
+        remote: Bool = false
     ) -> (connection: NWConnection, generation: UInt64) {
         networkQueue.sync {
             let peer = NWConnection(host: "127.0.0.1", port: 27015, using: .tcp)
@@ -5665,6 +5666,12 @@ public class NetworkManager: ObservableObject {
             committedRealtimeMode = mode
             committedTransportAudioAvailable = true
             lastClientPingSentAt = .greatestFiniteMagnitude
+            // Match connect(to:): session role is selected locally, not by feature-result packets.
+            remoteInputConnection = remote
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.connectionGenerationClock.current == generation else { return }
+                self.isRemoteControlSession = remote
+            }
             beginOwnedDecoderSession(networkGeneration: generation)
             setState(.streaming)
             return (peer, generation)

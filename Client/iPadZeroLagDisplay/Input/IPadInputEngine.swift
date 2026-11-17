@@ -32,7 +32,10 @@ enum IPadInputEvent: Equatable {
     private var contacts: [UInt64: Contact] = [:]
     private var quarantine: Set<UInt64> = []
     private var pencil: UInt64?
-    private var palmUntil: TimeInterval = 0
+    private var pencilMouse: PencilMouseState
+    var precisePencilAvailable = true
+    var pencilRightArmed: Bool { pencilMouse.rightArmed }
+    private var pencilMayStart: Bool { enabled && hardwareCaptureEnabled && precisePencilAvailable }
     private var native: (id: UInt64, point: CGPoint, pressure: UInt8)?
     private var lastLease: TimeInterval = 0
     private var buttons: Set<UInt8> = []
@@ -95,7 +98,49 @@ enum IPadInputEvent: Equatable {
     private var inertiaStarted: TimeInterval?, inertiaLast: TimeInterval = 0
     private var inertiaDistance: CGFloat = 0
 
-    init(clock: @escaping () -> TimeInterval) { self.clock = clock }
+    init(clock: @escaping () -> TimeInterval) {
+        self.clock = clock; pencilMouse = PencilMouseState(clock: clock)
+    }
+    func togglePencilRight() {
+        guard pencilMayStart else { return }
+        pencilMouse.toggleRight(); changed?()
+    }
+    func pencilHover(at p: CGPoint?) {
+        guard p == nil || pencilMayStart else { return }
+        applyPencil(pencilMouse.hover(at: p))
+    }
+    private func claimPencilScope() {
+        stopInertia()
+        quarantine.formUnion(contacts.keys); contacts.removeAll()
+        cancelNative(); for b in buttons.sorted() { button(b, false) }
+        externalButtons.removeAll(); hoverAnchor = nil; fractional = .zero; neutralRequired = true
+        drag = .idle
+        endAction(); endAction("externalButtons"); endExternalScroll(); endExternalTransform()
+        resetGesture()
+    }
+    private func applyPencil(_ effects: [PencilMouseState.Effect]) {
+        for effect in effects {
+            switch effect {
+            case .claimFingers: claimPencilScope()
+            case let .move(p): send(.pointer(0, 0, normalized(p.x), normalized(p.y)))
+            case let .button(b, down): button(b, down)
+            }
+        }
+        changed?()
+    }
+    private func beginPencil(id: UInt64, at p: CGPoint) {
+        guard pencilMayStart, !quarantine.contains(id), pencilMouse.activeID == nil else { return }
+        let effects = pencilMouse.begin(id: id, at: p)
+        guard !effects.isEmpty else { return }
+        // Retire the previous scope before acquiring this action's modifiers.
+        claimPencilScope(); pencil = id; beginAction("pencil")
+        applyPencil(effects.filter { $0 != .claimFingers })
+    }
+    private func endPencil(id: UInt64, at p: CGPoint?, cancelled: Bool) {
+        guard pencilMouse.activeID == id else { return }
+        applyPencil(pencilMouse.end(id: id, at: p, cancelled: cancelled || !pencilMayStart))
+        pencil = nil; endAction("pencil")
+    }
     private func send(_ e: IPadInputEvent) { emit?(e) }
     private func distance(_ a: CGPoint, _ b: CGPoint) -> CGFloat { hypot(a.x - b.x, a.y - b.y) }
     private func usage(_ m: IPadModifier) -> UInt16 {
@@ -150,7 +195,7 @@ enum IPadInputEvent: Equatable {
     }
     private func isCommand(_ key: UInt16) -> Bool { key == 0xe3 || key == 0xe7 }
     private func isPointerAction(_ owner: String) -> Bool {
-        ["pointer","click","externalButtons","scroll","transform","wheel","zoom"].contains(owner)
+        ["pointer","pencil","click","externalButtons","scroll","transform","wheel","zoom"].contains(owner)
     }
     private var pointerActionIsActive: Bool {
         !contacts.isEmpty || native != nil || !buttons.isEmpty || drag != .idle || externalScrolling ||
@@ -337,6 +382,8 @@ enum IPadInputEvent: Equatable {
     }
     func armDrag() {
         guard enabled else { return }; cancelInertia()
+        if let id = pencilMouse.activeID { quarantine.insert(id); endPencil(id: id, at: nil, cancelled: true) }
+        _ = pencilMouse.retire(); changed?()
         quarantine.formUnion(contacts.keys); contacts.removeAll(); pencil = nil
         cancelNative(); for b in buttons.sorted() { button(b,false) }
         externalButtons.removeAll(); hoverAnchor = nil; neutralRequired = true
@@ -361,27 +408,16 @@ enum IPadInputEvent: Equatable {
     func begin(id: UInt64, pencil isPencil: Bool, point: CGPoint, normalized p: CGPoint, tapCount: Int = 1, pressure: UInt8 = 255) {
         guard enabled, id != 0, contacts[id] == nil else { return }
         cancelInertia()
-        if isPencil {
-            guard pencil == nil else { return }
-            quarantine.formUnion(contacts.keys); contacts.removeAll()
-            cancelNative(); for b in buttons.sorted() { button(b, false) }
-            externalButtons.removeAll(); hoverAnchor = nil; neutralRequired = true
-            drag = .idle; endAction(); endAction("externalButtons")
-            endExternalScroll(); endExternalTransform(); resetGesture(); pencil = id
-        } else if pencil != nil || clock() < palmUntil || quarantine.contains(id) {
+        if isPencil { beginPencil(id: id, at: p); return }
+        if pencilMouse.blocksFingers || quarantine.contains(id) {
             quarantine.insert(id); return
         }
-        guard isPencil || mode != .direct || directAvailable else { return }
-        if !isPencil && !externalButtons.isEmpty { quarantine.insert(id); return }
+        guard mode != .direct || directAvailable else { return }
+        if !externalButtons.isEmpty { quarantine.insert(id); return }
         hoverAnchor = nil
         if contacts.isEmpty { resetGesture(); beginAction() }
         contacts[id] = Contact(pencil: isPencil, start: point, began: clock(), point: point, normalized: p)
         if !isPencil && gestureCancelled { return }
-        if isPencil {
-            if mode == .direct && directAvailable { touch(.down, id: id, at: p, pressure: 255) }
-            else if mode == .trackpad { button(1, true) }
-            return
-        }
         maximumFingers = max(maximumFingers, contacts.count)
         if contacts.count == 1 {
             if drag == .latched { suppressedTap = true }
@@ -406,13 +442,13 @@ enum IPadInputEvent: Equatable {
         pinching = false; scrolling = false; history.removeAll(); wheelFraction = .zero; fractional = .zero
     }
     func move(id: UInt64, point: CGPoint, normalized p: CGPoint, pressure: UInt8 = 255) {
+        if pencilMouse.activeID == id {
+            if pencilMayStart { applyPencil(pencilMouse.move(id: id, to: p)) }
+            return
+        }
         guard enabled, !gestureCancelled, var c = contacts[id], !quarantine.contains(id) else { return }
         let previous = c.point; c.point = point; c.normalized = p; contacts[id] = c
         if distance(c.start,point) > 8 { moved = true }
-        if c.pencil {
-            if let n = native { touch(.update, id: n.id, at: p, pressure: 255) }
-            else if mode == .trackpad { relative(CGPoint(x: point.x-previous.x,y: point.y-previous.y)) }; return
-        }
         if maximumFingers >= 2 {
             guard contacts.count == 2 else { return }
             let (center, span) = geometry()
@@ -455,6 +491,7 @@ enum IPadInputEvent: Equatable {
     }
     func end(id: UInt64, point: CGPoint, normalized p: CGPoint, cancelled: Bool) {
         if quarantine.remove(id) != nil { return }
+        if pencilMouse.activeID == id { endPencil(id: id, at: p, cancelled: cancelled); return }
         guard let c = contacts[id] else { return }
         defer { if !pointerActionIsActive { lastPointerActionEnd = clock() } }
         if cancelled && !c.pencil && maximumFingers >= 2 {
@@ -467,10 +504,7 @@ enum IPadInputEvent: Equatable {
         // Always finish with the final location under the old coordinate contract.
         if !cancelled { move(id: id,point: point,normalized: p) }
         contacts.removeValue(forKey: id)
-        if c.pencil {
-            if let n = native { touch(cancelled ? .cancel : .up,id: n.id,at: n.point,pressure: n.pressure) }
-            button(1,false); pencil = nil; palmUntil = clock() + 0.150
-        } else if maximumFingers == 1 {
+        if maximumFingers == 1 {
             if cancelled { cancelNative(); button(1,false); drag = .idle }
             else if drag == .armed { drag = .latched; suppressedTap = true }
             else if drag == .latched {
@@ -523,7 +557,7 @@ enum IPadInputEvent: Equatable {
         neutralRequired = true; endAction("externalButtons")
     }
     func zoom(scale: CGFloat, at p: CGPoint) {
-        guard enabled, pencil == nil, zoomAvailable, scale.isFinite, scale > 0 else { return }
+        guard enabled, !pencilMouse.blocksFingers, zoomAvailable, scale.isFinite, scale > 0 else { return }
         cancelNative(); button(1,false); if drag != .idle { drag = .idle }; cancelInertia(); suppressedTap = true
         let amount = Int32(max(-32767,min(32767,(log2(Double(scale)) * 1200).rounded())))
         guard amount != 0 else { return }
@@ -534,7 +568,7 @@ enum IPadInputEvent: Equatable {
         send(.pointer(4,0,amount,Int32(bitPattern: packed)))
     }
     func beginExternalScroll() {
-        guard enabled, pencil == nil else { return }; cancelInertia(); cancelNative()
+        guard enabled, !pencilMouse.blocksFingers else { return }; cancelInertia(); cancelNative()
         for b in buttons.sorted() { button(b,false) }
         quarantine.formUnion(contacts.keys); contacts.removeAll(); drag = .idle
         externalButtons.removeAll(); hoverAnchor = nil; neutralRequired = true
@@ -542,7 +576,7 @@ enum IPadInputEvent: Equatable {
     }
     func endExternalScroll() { externalScrolling = false; endAction("scroll") }
     func beginExternalTransform() {
-        guard enabled, pencil == nil else { return }; cancelInertia(); cancelNative()
+        guard enabled, !pencilMouse.blocksFingers else { return }; cancelInertia(); cancelNative()
         for b in buttons.sorted() { button(b,false) }
         quarantine.formUnion(contacts.keys); contacts.removeAll(); drag = .idle
         externalButtons.removeAll(); hoverAnchor = nil; neutralRequired = true
@@ -550,7 +584,7 @@ enum IPadInputEvent: Equatable {
     }
     func endExternalTransform() { endAction("transform") }
     func externalScroll(_ delta: CGPoint, discrete: Bool) {
-        guard enabled, pencil == nil else { return }
+        guard enabled, !pencilMouse.blocksFingers else { return }
         if inertiaStarted != nil { cancelInertia() }
         // UIKit owns continuous scrolling AND its momentum. Never start client inertia here.
         let x = discrete ? (delta.x == 0 ? 0 : delta.x > 0 ? 120.0 : -120.0) : Double(delta.x * 5)
@@ -574,7 +608,7 @@ enum IPadInputEvent: Equatable {
         }
     }
     func fingerScroll(_ delta: CGPoint) {
-        guard enabled else { return }
+        guard enabled, !pencilMouse.blocksFingers else { return }
         let d = CGPoint(x: delta.x*5,y: delta.y*5), now = clock()
         if let last = history.last, last.1.x*d.x < 0 || last.1.y*d.y < 0 { history.removeAll(); cancelInertia() }
         history.append((now,d)); history.removeAll { now - $0.0 > 0.080 }
@@ -599,6 +633,8 @@ enum IPadInputEvent: Equatable {
     }
     func tick() {
         let now = clock()
+        let wasArmed = pencilMouse.rightArmed; pencilMouse.tick()
+        if wasArmed != pencilMouse.rightArmed { changed?() }
         for key in physical.sorted() where physicalKeyIsDown?(key) == false {
             releasePhysical(key)
         }
@@ -627,6 +663,9 @@ enum IPadInputEvent: Equatable {
     }
     func retire() {
         // Stop delayed work first, then pointer terminals, ordinary keys, modifiers.
+        if let id = pencilMouse.activeID { quarantine.insert(id) }
+        _ = pencilMouse.retire() // Generic button retirement below retains terminal ordering.
+        changed?()
         stopInertia(); externalScrolling = false; quarantine.formUnion(contacts.keys); contacts.removeAll()
         cancelNative(); for b in buttons.sorted() { button(b,false) }
         for key in keys.keys.sorted() where key < 0xe0 { send(.key(key,1)) }
@@ -636,7 +675,7 @@ enum IPadInputEvent: Equatable {
         physicalEvidence.removeAll(); actionPhysicalEvidence.removeAll(); uncertainModifiers.removeAll()
         commandEvidence.removeAll(); preferredCommandSide = 0xe3; currentPointerCommand = nil; currentPointerCommandSides.removeAll()
         lastPointerActionEnd = clock()
-        pencil = nil; palmUntil = 0; drag = .idle
+        pencil = nil; drag = .idle
         hoverAnchor = nil; neutralRequired = true; resetGesture()
     }
 }

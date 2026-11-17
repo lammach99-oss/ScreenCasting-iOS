@@ -982,6 +982,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             sharedInput.engine.openSettings = { [weak touchView] in touchView?.onOpenSettings?() }
             sharedInput.engine.setHardwareCaptureEnabled(remoteKeyboardActive && !networkManager.captureInputBlocked)
             sharedInput.bind(networkManager, active: sessionInputActive ?? remoteKeyboardActive)
+            touchView.updatePencilIndicator()
             container.softwareTextView.keySourceRoutingEnabled = true
         }
         let metalView = container.metalView

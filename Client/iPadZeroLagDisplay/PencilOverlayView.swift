@@ -1,41 +1,21 @@
 import SwiftUI
 import UIKit
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Pattern A: PencilTouchView (UIViewRepresentable — Recommended)
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// Use this pattern when you need:
-//   • Apple Pencil Pro (240Hz coalesced samples)
-//   • Pressure sensitivity (UITouch.force)
-//   • Tilt / altitude angles
-//   • Precise finger vs. Pencil disambiguation
-//
-// The `onSendTouchEvent` closure receives pre-mapped UInt16 coordinates directly
-// from the UIKit layer — zero extra math needed at the SwiftUI call site.
-
-struct StreamingOverlay_PencilVariant: View {
+// Production-style Pencil overlay: precise mouse through the shared input route.
+// Coordinate mapping and lifecycle retirement belong to ConnectedPresentationSurface.
+@MainActor struct StreamingOverlay_PencilVariant: View {
     @ObservedObject var networkManager: NetworkManager
+    @Environment(\.scenePhase) private var scenePhase
+    @StateObject private var inputSession = IPadInputSession()
 
     var body: some View {
-        PencilTouchView(
-            // ── Optional: local tilt / barrel-roll rendering ──────────────
-            onPencilInput: { packet in
-                // Use PencilPacket.tiltX / tiltY / pressure for a local cursor overlay.
-                // This fires on main thread alongside onSendTouchEvent.
-            },
-            // ── Preferred: typed callback ─────────────────────────────────
-            onSendTouchEvent: { [weak networkManager] type, x, y, pressure in
-                // Called at up to 240Hz on the UIKit main-thread coalesced loop.
-                // sendTouchEvent is non-blocking and thread-safe — call directly.
-                networkManager?.sendTouchEvent(type: type, x: x, y: y, pressure: pressure)
-            }
-        )
-        .ignoresSafeArea()
+        ConnectedPresentationSurface(networkManager: networkManager,
+            remoteKeyboardActive: scenePhase == .active)
+            .iPadInputSession(inputSession)
+            .ignoresSafeArea()
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Pattern B: SwiftUI DragGesture (finger / mouse pointer)
 // ─────────────────────────────────────────────────────────────────────────────
 //

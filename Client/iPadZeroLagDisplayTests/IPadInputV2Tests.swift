@@ -119,7 +119,9 @@ import UIKit
         e.begin(id: 1,pencil: false,point: .zero,normalized: .zero)
         out.removeAll()
         e.withPointerCommand(true) { e.begin(id: 2,pencil: true,point: .zero,normalized: .zero) }
-        XCTAssertEqual(out,[.touch(.cancel,1,.zero,255),.key(0xe4,1),.key(0xe4,0),.touch(.down,2,.zero,255)])
+        // Precise Pencil preempts native touch, then owns an absolute mouse/button scope.
+        XCTAssertEqual(out,[.touch(.cancel,1,.zero,255),.key(0xe4,1),.key(0xe4,0),
+                            .pointer(0,0,0,0),.button(1,0,1)])
         e.end(id: 2,point: .zero,normalized: .zero,cancelled: false)
         out.removeAll(); e.click(1,at: .zero)
         XCTAssertFalse(out.contains(.key(0xe4,0)))
@@ -718,7 +720,9 @@ final class IPadInputV2Tests: XCTestCase {
             e.begin(id: 2,pencil: true,point: .zero,normalized: .zero)
             if pencilFirst { e.begin(id: 1,pencil: false,point: .zero,normalized: .zero) }
             e.end(id: 1,point: .zero,normalized: .zero,cancelled: true)
-            XCTAssertFalse(out.contains { if case .touch(.cancel, 2, _, _) = $0 { return true }; return false })
+            // Precise Pencil is a mouse now; a cancelled palm cannot emit its button Up.
+            XCTAssertFalse(out.contains { if case .touch(_, 2, _, _) = $0 { return true }; return false })
+            XCTAssertFalse(out.contains { if case .button(1, 1, _) = $0 { return true }; return false })
             e.end(id: 2,point: .zero,normalized: .zero,cancelled: false)
             e.begin(id: 3,pencil: false,point: .zero,normalized: .zero)
             let n = out.count; now = 0.2; e.move(id: 3,point: .zero,normalized: .zero)
@@ -959,7 +963,7 @@ extension IPadInputEngineTests {
                     case "key":
                         if remote { XCTAssertEqual(RemoteScanKeyCommand.decode(packet.payload)?.action,1) }
                         else { XCTAssertEqual(KeyboardInputCommand.decode(packet.payload)?.action,.keyUp) }
-                    case "button":
+                    case "button", "pencil": // Precise Pencil owns a mouse button, never native touch.
                         if remote { XCTAssertEqual(RemotePointerCommand.decode(packet.payload)?.a,1) }
                         else { XCTAssertTrue(IPadPointerV2Command.decode(packet.payload)?.terminal == true) }
                     default:

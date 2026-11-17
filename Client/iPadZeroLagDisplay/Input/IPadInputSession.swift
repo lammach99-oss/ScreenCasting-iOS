@@ -17,6 +17,7 @@ enum IPadNudgeDirection { case up, down, left, right }
     @Published private(set) var unavailableReason: String?
     @Published private(set) var touchMode: IPadTouchMode
     @Published private(set) var dragState: IPadDragState = .idle
+    @Published private(set) var pencilRightArmed = false
     @Published private(set) var scrollInertiaEnabled: Bool
     @Published private(set) var reverseScrollEnabled: Bool
     @Published private(set) var accessibleTarget: CGPoint = CGPoint(x: 0.5, y: 0.5)
@@ -55,6 +56,7 @@ enum IPadNudgeDirection { case up, down, left, right }
         engine.changed = { [weak self] in
             guard let self else { return }
             if self.dragState != self.engine.drag { self.dragState = self.engine.drag }
+            if self.pencilRightArmed != self.engine.pencilRightArmed { self.pencilRightArmed = self.engine.pencilRightArmed }
         }
     }
 

@@ -29,6 +29,7 @@ extension IPadInputSession {
         let identity = "\(generation):\(revision):\(remote):\(network.remoteInputRevision):\(context?.token ?? 0):\(context?.desktopEpoch ?? 0):\(features):\(pointerV2)"
         let route = IPadInputRoute(generation: generation,revision: revision,remote: remote,
             features: features,context: context,ticket: ticket,pointerV2: pointerV2)
+        engine.precisePencilAvailable = remote ? features & 2 != 0 && ready : pointerV2
         configure(identity: identity, point: point, type: type, direct: direct, zoom: zoom,
                   reason: !available ? "Input is temporarily unavailable" : (!remote && !pointerV2 ? "Trackpad and enhanced pointer actions require an updated PC host" : nil)) { [weak self, weak network] event in
             guard let self, let network, network.remoteKeyboardGeneration == generation else { return }

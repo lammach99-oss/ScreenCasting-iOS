@@ -853,7 +853,7 @@ enum ExternalWheelDelta {
     }
 }
 
-public class PencilUIKitView: UIView {
+public class PencilUIKitView: UIView, UIPencilInteractionDelegate {
 
     weak var inputSession: IPadInputSession?
     private var v2IDs: [ObjectIdentifier: UInt64] = [:]
@@ -1131,17 +1131,86 @@ public class PencilUIKitView: UIView {
     private var externalScroll = ExternalScrollGestureState()
     private var externalPinch = ExternalPinchGestureState()
     private var lastExternalMoveDiagnosticAt: TimeInterval = -.infinity
+    private let pencilArmedLabel = UILabel()
+
+    func updatePencilIndicator() {
+        pencilArmedLabel.isHidden = inputSession?.pencilRightArmed != true
+    }
+
+    private func installPencilMouseInteraction() {
+        let pencilHover = UIHoverGestureRecognizer(target: self, action: #selector(handlePencilHover(_:)))
+        pencilHover.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
+        pencilHover.cancelsTouchesInView = false
+        addGestureRecognizer(pencilHover)
+        addInteraction(UIPencilInteraction(delegate: self))
+        pencilArmedLabel.text = "Pencil: next touch right-click"
+        pencilArmedLabel.font = .preferredFont(forTextStyle: .caption1)
+        pencilArmedLabel.adjustsFontForContentSizeCategory = true
+        pencilArmedLabel.textColor = .white
+        pencilArmedLabel.numberOfLines = 0
+        pencilArmedLabel.isUserInteractionEnabled = false
+        pencilArmedLabel.isAccessibilityElement = true
+        pencilArmedLabel.isHidden = true
+        pencilArmedLabel.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(pencilArmedLabel)
+        NSLayoutConstraint.activate([
+            pencilArmedLabel.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 12),
+            pencilArmedLabel.trailingAnchor.constraint(lessThanOrEqualTo: safeAreaLayoutGuide.trailingAnchor, constant: -12),
+            pencilArmedLabel.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -18)
+        ])
+    }
+
+    @objc private func handlePencilHover(_ recognizer: UIHoverGestureRecognizer) {
+        routePencilHover(state: recognizer.state, point: recognizer.location(in: self))
+    }
+
+    /// The recognizer and deterministic geometry tests use the same adapter.
+    func routePencilHover(state: UIGestureRecognizer.State, point: CGPoint) {
+        let active = window != nil && (state == .began || state == .changed)
+        let mapped = active ? contentViewport?.normalizedPoint(for: point, in: bounds) : nil
+        inputSession?.engine.pencilHover(at: mapped)
+    }
+
+    private func togglePencilRight() {
+        guard window != nil, let session = inputSession else { return }
+        let before = session.pencilRightArmed
+        session.engine.togglePencilRight(); updatePencilIndicator()
+        if session.pencilRightArmed != before {
+            UIAccessibility.post(notification: .announcement, argument: session.pencilRightArmed
+                ? "Pencil: next touch right-click" : "Pencil right-click cancelled")
+        }
+    }
+
+    public func pencilInteractionDidTap(_ interaction: UIPencilInteraction) {
+        if #available(iOS 17.5, *) { return } // Modern delegate owns this event on newer systems.
+        guard UIPencilInteraction.preferredTapAction != .ignore else { return }
+        togglePencilRight()
+    }
+
+    @available(iOS 17.5, *)
+    public func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveTap tap: UIPencilInteraction.Tap) {
+        guard UIPencilInteraction.preferredTapAction != .ignore else { return }
+        togglePencilRight()
+    }
+
+    @available(iOS 17.5, *)
+    public func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
+        guard squeeze.phase == .ended, UIPencilInteraction.preferredSqueezeAction != .ignore else { return }
+        togglePencilRight()
+    }
 
     override public init(frame: CGRect) {
         super.init(frame: frame)
         isMultipleTouchEnabled = true
         backgroundColor = .clear
         installExternalPointerRecognizers()
+        installPencilMouseInteraction()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         installExternalPointerRecognizers()
+        installPencilMouseInteraction()
     }
 
     override public func layoutSubviews() {
@@ -1446,6 +1515,7 @@ public class PencilUIKitView: UIView {
 
     private func installExternalPointerRecognizers() {
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(handleExternalPointerHover(_:)))
+        hover.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
         hover.cancelsTouchesInView = false
         addGestureRecognizer(hover)
         let scroll = UIPanGestureRecognizer(target: self, action: #selector(handleExternalPointerScroll(_:)))

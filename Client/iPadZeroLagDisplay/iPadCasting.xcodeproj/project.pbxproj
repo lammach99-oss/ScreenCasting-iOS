@@ -114,9 +114,11 @@
 		1A0700040000000000000002 /* IPadInputEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0700030000000000000002 /* IPadInputEngine.swift */; };
 		1A0700040000000000000003 /* IPadInputSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0700030000000000000003 /* IPadInputSession.swift */; };
 		1A0700040000000000000004 /* IPadInputRouting.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0700030000000000000004 /* IPadInputRouting.swift */; };
+		1A0700040000000000000010 /* PencilMouseState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0700030000000000000010 /* PencilMouseState.swift */; };
 		1A0700040000000000000005 /* SessionInputBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0700030000000000000005 /* SessionInputBar.swift */; };
 		1A0700040000000000000006 /* AccessiblePointerControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0700030000000000000006 /* AccessiblePointerControls.swift */; };
 		1A0700040000000000000007 /* IPadInputV2Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0700030000000000000007 /* IPadInputV2Tests.swift */; };
+		1A0700040000000000000011 /* PencilMouseTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0700030000000000000011 /* PencilMouseTests.swift */; };
 		1A0700040000000000000008 /* InputBarAccessibilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0700030000000000000008 /* InputBarAccessibilityTests.swift */; };
 		1A0700040000000000000009 /* IPadInputV2Golden.json in Resources */ = {isa = PBXBuildFile; fileRef = 1A0700030000000000000009 /* IPadInputV2Golden.json */; };
 /* End PBXBuildFile section */
@@ -242,9 +244,11 @@
 		1A0700030000000000000002 /* IPadInputEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Input/IPadInputEngine.swift; sourceTree = "<group>"; };
 		1A0700030000000000000003 /* IPadInputSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Input/IPadInputSession.swift; sourceTree = "<group>"; };
 		1A0700030000000000000004 /* IPadInputRouting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Input/IPadInputRouting.swift; sourceTree = "<group>"; };
+		1A0700030000000000000010 /* PencilMouseState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Input/PencilMouseState.swift; sourceTree = "<group>"; };
 		1A0700030000000000000005 /* SessionInputBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionInputBar.swift; sourceTree = "<group>"; };
 		1A0700030000000000000006 /* AccessiblePointerControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccessiblePointerControls.swift; sourceTree = "<group>"; };
 		1A0700030000000000000007 /* IPadInputV2Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPadInputV2Tests.swift; sourceTree = "<group>"; };
+		1A0700030000000000000011 /* PencilMouseTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PencilMouseTests.swift; sourceTree = "<group>"; };
 		1A0700030000000000000008 /* InputBarAccessibilityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputBarAccessibilityTests.swift; sourceTree = "<group>"; };
 		1A0700030000000000000009 /* IPadInputV2Golden.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = Fixtures/IPadInputV2Golden.json; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -276,6 +280,7 @@
 				1A0700030000000000000006 /* AccessiblePointerControls.swift */,
 				1A0700030000000000000005 /* SessionInputBar.swift */,
 				1A0700030000000000000004 /* IPadInputRouting.swift */,
+				1A0700030000000000000010 /* PencilMouseState.swift */,
 				1A0700030000000000000003 /* IPadInputSession.swift */,
 				1A0700030000000000000002 /* IPadInputEngine.swift */,
 				1A0700030000000000000001 /* IPadInputCodec.swift */,
@@ -359,6 +364,7 @@
 				1A0700030000000000000009 /* IPadInputV2Golden.json */,
 				1A0700030000000000000008 /* InputBarAccessibilityTests.swift */,
 				1A0700030000000000000007 /* IPadInputV2Tests.swift */,
+				1A0700030000000000000011 /* PencilMouseTests.swift */,
 				FA2200000000000000000003 /* PhysicalMirrorControlTests.swift */,
 				FA2200000000000000000004 /* PencilKeyboardTests.swift */,
 				FA2200000000000000000005 /* SessionPanelTests.swift */,
@@ -503,6 +509,7 @@
 				1A0700040000000000000006 /* AccessiblePointerControls.swift in Sources */,
 				1A0700040000000000000005 /* SessionInputBar.swift in Sources */,
 				1A0700040000000000000004 /* IPadInputRouting.swift in Sources */,
+				1A0700040000000000000010 /* PencilMouseState.swift in Sources */,
 				1A0700040000000000000003 /* IPadInputSession.swift in Sources */,
 				1A0700040000000000000002 /* IPadInputEngine.swift in Sources */,
 				1A0700040000000000000001 /* IPadInputCodec.swift in Sources */,
@@ -577,6 +584,7 @@
 			files = (
 				1A0700040000000000000008 /* InputBarAccessibilityTests.swift in Sources */,
 				1A0700040000000000000007 /* IPadInputV2Tests.swift in Sources */,
+				1A0700040000000000000011 /* PencilMouseTests.swift in Sources */,
 				FA2300000000000000000003 /* PhysicalMirrorControlTests.swift in Sources */,
 				FA2300000000000000000004 /* PencilKeyboardTests.swift in Sources */,
 				FA2300000000000000000005 /* SessionPanelTests.swift in Sources */,

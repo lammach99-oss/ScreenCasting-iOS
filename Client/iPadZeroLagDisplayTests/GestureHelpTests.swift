@@ -63,4 +63,16 @@ final class GestureHelpTests: XCTestCase {
             XCTAssertFalse(helper.contains("Send"))
         }
     }
+
+    func testPencilHelpDescribesTheSamePreciseMouseInBothModes() throws {
+        for mode in [IPadTouchMode.direct, .trackpad] {
+            let description = GestureGuideContent.pencil(for: .input(mode))
+            XCTAssertTrue(description.contains("always points absolutely"))
+            XCTAssertTrue(description.contains("5 seconds")); XCTAssertTrue(description.contains("400 ms"))
+            XCTAssertTrue(description.contains("No Windows pen, pressure or tilt"))
+            XCTAssertFalse(description.contains("native touch contact"))
+            XCTAssertEqual(try XCTUnwrap(GestureGuideContent.items(for: .input(mode))
+                .first { $0.gesture == "Pencil" }?.result), "Precise absolute mouse; tip drags with left button")
+        }
+    }
 }

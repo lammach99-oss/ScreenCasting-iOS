@@ -174,7 +174,8 @@ final class SessionPanelTests: XCTestCase {
         for variant in ["extend", "mirror", "remote", "typed-extend", "typed-mirror", "unavailable"] {
             let network = NetworkManager()
             network.controlSendForAudioTesting = { _, done in done(nil) }
-            let peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+            let peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS,
+                remote: variant == "remote")
             defer { network.stopForTesting() }
             network.beginTransferWriterForTesting()
             if variant == "remote" {
@@ -194,24 +195,15 @@ final class SessionPanelTests: XCTestCase {
                         generation: peer.generation, connection: peer.connection)
                 } else if variant == "mirror" {
                     // One selected physical screen in the old monitor-catalogue format.
-                    var bytes = [UInt8](repeating: 0, count: 30)
-                    bytes[0] = 1; bytes[1] = 1; bytes[2] = 1
-                    MirrorControlCodec.put(1, &bytes, 4, 8)
-                    MirrorControlCodec.put(6, &bytes, 12, 8)
-                    MirrorControlCodec.put(6, &bytes, 20, 8)
-                    bytes[28] = 6
                     network.receiveCaptureTargetWireForTesting(type: .mirrorCatalogue,
-                        payload: Data(bytes + Array("Screen".utf8)),
+                        payload: Self.panelMirrorCatalogue(),
                         generation: peer.generation, connection: peer.connection)
+                    // Production exposes the list only after this source's frame was presented.
+                    let decoder = try XCTUnwrap(network.mirrorDecoderGenerationForTesting)
+                    network.recordRenderCompletion(sequence: 0, generation: decoder)
                 }
             }
-            // Drain real queue publications without sleeping or starting a media/audio engine.
-            for _ in 0..<4 {
-                network.networkQueueForTesting.sync {}
-                let published = expectation(description: "panel model publication")
-                DispatchQueue.main.async { published.fulfill() }
-                await fulfillment(of: [published], timeout: 2)
-            }
+            await drainPanelPublications(network)
             XCTAssertEqual(network.isRemoteControlSession, variant == "remote")
             XCTAssertEqual(network.captureTargetState.enabled, variant.hasPrefix("typed"))
             let kind = SessionPanelKind.make(remote: network.isRemoteControlSession,
@@ -242,14 +234,89 @@ final class SessionPanelTests: XCTestCase {
         }
     }
 
+    @MainActor func testMirrorPanelKindRequiresTheMatchingPresentationReceipt() async throws {
+        let network = NetworkManager()
+        network.controlSendForAudioTesting = { _, done in done(nil) }
+        let peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        defer { network.stopForTesting() }
+        network.beginTransferWriterForTesting()
+        network.receiveCaptureTargetWireForTesting(type: .displayCapabilities,
+            payload: CaptureTargetIntegrationTests.modes, flags: 0x6000,
+            generation: peer.generation, connection: peer.connection)
+        network.receiveCaptureTargetWireForTesting(type: .mirrorState,
+            payload: try CaptureTargetIntegrationTests.mode(revision: 1, epoch: 5, physical: true, active: true),
+            generation: peer.generation, connection: peer.connection)
+        network.receiveCaptureTargetWireForTesting(type: .mirrorCatalogue, payload: Self.panelMirrorCatalogue(),
+            generation: peer.generation, connection: peer.connection)
+        await drainPanelPublications(network)
+        XCTAssertNil(network.mirrorMonitorCatalogue, "A catalogue alone cannot claim a presented source")
+        func kind() -> SessionPanelKind {
+            SessionPanelKind.make(remote: network.isRemoteControlSession, targets: network.captureTargetState,
+                legacy: network.mirrorControlState, catalogue: network.mirrorMonitorCatalogue)
+        }
+        XCTAssertEqual(kind(), .castingUnknown)
+        let decoder = try XCTUnwrap(network.mirrorDecoderGenerationForTesting)
+        network.recordRenderCompletion(sequence: 0, generation: decoder &+ 1)
+        await drainPanelPublications(network)
+        XCTAssertEqual(kind(), .castingUnknown, "A different decoder cannot publish this catalogue")
+        network.recordRenderCompletion(sequence: 0, generation: decoder)
+        await drainPanelPublications(network)
+        XCTAssertEqual(kind(), .castingMirror)
+        XCTAssertEqual(network.mirrorMonitorCatalogue?.selected, 6)
+    }
+
+    @MainActor func testRemotePanelRoleComesFromConnectionBeforeFeaturesOrHosting() async {
+        let network = NetworkManager()
+        network.controlSendForAudioTesting = { _, done in done(nil) }
+        _ = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS, remote: true)
+        defer { network.stopForTesting() }
+        await drainPanelPublications(network)
+        XCTAssertTrue(network.isRemoteControlSession)
+        XCTAssertEqual(SessionPanelKind.make(remote: network.isRemoteControlSession, targets: network.captureTargetState,
+            legacy: network.mirrorControlState, catalogue: network.mirrorMonitorCatalogue), .wholePCRemote)
+    }
+
+    private static func panelMirrorCatalogue() -> Data {
+        var bytes = [UInt8](repeating: 0, count: 30)
+        bytes[0] = 1; bytes[1] = 1; bytes[2] = 1
+        MirrorControlCodec.put(1, &bytes, 4, 8)
+        MirrorControlCodec.put(6, &bytes, 12, 8)
+        MirrorControlCodec.put(6, &bytes, 20, 8)
+        bytes[28] = 6
+        return Data(bytes + Array("Screen".utf8))
+    }
+
+    @MainActor private func drainPanelPublications(_ network: NetworkManager) async {
+        // All fixture operations enqueue their publications before this network-to-main barrier.
+        // A continuation waits for those actual queues, not a guessed number of run-loop turns.
+        let queue = network.networkQueueForTesting
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            queue.async { DispatchQueue.main.async { continuation.resume() } }
+        }
+    }
+
     @MainActor private func assertHostedInWindow<V: View>(_ root: V, context: String,
                                                         file: StaticString = #filePath, line: UInt = #line) {
         let controller = UIHostingController(rootView: root)
+        let container = PanelHostingContainer()
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 834, height: 1194))
-        window.rootViewController = controller
+        window.rootViewController = container
         window.isHidden = false
-        defer { window.isHidden = true; window.rootViewController = nil }
+        container.view.frame = window.bounds
+        container.addChild(controller)
+        controller.beginAppearanceTransition(true, animated: false)
+        container.view.addSubview(controller.view)
         controller.view.frame = window.bounds
+        controller.didMove(toParent: container)
+        controller.endAppearanceTransition()
+        defer {
+            controller.willMove(toParent: nil)
+            controller.beginAppearanceTransition(false, animated: false)
+            controller.view.removeFromSuperview()
+            controller.endAppearanceTransition()
+            controller.removeFromParent()
+            window.isHidden = true; window.rootViewController = nil
+        }
         window.setNeedsLayout()
         window.layoutIfNeeded()
         controller.view.setNeedsLayout()
@@ -657,11 +724,18 @@ extension SessionPanelTests {
 extension SessionPanelTests {
     func testPencilHelpMatchesTouchAndPointerCapabilities() {
         let casting = GestureGuideContent.helper(for: .input(.direct)) + GestureGuideContent.pencil(for: .input(.direct))
-        XCTAssertTrue(casting.contains("touch contact"))
+        XCTAssertTrue(casting.contains("always points absolutely"))
         XCTAssertTrue(casting.contains("No Windows pen, pressure or tilt"))
         XCTAssertFalse(casting.contains("acts like a pen"))
         let trackpad = GestureGuideContent.pencil(for: .input(.trackpad))
-        XCTAssertTrue(trackpad.contains("relative mouse"))
+        XCTAssertTrue(trackpad.contains("always points absolutely"))
         XCTAssertTrue(trackpad.contains("No Windows pen, pressure or tilt"))
     }
 }
+
+#if targetEnvironment(simulator)
+/// The host owns appearance forwarding, so immediate test teardown cannot interrupt an implicit transition.
+@MainActor private final class PanelHostingContainer: UIViewController {
+    override var shouldAutomaticallyForwardAppearanceMethods: Bool { false }
+}
+#endif
