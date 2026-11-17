@@ -1824,35 +1824,12 @@ public class NetworkManager: ObservableObject {
             print("[IPAD][SETTINGS_SEND] result=waiting_for_host reason=\(reason)")
             return result
         }
-        let desired = clientSettingsState.desired
+        let desired = clientSettingsState.desired.forSession(remote: remoteInputConnection)
         let requestID = nextSettingsRequestID
         nextSettingsRequestID &+= 1
         let generation = clientSettingsState.generation
-        var payload = Data(count: 24)
-        payload.withUnsafeMutableBytes { bytes in
-            bytes.storeBytes(of: UInt8(1), toByteOffset: 0, as: UInt8.self)
-            bytes.storeBytes(
-                of: desired.audioEnabled ? UInt8(1) : UInt8(0),
-                toByteOffset: 1,
-                as: UInt8.self)
-            bytes.storeBytes(of: UInt8(0), toByteOffset: 2, as: UInt8.self)
-            bytes.storeBytes(
-                of: desired.adaptiveBitrateEnabled ? UInt8(1) : UInt8(0),
-                toByteOffset: 3,
-                as: UInt8.self)
-            bytes.storeBytes(
-                of: requestID.littleEndian,
-                toByteOffset: 4,
-                as: UInt32.self)
-            bytes.storeBytes(
-                of: generation.littleEndian,
-                toByteOffset: 8,
-                as: UInt64.self)
-            bytes.storeBytes(
-                of: UInt32(desired.bitrateMbps * 1_000_000).littleEndian,
-                toByteOffset: 16,
-                as: UInt32.self)
-        }
+        let payload = ClientSettingsWireCodec.update(requestID: requestID,
+            generation: generation, desired: desired, remote: remoteInputConnection)
         let result = DesiredSettingsSendResult.sent(requestID: requestID)
         DispatchQueue.main.async {
             self.settingsApplyStatus = DesiredSettingsSendPolicy.status(for: result)
@@ -1869,22 +1846,21 @@ public class NetworkManager: ObservableObject {
         return result
     }
 
-    private func requestCurrentUsbSettingsIfNeeded(generation: UInt64) {
+    private func requestCurrentSettingsIfNeeded(generation: UInt64) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
-        guard activeTransportKind == .usb,
-              generation == connectionGeneration,
+        guard generation == connectionGeneration,
               wireAuthenticatedGeneration == generation,
               committedTransportGeneration == generation,
-              settingsSyncPolicy.shouldRequestUsbSettings(
+              settingsSyncPolicy.shouldRequestSettings(
                 committedGeneration: generation) else { return }
         let requestID = nextSettingsRequestID
         nextSettingsRequestID &+= 1
         print(
-            "[IPAD][SETTINGS_SYNC_REQUEST] transport=usb " +
+            "[IPAD][SETTINGS_SYNC_REQUEST] " +
             "generation=\(generation) request=\(requestID)")
         sendWireMessage(
             type: .settingsGet,
-            payload: Data(count: 24),
+            payload: ClientSettingsWireCodec.get(requestID: requestID),
             sequence: requestID)
     }
 
@@ -2804,10 +2780,7 @@ public class NetworkManager: ObservableObject {
               state.generation >= clientSettingsState.generation else { return }
         let previousAudioEnabled = clientSettingsState.effective.audioEnabled
         let bitrateMbps = Double(state.bitrateBps) / 1_000_000
-        let effective = ClientStreamSettingsPreference.normalized(
-            bitrateMbps: bitrateMbps,
-            audioEnabled: state.audioEnabled,
-            adaptiveBitrateEnabled: state.adaptiveBitrateEnabled)
+        let effective = state.preference
         clientSettingsState.receiveHostState(
             effective,
             generation: state.generation)
@@ -2829,8 +2802,9 @@ public class NetworkManager: ObservableObject {
             hostGeneration: state.generation,
             desired: clientSettingsState.desired,
             effective: effective,
-            outcome: resolvedOutcome)
-        if case .rejected(.runtimeApplyFailed) = resolvedOutcome {
+            outcome: resolvedOutcome,
+            remote: remoteInputConnection)
+        if !remoteInputConnection, case .rejected(.runtimeApplyFailed) = resolvedOutcome {
             let desired = clientSettingsState.desired
             print(
                 "[IPAD][SETTINGS_RUNTIME_RECOVERY_ARMED] " +
@@ -2838,11 +2812,17 @@ public class NetworkManager: ObservableObject {
                 "desired_bitrate=\(UInt32(desired.bitrateMbps * 1_000_000)) " +
                 "desired_audio=\(desired.audioEnabled)")
         }
-        let isInSync = clientSettingsState.desired == effective
+        let isInSync = clientSettingsState.desired.forSession(remote: remoteInputConnection).matchesReportedSettings(effective)
         let rejected: Bool
         if case .rejected = resolvedOutcome { rejected = true } else { rejected = false }
         let status: String
-        if isInSync {
+        if remoteInputConnection {
+            switch resolvedOutcome {
+            case .state: status = "PC settings received"
+            case .applied: status = "Applied"
+            case .rejected: status = "Rejected by Host"
+            }
+        } else if isInSync {
             status = "Applied"
         } else if rejected && decision == .suppressHardRejection {
             status = "Rejected by Host"
@@ -4930,8 +4910,8 @@ public class NetworkManager: ObservableObject {
             audioEnabled: audioEnabled)
         setState(.streaming)
         startVideoReceiveLoop(generation: generation)
+        requestCurrentSettingsIfNeeded(generation: generation)
         if activeTransportKind == .usb {
-            requestCurrentUsbSettingsIfNeeded(generation: generation)
             recordUsbLifecycleDiagnostic(
                 "[USB_RECOVERY_CANDIDATE] attempt=\(generation) generation=\(generation) state=committed")
             recordUsbLifecycleDiagnostic("[USB_SESSION_COMMIT] generation=\(generation)")
@@ -5440,6 +5420,12 @@ public class NetworkManager: ObservableObject {
     var transferPendingForTesting: Int { networkQueue.sync { transferReceivePending } }
     func beginTransferWriterForTesting() {
         networkQueue.sync { controlChannelWriter.begin(generation: connectionGeneration) }
+    }
+    func requestCurrentSettingsForTesting(generation: UInt64) {
+        networkQueue.sync { requestCurrentSettingsIfNeeded(generation: generation) }
+    }
+    func sendDesiredSettingsForTesting() -> DesiredSettingsSendResult {
+        networkQueue.sync { sendDesiredSettingsIfPossible(reason: "test_explicit_change") }
     }
     func enqueueTransferWireForTesting(bulk: Bool, completion: @escaping (NWError?) -> Void) {
         networkQueue.async {

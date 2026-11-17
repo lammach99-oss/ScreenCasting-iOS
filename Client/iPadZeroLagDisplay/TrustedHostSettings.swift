@@ -376,6 +376,22 @@ struct ClientStreamSettingsPreference: Equatable {
     let audioEnabled: Bool
     let adaptiveBitrateEnabled: Bool
 
+    static let remoteUnsupportedReason = "Auto and PC audio are not available in remote sessions."
+    static func supportsAudioAndAuto(remote: Bool) -> Bool { !remote }
+
+    func forSession(remote: Bool) -> ClientStreamSettingsPreference {
+        ClientStreamSettingsPreference(bitrateMbps: bitrateMbps,
+            audioEnabled: remote ? false : audioEnabled,
+            adaptiveBitrateEnabled: remote ? false : adaptiveBitrateEnabled)
+    }
+
+    /// A whole-Mbps control must not rewrite a host's fractional readback just
+    /// because its display rounded. Explicit user changes still send exactly.
+    func matchesReportedSettings(_ host: ClientStreamSettingsPreference) -> Bool {
+        bitrateMbps == host.bitrateMbps.rounded() && audioEnabled == host.audioEnabled &&
+            adaptiveBitrateEnabled == host.adaptiveBitrateEnabled
+    }
+
     static func normalized(
         bitrateMbps: Double,
         audioEnabled: Bool,
@@ -438,6 +454,26 @@ enum TrustedSettingsRejectReason: UInt8, Equatable {
     case invalidRequest = 4
 }
 
+enum ClientSettingsWireCodec {
+    static func get(requestID: UInt32) -> Data {
+        var payload = Data(count: 24)
+        payload[0] = 1
+        payload.storeLittleEndian(requestID, at: 4)
+        return payload
+    }
+
+    static func update(requestID: UInt32, generation: UInt64,
+                       desired: ClientStreamSettingsPreference, remote: Bool) -> Data {
+        let supported = desired.forSession(remote: remote)
+        var payload = get(requestID: requestID)
+        payload[1] = supported.audioEnabled ? 1 : 0
+        payload[3] = supported.adaptiveBitrateEnabled ? 1 : 0
+        payload.storeLittleEndian(generation, at: 8)
+        payload.storeLittleEndian(UInt32(supported.bitrateMbps * 1_000_000), at: 16)
+        return payload
+    }
+}
+
 enum ClientSettingsApplyOutcome: Equatable {
     case state
     case applied
@@ -462,9 +498,17 @@ struct ClientSettingsReconciliationGate {
         hostGeneration: UInt64,
         desired: ClientStreamSettingsPreference,
         effective: ClientStreamSettingsPreference,
-        outcome: ClientSettingsApplyOutcome
+        outcome: ClientSettingsApplyOutcome,
+        remote: Bool = false
     ) -> ClientSettingsReconciliationDecision {
-        guard desired != effective else {
+        // Remote has no persisted casting preference authority. Only explicit
+        // user changes send Update; readback/rejections never manufacture one.
+        if remote {
+            if desired.forSession(remote: true).matchesReportedSettings(effective) { return .inSync }
+            if case .rejected = outcome { return .suppressHardRejection }
+            return .suppressAlreadyAttempted
+        }
+        guard !desired.matchesReportedSettings(effective) else {
             runtimeApplyFailedGeneration = nil
             runtimeReadyRetryGeneration = nil
             if hardRejectedGeneration == hostGeneration {
@@ -568,20 +612,20 @@ struct ClientSettingsStateModel {
 }
 
 struct ClientSettingsSyncPolicy {
-    private(set) var lastUsbSettingsGetGeneration: UInt64?
+    private(set) var lastSettingsGetGeneration: UInt64?
 
-    mutating func shouldRequestUsbSettings(
+    mutating func shouldRequestSettings(
         committedGeneration: UInt64
     ) -> Bool {
-        guard lastUsbSettingsGetGeneration != committedGeneration else {
+        guard lastSettingsGetGeneration != committedGeneration else {
             return false
         }
-        lastUsbSettingsGetGeneration = committedGeneration
+        lastSettingsGetGeneration = committedGeneration
         return true
     }
 
     mutating func reset() {
-        lastUsbSettingsGetGeneration = nil
+        lastSettingsGetGeneration = nil
     }
 }
 
@@ -615,6 +659,11 @@ struct TrustedSettingsState: Equatable {
     let adaptiveBitrateEnabled: Bool
     let rejectionReason: TrustedSettingsRejectReason
 
+    var preference: ClientStreamSettingsPreference {
+        ClientStreamSettingsPreference(bitrateMbps: Double(bitrateBps) / 1_000_000,
+            audioEnabled: audioEnabled, adaptiveBitrateEnabled: adaptiveBitrateEnabled)
+    }
+
     static func decode(_ payload: Data) -> TrustedSettingsState? {
         guard payload.count == 24, payload[0] == 1, payload[1] <= 1,
               let rejectionReason = TrustedSettingsRejectReason(rawValue: payload[2]),
@@ -627,8 +676,7 @@ struct TrustedSettingsState: Equatable {
         let bitrateBps = payload.withUnsafeBytes {
             $0.loadUnaligned(fromByteOffset: 16, as: UInt32.self).littleEndian
         }
-        guard bitrateBps >= 3_000_000, bitrateBps <= 100_000_000,
-              bitrateBps.isMultiple(of: 1_000_000) else { return nil }
+        guard bitrateBps >= 3_000_000, bitrateBps <= 100_000_000 else { return nil }
         return TrustedSettingsState(
             generation: generation,
             bitrateBps: bitrateBps,

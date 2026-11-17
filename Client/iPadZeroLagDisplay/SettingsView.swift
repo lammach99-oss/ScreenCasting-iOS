@@ -40,6 +40,9 @@ import SwiftUI
     private let secondary = Color(uiColor: SessionInk.secondary)
     /// Switches and controls share the one signal-blue accent.
     private let switchTint = Color(uiColor: SessionInk.accent)
+    private var supportsAudioAndAuto: Bool {
+        ClientStreamSettingsPreference.supportsAudioAndAuto(remote: networkManager.isRemoteControlSession)
+    }
 
     // MARK: Body
 
@@ -259,13 +262,15 @@ import SwiftUI
         var body: some View {
             Section {
                 Toggle("Automatic bitrate", isOn: Binding(
-                    get: { owner.draftAdaptiveBitrateEnabled },
+                    get: { owner.draftAdaptiveBitrateEnabled && owner.supportsAudioAndAuto },
                     set: { value in
+                        if !owner.supportsAudioAndAuto { return }
                         owner.draftAdaptiveBitrateEnabled = value
                         owner.saveDesiredSettings()
                     }))
                     .tint(owner.switchTint)
-                if !owner.draftAdaptiveBitrateEnabled {
+                    .disabled(!owner.supportsAudioAndAuto)
+                if !(owner.draftAdaptiveBitrateEnabled && owner.supportsAudioAndAuto) {
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
                             Text("Bitrate")
@@ -289,16 +294,21 @@ import SwiftUI
                     }
                 }
                 Toggle("Sound from the PC", isOn: Binding(
-                    get: { owner.draftAudioEnabled },
+                    get: { owner.draftAudioEnabled && owner.supportsAudioAndAuto },
                     set: { value in
+                        if !owner.supportsAudioAndAuto { return }
                         owner.draftAudioEnabled = value
                         owner.saveDesiredSettings()
                     }))
                     .tint(owner.switchTint)
+                    .disabled(!owner.supportsAudioAndAuto)
             } header: {
                 Text("Stream quality")
             } footer: {
                 VStack(alignment: .leading, spacing: 4) {
+                    if !owner.supportsAudioAndAuto {
+                        Text(ClientStreamSettingsPreference.remoteUnsupportedReason)
+                    }
                     Text(SettingsCopy.pcUsing(adaptive: owner.networkManager.isAdaptiveBitrate,
                                               mbps: owner.networkManager.effectiveBitrateMbps,
                                               audio: owner.networkManager.effectiveAudioEnabled))

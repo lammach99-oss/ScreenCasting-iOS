@@ -1197,6 +1197,75 @@ final class WifiReconnectTargetTests: XCTestCase {
 }
 
 final class ClientStreamSettingsPreferenceTests: XCTestCase {
+    func testVersionedSettingsGetGoldenBytes() {
+        let bytes = ClientSettingsWireCodec.get(requestID: 0x12345678)
+        XCTAssertEqual(bytes, Data([1,0,0,0,0x78,0x56,0x34,0x12] + [UInt8](repeating: 0, count: 16)))
+        XCTAssertEqual(bytes.count, 24)
+    }
+
+    func testHostBitrateAcceptsEveryIntegerInRangeWithoutQuantizingReadback() throws {
+        for bps: UInt32 in [3_000_000,3_000_001,30_966_432,99_500_000,99_999_999,100_000_000] {
+            var payload = Data(count: 24); payload[0] = 1
+            payload.storeLittleEndian(bps, at: 16)
+            let host = try XCTUnwrap(TrustedSettingsState.decode(payload))
+            XCTAssertEqual(host.bitrateBps, bps)
+            XCTAssertEqual(host.preference.bitrateMbps, Double(bps) / 1_000_000)
+        }
+        for bps: UInt32 in [0,2_999_999,100_000_001,UInt32.max] {
+            var payload = Data(count: 24); payload[0] = 1; payload.storeLittleEndian(bps, at: 16)
+            XCTAssertNil(TrustedSettingsState.decode(payload))
+        }
+    }
+
+    func testRoundedHostDisplayDoesNotCreateAnAutomaticWrite() {
+        let desired = ClientStreamSettingsPreference.normalized(bitrateMbps: 31, audioEnabled: false)
+        let host = ClientStreamSettingsPreference(bitrateMbps: 30.966432, audioEnabled: false, adaptiveBitrateEnabled: false)
+        var model = ClientSettingsStateModel(desired: desired)
+        model.receiveHostState(host, generation: 7)
+        var gate = ClientSettingsReconciliationGate()
+        for outcome: ClientSettingsApplyOutcome in [.state,.applied] {
+            XCTAssertEqual(gate.decision(hostGeneration: 7, desired: desired, effective: model.effective, outcome: outcome), .inSync)
+        }
+        XCTAssertEqual(model.effective.bitrateMbps, 30.966432)
+        XCTAssertEqual(model.desired.bitrateMbps, 31)
+        XCTAssertEqual(SettingsCopy.pcUsing(adaptive: false, mbps: model.effective.bitrateMbps, audio: false),
+            "The PC is using 31 Mbps, audio off")
+        XCTAssertNil(gate.lastAutomaticAttemptGeneration)
+    }
+
+    func testRemoteUpdatesCannotCarryCastingAudioOrAutoButCastingKeepsBoth() {
+        let desired = ClientStreamSettingsPreference.normalized(bitrateMbps: 31, audioEnabled: true, adaptiveBitrateEnabled: true)
+        let remote = ClientSettingsWireCodec.update(requestID: 9, generation: 7, desired: desired, remote: true)
+        let casting = ClientSettingsWireCodec.update(requestID: 9, generation: 7, desired: desired, remote: false)
+        XCTAssertEqual(remote[1], 0); XCTAssertEqual(remote[3], 0)
+        XCTAssertEqual(casting[1], 1); XCTAssertEqual(casting[3], 1)
+        XCTAssertEqual(remote.subdata(in: 4..<24), casting.subdata(in: 4..<24))
+        XCTAssertEqual(TrustedSettingsState.decode(remote)?.bitrateBps, 31_000_000)
+        XCTAssertFalse(desired.forSession(remote: true).audioEnabled)
+        XCTAssertFalse(desired.forSession(remote: true).adaptiveBitrateEnabled)
+        XCTAssertEqual(desired.forSession(remote: false), desired)
+        XCTAssertTrue(desired.audioEnabled); XCTAssertTrue(desired.adaptiveBitrateEnabled)
+    }
+
+    func testRemoteStateAppliedAndEveryRejectedOutcomeNeverAutomaticallyResend() {
+        let desired = ClientStreamSettingsPreference.normalized(bitrateMbps: 20, audioEnabled: true, adaptiveBitrateEnabled: true)
+        let host = ClientStreamSettingsPreference(bitrateMbps: 30.966432, audioEnabled: false, adaptiveBitrateEnabled: false)
+        var gate = ClientSettingsReconciliationGate()
+        for outcome: ClientSettingsApplyOutcome in [.state,.applied,.rejected(.invalidRequest),.state,
+            .rejected(.staleGeneration),.state,.rejected(.runtimeApplyFailed),.state,.rejected(.invalidBitrate)] {
+            XCTAssertNotEqual(gate.decision(hostGeneration: 7, desired: desired, effective: host, outcome: outcome, remote: true), .send)
+        }
+        XCTAssertNil(gate.lastAutomaticAttemptGeneration)
+        // Remote suppression cannot contaminate the independent casting domain.
+        XCTAssertEqual(gate.decision(hostGeneration: 7, desired: desired, effective: host, outcome: .state), .send)
+    }
+
+    func testRemoteSettingsControlsReportUnsupportedFeaturesAndKeepBitrateAvailable() {
+        XCTAssertFalse(ClientStreamSettingsPreference.supportsAudioAndAuto(remote: true))
+        XCTAssertTrue(ClientStreamSettingsPreference.supportsAudioAndAuto(remote: false))
+        XCTAssertEqual(ClientStreamSettingsPreference.remoteUnsupportedReason, "Auto and PC audio are not available in remote sessions.")
+    }
+
     func testBitrateV1CeilingAndHostState() {
         XCTAssertEqual(ClientStreamSettingsPreference.defaultBitrateMbps, 20)
         for value in [3.0, 20, 50, 75, 100] {
@@ -1213,7 +1282,7 @@ final class ClientStreamSettingsPreferenceTests: XCTestCase {
         }
         XCTAssertEqual(decode(100_000_000)?.bitrateBps, 100_000_000)
         XCTAssertNil(decode(101_000_000))
-        XCTAssertNil(decode(99_500_000))
+        XCTAssertEqual(decode(99_500_000)?.bitrateBps, 99_500_000)
     }
 
     func testClientStreamSettingsDefaultTo20MbpsAndAudioOn() throws {
@@ -1789,19 +1858,19 @@ final class ClientStreamSettingsPreferenceTests: XCTestCase {
 
     func testUsbCommittedGenerationRequestsSettingsStateOnce() {
         var policy = ClientSettingsSyncPolicy()
-        XCTAssertTrue(policy.shouldRequestUsbSettings(committedGeneration: 12))
+        XCTAssertTrue(policy.shouldRequestSettings(committedGeneration: 12))
     }
 
     func testUsbSettingsSyncDoesNotRepeatForSameGeneration() {
         var policy = ClientSettingsSyncPolicy()
-        XCTAssertTrue(policy.shouldRequestUsbSettings(committedGeneration: 12))
-        XCTAssertFalse(policy.shouldRequestUsbSettings(committedGeneration: 12))
+        XCTAssertTrue(policy.shouldRequestSettings(committedGeneration: 12))
+        XCTAssertFalse(policy.shouldRequestSettings(committedGeneration: 12))
     }
 
     func testNewUsbGenerationCanRequestSettingsStateAgain() {
         var policy = ClientSettingsSyncPolicy()
-        XCTAssertTrue(policy.shouldRequestUsbSettings(committedGeneration: 12))
-        XCTAssertTrue(policy.shouldRequestUsbSettings(committedGeneration: 13))
+        XCTAssertTrue(policy.shouldRequestSettings(committedGeneration: 12))
+        XCTAssertTrue(policy.shouldRequestSettings(committedGeneration: 13))
     }
 
     func testPersistedDesiredSettingsReconcileAfterUsbSettingsState() {
@@ -1815,13 +1884,133 @@ final class ClientStreamSettingsPreferenceTests: XCTestCase {
         var sync = ClientSettingsSyncPolicy()
         var gate = ClientSettingsReconciliationGate()
 
-        XCTAssertTrue(sync.shouldRequestUsbSettings(committedGeneration: 1))
+        XCTAssertTrue(sync.shouldRequestSettings(committedGeneration: 1))
         XCTAssertEqual(gate.decision(
             hostGeneration: model.generation,
             desired: model.desired,
             effective: model.effective,
             outcome: .state), .send)
     }
+}
+
+@MainActor final class RemoteSettingsCompatibilityTests: XCTestCase {
+    #if targetEnvironment(simulator)
+    private func drain(_ network: NetworkManager) async {
+        let queue = network.networkQueueForTesting
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            queue.async { DispatchQueue.main.async { continuation.resume() } }
+        }
+    }
+
+    func testProductionSettingsGetIsVersionedOncePerCommittedCastingAndRemoteSession() async throws {
+        for remote in [false,true] {
+            let suite = "SettingsWire." + UUID().uuidString
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let network = NetworkManager(userDefaults: defaults)
+            var writes: [Data] = []
+            network.controlSendForAudioTesting = { data, done in writes.append(data); done(nil) }
+            network.realtimeAudioPlaybackForTesting = { _ in }
+            let peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS, remote: remote)
+            defer { network.stopForTesting() }
+            network.beginTransferWriterForTesting()
+            network.requestCurrentSettingsForTesting(generation: peer.generation + 1)
+            network.requestCurrentSettingsForTesting(generation: peer.generation)
+            network.requestCurrentSettingsForTesting(generation: peer.generation)
+            await drain(network)
+            let messages = network.networkQueueForTesting.sync { writes.filter { $0[5] == WireMessageType.settingsGet.rawValue } }
+            let message = try XCTUnwrap(messages.first)
+            XCTAssertEqual(messages.count, 1)
+            XCTAssertEqual(message.count, 40)
+            let id = message.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 12, as: UInt32.self).littleEndian }
+            XCTAssertNotEqual(id, 0)
+            XCTAssertEqual(Data(message.dropFirst(16)), ClientSettingsWireCodec.get(requestID: id))
+            network.stopForTesting()
+            let next = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS, remote: remote)
+            network.beginTransferWriterForTesting()
+            network.requestCurrentSettingsForTesting(generation: peer.generation)
+            network.requestCurrentSettingsForTesting(generation: next.generation)
+            await drain(network)
+            let reconnectGets = network.networkQueueForTesting.sync { writes.filter { $0[5] == WireMessageType.settingsGet.rawValue } }
+            XCTAssertEqual(reconnectGets.count, 2, "Reconnect gets a fresh settings domain; stale generation cannot request")
+            let newest = try XCTUnwrap(reconnectGets.last)
+            let nextID = newest.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 12, as: UInt32.self).littleEndian }
+            XCTAssertNotEqual(nextID, id)
+            XCTAssertEqual(Data(newest.dropFirst(16)), ClientSettingsWireCodec.get(requestID: nextID))
+        }
+    }
+
+    func testRemoteReadbackRoundingAndRejectedRepliesNeverSendWhileExplicitUpdateIsSafe() async throws {
+        let suite = "SettingsRemote." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let desired = ClientStreamSettingsPreference.normalized(bitrateMbps: 31, audioEnabled: true, adaptiveBitrateEnabled: true)
+        ClientStreamSettingsStore.save(desired, defaults: defaults)
+        let network = NetworkManager(userDefaults: defaults)
+        var writes: [Data] = []
+        network.controlSendForAudioTesting = { data, done in writes.append(data); done(nil) }
+        network.realtimeAudioPlaybackForTesting = { _ in }
+        let peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS, remote: true)
+        defer { network.stopForTesting() }; network.beginTransferWriterForTesting()
+        var payload = Data(count: 24); payload[0] = 1
+        payload.storeLittleEndian(UInt64(7), at: 8); payload.storeLittleEndian(UInt32(30_966_432), at: 16)
+        network.receiveCaptureTargetWireForTesting(type: .settingsState, payload: payload,
+            generation: peer.generation, connection: peer.connection)
+        await drain(network)
+        XCTAssertEqual(network.effectiveBitrateMbps, 30.966432)
+        XCTAssertEqual(network.desiredBitrateMbps, 31)
+        XCTAssertTrue(network.desiredAudioEnabled); XCTAssertTrue(network.desiredAdaptiveBitrateEnabled)
+        XCTAssertFalse(network.effectiveAudioEnabled); XCTAssertFalse(network.isAdaptiveBitrate)
+        XCTAssertTrue(network.networkQueueForTesting.sync { writes.isEmpty })
+        let result = network.sendDesiredSettingsForTesting()
+        guard case .sent = result else { return XCTFail("Explicit update must use the committed writer") }
+        await drain(network)
+        let updates = network.networkQueueForTesting.sync { writes.filter { $0[5] == WireMessageType.settingsUpdate.rawValue } }
+        XCTAssertEqual(updates.count, 1)
+        let update = try XCTUnwrap(updates.first).subdata(in: 16..<40)
+        XCTAssertEqual(update[1], 0); XCTAssertEqual(update[3], 0)
+        XCTAssertEqual(TrustedSettingsState.decode(update)?.generation, 7)
+        XCTAssertEqual(TrustedSettingsState.decode(update)?.bitrateBps, 31_000_000)
+        for reason: TrustedSettingsRejectReason in [.invalidRequest,.staleGeneration,.runtimeApplyFailed,.invalidBitrate] {
+            payload[2] = reason.rawValue
+            network.receiveCaptureTargetWireForTesting(type: .settingsRejected, payload: payload,
+                generation: peer.generation, connection: peer.connection)
+            await drain(network)
+            XCTAssertEqual(network.settingsApplyStatus, "Rejected by Host")
+            payload[2] = 0
+            network.receiveCaptureTargetWireForTesting(type: .settingsState, payload: payload,
+                generation: peer.generation, connection: peer.connection)
+            await drain(network)
+        }
+        XCTAssertEqual(network.networkQueueForTesting.sync { writes.filter { $0[5] == WireMessageType.settingsUpdate.rawValue }.count }, 1)
+    }
+
+    func testCastingStillAutomaticallyReconcilesAudioAndAutoAndPreservesExactReadback() async throws {
+        let suite = "SettingsCasting." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let desired = ClientStreamSettingsPreference.normalized(bitrateMbps: 12, audioEnabled: true, adaptiveBitrateEnabled: true)
+        ClientStreamSettingsStore.save(desired, defaults: defaults)
+        let network = NetworkManager(userDefaults: defaults)
+        var writes: [Data] = []
+        network.controlSendForAudioTesting = { data, done in writes.append(data); done(nil) }
+        network.realtimeAudioPlaybackForTesting = { _ in }
+        let peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        defer { network.stopForTesting() }; network.beginTransferWriterForTesting()
+        var payload = Data(count: 24); payload[0] = 1
+        payload.storeLittleEndian(UInt64(7), at: 8); payload.storeLittleEndian(UInt32(30_966_432), at: 16)
+        network.receiveCaptureTargetWireForTesting(type: .settingsState, payload: payload,
+            generation: peer.generation, connection: peer.connection)
+        await drain(network)
+        let updates = network.networkQueueForTesting.sync { writes.filter { $0[5] == WireMessageType.settingsUpdate.rawValue } }
+        XCTAssertEqual(updates.count, 1)
+        let update = try XCTUnwrap(updates.first).subdata(in: 16..<40)
+        XCTAssertEqual(update[1], 1); XCTAssertEqual(update[3], 1)
+        XCTAssertEqual(TrustedSettingsState.decode(update)?.bitrateBps, 12_000_000)
+        XCTAssertEqual(network.effectiveBitrateMbps, 30.966432)
+        XCTAssertEqual(network.desiredBitrateMbps, 12)
+    }
+    #endif
 }
 
 final class VideoThroughputV1Tests: XCTestCase {
