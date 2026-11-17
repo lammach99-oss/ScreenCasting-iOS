@@ -10,7 +10,9 @@ struct PencilMouseState {
     }
     private let clock: () -> TimeInterval
     private(set) var activeID: UInt64?
-    private var activeButton: UInt8 = 1
+    // A tip arriving during a physical mouse drag owns only palm suppression.
+    // It cannot acquire a button later in the same contact.
+    private var activeButton: UInt8?
     private var hovering = false
     private var graceUntil: TimeInterval = -.infinity
     private var armedUntil: TimeInterval = -.infinity
@@ -39,29 +41,34 @@ struct PencilMouseState {
         hovering = true
         return (claim ? [.claimFingers] : []) + [.move(point)]
     }
-    mutating func begin(id: UInt64, at point: CGPoint) -> [Effect] {
+    mutating func begin(id: UInt64, at point: CGPoint, pointerAvailable: Bool = true) -> [Effect] {
         guard activeID == nil, id != 0, valid(point) else { return [] }
         tick()
-        activeID = id; activeButton = rightArmed ? 2 : 1
-        rightArmed = false; armedUntil = -.infinity
+        activeID = id
         hovering = false // Hover-to-tip handoff must not leave a permanent hover lease.
-        return [.claimFingers, .move(point), .button(activeButton, true)]
+        guard pointerAvailable else { activeButton = nil; return [.claimFingers] }
+        let button: UInt8 = rightArmed ? 2 : 1
+        activeButton = button
+        rightArmed = false; armedUntil = -.infinity
+        return [.claimFingers, .move(point), .button(button, true)]
     }
     mutating func move(id: UInt64, to point: CGPoint) -> [Effect] {
-        guard activeID == id, valid(point) else { return [] }
+        guard activeID == id, activeButton != nil, valid(point) else { return [] }
         return [.move(point)]
     }
     mutating func end(id: UInt64, at point: CGPoint?, cancelled: Bool) -> [Effect] {
         guard activeID == id else { return [] }
+        let button = activeButton
+        activeID = nil; activeButton = nil; hovering = false; graceUntil = clock() + 0.400
+        guard let button else { return [] }
         let move: [Effect]
         if !cancelled, let point, valid(point) { move = [.move(point)] } else { move = [] }
-        activeID = nil; hovering = false; graceUntil = clock() + 0.400
-        return move + [.button(activeButton, false)]
+        return move + [.button(button, false)]
     }
     mutating func retire() -> [Effect] {
-        let effects: [Effect] = activeID == nil ? [] : [.button(activeButton, false)]
+        let effects: [Effect] = activeButton.map { [Effect.button($0, false)] } ?? []
         if activeID != nil || hovering { graceUntil = clock() + 0.400 }
-        activeID = nil; hovering = false; rightArmed = false; armedUntil = -.infinity
+        activeID = nil; activeButton = nil; hovering = false; rightArmed = false; armedUntil = -.infinity
         return effects
     }
 }

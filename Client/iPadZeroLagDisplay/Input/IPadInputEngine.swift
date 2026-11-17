@@ -109,20 +109,34 @@ enum IPadInputEvent: Equatable {
         guard p == nil || pencilMayStart else { return }
         applyPencil(pencilMouse.hover(at: p))
     }
-    private func claimPencilScope() {
+    /// Palm retirement is scoped to direct fingers and their synthetic drag.
+    /// Physical buttons, transactions, wheel and trackpad transforms survive.
+    private func retireFingerScope() {
+        guard !contacts.isEmpty || native != nil || drag != .idle || inertiaStarted != nil ||
+              actionOwners.contains("pointer") else { return }
+        let preserveExternalRemainders = externalScrolling || isExternalTransforming || !externalButtons.isEmpty
+        let priorWheel = wheelFraction, priorRelative = fractional
         stopInertia()
         quarantine.formUnion(contacts.keys); contacts.removeAll()
-        cancelNative(); for b in buttons.sorted() { button(b, false) }
-        externalButtons.removeAll(); hoverAnchor = nil; fractional = .zero; neutralRequired = true
+        cancelNative()
+        if pencil == nil {
+            for b in buttons.subtracting(externalButtons).sorted() { button(b, false) }
+        }
         drag = .idle
-        endAction(); endAction("externalButtons"); endExternalScroll(); endExternalTransform()
+        endAction()
         resetGesture()
+        if preserveExternalRemainders { wheelFraction = priorWheel; fractional = priorRelative }
+    }
+    private func claimPencilScope() {
+        retireFingerScope()
+        if externalButtons.isEmpty { hoverAnchor = nil; fractional = .zero }
     }
     private func applyPencil(_ effects: [PencilMouseState.Effect]) {
         for effect in effects {
             switch effect {
             case .claimFingers: claimPencilScope()
-            case let .move(p): send(.pointer(0, 0, normalized(p.x), normalized(p.y)))
+            case let .move(p):
+                if externalButtons.isEmpty { send(.pointer(0, 0, normalized(p.x), normalized(p.y))) }
             case let .button(b, down): button(b, down)
             }
         }
@@ -130,10 +144,11 @@ enum IPadInputEvent: Equatable {
     }
     private func beginPencil(id: UInt64, at p: CGPoint) {
         guard pencilMayStart, !quarantine.contains(id), pencilMouse.activeID == nil else { return }
-        let effects = pencilMouse.begin(id: id, at: p)
+        let effects = pencilMouse.begin(id: id, at: p, pointerAvailable: externalButtons.isEmpty)
         guard !effects.isEmpty else { return }
         // Retire the previous scope before acquiring this action's modifiers.
-        claimPencilScope(); pencil = id; beginAction("pencil")
+        claimPencilScope()
+        if externalButtons.isEmpty { pencil = id; beginAction("pencil") }
         applyPencil(effects.filter { $0 != .claimFingers })
     }
     private func endPencil(id: UInt64, at p: CGPoint?, cancelled: Bool) {
@@ -530,7 +545,23 @@ enum IPadInputEvent: Equatable {
         if x != 0 || y != 0 { send(.pointer(1,0,x,y)) }
     }
     func external(point: CGPoint, normalized p: CGPoint, buttons mask: UInt) {
-        guard enabled, pencil == nil, contacts.isEmpty, drag == .idle else { return }; cancelInertia()
+        guard enabled, hardwareCaptureEnabled else {
+            // Ineligibility cannot reject an already-owned physical Up, but
+            // neither movement nor a new bit may cross this boundary.
+            for b in externalButtons.sorted() where mask & (1 << UInt(b-1)) == 0 {
+                externalButtons.remove(b); button(b,false)
+            }
+            if externalButtons.isEmpty { endAction("externalButtons") }
+            hoverAnchor = nil; fractional = .zero; neutralRequired = true
+            return
+        }
+        guard contacts.isEmpty, drag == .idle else { return }; cancelInertia()
+        // Physical button Down wins arbitration. Retire the old tip before
+        // acquiring a new transaction; its later Up cannot release the mouse.
+        if let id = pencil {
+            guard mask != 0 else { return }
+            quarantine.insert(id); endPencil(id: id, at: nil, cancelled: true)
+        }
         if neutralRequired {
             hoverAnchor = point
             guard mask == 0 else { return }; neutralRequired = false
@@ -546,7 +577,7 @@ enum IPadInputEvent: Equatable {
         if externalButtons.isEmpty { endAction("externalButtons") }
     }
     func hover(point: CGPoint, normalized p: CGPoint) {
-        guard enabled, contacts.isEmpty, pencil == nil, drag == .idle else { return }
+        guard enabled, hardwareCaptureEnabled, contacts.isEmpty, pencil == nil, drag == .idle else { return }
         if mode == .trackpad { if let a = hoverAnchor { relative(CGPoint(x: point.x-a.x,y: point.y-a.y)) } }
         else { send(.pointer(0,0,normalized(p.x),normalized(p.y))) }
         hoverAnchor = point
@@ -557,8 +588,11 @@ enum IPadInputEvent: Equatable {
         neutralRequired = true; endAction("externalButtons")
     }
     func zoom(scale: CGFloat, at p: CGPoint) {
-        guard enabled, !pencilMouse.blocksFingers, zoomAvailable, scale.isFinite, scale > 0 else { return }
-        cancelNative(); button(1,false); if drag != .idle { drag = .idle }; cancelInertia(); suppressedTap = true
+        guard enabled, hardwareCaptureEnabled, isExternalTransforming || !pencilMouse.blocksFingers,
+              zoomAvailable, scale.isFinite, scale > 0 else { return }
+        cancelNative()
+        if pencil == nil && !externalButtons.contains(1) { button(1,false) }
+        if drag != .idle { drag = .idle }; cancelInertia(); suppressedTap = true
         let amount = Int32(max(-32767,min(32767,(log2(Double(scale)) * 1200).rounded())))
         guard amount != 0 else { return }
         let temporary = !pointerActionIsActive
@@ -568,23 +602,21 @@ enum IPadInputEvent: Equatable {
         send(.pointer(4,0,amount,Int32(bitPattern: packed)))
     }
     func beginExternalScroll() {
-        guard enabled, !pencilMouse.blocksFingers else { return }; cancelInertia(); cancelNative()
-        for b in buttons.sorted() { button(b,false) }
-        quarantine.formUnion(contacts.keys); contacts.removeAll(); drag = .idle
-        externalButtons.removeAll(); hoverAnchor = nil; neutralRequired = true
-        externalScrolling = true; beginAction("scroll"); endAction(); endAction("externalButtons"); endExternalTransform()
+        guard enabled, hardwareCaptureEnabled else { return }
+        // Acquire before retiring fingers: their one-shot modifier may also
+        // belong to this new action. Physical button ownership is independent.
+        externalScrolling = true; beginAction("scroll")
+        retireFingerScope(); endExternalTransform()
     }
     func endExternalScroll() { externalScrolling = false; endAction("scroll") }
     func beginExternalTransform() {
-        guard enabled, !pencilMouse.blocksFingers else { return }; cancelInertia(); cancelNative()
-        for b in buttons.sorted() { button(b,false) }
-        quarantine.formUnion(contacts.keys); contacts.removeAll(); drag = .idle
-        externalButtons.removeAll(); hoverAnchor = nil; neutralRequired = true
-        beginAction("transform"); endAction(); endAction("externalButtons"); endExternalScroll()
+        guard enabled, hardwareCaptureEnabled else { return }
+        beginAction("transform")
+        retireFingerScope(); endExternalScroll()
     }
     func endExternalTransform() { endAction("transform") }
     func externalScroll(_ delta: CGPoint, discrete: Bool) {
-        guard enabled, !pencilMouse.blocksFingers else { return }
+        guard enabled, hardwareCaptureEnabled else { return }
         if inertiaStarted != nil { cancelInertia() }
         // UIKit owns continuous scrolling AND its momentum. Never start client inertia here.
         let x = discrete ? (delta.x == 0 ? 0 : delta.x > 0 ? 120.0 : -120.0) : Double(delta.x * 5)

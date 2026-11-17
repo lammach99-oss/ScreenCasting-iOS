@@ -521,7 +521,7 @@ import UIKit
         session.releaseAll()
     }
     #endif
-    func testPencilPreemptionAndScrollTransformReplacementLeaveNoActionOwnerBehind() {
+    func testPencilCoexistenceAndScrollTransformReplacementLeaveNoActionOwnerBehind() {
         for transform in [false,true] {
             let e = engine(); var out: [IPadInputEvent] = []; e.emit = { out.append($0) }
             e.setModifier(.shift,.oneShot)
@@ -529,6 +529,8 @@ import UIKit
             else { e.beginExternalScroll(); e.beginExternalTransform() }
             e.begin(id: 1,pencil: true,point: .zero,normalized: .zero)
             e.end(id: 1,point: .zero,normalized: .zero,cancelled: false)
+            XCTAssertFalse(out.contains(.key(0xe1,1)), "Pencil cannot retire an external gesture's modifier")
+            e.endExternalScroll(); e.endExternalTransform()
             XCTAssertEqual(out.filter { $0 == .key(0xe1,1) }.count,1)
             out.removeAll(); e.setModifier(.control,.oneShot); e.tapKey(6)
             XCTAssertEqual(out,[.key(0xe0,0),.key(6,0),.key(6,1),.key(0xe0,1)])
