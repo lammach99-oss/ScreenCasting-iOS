@@ -1139,6 +1139,7 @@ public class PencilUIKitView: UIView, UIPencilInteractionDelegate {
 
     private func installPencilMouseInteraction() {
         let pencilHover = UIHoverGestureRecognizer(target: self, action: #selector(handlePencilHover(_:)))
+        pencilHover.name = "IPadInput.pencilHover"
         pencilHover.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
         pencilHover.cancelsTouchesInView = false
         addGestureRecognizer(pencilHover)
@@ -1521,20 +1522,24 @@ public class PencilUIKitView: UIView, UIPencilInteractionDelegate {
 
     private func installExternalPointerRecognizers() {
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(handleExternalPointerHover(_:)))
+        hover.name = "IPadInput.pointerHover"
         hover.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
         hover.cancelsTouchesInView = false
         addGestureRecognizer(hover)
         let scroll = UIPanGestureRecognizer(target: self, action: #selector(handleExternalPointerScroll(_:)))
+        scroll.name = "IPadInput.continuousScroll"
         scroll.allowedScrollTypesMask = .continuous
         scroll.allowedTouchTypes = []
         scroll.cancelsTouchesInView = false
         addGestureRecognizer(scroll)
         let wheel = UIPanGestureRecognizer(target: self, action: #selector(handleExternalPointerDiscreteScroll(_:)))
+        wheel.name = "IPadInput.discreteScroll"
         wheel.allowedScrollTypesMask = .discrete
         wheel.allowedTouchTypes = []
         wheel.cancelsTouchesInView = false
         addGestureRecognizer(wheel)
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handleExternalPointerPinch(_:)))
+        pinch.name = "IPadInput.pinch"
         // The existing indirect-input opt-in supplies touch-free trackpad transform events.
         pinch.allowedTouchTypes = []
         pinch.cancelsTouchesInView = false

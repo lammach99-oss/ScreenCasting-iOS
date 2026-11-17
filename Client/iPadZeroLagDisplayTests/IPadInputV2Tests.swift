@@ -212,10 +212,18 @@ import UIKit
                 // Round eleven: restoration needs flags on this triggering event.
                 e.withPointerCommand(true) {
                     switch action {
-                    case "direct","pencil":
-                        e.begin(id: 1,pencil: action == "pencil",point: .zero,normalized: .zero)
-                        XCTAssertTrue(out.contains(.touch(.down,1,.zero,255)))
+                    case "direct":
+                        e.begin(id: 1,pencil: false,point: .zero,normalized: .zero)
+                        XCTAssertEqual(out, [.key(ctrl,0),.touch(.down,1,.zero,255)], action)
                         e.end(id: 1,point: .zero,normalized: .zero,cancelled: false)
+                    case "pencil":
+                        // Precise Pencil is a mouse, independent of touch mode.
+                        // Ctrl must precede the absolute move AND button Down.
+                        e.begin(id: 1,pencil: true,point: .zero,normalized: .zero)
+                        XCTAssertEqual(out, [.key(ctrl,0),.pointer(0,0,0,0),.button(1,0,1)], action)
+                        e.end(id: 1,point: .zero,normalized: .zero,cancelled: false)
+                        XCTAssertEqual(Array(out.suffix(3)), [.pointer(0,0,0,0),.button(1,1,1),.key(ctrl,1)], action)
+                        XCTAssertEqual(out.filter { if case .touch = $0 { return true }; return false }.count, 0, action)
                     case "trackpad":
                         e.mode = .trackpad; e.begin(id: 1,pencil: false,point: .zero,normalized: .zero)
                         e.end(id: 1,point: .zero,normalized: .zero,cancelled: false)

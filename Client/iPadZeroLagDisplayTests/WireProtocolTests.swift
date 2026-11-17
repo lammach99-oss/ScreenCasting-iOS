@@ -808,15 +808,31 @@ final class ExternalPointerInputTests: XCTestCase {
         XCTAssertTrue(state.scroll(delta: .zero, generation: 7).isEmpty)
     }
 
-    @MainActor func testRecognizersCannotConsumeDirectFingerInput() {
+    @MainActor func testRecognizersCannotConsumeDirectFingerInput() throws {
         let view = PencilUIKitView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
-        let hover = (view.gestureRecognizers ?? []).compactMap { $0 as? UIHoverGestureRecognizer }
-        let scroll = (view.gestureRecognizers ?? []).compactMap { $0 as? UIPanGestureRecognizer }.filter { $0.allowedScrollTypesMask == .continuous }
-        XCTAssertEqual(hover.count, 1)
-        XCTAssertEqual(scroll.count, 1)
-        XCTAssertFalse(hover.first?.cancelsTouchesInView ?? true)
-        XCTAssertFalse(scroll.first?.cancelsTouchesInView ?? true)
-        XCTAssertEqual(scroll.first?.allowedTouchTypes, [])
+        // UIPencilInteraction may install UIKit-owned hover recognizers. Count
+        // our adapters and inspect admission, not UIKit's private inventory.
+        let owned = (view.gestureRecognizers ?? []).filter { $0.name?.hasPrefix("IPadInput.") == true }
+        XCTAssertEqual(owned.count, 5)
+        XCTAssertEqual(Set(owned.compactMap(\.name)), Set([
+            "IPadInput.pencilHover", "IPadInput.pointerHover", "IPadInput.continuousScroll",
+            "IPadInput.discreteScroll", "IPadInput.pinch"]))
+        let direct = NSNumber(value: UITouch.TouchType.direct.rawValue)
+        for recognizer in owned {
+            XCTAssertFalse(recognizer.allowedTouchTypes.contains(direct), recognizer.name ?? "unnamed")
+            XCTAssertFalse(recognizer.cancelsTouchesInView, recognizer.name ?? "unnamed")
+        }
+        let pointerHover = try XCTUnwrap(owned.first { $0.name == "IPadInput.pointerHover" } as? UIHoverGestureRecognizer)
+        let pencilHover = try XCTUnwrap(owned.first { $0.name == "IPadInput.pencilHover" } as? UIHoverGestureRecognizer)
+        XCTAssertEqual(pointerHover.allowedTouchTypes, [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)])
+        XCTAssertEqual(pencilHover.allowedTouchTypes, [NSNumber(value: UITouch.TouchType.pencil.rawValue)])
+        let scroll = try XCTUnwrap(owned.first { $0.name == "IPadInput.continuousScroll" } as? UIPanGestureRecognizer)
+        let wheel = try XCTUnwrap(owned.first { $0.name == "IPadInput.discreteScroll" } as? UIPanGestureRecognizer)
+        let pinch = try XCTUnwrap(owned.first { $0.name == "IPadInput.pinch" } as? UIPinchGestureRecognizer)
+        XCTAssertEqual(scroll.allowedScrollTypesMask, .continuous)
+        XCTAssertEqual(wheel.allowedScrollTypesMask, .discrete)
+        let touchFree: [UIGestureRecognizer] = [scroll, wheel, pinch]
+        for recognizer in touchFree { XCTAssertEqual(recognizer.allowedTouchTypes, []) }
         view.configureDirectTouch(active: true, generation: 7)
         view.configureExternalPointer(active: true, generation: 7)
         var contacts: [DirectTouchContactCommand] = []
