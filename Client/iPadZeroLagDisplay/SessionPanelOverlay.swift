@@ -75,6 +75,17 @@ private extension Color {
     @AppStorage("ScreenCasting.client.screenPickerOffset") private var storedOffset: Double = 0
     @Environment(\.dynamicTypeSize) private var typeSize
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOver
+    #if targetEnvironment(simulator)
+    var voiceOverForTesting: Bool? = nil
+    #endif
+
+    private var usesVoiceOver: Bool {
+        #if targetEnvironment(simulator)
+        return voiceOverForTesting ?? voiceOver
+        #else
+        return voiceOver
+        #endif
+    }
 
     private var monitorControlEnabled: Bool {
         networkManager.remoteMonitorState.isSourceRecovery ? remoteInput.monitorControlAvailable : remoteInput.pointerEnabled
@@ -126,54 +137,7 @@ private extension Color {
     }
 
     var body: some View {
-        GeometryReader { proxy in
-            ZStack(alignment: .top) {
-                if isOpen {
-                    // Tapping outside closes the panel; while it is open nothing reaches the PC.
-                    Color(ink: SessionInk.canvas).opacity(0.001).contentShape(Rectangle()).onTapGesture { close() }
-                }
-                VStack(spacing: 10) {
-                    // After a few idle seconds the pill shrinks to a slim handle so the top of the PC stays visible.
-                    TimelineView(.periodic(from: .now, by: 1)) { context in
-                        // VoiceOver keeps the full pill: swapping views every idle cycle would drop its focus.
-                        let mode = SessionPillPresentation.make(isOpen: isOpen || voiceOver,
-                                                                idleFor: context.date.timeIntervalSince(lastInteraction),
-                                                                reconnecting: session.reconnecting)
-                        ZStack(alignment: .top) {
-                            if mode == .full {
-                                pill(maxX: proxy.size.width).transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .top)))
-                            } else {
-                                handle(maxX: proxy.size.width).transition(.opacity)
-                            }
-                        }
-                        .animation(reduceMotion ? nil : .easeOut(duration: 0.3), value: mode)
-                    }
-                    .background(GeometryReader { pillProxy in
-                        Color.clear.preference(key: SessionPillHeightKey.self, value: pillProxy.size.height)
-                    })
-                    if isOpen {
-                        // Sized to its content; only very large text or many screens reach the cap and scroll.
-                        panel(width: min(420, proxy.size.width - 24),
-                              maxHeight: max(120, proxy.size.height - pillHeight - 34 - (inputSession.dragState == .latched ? 80 : 0)))
-                            .transition(.opacity.combined(with: .move(edge: .top)))
-                    }
-                }
-                .offset(x: clampedOffset(width: proxy.size.width))
-                .padding(.top, 12)
-            }
-            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
-            .overlay(alignment: .bottom) {
-                VStack(spacing: 8) {
-                    SessionDraggingChip()
-                    if inputBarVisible && !isOpen {
-                        SessionInputBar(onClose: { inputBarVisible = false })
-                            .frame(maxHeight: max(44, proxy.size.height * 0.45))
-                    }
-                }
-                .frame(maxWidth: min(620, max(0, proxy.size.width - 24)))
-                .padding(.bottom, max(12, proxy.safeAreaInsets.bottom))
-            }
-        }
+        OverlaySurface(owner: self)
         .environment(\.colorScheme, .dark)
         .tint(Color(ink: SessionInk.accent))
         .onPreferenceChange(SessionPillHeightKey.self) { height in
@@ -212,72 +176,17 @@ private extension Color {
 
     // MARK: Pill
 
-    private func pill(maxX: CGFloat) -> some View {
-        let s = session
-        return Button {
-            isOpen ? close() : open()
-        } label: {
-            Group {
-                if s.reconnecting {
-                    HStack(spacing: 8) {
-                        Image(systemName: "arrow.triangle.2.circlepath").accessibilityHidden(true)
-                        Text(s.reconnectingText).fixedSize(horizontal: false, vertical: true)
-                    }
-                } else {
-                    ViewThatFits(in: .horizontal) {
-                        HStack(spacing: 8) { pillTitle; routeAndControl }.fixedSize(horizontal: true, vertical: false)
-                        VStack(alignment: .leading, spacing: 8) { pillTitle; routeAndControl }
-                    }
-                }
-            }
-            .frame(maxWidth: max(44, min(392, maxX - 52)))
-            .font(.subheadline)
-            .foregroundStyle(Color(ink: s.reconnecting ? SessionInk.warning : SessionInk.text))
-            .padding(.horizontal, 14).padding(.vertical, 10)
-            .frame(minHeight: 44)
-            .background(Color(ink: SessionInk.surface).opacity(0.94), in: Capsule())
-            .overlay(Capsule().stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
-            .shadow(color: Color(ink: SessionInk.canvas).opacity(0.35), radius: 10, y: 4)
-            .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .gesture(moveAlongTop(maxX: maxX))
-        .accessibilityLabel(pillLabel(s))
-        .accessibilityValue(isOpen ? "Expanded" : "Collapsed")
-        .accessibilityHint("Opens screens, keyboard, files, settings and disconnect")
+    private func pill(maxX: CGFloat) -> SessionPill {
+        SessionPill(owner: self, maxX: maxX)
     }
 
-    private var pillTitle: some View {
-        HStack(spacing: 8) {
-            Image(systemName: icon(session.icon)).accessibilityHidden(true)
-                .foregroundStyle(Color(ink: SessionInk.accent))
-            Text(session.title).fontWeight(.semibold).fixedSize(horizontal: false, vertical: true)
-            Image(systemName: "chevron.down").font(.caption.weight(.bold)).accessibilityHidden(true)
-                .rotationEffect(.degrees(isOpen ? 180 : 0))
-                .foregroundStyle(Color(ink: SessionInk.secondary))
-        }
+    private var pillTitle: PillTitle {
+        PillTitle(owner: self)
     }
 
     /// The idle pill: a slim bar at the top edge, green while touches drive the PC. Tapping it opens the panel.
-    private func handle(maxX: CGFloat) -> some View {
-        let s = session
-        return Button { open() } label: {
-            // A dark backing keeps the bar visible over a white PC title bar.
-            Capsule()
-                .fill(Color(ink: s.control == .on ? SessionInk.positive : SessionInk.text))
-                .frame(width: 56, height: 5)
-                .frame(width: 66, height: 13)
-                .background(Color(ink: SessionInk.canvas).opacity(0.72), in: Capsule())
-                .overlay(Capsule().stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
-                .frame(width: 96, height: 44)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .offset(y: -8)
-        .gesture(moveAlongTop(maxX: maxX))
-        .accessibilityLabel(pillLabel(s))
-        .accessibilityValue("Collapsed")
-        .accessibilityHint("Opens screens, keyboard, files, settings and disconnect")
+    private func handle(maxX: CGFloat) -> SessionHandle {
+        SessionHandle(owner: self, maxX: maxX)
     }
 
     private func moveAlongTop(maxX: CGFloat) -> some Gesture {
@@ -296,68 +205,20 @@ private extension Color {
 
     // MARK: Panel
 
-    private func panel(width: CGFloat, maxHeight: CGFloat) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
-            panelHeader
-            ViewThatFits(in: .vertical) {
-                panelSections.fixedSize(horizontal: false, vertical: true)
-                ScrollView { panelSections }.scrollBounceBehavior(.basedOnSize)
-            }
-            footer(session)
-        }
-        .foregroundStyle(Color(ink: SessionInk.text))
-        .padding(16)
-        .frame(width: width)
-        .background(Color(ink: SessionInk.surface).opacity(0.96), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
-        .shadow(color: Color(ink: SessionInk.canvas).opacity(0.45), radius: 24, y: 12)
-        .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .onTapGesture { lastInteraction = Date() }
-        .frame(maxHeight: maxHeight, alignment: .top)
-        .accessibilityAddTraits(.isModal)
-        .accessibilityAction(.escape) { close() }
+    private func panel(width: CGFloat, maxHeight: CGFloat) -> PanelContent {
+        PanelContent(owner: self, width: width, maxHeight: maxHeight)
     }
 
-    private var panelSections: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            if ScreenPickerSnapshot.shouldShowPicker(remote: networkManager.isRemoteControlSession,
-                mirror: !networkManager.isRemoteControlSession, acceptedFeatures: networkManager.remoteMonitorState.enabled ? 7 : 0,
-                typedSources: networkManager.captureTargetState.enabled) { screens(picker) }
-            if !networkManager.isRemoteControlSession { connectionPicker }
-            if !networkManager.isRemoteControlSession && picker.control != .unavailable { castingControl }
-            tools
-            touchSection
-            if networkManager.isRemoteControlSession { remoteActions }
-        }
+    private var panelSections: PanelSections {
+        PanelSections(owner: self)
     }
 
-    private var panelHeader: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(session.hostLabel).font(.headline).fixedSize()
-                    Spacer(minLength: 8)
-                    routeAndControl.fixedSize()
-                }
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(session.hostLabel).font(.headline)
-                    routeAndControl
-                }
-            }
-            if session.reconnecting {
-                Label(session.reconnectingText, systemImage: "arrow.triangle.2.circlepath")
-                    .font(.footnote).foregroundStyle(Color(ink: SessionInk.warning))
-            }
-            if let performance { performance }
-        }
+    private var panelHeader: PanelHeader {
+        PanelHeader(owner: self)
     }
 
-    private var routeAndControl: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 8) { routeLabel; controlBadge(session.control, compact: true) }
-            VStack(alignment: .leading, spacing: 8) { routeLabel; controlBadge(session.control, compact: true) }
-        }
-        .font(.footnote)
+    private var routeAndControl: RouteAndControl {
+        RouteAndControl(owner: self)
     }
 
     @ViewBuilder private var routeLabel: some View {
@@ -371,112 +232,28 @@ private extension Color {
             .accessibilityAddTraits(.isHeader)
     }
 
-    private func screens(_ p: ScreenPickerSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            sectionTitle("Screen")
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 8) { switchScreenButton.fixedSize(horizontal: true, vertical: false); castingModes }
-                VStack(alignment: .leading, spacing: 8) { switchScreenButton; castingModes }
-            }
-            screenStatus(p)
-        }
+    private func screens(_ p: ScreenPickerSnapshot) -> ScreenSection {
+        ScreenSection(owner: self, p: p)
     }
 
-    private var switchScreenButton: some View {
-        Button { cycleScreen() } label: {
-            HStack(spacing: 8) {
-                if cycle.pending { ProgressView().tint(Color(ink: SessionInk.warning)).accessibilityHidden(true) }
-                else { Image(systemName: "display").accessibilityHidden(true) }
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Switch screen").font(.subheadline.weight(.semibold))
-                    Text(cycle.detail).font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
-                }
-                .fixedSize(horizontal: false, vertical: true)
-            }
-            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-            .padding(8)
-            .background(Color(ink: SessionInk.raised), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
-        }
-        .buttonStyle(.plain)
-        .disabled(!cycle.enabled)
-        .opacity(cycle.enabled ? 1 : 0.6)
-        .accessibilityLabel("Switch screen")
-        .accessibilityValue(cycle.accessibilityValue)
-        .accessibilityHint(cycle.hint)
-        .accessibilityIdentifier("session.switch-screen")
-        .accessibilityFocused($switchFocused)
+    private var switchScreenButton: ScreenSwitchButton {
+        ScreenSwitchButton(owner: self)
     }
 
-    @ViewBuilder private var castingModes: some View {
-        if !networkManager.isRemoteControlSession {
-            if typeSize.isAccessibilitySize {
-                VStack(spacing: 8) { modeButtons }
-            } else {
-                HStack(spacing: 8) { modeButtons }
-            }
-        }
+    private var castingModes: ModeChoices {
+        ModeChoices(owner: self)
     }
 
-    private var modeButtons: some View {
-        Group {
-            modeButton("Extend", choice: modeChoices.extend, identifier: "session.mode.extend")
-            modeButton("Mirror", choice: modeChoices.mirror, identifier: "session.mode.mirror")
-        }
+    private var modeButtons: ModeButtons {
+        ModeButtons(owner: self)
     }
 
-    private func modeButton(_ title: String, choice: CaptureModeChoice, identifier: String) -> some View {
-        Button {
-            guard choice.enabled, let id = choice.targetId else { return }
-            requestScreen(id)
-        } label: {
-            Text(title).font(.subheadline.weight(.semibold))
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, 8)
-                .frame(minWidth: 44, maxWidth: .infinity, minHeight: 44)
-                .background(Color(ink: choice.selected ? SessionInk.accent : SessionInk.raised)
-                    .opacity(choice.selected ? 0.16 : 1), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(Color(ink: choice.selected ? SessionInk.accent : SessionInk.hairline), lineWidth: 0.5))
-        }
-        .buttonStyle(.plain)
-        .disabled(!choice.enabled)
-        .accessibilityLabel(title)
-        .accessibilityValue(choice.selected ? "Selected" : "Not selected")
-        .accessibilityAddTraits(choice.selected ? .isSelected : [])
-        .accessibilityHint(modeChoices.explanation ?? "")
-        .accessibilityIdentifier(identifier)
+    private func modeButton(_ title: String, choice: CaptureModeChoice, identifier: String) -> ModeButton {
+        ModeButton(owner: self, title: title, choice: choice, identifier: identifier)
     }
 
-    private func screenStatus(_ p: ScreenPickerSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if let message = screenMessage {
-                Text(message).font(.footnote).fixedSize(horizontal: false, vertical: true)
-                    .foregroundStyle(Color(ink: screenHasFailure ? SessionInk.danger : SessionInk.warning))
-            }
-            if permissionAsked && !p.canAskPermission && p.phase == .locked {
-                Text(CastingPermissionCopy.requestSent).font(.footnote).foregroundStyle(Color(ink: SessionInk.warning))
-            }
-            if p.canAskPermission {
-                Button("Ask PC to allow") {
-                    permissionAsked = true; lastInteraction = Date()
-                    networkManager.requestMirrorSwitchPermission()
-                }
-                .buttonStyle(.bordered).frame(minHeight: 44)
-                .accessibilityHint("Shows an approval pop-up on the PC")
-            }
-            if !networkManager.isRemoteControlSession, let explanation = modeChoices.explanation {
-                Text(explanation).font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if networkManager.captureTargetState.enabled && !p.isSwitching &&
-                (networkManager.captureTargetState.listUnavailable || networkManager.captureTargetState.needsCatalogueRefresh ||
-                 networkManager.captureTargetState.catalogue?.state == 0 || networkManager.captureTargetState.catalogue?.state == 3) {
-                Button("Refresh screens") { networkManager.refreshMirrorScreens() }
-                    .buttonStyle(.bordered).frame(minHeight: 44)
-            }
-        }
+    private func screenStatus(_ p: ScreenPickerSnapshot) -> ScreenStatus {
+        ScreenStatus(owner: self, p: p)
     }
 
     private var screenHasFailure: Bool {
@@ -550,240 +327,38 @@ private extension Color {
         switchFocused = true
     }
 
-    private var castingControl: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            sectionTitle("Control")
-            actionButton(picker.control == .on ? "Stop control" : "Ask control",
-                         icon: picker.control == .on ? "hand.raised.slash" : "hand.point.up.left",
-                         enabled: picker.control == .on || !controlPermissionAsked) {
-                lastInteraction = Date()
-                if picker.control == .on {
-                    remoteInput.suspend(reason: 1); networkManager.releaseMirrorControl(); controlPermissionAsked = false
-                } else { networkManager.requestMirrorControl(); controlPermissionAsked = true }
-            }
-            if controlPermissionAsked && picker.control != .on {
-                Text(CastingPermissionCopy.requestSent).font(.footnote)
-                    .foregroundStyle(Color(ink: SessionInk.secondary))
-            }
-        }
+    private var castingControl: CastingControlSection {
+        CastingControlSection(owner: self)
     }
 
-    private var tools: some View {
-        let canType = inputSession.canType && !networkManager.captureInputBlocked
-        return VStack(alignment: .leading, spacing: 8) {
-            sectionTitle("Tools")
-            SessionActionLayout(accessibility: typeSize.isAccessibilitySize) {
-                actionButton("Keyboard", icon: "keyboard", enabled: canType,
-                             hint: canType ? nil : (inputSession.unavailableReason ?? "Ask for control first to type on the PC")) {
-                    guard inputSession.canType, !networkManager.captureInputBlocked else { return }
-                    close()
-                    inputBarVisible = true
-                    inputSession.showSoftwareKeyboard()
-                }
-                actionButton("Files", icon: "arrow.left.arrow.right") { close(); onFiles() }
-                actionButton("Settings", icon: "gearshape") { close(); onSettings() }
-            }
-        }
+    private var tools: ToolsSection {
+        ToolsSection(owner: self)
     }
 
-    private var touchSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            sectionTitle("Touch")
-            RemoteMouseControls()
-            moreInput
-        }
+    private var touchSection: TouchSection {
+        TouchSection(owner: self)
     }
 
-    private var moreInput: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Button { moreInputExpanded.toggle() } label: {
-                HStack(spacing: 8) {
-                    Text("More input").font(.subheadline.weight(.semibold))
-                    Image(systemName: "chevron.down").rotationEffect(.degrees(moreInputExpanded ? 180 : 0))
-                        .accessibilityHidden(true)
-                }
-                .frame(minHeight: 44)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityValue(moreInputExpanded ? "Expanded" : "Collapsed")
-            .accessibilityIdentifier("session.more-input")
-            if moreInputExpanded {
-                Toggle("Scroll inertia", isOn: Binding(get: { inputSession.scrollInertiaEnabled },
-                                                       set: { inputSession.setScrollInertia($0) }))
-                    .font(.subheadline).frame(minHeight: 44).disabled(!inputSession.canPoint)
-                Toggle("Reverse scroll direction", isOn: Binding(get: { inputSession.reverseScrollEnabled },
-                                                                  set: { inputSession.setReverseScroll($0) }))
-                    .font(.subheadline).frame(minHeight: 44).disabled(!inputSession.canPoint)
-                Text("Inertia affects finger wheel scrolling. Reverse affects wheel direction. Windows controls native one-finger touch pan.")
-                    .font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
-                    .fixedSize(horizontal: false, vertical: true)
-                actionButton("Gesture help", icon: "hand.draw") { close(); onGestures() }
-                AccessiblePointerControls()
-                RemoteMouseExtras()
-            }
-        }
+    private var moreInput: MoreInputSection {
+        MoreInputSection(owner: self)
     }
 
-    private var connectionPicker: some View {
-        let state = networkManager.connectionSwitchState
-        return VStack(alignment: .leading, spacing: 8) {
-            sectionTitle("Connection")
-            Text(state.recommendationText).font(.footnote)
-                .foregroundStyle(Color(ink: SessionInk.secondary))
-            ForEach([ConnectionRoute.usb, .wifi], id: \.rawValue) { route in
-                let reason = state.disabledReason(for: route, hasWifiEndpoint: networkManager.hasReconnectTarget)
-                Button {
-                    lastInteraction = Date()
-                    remoteInput.suspend(reason: 1)
-                    networkManager.requestConnectionRoute(route)
-                } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: route == .usb ? "cable.connector" : "wifi").accessibilityHidden(true)
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack {
-                                Text(route.label).font(.subheadline.weight(.semibold))
-                                if state.snapshot?.recommended == route && !state.needsRefresh {
-                                    Text("Recommended").font(.caption)
-                                }
-                            }
-                            if let reason { Text(reason).font(.caption).fixedSize(horizontal: false, vertical: true) }
-                        }
-                        Spacer(minLength: 4)
-                        if state.actualRoute == route {
-                            Image(systemName: "checkmark").accessibilityHidden(true)
-                        }
-                    }
-                    .foregroundStyle(Color(ink: SessionInk.text))
-                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                    .padding(.horizontal, 10).padding(.vertical, 4)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .background(Color(ink: SessionInk.raised), in: RoundedRectangle(cornerRadius: 10))
-                .disabled(reason != nil)
-                .opacity(reason == nil ? 1 : 0.6)
-                .accessibilityLabel(route.label + (state.actualRoute == route ? ", Connected" : ""))
-                .accessibilityHint(reason ?? ("Switch to " + route.label))
-                .accessibilityAddTraits(state.actualRoute == route ? .isSelected : [])
-            }
-            HStack(spacing: 8) {
-                if state.pending != nil { ProgressView().tint(Color(ink: SessionInk.accent)) }
-                Text(state.message).font(.footnote).fixedSize(horizontal: false, vertical: true)
-            }
-            .foregroundStyle(Color(ink: state.offersReconnect ? SessionInk.warning : SessionInk.secondary))
-            .accessibilityElement(children: .combine)
-            if state.enabled && state.snapshot?.allowed == false && state.pending == nil && !state.offersReconnect {
-                Button("Ask PC") {
-                    let target: ConnectionRoute = state.actualRoute == .usb ? .wifi : .usb
-                    networkManager.requestConnectionRoute(target, askPC: true)
-                }
-                .buttonStyle(.bordered).frame(minHeight: 44)
-                .disabled(state.phase == .permissionRequired || state.needsRefresh)
-            }
-            if state.needsRefresh && state.pending == nil && !state.offersReconnect {
-                Button("Refresh connection status") { networkManager.refreshConnectionStatus() }
-                    .buttonStyle(.bordered).frame(minHeight: 44)
-            }
-            if state.offersReconnect {
-                Button("Reconnect over Wi-Fi") { networkManager.reconnectConnectionOverWifi() }
-                    .buttonStyle(.bordered).frame(minHeight: 44)
-                    .disabled(!networkManager.hasReconnectTarget)
-            }
-        }
+    private var connectionPicker: ConnectionSection {
+        ConnectionSection(owner: self)
     }
 
     /// Remote control service only: keys the iPad cannot send, and power.
-    private var remoteActions: some View {
-        SessionActionLayout(accessibility: typeSize.isAccessibilitySize) {
-            actionButton("Ctrl+Alt+Del", icon: "lock.shield", hint: "Opens the Windows security screen") {
-                lastInteraction = Date()
-                networkManager.sendRemoteCommand(.secureAttention)
-            }
-            actionButton("Lock PC", icon: "lock") {
-                lastInteraction = Date()
-                networkManager.sendRemoteCommand(.lock)
-            }
-            actionButton("Restart PC", icon: "arrow.clockwise") { confirmRestart = true }
-        }
-        .confirmationDialog("Restart the PC?", isPresented: $confirmRestart, titleVisibility: .visible) {
-            Button("Restart", role: .destructive) { networkManager.sendRemoteCommand(.restart, confirmed: true) }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Unsaved work on the PC may ask to be saved. The iPad reconnects when the PC is back.")
-        }
+    private var remoteActions: RemoteActionsSection {
+        RemoteActionsSection(owner: self)
     }
 
     private func actionButton(_ title: String, icon: String, enabled: Bool = true, hint: String? = nil,
-                              action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 6) {
-                Image(systemName: icon).accessibilityHidden(true).font(.title3).foregroundStyle(Color(ink: SessionInk.accent))
-                Text(title).font(.footnote.weight(.medium)).fixedSize(horizontal: false, vertical: true)
-                    .multilineTextAlignment(.center)
-            }
-            .frame(maxWidth: .infinity, minHeight: 60)
-            .background(Color(ink: SessionInk.raised), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .opacity(enabled ? 1 : 0.45)
-        }
-        .buttonStyle(.plain)
-        .disabled(!enabled)
-        .accessibilityLabel(title)
-        .accessibilityHint(hint ?? "")
+                              action: @escaping () -> Void) -> PanelActionButton {
+        PanelActionButton(owner: self, title: title, icon: icon, enabled: enabled, hint: hint, action: action)
     }
 
-    private func footer(_ s: SessionPanelSnapshot) -> some View {
-        let armed = disconnectTick >= 0 && disconnectArming.isArmed(at: Date())
-        let tip = Group {
-            if armed {
-                Text("Disconnect from \(s.hostLabel)?").font(.caption).foregroundStyle(Color(ink: SessionInk.danger))
-            } else {
-                Button { close(); onGestures() } label: {
-                    Label("Gestures", systemImage: "questionmark.circle")
-                        .font(.subheadline)
-                        .foregroundStyle(Color(ink: SessionInk.secondary))
-                        .frame(minHeight: 44)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityHint("Shows the touch and Pencil gestures")
-            }
-        }
-        let button = Button {
-            lastInteraction = Date()
-            if disconnectArming.tap(at: Date()) {
-                close()
-                remoteInput.suspend(reason: 1)
-                networkManager.stop()
-            } else {
-                disconnectTick += 1
-                UIAccessibility.post(notification: .announcement,
-                                     argument: "Disconnect from \(s.hostLabel)? Activate again within 4 seconds.")
-                DispatchQueue.main.asyncAfter(deadline: .now() + DisconnectArming.window + 0.1) { disconnectTick += 1 }
-            }
-        } label: {
-            Label(armed ? "Disconnect now" : "Disconnect", systemImage: "xmark.circle")
-                .font(.subheadline.weight(.semibold))
-                .fixedSize()
-                .foregroundStyle(Color(ink: armed ? SessionInk.onDanger : SessionInk.danger))
-                .padding(.horizontal, 12).frame(minHeight: 44)
-                .background(armed ? Color(ink: SessionInk.dangerFill) : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(Color(ink: SessionInk.dangerFill).opacity(armed ? 0 : 0.6), lineWidth: 0.5))
-        }
-        .buttonStyle(.plain)
-        .accessibilityHint(armed ? "Ends the session with \(s.hostLabel)" : "Asks to confirm before ending the session")
-        return Group {
-            if typeSize.isAccessibilitySize {
-                VStack(alignment: .leading, spacing: 8) { tip; button }
-            } else {
-                HStack(spacing: 10) { tip; Spacer(minLength: 8); button }
-            }
-        }
-        .padding(.top, 12)
-        .overlay(alignment: .top) { Rectangle().fill(Color(ink: SessionInk.hairline)).frame(height: 0.5) }
+    private func footer(_ s: SessionPanelSnapshot) -> PanelFooter {
+        PanelFooter(owner: self, s: s)
     }
 
     private func controlBadge(_ control: ScreenPickerSnapshot.Control, compact: Bool) -> some View {
@@ -836,6 +411,623 @@ private extension Color {
         let limit = max(0, width / 2 - 240)
         return min(max(x, -limit), limit)
     }
+
+    // Concrete boundaries stop Swift metadata from expanding the entire panel at first open.
+    // The owner retains all state/focus locations; child views do not re-own that state.
+    @MainActor private struct OverlaySurface: View {
+        let owner: SessionPanelOverlay
+        var body: some View {
+            GeometryReader { proxy in
+                ZStack(alignment: .top) {
+                    if owner.isOpen {
+                        // Tapping outside closes the panel; while it is open nothing reaches the PC.
+                        Color(ink: SessionInk.canvas).opacity(0.001).contentShape(Rectangle()).onTapGesture { owner.close() }
+                    }
+                    VStack(spacing: 10) {
+                        // After a few idle seconds the pill shrinks to a slim handle so the top of the PC stays visible.
+                        TimelineView(.periodic(from: .now, by: 1)) { context in
+                            // VoiceOver keeps the full pill: swapping views every idle cycle would drop its focus.
+                            let mode = SessionPillPresentation.make(isOpen: owner.isOpen || owner.usesVoiceOver,
+                                                                    idleFor: context.date.timeIntervalSince(owner.lastInteraction),
+                                                                    reconnecting: owner.session.reconnecting)
+                            ZStack(alignment: .top) {
+                                if mode == .full {
+                                    owner.pill(maxX: proxy.size.width).transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .top)))
+                                } else {
+                                    owner.handle(maxX: proxy.size.width).transition(.opacity)
+                                }
+                            }
+                            .animation(owner.reduceMotion ? nil : .easeOut(duration: 0.3), value: mode)
+                        }
+                        .background(GeometryReader { pillProxy in
+                            Color.clear.preference(key: SessionPillHeightKey.self, value: pillProxy.size.height)
+                        })
+                        if owner.isOpen {
+                            // Sized to its content; only very large text or many screens reach the cap and scroll.
+                            owner.panel(width: min(420, proxy.size.width - 24),
+                                  maxHeight: max(120, proxy.size.height - owner.pillHeight - 34 - (owner.inputSession.dragState == .latched ? 80 : 0)))
+                                .transition(.opacity.combined(with: .move(edge: .top)))
+                        }
+                    }
+                    .offset(x: owner.clampedOffset(width: proxy.size.width))
+                    .padding(.top, 12)
+                }
+                .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
+                .overlay(alignment: .bottom) {
+                    VStack(spacing: 8) {
+                        SessionDraggingChip()
+                        if owner.inputBarVisible && !owner.isOpen {
+                            SessionInputBar(onClose: { owner.inputBarVisible = false })
+                                .frame(maxHeight: max(44, proxy.size.height * 0.45))
+                        }
+                    }
+                    .frame(maxWidth: min(620, max(0, proxy.size.width - 24)))
+                    .padding(.bottom, max(12, proxy.safeAreaInsets.bottom))
+                }
+            }
+        }
+    }
+
+    @MainActor private struct PanelContent: View {
+        let owner: SessionPanelOverlay
+        let width: CGFloat
+        let maxHeight: CGFloat
+        var body: some View {
+            VStack(alignment: .leading, spacing: 14) {
+                owner.panelHeader
+                ViewThatFits(in: .vertical) {
+                    owner.panelSections.fixedSize(horizontal: false, vertical: true)
+                    ScrollView { owner.panelSections }.scrollBounceBehavior(.basedOnSize)
+                }
+                owner.footer(owner.session)
+            }
+            .foregroundStyle(Color(ink: SessionInk.text))
+            .padding(16)
+            .frame(width: width)
+            .background(Color(ink: SessionInk.surface).opacity(0.96), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
+            .shadow(color: Color(ink: SessionInk.canvas).opacity(0.45), radius: 24, y: 12)
+            .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .onTapGesture { owner.lastInteraction = Date() }
+            .frame(maxHeight: maxHeight, alignment: .top)
+            .accessibilityAddTraits(.isModal)
+            .accessibilityAction(.escape) { owner.close() }
+        }
+    }
+
+    @MainActor private struct PanelSections: View {
+        let owner: SessionPanelOverlay
+        var body: some View {
+            VStack(alignment: .leading, spacing: 14) {
+                if ScreenPickerSnapshot.shouldShowPicker(remote: owner.networkManager.isRemoteControlSession,
+                    mirror: !owner.networkManager.isRemoteControlSession, acceptedFeatures: owner.networkManager.remoteMonitorState.enabled ? 7 : 0,
+                    typedSources: owner.networkManager.captureTargetState.enabled) { owner.screens(owner.picker) }
+                if !owner.networkManager.isRemoteControlSession { owner.connectionPicker }
+                if !owner.networkManager.isRemoteControlSession && owner.picker.control != .unavailable { owner.castingControl }
+                owner.tools
+                owner.touchSection
+                if owner.networkManager.isRemoteControlSession { owner.remoteActions }
+            }
+        }
+    }
+
+    @MainActor private struct PanelHeader: View {
+        let owner: SessionPanelOverlay
+        var body: some View {
+            VStack(alignment: .leading, spacing: 8) {
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(owner.session.hostLabel).font(.headline).fixedSize()
+                        Spacer(minLength: 8)
+                        owner.routeAndControl.fixedSize()
+                    }
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(owner.session.hostLabel).font(.headline)
+                        owner.routeAndControl
+                    }
+                }
+                if owner.session.reconnecting {
+                    Label(owner.session.reconnectingText, systemImage: "arrow.triangle.2.circlepath")
+                        .font(.footnote).foregroundStyle(Color(ink: SessionInk.warning))
+                }
+                if let performance = owner.performance { performance }
+            }
+        }
+    }
+
+    @MainActor private struct ScreenSection: View {
+        let owner: SessionPanelOverlay
+        let p: ScreenPickerSnapshot
+        var body: some View {
+            VStack(alignment: .leading, spacing: 8) {
+                owner.sectionTitle("Screen")
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) { owner.switchScreenButton.fixedSize(horizontal: true, vertical: false); owner.castingModes }
+                    VStack(alignment: .leading, spacing: 8) { owner.switchScreenButton; owner.castingModes }
+                }
+                owner.screenStatus(p)
+            }
+        }
+    }
+
+    @MainActor private struct ScreenSwitchButton: View {
+        let owner: SessionPanelOverlay
+        var body: some View {
+            Button { owner.cycleScreen() } label: {
+                HStack(spacing: 8) {
+                    if owner.cycle.pending { ProgressView().tint(Color(ink: SessionInk.warning)).accessibilityHidden(true) }
+                    else { Image(systemName: "display").accessibilityHidden(true) }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Switch screen").font(.subheadline.weight(.semibold))
+                        Text(owner.cycle.detail).font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
+                    }
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .padding(8)
+                .background(Color(ink: SessionInk.raised), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
+            }
+            .buttonStyle(.plain)
+            .disabled(!owner.cycle.enabled)
+            .opacity(owner.cycle.enabled ? 1 : 0.6)
+            .accessibilityLabel("Switch screen")
+            .accessibilityValue(owner.cycle.accessibilityValue)
+            .accessibilityHint(owner.cycle.hint)
+            .accessibilityIdentifier("session.switch-screen")
+            .accessibilityFocused(owner.$switchFocused)
+        }
+    }
+
+    @MainActor private struct ModeChoices: View {
+        let owner: SessionPanelOverlay
+        @ViewBuilder var body: some View {
+            if !owner.networkManager.isRemoteControlSession {
+                if owner.typeSize.isAccessibilitySize {
+                    VStack(spacing: 8) { owner.modeButtons }
+                } else {
+                    HStack(spacing: 8) { owner.modeButtons }
+                }
+            }
+        }
+    }
+
+    @MainActor private struct ModeButtons: View {
+        let owner: SessionPanelOverlay
+        var body: some View {
+            Group {
+                owner.modeButton("Extend", choice: owner.modeChoices.extend, identifier: "session.mode.extend")
+                owner.modeButton("Mirror", choice: owner.modeChoices.mirror, identifier: "session.mode.mirror")
+            }
+        }
+    }
+
+    @MainActor private struct ModeButton: View {
+        let owner: SessionPanelOverlay
+        let title: String
+        let choice: CaptureModeChoice
+        let identifier: String
+        var body: some View {
+            Button {
+                guard choice.enabled, let id = choice.targetId else { return }
+                owner.requestScreen(id)
+            } label: {
+                Text(title).font(.subheadline.weight(.semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 8)
+                    .frame(minWidth: 44, maxWidth: .infinity, minHeight: 44)
+                    .background(Color(ink: choice.selected ? SessionInk.accent : SessionInk.raised)
+                        .opacity(choice.selected ? 0.16 : 1), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(Color(ink: choice.selected ? SessionInk.accent : SessionInk.hairline), lineWidth: 0.5))
+            }
+            .buttonStyle(.plain)
+            .disabled(!choice.enabled)
+            .accessibilityLabel(title)
+            .accessibilityValue(choice.selected ? "Selected" : "Not selected")
+            .accessibilityAddTraits(choice.selected ? .isSelected : [])
+            .accessibilityHint(owner.modeChoices.explanation ?? "")
+            .accessibilityIdentifier(identifier)
+        }
+    }
+
+    @MainActor private struct ScreenStatus: View {
+        let owner: SessionPanelOverlay
+        let p: ScreenPickerSnapshot
+        var body: some View {
+            VStack(alignment: .leading, spacing: 8) {
+                if let message = owner.screenMessage {
+                    Text(message).font(.footnote).fixedSize(horizontal: false, vertical: true)
+                        .foregroundStyle(Color(ink: owner.screenHasFailure ? SessionInk.danger : SessionInk.warning))
+                }
+                if owner.permissionAsked && !p.canAskPermission && p.phase == .locked {
+                    Text(CastingPermissionCopy.requestSent).font(.footnote).foregroundStyle(Color(ink: SessionInk.warning))
+                }
+                if p.canAskPermission {
+                    Button("Ask PC to allow") {
+                        owner.permissionAsked = true; owner.lastInteraction = Date()
+                        owner.networkManager.requestMirrorSwitchPermission()
+                    }
+                    .buttonStyle(.bordered).frame(minHeight: 44)
+                    .accessibilityHint("Shows an approval pop-up on the PC")
+                }
+                if !owner.networkManager.isRemoteControlSession, let explanation = owner.modeChoices.explanation {
+                    Text(explanation).font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if owner.networkManager.captureTargetState.enabled && !p.isSwitching &&
+                    (owner.networkManager.captureTargetState.listUnavailable || owner.networkManager.captureTargetState.needsCatalogueRefresh ||
+                     owner.networkManager.captureTargetState.catalogue?.state == 0 || owner.networkManager.captureTargetState.catalogue?.state == 3) {
+                    Button("Refresh screens") { owner.networkManager.refreshMirrorScreens() }
+                        .buttonStyle(.bordered).frame(minHeight: 44)
+                }
+            }
+        }
+    }
+
+    @MainActor private struct CastingControlSection: View {
+        let owner: SessionPanelOverlay
+        var body: some View {
+            VStack(alignment: .leading, spacing: 8) {
+                owner.sectionTitle("Control")
+                owner.actionButton(owner.picker.control == .on ? "Stop control" : "Ask control",
+                             icon: owner.picker.control == .on ? "hand.raised.slash" : "hand.point.up.left",
+                             enabled: owner.picker.control == .on || !owner.controlPermissionAsked) {
+                    owner.lastInteraction = Date()
+                    if owner.picker.control == .on {
+                        owner.remoteInput.suspend(reason: 1); owner.networkManager.releaseMirrorControl(); owner.controlPermissionAsked = false
+                    } else { owner.networkManager.requestMirrorControl(); owner.controlPermissionAsked = true }
+                }
+                if owner.controlPermissionAsked && owner.picker.control != .on {
+                    Text(CastingPermissionCopy.requestSent).font(.footnote)
+                        .foregroundStyle(Color(ink: SessionInk.secondary))
+                }
+            }
+        }
+    }
+
+    @MainActor private struct ToolsSection: View {
+        let owner: SessionPanelOverlay
+        var body: some View {
+            let canType = owner.inputSession.canType && !owner.networkManager.captureInputBlocked
+            return VStack(alignment: .leading, spacing: 8) {
+                owner.sectionTitle("Tools")
+                SessionActionLayout(accessibility: owner.typeSize.isAccessibilitySize) {
+                    owner.actionButton("Keyboard", icon: "keyboard", enabled: canType,
+                                 hint: canType ? nil : (owner.inputSession.unavailableReason ?? "Ask for control first to type on the PC")) {
+                        guard owner.inputSession.canType, !owner.networkManager.captureInputBlocked else { return }
+                        owner.close()
+                        owner.inputBarVisible = true
+                        owner.inputSession.showSoftwareKeyboard()
+                    }
+                    owner.actionButton("Files", icon: "arrow.left.arrow.right") { owner.close(); owner.onFiles() }
+                    owner.actionButton("Settings", icon: "gearshape") { owner.close(); owner.onSettings() }
+                }
+            }
+        }
+    }
+
+    @MainActor private struct TouchSection: View {
+        let owner: SessionPanelOverlay
+        var body: some View {
+            VStack(alignment: .leading, spacing: 8) {
+                owner.sectionTitle("Touch")
+                RemoteMouseControls()
+                owner.moreInput
+            }
+        }
+    }
+
+    @MainActor private struct MoreInputSection: View {
+        let owner: SessionPanelOverlay
+        var body: some View {
+            VStack(alignment: .leading, spacing: 8) {
+                Button { owner.moreInputExpanded.toggle() } label: {
+                    HStack(spacing: 8) {
+                        Text("More input").font(.subheadline.weight(.semibold))
+                        Image(systemName: "chevron.down").rotationEffect(.degrees(owner.moreInputExpanded ? 180 : 0))
+                            .accessibilityHidden(true)
+                    }
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityValue(owner.moreInputExpanded ? "Expanded" : "Collapsed")
+                .accessibilityIdentifier("session.more-input")
+                if owner.moreInputExpanded {
+                    Toggle("Scroll inertia", isOn: Binding(get: { owner.inputSession.scrollInertiaEnabled },
+                                                           set: { owner.inputSession.setScrollInertia($0) }))
+                        .font(.subheadline).frame(minHeight: 44).disabled(!owner.inputSession.canPoint)
+                    Toggle("Reverse scroll direction", isOn: Binding(get: { owner.inputSession.reverseScrollEnabled },
+                                                                      set: { owner.inputSession.setReverseScroll($0) }))
+                        .font(.subheadline).frame(minHeight: 44).disabled(!owner.inputSession.canPoint)
+                    Text("Inertia affects finger wheel scrolling. Reverse affects wheel direction. Windows controls native one-finger touch pan.")
+                        .font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
+                        .fixedSize(horizontal: false, vertical: true)
+                    owner.actionButton("Gesture help", icon: "hand.draw") { owner.close(); owner.onGestures() }
+                    AccessiblePointerControls()
+                    RemoteMouseExtras()
+                }
+            }
+        }
+    }
+
+    @MainActor private struct ConnectionSection: View {
+        let owner: SessionPanelOverlay
+        var body: some View {
+            let state = owner.networkManager.connectionSwitchState
+            return VStack(alignment: .leading, spacing: 8) {
+                owner.sectionTitle("Connection")
+                Text(state.recommendationText).font(.footnote)
+                    .foregroundStyle(Color(ink: SessionInk.secondary))
+                ForEach([ConnectionRoute.usb, .wifi], id: \.rawValue) { route in
+                    let reason = state.disabledReason(for: route, hasWifiEndpoint: owner.networkManager.hasReconnectTarget)
+                    Button {
+                        owner.lastInteraction = Date()
+                        owner.remoteInput.suspend(reason: 1)
+                        owner.networkManager.requestConnectionRoute(route)
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: route == .usb ? "cable.connector" : "wifi").accessibilityHidden(true)
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack {
+                                    Text(route.label).font(.subheadline.weight(.semibold))
+                                    if state.snapshot?.recommended == route && !state.needsRefresh {
+                                        Text("Recommended").font(.caption)
+                                    }
+                                }
+                                if let reason { Text(reason).font(.caption).fixedSize(horizontal: false, vertical: true) }
+                            }
+                            Spacer(minLength: 4)
+                            if state.actualRoute == route {
+                                Image(systemName: "checkmark").accessibilityHidden(true)
+                            }
+                        }
+                        .foregroundStyle(Color(ink: SessionInk.text))
+                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                        .padding(.horizontal, 10).padding(.vertical, 4)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .background(Color(ink: SessionInk.raised), in: RoundedRectangle(cornerRadius: 10))
+                    .disabled(reason != nil)
+                    .opacity(reason == nil ? 1 : 0.6)
+                    .accessibilityLabel(route.label + (state.actualRoute == route ? ", Connected" : ""))
+                    .accessibilityHint(reason ?? ("Switch to " + route.label))
+                    .accessibilityAddTraits(state.actualRoute == route ? .isSelected : [])
+                }
+                HStack(spacing: 8) {
+                    if state.pending != nil { ProgressView().tint(Color(ink: SessionInk.accent)) }
+                    Text(state.message).font(.footnote).fixedSize(horizontal: false, vertical: true)
+                }
+                .foregroundStyle(Color(ink: state.offersReconnect ? SessionInk.warning : SessionInk.secondary))
+                .accessibilityElement(children: .combine)
+                if state.enabled && state.snapshot?.allowed == false && state.pending == nil && !state.offersReconnect {
+                    Button("Ask PC") {
+                        let target: ConnectionRoute = state.actualRoute == .usb ? .wifi : .usb
+                        owner.networkManager.requestConnectionRoute(target, askPC: true)
+                    }
+                    .buttonStyle(.bordered).frame(minHeight: 44)
+                    .disabled(state.phase == .permissionRequired || state.needsRefresh)
+                }
+                if state.needsRefresh && state.pending == nil && !state.offersReconnect {
+                    Button("Refresh connection status") { owner.networkManager.refreshConnectionStatus() }
+                        .buttonStyle(.bordered).frame(minHeight: 44)
+                }
+                if state.offersReconnect {
+                    Button("Reconnect over Wi-Fi") { owner.networkManager.reconnectConnectionOverWifi() }
+                        .buttonStyle(.bordered).frame(minHeight: 44)
+                        .disabled(!owner.networkManager.hasReconnectTarget)
+                }
+            }
+        }
+    }
+
+    @MainActor private struct RemoteActionsSection: View {
+        let owner: SessionPanelOverlay
+        var body: some View {
+            SessionActionLayout(accessibility: owner.typeSize.isAccessibilitySize) {
+                owner.actionButton("Ctrl+Alt+Del", icon: "lock.shield", hint: "Opens the Windows security screen") {
+                    owner.lastInteraction = Date()
+                    owner.networkManager.sendRemoteCommand(.secureAttention)
+                }
+                owner.actionButton("Lock PC", icon: "lock") {
+                    owner.lastInteraction = Date()
+                    owner.networkManager.sendRemoteCommand(.lock)
+                }
+                owner.actionButton("Restart PC", icon: "arrow.clockwise") { owner.confirmRestart = true }
+            }
+            .confirmationDialog("Restart the PC?", isPresented: owner.$confirmRestart, titleVisibility: .visible) {
+                Button("Restart", role: .destructive) { owner.networkManager.sendRemoteCommand(.restart, confirmed: true) }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Unsaved work on the PC may ask to be saved. The iPad reconnects when the PC is back.")
+            }
+        }
+    }
+
+    @MainActor private struct PanelFooter: View {
+        let owner: SessionPanelOverlay
+        let s: SessionPanelSnapshot
+        var body: some View {
+            let armed = owner.disconnectTick >= 0 && owner.disconnectArming.isArmed(at: Date())
+            let tip = Group {
+                if armed {
+                    Text("Disconnect from \(s.hostLabel)?").font(.caption).foregroundStyle(Color(ink: SessionInk.danger))
+                } else {
+                    Button { owner.close(); owner.onGestures() } label: {
+                        Label("Gestures", systemImage: "questionmark.circle")
+                            .font(.subheadline)
+                            .foregroundStyle(Color(ink: SessionInk.secondary))
+                            .frame(minHeight: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("Shows the touch and Pencil gestures")
+                }
+            }
+            let button = Button {
+                owner.lastInteraction = Date()
+                if owner.disconnectArming.tap(at: Date()) {
+                    owner.close()
+                    owner.remoteInput.suspend(reason: 1)
+                    owner.networkManager.stop()
+                } else {
+                    owner.disconnectTick += 1
+                    UIAccessibility.post(notification: .announcement,
+                                         argument: "Disconnect from \(s.hostLabel)? Activate again within 4 seconds.")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + DisconnectArming.window + 0.1) { owner.disconnectTick += 1 }
+                }
+            } label: {
+                Label(armed ? "Disconnect now" : "Disconnect", systemImage: "xmark.circle")
+                    .font(.subheadline.weight(.semibold))
+                    .fixedSize()
+                    .foregroundStyle(Color(ink: armed ? SessionInk.onDanger : SessionInk.danger))
+                    .padding(.horizontal, 12).frame(minHeight: 44)
+                    .background(armed ? Color(ink: SessionInk.dangerFill) : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Color(ink: SessionInk.dangerFill).opacity(armed ? 0 : 0.6), lineWidth: 0.5))
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint(armed ? "Ends the session with \(s.hostLabel)" : "Asks to confirm before ending the session")
+            return Group {
+                if owner.typeSize.isAccessibilitySize {
+                    VStack(alignment: .leading, spacing: 8) { tip; button }
+                } else {
+                    HStack(spacing: 10) { tip; Spacer(minLength: 8); button }
+                }
+            }
+            .padding(.top, 12)
+            .overlay(alignment: .top) { Rectangle().fill(Color(ink: SessionInk.hairline)).frame(height: 0.5) }
+        }
+    }
+
+    @MainActor private struct PanelActionButton: View {
+        let owner: SessionPanelOverlay
+        let title: String
+        let icon: String
+        let enabled: Bool
+        let hint: String?
+        let action: () -> Void
+        var body: some View {
+            Button(action: action) {
+                VStack(spacing: 6) {
+                    Image(systemName: owner.icon).accessibilityHidden(true).font(.title3).foregroundStyle(Color(ink: SessionInk.accent))
+                    Text(title).font(.footnote.weight(.medium)).fixedSize(horizontal: false, vertical: true)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, minHeight: 60)
+                .background(Color(ink: SessionInk.raised), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .opacity(enabled ? 1 : 0.45)
+            }
+            .buttonStyle(.plain)
+            .disabled(!enabled)
+            .accessibilityLabel(title)
+            .accessibilityHint(hint ?? "")
+        }
+    }
+
+    @MainActor private struct RouteAndControl: View {
+        let owner: SessionPanelOverlay
+        var body: some View {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) { owner.routeLabel; owner.controlBadge(owner.session.control, compact: true) }
+                VStack(alignment: .leading, spacing: 8) { owner.routeLabel; owner.controlBadge(owner.session.control, compact: true) }
+            }
+            .font(.footnote)
+        }
+    }
+
+    @MainActor private struct PillTitle: View {
+        let owner: SessionPanelOverlay
+        var body: some View {
+            HStack(spacing: 8) {
+                Image(systemName: owner.icon(owner.session.icon)).accessibilityHidden(true)
+                    .foregroundStyle(Color(ink: SessionInk.accent))
+                Text(owner.session.title).fontWeight(.semibold).fixedSize(horizontal: false, vertical: true)
+                Image(systemName: "chevron.down").font(.caption.weight(.bold)).accessibilityHidden(true)
+                    .rotationEffect(.degrees(owner.isOpen ? 180 : 0))
+                    .foregroundStyle(Color(ink: SessionInk.secondary))
+            }
+        }
+    }
+
+    @MainActor private struct SessionPill: View {
+        let owner: SessionPanelOverlay
+        let maxX: CGFloat
+        var body: some View {
+            let s = owner.session
+            return Button {
+                owner.isOpen ? owner.close() : owner.open()
+            } label: {
+                Group {
+                    if s.reconnecting {
+                        HStack(spacing: 8) {
+                            Image(systemName: "arrow.triangle.2.circlepath").accessibilityHidden(true)
+                            Text(s.reconnectingText).fixedSize(horizontal: false, vertical: true)
+                        }
+                    } else {
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: 8) { owner.pillTitle; owner.routeAndControl }.fixedSize(horizontal: true, vertical: false)
+                            VStack(alignment: .leading, spacing: 8) { owner.pillTitle; owner.routeAndControl }
+                        }
+                    }
+                }
+                .frame(maxWidth: max(44, min(392, maxX - 52)))
+                .font(.subheadline)
+                .foregroundStyle(Color(ink: s.reconnecting ? SessionInk.warning : SessionInk.text))
+                .padding(.horizontal, 14).padding(.vertical, 10)
+                .frame(minHeight: 44)
+                .background(Color(ink: SessionInk.surface).opacity(0.94), in: Capsule())
+                .overlay(Capsule().stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
+                .shadow(color: Color(ink: SessionInk.canvas).opacity(0.35), radius: 10, y: 4)
+                .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .gesture(owner.moveAlongTop(maxX: maxX))
+            .accessibilityLabel(owner.pillLabel(s))
+            .accessibilityValue(owner.isOpen ? "Expanded" : "Collapsed")
+            .accessibilityHint("Opens screens, keyboard, files, settings and disconnect")
+        }
+    }
+
+    @MainActor private struct SessionHandle: View {
+        let owner: SessionPanelOverlay
+        let maxX: CGFloat
+        var body: some View {
+            let s = owner.session
+            return Button { owner.open() } label: {
+                // A dark backing keeps the bar visible over a white PC title bar.
+                Capsule()
+                    .fill(Color(ink: s.control == .on ? SessionInk.positive : SessionInk.text))
+                    .frame(width: 56, height: 5)
+                    .frame(width: 66, height: 13)
+                    .background(Color(ink: SessionInk.canvas).opacity(0.72), in: Capsule())
+                    .overlay(Capsule().stroke(Color(ink: SessionInk.hairline), lineWidth: 0.5))
+                    .frame(width: 96, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .offset(y: -8)
+            .gesture(owner.moveAlongTop(maxX: maxX))
+            .accessibilityLabel(owner.pillLabel(s))
+            .accessibilityValue("Collapsed")
+            .accessibilityHint("Opens screens, keyboard, files, settings and disconnect")
+        }
+    }
+
+    #if targetEnvironment(simulator)
+    /// Eagerly exercise the otherwise collapsed input controls in the hosting regression test.
+    func expandedInputForTesting(voiceOver: Bool = false) -> Self {
+        var view = self
+        view._moreInputExpanded = State(initialValue: true)
+        view.voiceOverForTesting = voiceOver
+        return view
+    }
+    #endif
 }
 
 /// Reflows actions from three columns to two, then one at accessibility sizes.

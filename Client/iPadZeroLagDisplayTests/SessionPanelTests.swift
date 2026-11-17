@@ -5,6 +5,175 @@ import SwiftUI
 
 /// The session pill is the one visible handle for every session: what it says, and how Disconnect is confirmed.
 final class SessionPanelTests: XCTestCase {
+    func testPanelBuildersHaveBoundedMetadataComposition() throws {
+        let app = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("iPadZeroLagDisplay")
+        let files = ["SessionPanelOverlay.swift", "SessionInputBar.swift", "GestureHelp.swift",
+                     "AccessiblePointerControls.swift", "RemoteControl/RemoteMouseControls.swift",
+                     "RemoteControl/RemoteSpecialKeyBar.swift", "ContentView.swift", "SettingsView.swift",
+                     "DataTransfer/TransferCenterSheet.swift"]
+        let builder = try NSRegularExpression(pattern: #"(?:var\s+\w+\s*:\s*some View|func\s+\w+\s*\([^{}]*?\)\s*->\s*some View)\s*\{"#)
+        for file in files {
+            let text = try String(contentsOf: app.appendingPathComponent(file), encoding: .utf8)
+            XCTAssertFalse(text.contains("AnyView("), file)
+            for match in builder.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+                let range = try XCTUnwrap(Range(match.range, in: text))
+                let start = range.upperBound
+                var cursor = start, depth = 1
+                while cursor < text.endIndex && depth > 0 {
+                    if text[cursor] == "{" { depth += 1 }
+                    if text[cursor] == "}" { depth -= 1 }
+                    cursor = text.index(after: cursor)
+                }
+                let lines = text[start..<cursor].split(separator: "\n").filter {
+                    let line = $0.trimmingCharacters(in: .whitespaces)
+                    return !line.isEmpty && !line.hasPrefix("//")
+                }.count - 1 // Exclude the builder's closing brace.
+                XCTAssertLessThanOrEqual(lines, 75, "\(file): \(text[range]) - extract a concrete View")
+            }
+        }
+        let panel = try String(contentsOf: app.appendingPathComponent(files[0]), encoding: .utf8)
+        XCTAssertTrue(panel.contains("-> PanelContent"))
+        XCTAssertTrue(panel.contains("var panelSections: PanelSections"))
+        for section in ["PanelContent", "PanelSections", "ScreenSection", "ConnectionSection",
+                        "CastingControlSection", "ToolsSection", "TouchSection", "MoreInputSection",
+                        "RemoteActionsSection", "PanelHeader", "PanelFooter", "OverlaySurface"] {
+            XCTAssertTrue(panel.contains("struct \(section): View"), section)
+        }
+    }
+
+    #if targetEnvironment(simulator)
+    @MainActor func testThreeFingerPanelCallbackCanRetireInputReentrantly() {
+        var now: TimeInterval = 0
+        let input = IPadInputSession(clock: { now }, automaticallyTicks: false)
+        var events: [IPadInputEvent] = []
+        input.configure(identity: "panel", point: true, type: true, direct: true, zoom: true,
+                        reason: nil, sink: { events.append($0) })
+        input.engine.mode = .direct
+        input.engine.hardware(usage: 0xe1, down: true)
+        var opened = 0
+        input.engine.openSettings = {
+            opened += 1
+            input.releaseAll() // Same synchronous retirement as ContentView's panel onChange.
+        }
+        for id in UInt64(1)...UInt64(3) {
+            now += 0.01
+            input.engine.begin(id: id, pencil: false, point: CGPoint(x: CGFloat(id) * 20, y: 20),
+                               normalized: CGPoint(x: 0.5, y: 0.5))
+        }
+        for id in UInt64(1)...UInt64(3) {
+            now += 0.01
+            input.engine.end(id: id, point: CGPoint(x: CGFloat(id) * 20, y: 20),
+                             normalized: CGPoint(x: 0.5, y: 0.5), cancelled: false)
+        }
+        XCTAssertEqual(opened, 1)
+        XCTAssertEqual(events.filter { $0 == .key(0xe1, 1) }.count, 1)
+        XCTAssertEqual(events.filter { if case .touch(.cancel, _, _, _) = $0 { return true }; return false }.count, 1)
+        let retired = events
+        input.releaseAll()
+        XCTAssertEqual(events, retired, "Panel retirement must remain idempotent")
+    }
+
+    /// Exercise the previously unopened branch, including every eagerly built input section.
+    /// UIKit cannot be hosted on a background Thread with an artificially small stack.
+    @MainActor func testOpenPanelMetadataInHostingWindow() async throws {
+        for variant in ["extend", "mirror", "remote", "typed-extend", "typed-mirror", "unavailable"] {
+            let network = NetworkManager()
+            network.controlSendForAudioTesting = { _, done in done(nil) }
+            let peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+            defer { network.stopForTesting() }
+            network.beginTransferWriterForTesting()
+            if variant == "remote" {
+                network.beginRemoteMonitorForTesting(acceptedFeatures: 0x1f)
+            } else if variant != "unavailable" {
+                network.receiveCaptureTargetWireForTesting(type: .displayCapabilities,
+                    payload: CaptureTargetIntegrationTests.modes, flags: variant.hasPrefix("typed") ? 0x7c00 : 0x6000,
+                    generation: peer.generation, connection: peer.connection)
+                network.receiveCaptureTargetWireForTesting(type: .mirrorState,
+                    payload: try CaptureTargetIntegrationTests.mode(revision: 1, epoch: 5,
+                        physical: variant.contains("mirror"), active: variant.contains("mirror")),
+                    generation: peer.generation, connection: peer.connection)
+                if variant.hasPrefix("typed") {
+                    network.receiveCaptureTargetWireForTesting(type: .sourceCatalogue,
+                        payload: CaptureTargetIntegrationTests.catalogue(revision: 3,
+                            current: variant.contains("mirror") ? 4 : 1),
+                        generation: peer.generation, connection: peer.connection)
+                } else if variant == "mirror" {
+                    // One selected physical screen in the old monitor-catalogue format.
+                    var bytes = [UInt8](repeating: 0, count: 30)
+                    bytes[0] = 1; bytes[1] = 1; bytes[2] = 1
+                    MirrorControlCodec.put(1, &bytes, 4, 8)
+                    MirrorControlCodec.put(6, &bytes, 12, 8)
+                    MirrorControlCodec.put(6, &bytes, 20, 8)
+                    bytes[28] = 6
+                    network.receiveCaptureTargetWireForTesting(type: .mirrorCatalogue,
+                        payload: Data(bytes + Array("Screen".utf8)),
+                        generation: peer.generation, connection: peer.connection)
+                }
+            }
+            // Drain real queue publications without sleeping or starting a media/audio engine.
+            for _ in 0..<4 {
+                network.networkQueueForTesting.sync {}
+                let published = expectation(description: "panel model publication")
+                DispatchQueue.main.async { published.fulfill() }
+                await fulfillment(of: [published], timeout: 2)
+            }
+            XCTAssertEqual(network.isRemoteControlSession, variant == "remote")
+            XCTAssertEqual(network.captureTargetState.enabled, variant.hasPrefix("typed"))
+            let kind = SessionPanelKind.make(remote: network.isRemoteControlSession,
+                targets: network.captureTargetState, legacy: network.mirrorControlState,
+                catalogue: network.mirrorMonitorCatalogue)
+            let expected: SessionPanelKind = variant == "unavailable" ? .castingUnknown
+                : (variant == "remote" ? .wholePCRemote : (variant.contains("mirror") ? .castingMirror : .castingExtend))
+            XCTAssertEqual(kind, expected, variant)
+            let input = IPadInputSession(automaticallyTicks: false)
+            input.configure(identity: variant, point: variant != "unavailable", type: variant != "unavailable",
+                            direct: variant != "unavailable", zoom: true,
+                            reason: variant == "unavailable" ? "Control unavailable" : nil, sink: { _ in })
+            for size in [DynamicTypeSize.large, .accessibility5] {
+                for voiceOver in [false, true] {
+                    let panel = SessionPanelOverlay(networkManager: network, hostLabel: "PC", isOpen: .constant(true),
+                        remoteInput: RemoteSessionInputState(), tailnetTarget: false, performance: nil,
+                        onPillHeightChange: { _ in }, onFiles: {}, onSettings: {}, onGestures: {})
+                        .expandedInputForTesting(voiceOver: voiceOver)
+                        .environmentObject(input)
+                        .environment(\.dynamicTypeSize, size)
+                        .environment(\.accessibilityEnabled, voiceOver)
+                    assertHostedInWindow(panel, context: variant)
+                    assertHostedInWindow(SessionInputBar(onClose: {}, expandedSections: true)
+                        .environmentObject(input).environment(\.dynamicTypeSize, size)
+                        .environment(\.accessibilityEnabled, voiceOver), context: "input " + variant)
+                }
+            }
+        }
+    }
+
+    @MainActor private func assertHostedInWindow<V: View>(_ root: V, context: String,
+                                                        file: StaticString = #filePath, line: UInt = #line) {
+        let controller = UIHostingController(rootView: root)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 834, height: 1194))
+        window.rootViewController = controller
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        controller.view.frame = window.bounds
+        window.setNeedsLayout()
+        window.layoutIfNeeded()
+        controller.view.setNeedsLayout()
+        controller.view.layoutIfNeeded()
+        let size = controller.sizeThatFits(in: window.bounds.size)
+        XCTAssertTrue(size.width.isFinite && size.height.isFinite, context, file: file, line: line)
+        XCTAssertGreaterThan(size.height, 0, context, file: file, line: line)
+        XCTAssertTrue(controller.view.window === window, context, file: file, line: line)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let image = UIGraphicsImageRenderer(size: window.bounds.size, format: format).image { renderer in
+            window.layer.render(in: renderer.cgContext)
+        }
+        XCTAssertEqual(image.cgImage?.width, 834, context, file: file, line: line)
+        XCTAssertEqual(image.cgImage?.height, 1194, context, file: file, line: line)
+    }
+    #endif
+
     func testScreenCycleUsesCatalogueOrderAndWrapsWithoutNamesAsIdentity() {
         let entries = [ScreenPickerTile(id: 30, label: "Screen", isBuiltIn: false, status: .available),
                        ScreenPickerTile(id: 10, label: "Screen", isBuiltIn: false, status: .available),
@@ -60,8 +229,8 @@ final class SessionPanelTests: XCTestCase {
     func testSharedInputControlsAreNotGatedOnRemoteNegotiation() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         let panel = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/SessionPanelOverlay.swift"), encoding: .utf8)
-        let touch = try XCTUnwrap(panel.components(separatedBy: "private var touchSection:").last?
-            .components(separatedBy: "private var connectionPicker:").first)
+        let touch = try XCTUnwrap(panel.components(separatedBy: "struct TouchSection: View").last?
+            .components(separatedBy: "struct ConnectionSection: View").first)
         XCTAssertTrue(touch.contains("RemoteMouseControls()"))
         XCTAssertTrue(touch.contains("AccessiblePointerControls()"))
         XCTAssertTrue(touch.contains("RemoteMouseExtras()"))
@@ -114,16 +283,16 @@ final class SessionPanelTests: XCTestCase {
         let panel = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/SessionPanelOverlay.swift"), encoding: .utf8)
         XCTAssertEqual(panel.components(separatedBy: ".accessibilityIdentifier(\"session.switch-screen\")").count - 1, 1)
         XCTAssertFalse(panel.contains("tileView("))
-        let sections = try XCTUnwrap(panel.components(separatedBy: "private var panelSections:").last?
-            .components(separatedBy: "private var panelHeader:").first)
+        let sections = try XCTUnwrap(panel.components(separatedBy: "struct PanelSections: View").last?
+            .components(separatedBy: "struct PanelHeader: View").first)
         var previous = sections.startIndex
-        for name in ["screens(picker)", "connectionPicker", "castingControl", "tools", "touchSection", "remoteActions"] {
+        for name in ["screens(owner.picker)", "connectionPicker", "castingControl", "tools", "touchSection", "remoteActions"] {
             let range = try XCTUnwrap(sections.range(of: name))
             XCTAssertGreaterThanOrEqual(range.lowerBound, previous)
             previous = range.upperBound
         }
         XCTAssertTrue(panel.contains("min(420, proxy.size.width - 24)"))
-        XCTAssertTrue(panel.contains("footer(session)"))
+        XCTAssertTrue(panel.contains("footer(owner.session)"))
         XCTAssertFalse(panel.contains("minimumScaleFactor"))
     }
 
@@ -132,9 +301,9 @@ final class SessionPanelTests: XCTestCase {
         let content = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/ContentView.swift"), encoding: .utf8)
         let panel = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/SessionPanelOverlay.swift"), encoding: .utf8)
         XCTAssertTrue(content.contains("if isHudVisible && !isSessionPanelOpen"))
-        XCTAssertTrue(content.contains("performance: isHudVisible ? SessionPerformanceReadout"))
+        XCTAssertTrue(content.contains("performance: owner.isHudVisible ? SessionPerformanceReadout"))
         XCTAssertTrue(content.contains("sessionPillHeight + 24"))
-        XCTAssertTrue(panel.contains("if let performance { performance }"))
+        XCTAssertTrue(panel.contains("if let performance = owner.performance { performance }"))
         XCTAssertTrue(panel.contains("Frame receive, "))
         XCTAssertTrue(panel.contains("Video RX, "))
     }
@@ -212,7 +381,8 @@ final class SessionPanelTests: XCTestCase {
         XCTAssertFalse(readout.contains("RoundedRectangle")); XCTAssertFalse(readout.contains("Capsule"))
         XCTAssertFalse(readout.contains("Divider")); XCTAssertFalse(readout.contains("Image("))
         XCTAssertTrue(readout.contains("if contrast == .increased"))
-        let hud = try XCTUnwrap(content.components(separatedBy: "private var streamingHUD:").last)
+        let hud = try XCTUnwrap(content.components(separatedBy: "private var streamingHUD:").last?
+            .components(separatedBy: "@MainActor private struct AuthenticationOverlay").first)
         XCTAssertFalse(hud.contains(".background(")); XCTAssertFalse(hud.contains(".overlay("))
         XCTAssertTrue(hud.contains(".allowsHitTesting(false)"))
         XCTAssertTrue(hud.contains("presentationGeometry?.safeAreaInsets"))
@@ -221,9 +391,9 @@ final class SessionPanelTests: XCTestCase {
     func testKeyboardAvailabilityComesFromSharedSessionWithoutScanNegotiation() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         let panel = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/SessionPanelOverlay.swift"), encoding: .utf8)
-        let tools = try XCTUnwrap(panel.components(separatedBy: "private var tools:").last?
-            .components(separatedBy: "private var touchSection:").first)
-        XCTAssertTrue(tools.contains("let canType = inputSession.canType"))
+        let tools = try XCTUnwrap(panel.components(separatedBy: "struct ToolsSection: View").last?
+            .components(separatedBy: "struct TouchSection: View").first)
+        XCTAssertTrue(tools.contains("let canType = owner.inputSession.canType"))
         XCTAssertFalse(tools.contains("usesScanKeyboard"))
     }
 

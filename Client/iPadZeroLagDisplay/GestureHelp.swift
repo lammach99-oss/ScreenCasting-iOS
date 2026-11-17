@@ -160,16 +160,52 @@ enum GestureGuideContent {
         .onAppear { UIAccessibility.post(notification: .screenChanged, argument: nil) }
     }
 
-    private var card: some View {
-        VStack(alignment: .leading, spacing: 14) {
+    private var card: GuideCard {
+        GuideCard(owner: self)
+    }
+
+    private var footer: GuideFooter {
+        GuideFooter(owner: self)
+    }
+
+    // Nominal view types bound metadata expansion across independently rendered sections.
+    @MainActor private struct GuideCard: View {
+        let owner: GestureGuideCard
+        var body: some View {
+            VStack(alignment: .leading, spacing: 14) {
+                GuideHeading(owner: owner)
+                GuideGestures(owner: owner)
+                GuidePencil(owner: owner)
+                owner.footer
+            }
+            .foregroundStyle(Color(uiColor: SessionInk.text))
+            .padding(20)
+            .background(Color(uiColor: SessionInk.surface), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(Color(uiColor: SessionInk.hairline), lineWidth: 0.5))
+            .shadow(color: Color(uiColor: SessionInk.canvas).opacity(0.45), radius: 24, y: 12)
+            .accessibilityElement(children: .contain)
+            .accessibilityAddTraits(.isModal)
+            .accessibilityAction(.escape) { owner.onDone() }
+        }
+    }
+
+    @MainActor private struct GuideHeading: View {
+        let owner: GestureGuideCard
+        var body: some View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Control your PC by touch").font(.title3.weight(.semibold))
                     .accessibilityAddTraits(.isHeader)
-                Text(GestureGuideContent.helper(for: currentMode))
+                Text(GestureGuideContent.helper(for: owner.currentMode))
                     .font(.subheadline).foregroundStyle(Color(uiColor: SessionInk.secondary))
             }
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? 220 : 140), spacing: 8)], spacing: 8) {
-                ForEach(gestures, id: \.gesture) { item in
+        }
+    }
+
+    @MainActor private struct GuideGestures: View {
+        let owner: GestureGuideCard
+        var body: some View {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: owner.typeSize.isAccessibilitySize ? 220 : 140), spacing: 8)], spacing: 8) {
+                ForEach(owner.gestures, id: \.gesture) { item in
                     VStack(alignment: .leading, spacing: 4) {
                         Image(systemName: item.symbol).font(.title2).foregroundStyle(Color(uiColor: SessionInk.accent))
                             .accessibilityHidden(true)
@@ -182,12 +218,18 @@ enum GestureGuideContent {
                     .accessibilityElement(children: .combine)
                 }
             }
+        }
+    }
+
+    @MainActor private struct GuidePencil: View {
+        let owner: GestureGuideCard
+        var body: some View {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: "applepencil").font(.title3).foregroundStyle(Color(uiColor: SessionInk.accent))
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Apple Pencil").font(.subheadline.weight(.semibold))
-                    Text(GestureGuideContent.pencil(for: currentMode))
+                    Text(GestureGuideContent.pencil(for: owner.currentMode))
                         .font(.caption).foregroundStyle(Color(uiColor: SessionInk.secondary))
                 }
             }
@@ -195,35 +237,29 @@ enum GestureGuideContent {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color(uiColor: SessionInk.raised), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             .accessibilityElement(children: .combine)
-            footer
         }
-        .foregroundStyle(Color(uiColor: SessionInk.text))
-        .padding(20)
-        .background(Color(uiColor: SessionInk.surface), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(Color(uiColor: SessionInk.hairline), lineWidth: 0.5))
-        .shadow(color: Color(uiColor: SessionInk.canvas).opacity(0.45), radius: 24, y: 12)
-        .accessibilityElement(children: .contain)
-        .accessibilityAddTraits(.isModal)
-        .accessibilityAction(.escape) { onDone() }
     }
 
-    private var footer: some View {
-        let hint = Text("Find this again: session panel > Touch > More input > Gesture help")
-            .font(.caption).foregroundStyle(Color(uiColor: SessionInk.secondary))
-        let done = Button(action: onDone) {
-            Text("Got it")
-                .font(.headline)
-                .foregroundStyle(Color(uiColor: SessionInk.onAccent))
-                .padding(.horizontal, 22)
-                .frame(minHeight: 44)
-                .background(Color(uiColor: SessionInk.accent), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        return Group {
-            if typeSize.isAccessibilitySize {
-                VStack(alignment: .leading, spacing: 10) { hint; done }
-            } else {
-                HStack { hint; Spacer(minLength: 8); done }
+    @MainActor private struct GuideFooter: View {
+        let owner: GestureGuideCard
+        var body: some View {
+            let hint = Text("Find this again: session panel > Touch > More input > Gesture help")
+                .font(.caption).foregroundStyle(Color(uiColor: SessionInk.secondary))
+            let done = Button(action: owner.onDone) {
+                Text("Got it")
+                    .font(.headline)
+                    .foregroundStyle(Color(uiColor: SessionInk.onAccent))
+                    .padding(.horizontal, 22)
+                    .frame(minHeight: 44)
+                    .background(Color(uiColor: SessionInk.accent), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            return Group {
+                if owner.typeSize.isAccessibilitySize {
+                    VStack(alignment: .leading, spacing: 10) { hint; done }
+                } else {
+                    HStack { hint; Spacer(minLength: 8); done }
+                }
             }
         }
     }

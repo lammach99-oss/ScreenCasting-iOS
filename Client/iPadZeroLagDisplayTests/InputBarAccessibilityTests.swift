@@ -88,7 +88,8 @@ final class InputBarAccessibilityTests: XCTestCase {
     func testLatchChipLivesOutsidePanelAndBarVisibilityConditions() throws {
         let source = try clientSource("SessionPanelOverlay.swift")
         let overlay = try XCTUnwrap(source.components(separatedBy: ".overlay(alignment: .bottom)").last?
-            .components(separatedBy: ".environment(\\.colorScheme").first)
+            .components(separatedBy: "struct PanelContent: View").first)
+            .replacingOccurrences(of: "owner.", with: "")
         XCTAssertTrue(overlay.contains("SessionDraggingChip()"))
         XCTAssertFalse(overlay.contains("if isOpen"))
         XCTAssertLessThan(try XCTUnwrap(overlay.range(of: "SessionDraggingChip()")?.lowerBound),

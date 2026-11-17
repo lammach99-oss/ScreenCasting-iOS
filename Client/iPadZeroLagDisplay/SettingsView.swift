@@ -7,7 +7,7 @@ import SwiftUI
 /// ## State Ownership
 ///   Client intent and Host effective state are distinct published values in
 ///   `NetworkManager`; Host reports never move these controls.
-public struct SettingsView: View {
+@MainActor public struct SettingsView: View {
 
     // MARK: Dependencies
     @ObservedObject var networkManager: NetworkManager
@@ -122,182 +122,20 @@ public struct SettingsView: View {
 
     // MARK: - Sections
 
-    private var displaySection: some View {
-        Section {
-            if networkManager.displayCapabilities != nil {
-                // Only a user's pick sends a request; drafts synced from the PC never do.
-                Picker("Orientation", selection: Binding(
-                    get: { draftOrientationMode },
-                    set: { mode in
-                        draftOrientationMode = mode
-                        if mode != currentOrientationMode { applyDisplaySettings() }
-                    })) {
-                    ForEach(DisplayOrientationMode.allCases, id: \.self) { mode in
-                        Text(mode.title).tag(mode)
-                    }
-                }
-                .pickerStyle(.menu)
-                .disabled(networkManager.isDisplayConfigurationPending)
-                if networkManager.isDisplayConfigurationPending {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                        Text("Applying…").foregroundStyle(secondary)
-                    }
-                    .accessibilityElement(children: .combine)
-                } else if let effective = networkManager.effectiveDisplayState {
-                    Text(SettingsCopy.nowShowing(width: effective.width, height: effective.height,
-                                                 refreshHz: effective.refreshHz,
-                                                 portrait: effective.orientation == .portrait))
-                        .font(.footnote)
-                        .foregroundStyle(secondary)
-                }
-                if let failure = networkManager.displayConfigurationFailureMessage {
-                    Label(failure, systemImage: "exclamationmark.triangle")
-                        .font(.footnote)
-                        .foregroundStyle(Color(uiColor: SessionInk.warning))
-                }
-            } else {
-                Text("Connect to your PC to change the display.")
-                    .foregroundStyle(secondary)
-            }
-            Toggle("Game mode", isOn: $gameModeEnabled).tint(switchTint)
-            Toggle("Show frame rate on screen", isOn: $showPerformanceHUD).tint(switchTint)
-        } header: {
-            Text("Display")
-        } footer: {
-            Text("Game mode streams up to 120 frames a second for fast motion. Off keeps a steady 60.")
-        }
-        .listRowBackground(rowBackground)
+    private var displaySection: DisplaySection {
+        DisplaySection(owner: self)
     }
 
-    private var streamSection: some View {
-        Section {
-            Toggle("Automatic bitrate", isOn: Binding(
-                get: { draftAdaptiveBitrateEnabled },
-                set: { value in
-                    draftAdaptiveBitrateEnabled = value
-                    saveDesiredSettings()
-                }))
-                .tint(switchTint)
-            if !draftAdaptiveBitrateEnabled {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Text("Bitrate")
-                        Spacer()
-                        Text(String(format: "%.0f Mbps", draftBitrate))
-                            .monospacedDigit()
-                            .foregroundStyle(secondary)
-                    }
-                    .accessibilityHidden(true) // The slider below reads the same label and value.
-                    // Client desired bitrate is authoritative; Host reports the effective value.
-                    Slider(value: $draftBitrate, in: 3...100, step: 1) {
-                        Text("Bitrate")
-                    } minimumValueLabel: {
-                        Text("3").font(.caption).foregroundStyle(secondary).accessibilityHidden(true)
-                    } maximumValueLabel: {
-                        Text("100").font(.caption).foregroundStyle(secondary).accessibilityHidden(true)
-                    } onEditingChanged: { editing in
-                        if !editing { saveDesiredSettings() }
-                    }
-                    .accessibilityValue(String(format: "%.0f megabits per second", draftBitrate))
-                }
-            }
-            Toggle("Sound from the PC", isOn: Binding(
-                get: { draftAudioEnabled },
-                set: { value in
-                    draftAudioEnabled = value
-                    saveDesiredSettings()
-                }))
-                .tint(switchTint)
-        } header: {
-            Text("Stream quality")
-        } footer: {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(SettingsCopy.pcUsing(adaptive: networkManager.isAdaptiveBitrate,
-                                          mbps: networkManager.effectiveBitrateMbps,
-                                          audio: networkManager.effectiveAudioEnabled))
-                if !networkManager.settingsApplyStatus.isEmpty {
-                    Text(networkManager.settingsApplyStatus)
-                }
-            }
-        }
-        .listRowBackground(rowBackground)
+    private var streamSection: StreamSection {
+        StreamSection(owner: self)
     }
 
-    private var connectionSection: some View {
-        Section {
-            Button(role: .destructive) {
-                showDisconnectConfirmation = true
-            } label: {
-                Label("Disconnect", systemImage: "xmark.circle")
-            }
-            .confirmationDialog("Disconnect from your PC?", isPresented: $showDisconnectConfirmation,
-                                titleVisibility: .visible) {
-                Button("Disconnect", role: .destructive) {
-                    networkManager.stop()
-                    dismiss()
-                }
-                Button("Cancel", role: .cancel) {}
-            }
-            Button(role: .destructive) {
-                showForgetConfirmation = true
-            } label: {
-                Label("Forget this PC", systemImage: "trash")
-            }
-            .confirmationDialog("Forget this PC?", isPresented: $showForgetConfirmation,
-                                titleVisibility: .visible) {
-                Button("Forget PC", role: .destructive) {
-                    networkManager.forgetTrustedHost()
-                    dismiss()
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("Next time you connect, you'll enter the PC's PIN again.")
-            }
-        } header: {
-            Text("Connection")
-        } footer: {
-            Text("Forget this PC to pair again with a new PIN.")
-        }
-        .listRowBackground(rowBackground)
+    private var connectionSection: ConnectionSection {
+        ConnectionSection(owner: self)
     }
 
-    private var advancedSection: some View {
-        Section {
-            DisclosureGroup("Advanced", isExpanded: $showAdvanced) {
-                latencyRow("Frame receive", networkManager.lastFrameReceiveDurationMs)
-                latencyRow("Decode", networkManager.lastDecodeLatencyMs)
-                LabeledContent("Bitrate in use",
-                               value: String(format: "%.0f Mbps", networkManager.effectiveBitrateMbps))
-                LabeledContent("Video received",
-                               value: String(format: "%.1f Mbps", networkManager.hudTelemetry.videoRxMbps))
-                Toggle("Debug logging", isOn: $clientDebugLoggingEnabled).tint(switchTint)
-                Text("Writes detailed logs for troubleshooting. Leave it off day to day.")
-                    .font(.footnote)
-                    .foregroundStyle(secondary)
-                Button(role: .destructive) {
-                    showDeleteLogsConfirmation = true
-                } label: {
-                    Text(isDeletingClientLogs ? "Deleting logs…" : "Delete logs")
-                }
-                .disabled(isDeletingClientLogs)
-                .confirmationDialog("Delete the iPad's logs?", isPresented: $showDeleteLogsConfirmation,
-                                    titleVisibility: .visible) {
-                    Button("Delete logs", role: .destructive) {
-                        deleteClientLogs()
-                    }
-                    Button("Cancel", role: .cancel) {}
-                } message: {
-                    Text("Deletes saved diagnostic and telemetry logs. If debug logging is on, the current log is kept.")
-                }
-                if let clientLogDeletionMessage {
-                    Text(clientLogDeletionMessage)
-                        .font(.footnote)
-                        .foregroundStyle(secondary)
-                }
-            }
-        }
-        .listRowBackground(rowBackground)
+    private var advancedSection: AdvancedSection {
+        AdvancedSection(owner: self)
     }
 
     /// A timing in words and colour together, so the colour never carries the meaning alone.
@@ -361,6 +199,197 @@ public struct SettingsView: View {
                 clientLogDeletionMessage =
                     "Couldn't delete the logs: \(error.localizedDescription)"
             }
+        }
+    }
+
+    // Nominal view types bound metadata expansion across independently rendered sections.
+    @MainActor private struct DisplaySection: View {
+        let owner: SettingsView
+        var body: some View {
+            Section {
+                if owner.networkManager.displayCapabilities != nil {
+                    // Only a user's pick sends a request; drafts synced from the PC never do.
+                    Picker("Orientation", selection: Binding(
+                        get: { owner.draftOrientationMode },
+                        set: { mode in
+                            owner.draftOrientationMode = mode
+                            if mode != owner.currentOrientationMode { owner.applyDisplaySettings() }
+                        })) {
+                        ForEach(DisplayOrientationMode.allCases, id: \.self) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .disabled(owner.networkManager.isDisplayConfigurationPending)
+                    if owner.networkManager.isDisplayConfigurationPending {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                            Text("Applying…").foregroundStyle(owner.secondary)
+                        }
+                        .accessibilityElement(children: .combine)
+                    } else if let effective = owner.networkManager.effectiveDisplayState {
+                        Text(SettingsCopy.nowShowing(width: effective.width, height: effective.height,
+                                                     refreshHz: effective.refreshHz,
+                                                     portrait: effective.orientation == .portrait))
+                            .font(.footnote)
+                            .foregroundStyle(owner.secondary)
+                    }
+                    if let failure = owner.networkManager.displayConfigurationFailureMessage {
+                        Label(failure, systemImage: "exclamationmark.triangle")
+                            .font(.footnote)
+                            .foregroundStyle(Color(uiColor: SessionInk.warning))
+                    }
+                } else {
+                    Text("Connect to your PC to change the display.")
+                        .foregroundStyle(owner.secondary)
+                }
+                Toggle("Game mode", isOn: owner.$gameModeEnabled).tint(owner.switchTint)
+                Toggle("Show frame rate on screen", isOn: owner.$showPerformanceHUD).tint(owner.switchTint)
+            } header: {
+                Text("Display")
+            } footer: {
+                Text("Game mode streams up to 120 frames a second for fast motion. Off keeps a steady 60.")
+            }
+            .listRowBackground(owner.rowBackground)
+        }
+    }
+
+    @MainActor private struct StreamSection: View {
+        let owner: SettingsView
+        var body: some View {
+            Section {
+                Toggle("Automatic bitrate", isOn: Binding(
+                    get: { owner.draftAdaptiveBitrateEnabled },
+                    set: { value in
+                        owner.draftAdaptiveBitrateEnabled = value
+                        owner.saveDesiredSettings()
+                    }))
+                    .tint(owner.switchTint)
+                if !owner.draftAdaptiveBitrateEnabled {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("Bitrate")
+                            Spacer()
+                            Text(String(format: "%.0f Mbps", owner.draftBitrate))
+                                .monospacedDigit()
+                                .foregroundStyle(owner.secondary)
+                        }
+                        .accessibilityHidden(true) // The slider below reads the same label and value.
+                        // Client desired bitrate is authoritative; Host reports the effective value.
+                        Slider(value: owner.$draftBitrate, in: 3...100, step: 1) {
+                            Text("Bitrate")
+                        } minimumValueLabel: {
+                            Text("3").font(.caption).foregroundStyle(owner.secondary).accessibilityHidden(true)
+                        } maximumValueLabel: {
+                            Text("100").font(.caption).foregroundStyle(owner.secondary).accessibilityHidden(true)
+                        } onEditingChanged: { editing in
+                            if !editing { owner.saveDesiredSettings() }
+                        }
+                        .accessibilityValue(String(format: "%.0f megabits per second", owner.draftBitrate))
+                    }
+                }
+                Toggle("Sound from the PC", isOn: Binding(
+                    get: { owner.draftAudioEnabled },
+                    set: { value in
+                        owner.draftAudioEnabled = value
+                        owner.saveDesiredSettings()
+                    }))
+                    .tint(owner.switchTint)
+            } header: {
+                Text("Stream quality")
+            } footer: {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(SettingsCopy.pcUsing(adaptive: owner.networkManager.isAdaptiveBitrate,
+                                              mbps: owner.networkManager.effectiveBitrateMbps,
+                                              audio: owner.networkManager.effectiveAudioEnabled))
+                    if !owner.networkManager.settingsApplyStatus.isEmpty {
+                        Text(owner.networkManager.settingsApplyStatus)
+                    }
+                }
+            }
+            .listRowBackground(owner.rowBackground)
+        }
+    }
+
+    @MainActor private struct ConnectionSection: View {
+        let owner: SettingsView
+        var body: some View {
+            Section {
+                Button(role: .destructive) {
+                    owner.showDisconnectConfirmation = true
+                } label: {
+                    Label("Disconnect", systemImage: "xmark.circle")
+                }
+                .confirmationDialog("Disconnect from your PC?", isPresented: owner.$showDisconnectConfirmation,
+                                    titleVisibility: .visible) {
+                    Button("Disconnect", role: .destructive) {
+                        owner.networkManager.stop()
+                        owner.dismiss()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                }
+                Button(role: .destructive) {
+                    owner.showForgetConfirmation = true
+                } label: {
+                    Label("Forget this PC", systemImage: "trash")
+                }
+                .confirmationDialog("Forget this PC?", isPresented: owner.$showForgetConfirmation,
+                                    titleVisibility: .visible) {
+                    Button("Forget PC", role: .destructive) {
+                        owner.networkManager.forgetTrustedHost()
+                        owner.dismiss()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("Next time you connect, you'll enter the PC's PIN again.")
+                }
+            } header: {
+                Text("Connection")
+            } footer: {
+                Text("Forget this PC to pair again with a new PIN.")
+            }
+            .listRowBackground(owner.rowBackground)
+        }
+    }
+
+    @MainActor private struct AdvancedSection: View {
+        let owner: SettingsView
+        var body: some View {
+            Section {
+                DisclosureGroup("Advanced", isExpanded: owner.$showAdvanced) {
+                    owner.latencyRow("Frame receive", owner.networkManager.lastFrameReceiveDurationMs)
+                    owner.latencyRow("Decode", owner.networkManager.lastDecodeLatencyMs)
+                    LabeledContent("Bitrate in use",
+                                   value: String(format: "%.0f Mbps", owner.networkManager.effectiveBitrateMbps))
+                    LabeledContent("Video received",
+                                   value: String(format: "%.1f Mbps", owner.networkManager.hudTelemetry.videoRxMbps))
+                    Toggle("Debug logging", isOn: owner.$clientDebugLoggingEnabled).tint(owner.switchTint)
+                    Text("Writes detailed logs for troubleshooting. Leave it off day to day.")
+                        .font(.footnote)
+                        .foregroundStyle(owner.secondary)
+                    Button(role: .destructive) {
+                        owner.showDeleteLogsConfirmation = true
+                    } label: {
+                        Text(owner.isDeletingClientLogs ? "Deleting logs…" : "Delete logs")
+                    }
+                    .disabled(owner.isDeletingClientLogs)
+                    .confirmationDialog("Delete the iPad's logs?", isPresented: owner.$showDeleteLogsConfirmation,
+                                        titleVisibility: .visible) {
+                        Button("Delete logs", role: .destructive) {
+                            owner.deleteClientLogs()
+                        }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text("Deletes saved diagnostic and telemetry logs. If debug logging is on, the current log is kept.")
+                    }
+                    if let clientLogDeletionMessage = owner.clientLogDeletionMessage {
+                        Text(clientLogDeletionMessage)
+                            .font(.footnote)
+                            .foregroundStyle(owner.secondary)
+                    }
+                }
+            }
+            .listRowBackground(owner.rowBackground)
         }
     }
 }

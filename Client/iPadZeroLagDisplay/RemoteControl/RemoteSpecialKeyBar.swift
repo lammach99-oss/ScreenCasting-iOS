@@ -33,6 +33,11 @@ struct SessionSpecialKey: Identifiable {
     @State private var expanded = false
     @State private var functionsExpanded = false
 
+    init(expanded: Bool = false, functionsExpanded: Bool = false) {
+        _expanded = State(initialValue: expanded)
+        _functionsExpanded = State(initialValue: functionsExpanded)
+    }
+
     private var columns: [GridItem] {
         [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? 180 : 100), spacing: 8)]
     }
@@ -40,13 +45,9 @@ struct SessionSpecialKey: Identifiable {
     var body: some View {
         DisclosureGroup(isExpanded: $expanded) {
             VStack(alignment: .leading, spacing: 8) {
-                LazyVGrid(columns: columns, spacing: 8) {
-                    ForEach(SessionSpecialKey.standard) { key in keyButton(key) }
-                }
+                SpecialKeyGrid(keys: SessionSpecialKey.standard, columns: columns)
                 DisclosureGroup(isExpanded: $functionsExpanded) {
-                    LazyVGrid(columns: columns, spacing: 8) {
-                        ForEach(SessionSpecialKey.functions) { key in keyButton(key) }
-                    }
+                    SpecialKeyGrid(keys: SessionSpecialKey.functions, columns: columns)
                 } label: {
                     Text("F1-F12").font(.subheadline).frame(minHeight: 44)
                 }
@@ -58,7 +59,22 @@ struct SessionSpecialKey: Identifiable {
         .foregroundStyle(Color(uiColor: SessionInk.text))
     }
 
-    private func keyButton(_ key: SessionSpecialKey) -> some View {
+}
+
+@MainActor private struct SpecialKeyGrid: View {
+    let keys: [SessionSpecialKey]
+    let columns: [GridItem]
+    var body: some View {
+        LazyVGrid(columns: columns, spacing: 8) {
+            ForEach(keys) { key in SpecialKeyButton(key: key) }
+        }
+    }
+}
+
+@MainActor private struct SpecialKeyButton: View {
+    @EnvironmentObject private var inputSession: IPadInputSession
+    let key: SessionSpecialKey
+    var body: some View {
         Button {
             guard inputSession.canType else { return }
             inputSession.tapKey(hidUsage: key.usage)

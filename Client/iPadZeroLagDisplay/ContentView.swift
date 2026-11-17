@@ -45,7 +45,7 @@ private extension Color {
     static let inkOnAccent = Color(uiColor: SessionInk.onAccent)
 }
 
-struct PINEntryView: View {
+@MainActor struct PINEntryView: View {
     @Binding var pin: String
     let authFailed: Bool
     let failureReason: String
@@ -62,39 +62,9 @@ struct PINEntryView: View {
                 .onTapGesture { } // Consume taps to block dismissal
 
             VStack(spacing: 24) {
-                VStack(spacing: 8) {
-                    Image(systemName: "lock.shield")
-                        .font(.system(size: 40))
-                        .foregroundStyle(Color.inkText)
-                        .accessibilityHidden(true)
-                    Text("Enter pairing PIN")
-                        .font(.title2.weight(.semibold))
-                        .foregroundStyle(Color.inkText)
-                    Text("Type the 4-digit PIN shown on your Windows PC.")
-                        .font(.subheadline)
-                        .multilineTextAlignment(.center)
-                        .foregroundStyle(Color.inkSecondary)
-                }
+                PINHeading(owner: self)
 
-                HStack(spacing: 20) {
-                    ForEach(0..<4, id: \.self) { index in
-                        ZStack {
-                            Circle()
-                                .stroke(index < pin.count ? Color.inkAccent : Color.inkHairline, lineWidth: 2)
-                                .frame(width: 22, height: 22)
-                            if index < pin.count {
-                                Circle()
-                                    .fill(Color.inkAccent)
-                                    .frame(width: 12, height: 12)
-                                    .transition(.scale.combined(with: .opacity))
-                            }
-                        }
-                        .animation(.spring(response: 0.2, dampingFraction: 0.7), value: pin.count)
-                    }
-                }
-                .modifier(ShakeEffect(animatableData: shakeAttempts))
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("\(pin.count) of 4 digits entered")
+                PINProgress(owner: self)
 
                 // Invisible SecureField capturing keyboard input
                 SecureField("", text: $pin)
@@ -128,25 +98,7 @@ struct PINEntryView: View {
                         .transition(.opacity.combined(with: .scale(scale: 0.95)))
                 }
 
-                VStack(spacing: 8) {
-                    Button(action: onSubmit) {
-                        Text("Confirm PIN")
-                            .font(.headline)
-                            .foregroundStyle(pin.count == 4 ? Color.inkOnAccent : Color.inkSecondary)
-                            .frame(maxWidth: .infinity, minHeight: 50)
-                            .background(pin.count == 4 ? Color.inkAccent : Color.inkRaised,
-                                        in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    }
-                    .disabled(pin.count != 4)
-                    .animation(.easeInOut(duration: 0.2), value: pin.count)
-
-                    Button(action: onCancel) {
-                        Text("Cancel")
-                            .font(.subheadline)
-                            .foregroundStyle(Color.inkSecondary)
-                            .frame(maxWidth: .infinity, minHeight: 44)
-                    }
-                }
+                PINActions(owner: self)
             }
             .padding(28)
             .frame(maxWidth: 360)
@@ -173,6 +125,75 @@ struct PINEntryView: View {
             }
         }
     }
+    @MainActor private struct PINHeading: View {
+        let owner: PINEntryView
+        var body: some View {
+            VStack(spacing: 8) {
+                Image(systemName: "lock.shield")
+                    .font(.system(size: 40))
+                    .foregroundStyle(Color.inkText)
+                    .accessibilityHidden(true)
+                Text("Enter pairing PIN")
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(Color.inkText)
+                Text("Type the 4-digit PIN shown on your Windows PC.")
+                    .font(.subheadline)
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(Color.inkSecondary)
+            }
+        }
+    }
+
+    @MainActor private struct PINProgress: View {
+        let owner: PINEntryView
+        var body: some View {
+            HStack(spacing: 20) {
+                ForEach(0..<4, id: \.self) { index in
+                    ZStack {
+                        Circle()
+                            .stroke(index < owner.pin.count ? Color.inkAccent : Color.inkHairline, lineWidth: 2)
+                            .frame(width: 22, height: 22)
+                        if index < owner.pin.count {
+                            Circle()
+                                .fill(Color.inkAccent)
+                                .frame(width: 12, height: 12)
+                                .transition(.scale.combined(with: .opacity))
+                        }
+                    }
+                    .animation(.spring(response: 0.2, dampingFraction: 0.7), value: owner.pin.count)
+                }
+            }
+            .modifier(ShakeEffect(animatableData: owner.shakeAttempts))
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(owner.pin.count) of 4 digits entered")
+        }
+    }
+
+    @MainActor private struct PINActions: View {
+        let owner: PINEntryView
+        var body: some View {
+            VStack(spacing: 8) {
+                Button(action: owner.onSubmit) {
+                    Text("Confirm PIN")
+                        .font(.headline)
+                        .foregroundStyle(owner.pin.count == 4 ? Color.inkOnAccent : Color.inkSecondary)
+                        .frame(maxWidth: .infinity, minHeight: 50)
+                        .background(owner.pin.count == 4 ? Color.inkAccent : Color.inkRaised,
+                                    in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+                .disabled(owner.pin.count != 4)
+                .animation(.easeInOut(duration: 0.2), value: owner.pin.count)
+
+                Button(action: owner.onCancel) {
+                    Text("Cancel")
+                        .font(.subheadline)
+                        .foregroundStyle(Color.inkSecondary)
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                }
+            }
+        }
+    }
+
 }
 
 // MARK: - Wi-Fi Host Identity Confirmation
@@ -241,7 +262,7 @@ struct HostIdentityConfirmationView: View {
 
 // MARK: - ContentView
 
-public struct ContentView: View {
+@MainActor public struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     private static let geometryLogger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "com.iPadZeroLagDisplay.client",
@@ -311,68 +332,13 @@ public struct ContentView: View {
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .background {
-            GeometryReader { proxy in
-                Color.clear
-                    .onAppear {
-                        updateDisplayOrientation(for: proxy.size)
-                    }
-                    .onChange(of: proxy.size) { _, size in
-                        updateDisplayOrientation(for: size)
-                    }
-            }
+            RootGeometryObserver(owner: self)
         }
-        .onAppear {
-            remoteInput.bind(networkManager)
-            remoteInput.configure(remoteInputConfiguration)
-            recentRemoteHosts = RecentRemoteHostStore.load()
-            UIApplication.shared.isIdleTimerDisabled = true
-            setWifiBrowsing(true)
-            networkManager.setDesiredPipelineMode(
-                gameModeEnabled ? .game : .office)
-            networkManager.applicationDidBecomeActive()
-        }
-        .onChange(of: gameModeEnabled) { _, enabled in
-            networkManager.setDesiredPipelineMode(
-                enabled ? .game : .office)
-        }
-        .onChange(of: isSessionPanelOpen) { _, _ in inputSession.releaseAll() }
-        .onDisappear {
-            inputSession.releaseAll()
-            UIApplication.shared.isIdleTimerDisabled = false
-            setWifiBrowsing(false)
-        }
+        .modifier(SessionLifecycle(owner: self))
         .animation(.easeInOut(duration: 0.3), value: streamManager.isConnected)
         // PIN entry overlay: shown when awaiting PIN or after auth failure
         .overlay {
-            if isHostIdentityPhase {
-                HostIdentityConfirmationView(
-                    identityCode: networkManager.hostIdentityCode ?? "Unavailable",
-                    onConfirm: {
-                        networkManager.confirmHostIdentity()
-                    },
-                    onCancel: {
-                        enteredPIN = ""
-                        networkManager.stop()
-                    }
-                )
-                .transition(.opacity.combined(with: .scale(scale: 0.96)))
-                .zIndex(10)
-            } else if isPINPhase {
-                PINEntryView(
-                    pin: $enteredPIN,
-                    authFailed: isAuthFailed,
-                    failureReason: authFailureReason,
-                    onSubmit: {
-                        networkManager.sendAuthPIN(enteredPIN)
-                    },
-                    onCancel: {
-                        enteredPIN = ""
-                        networkManager.stop()
-                    }
-                )
-                .transition(.opacity.combined(with: .scale(scale: 0.96)))
-                .zIndex(10)
-            }
+            AuthenticationOverlay(owner: self)
         }
         .animation(.spring(response: 0.35, dampingFraction: 0.85), value: isPINPhase)
         .onChange(of: networkManager.connectionState) { _, newState in
@@ -486,77 +452,8 @@ public struct ContentView: View {
     }
 
     @ViewBuilder
-    private var connectedVideoSurface: some View {
-        GeometryReader { proxy in
-            let frame = FullscreenSurfaceLayout.edgeToEdgeFrame(
-                proposedBounds: proxy.frame(in: .local),
-                safeAreaInsets: proxy.safeAreaInsets)
-
-            ConnectedPresentationSurface(
-                networkManager: networkManager,
-                gameModeEnabled: gameModeEnabled,
-                remoteKeyboardActive: streamManager.isConnected && scenePhase == .active && !isSheetPresented && !showGestureGuide,
-                onKeyboardInput: { command in
-                    networkManager.sendKeyboardInput(command)
-                },
-                onTextCommit: { text in
-                    networkManager.sendTextCommit(text)
-                },
-                onFrameRendered: {
-                    streamManager.registerFrameRendered()
-                },
-                onContentViewportChanged: { viewport in
-                    renderedContentViewport = viewport
-                },
-                onGeometrySnapshotChanged: { snapshot in
-                    rendererGeometrySnapshot = snapshot
-                    if let presentationGeometry {
-                        emitGeometrySnapshot(snapshot, presentationGeometry)
-                    }
-                },
-                onPresentationGeometryChanged: { geometry in
-                    presentationGeometry = geometry
-                    if let rendererGeometrySnapshot {
-                        emitGeometrySnapshot(rendererGeometrySnapshot, geometry)
-                    }
-                },
-                onTouchBoundsChanged: { _ in },
-                onPencilInput: { _ in },
-                onSendTouchEvent: { type, x, y, pressure in
-                    networkManager.sendTouchEvent(
-                        type: type,
-                        x: x,
-                        y: y,
-                        pressure: pressure)
-                },
-                onDirectTouchContact: { command in
-                    networkManager.sendDirectTouchContact(command)
-                },
-                onPointerInput: { command in
-                    networkManager.sendPointerInput(command)
-                },
-                onOpenSettings: {
-                    // The 3-finger tap opens the session panel; Settings is one tap inside it.
-                    isSessionPanelOpen = true
-                })
-                .remoteSessionInput(remoteInput)
-                .iPadInputSession(inputSession)
-                .gestureHints { hint in showGestureToast(hint) }
-                .frame(width: frame.width, height: frame.height)
-                .offset(x: frame.minX, y: frame.minY)
-                .allowsHitTesting(true)
-                .ignoresSafeArea(.keyboard)
-                // This container has the committed drawable size. Publish
-                // it as an orientation source so capabilities-first startup
-                // cannot miss the initial portrait request.
-                .onAppear {
-                    updateDisplayOrientation(for: proxy.size)
-                }
-                .onChange(of: proxy.size) { _, size in
-                    updateDisplayOrientation(for: size)
-                }
-        }
-        .ignoresSafeArea(.container, edges: .all)
+    private var connectedVideoSurface: ConnectedVideoSurface {
+        ConnectedVideoSurface(owner: self)
     }
 
     /// Touches reach the PC: an extended display, or a mirrored screen under granted control.
@@ -622,52 +519,8 @@ public struct ContentView: View {
     }
 
     @ViewBuilder
-    private var foregroundLayer: some View {
-        if streamManager.isConnected {
-            ZStack {
-                streamingHUD
-                VStack {
-                    CaptureAvailabilityNotice(message: networkManager.captureAvailabilityNotice)
-                        .padding(.top, sessionPillHeight + (isHudVisible && !isSessionPanelOpen ? 48 : 24))
-                        .padding(.horizontal, 24)
-                    Spacer()
-                }
-                .allowsHitTesting(false)
-                SessionPanelOverlay(
-                    networkManager: networkManager,
-                    hostLabel: SessionPanelSnapshot.sessionHost(current: lastHostLabel, lastWifi: lastWifiHostLabel,
-                                                                usb: usbChosen),
-                    isOpen: $isSessionPanelOpen,
-                    remoteInput: remoteInput,
-                    tailnetTarget: RemoteHostAddress.parse(hostIP.isEmpty ? lastWifiHostLabel : hostIP)?.isTailnet ?? false,
-                    performance: isHudVisible ? SessionPerformanceReadout(fps: Double(streamManager.currentFPS),
-                        frameReceiveMs: Double(streamManager.frameReceiveMs), videoRxMbps: networkManager.hudTelemetry.videoRxMbps) : nil,
-                    onPillHeightChange: { sessionPillHeight = $0 },
-                    onFiles: { isTransferPresented = true },
-                    onSettings: { isSettingsPresented = true },
-                    onGestures: { showGestureGuide = true })
-                VStack {
-                    Spacer()
-                    if let toast = gestureToast {
-                        GestureToastView(hint: toast.hint, text: toast.text)
-                            .padding(.bottom, 28)
-                            .transition(.opacity)
-                    }
-                }
-                .allowsHitTesting(false)
-                .animation(.easeOut(duration: 0.2), value: gestureToast)
-                if showGestureGuide {
-                    GestureGuideCard(mode: .input(inputSession.touchMode), onDone: {
-                        gestureGuideSeen = true
-                        showGestureGuide = false
-                    })
-                    .transition(.opacity)
-                }
-            }
-            .animation(.easeOut(duration: 0.2), value: showGestureGuide)
-        } else {
-            disconnectedDashboard
-        }
+    private var foregroundLayer: ForegroundLayer {
+        ForegroundLayer(owner: self)
     }
 
     // MARK: - Disconnected Dashboard
@@ -722,46 +575,8 @@ public struct ContentView: View {
 
     private var lastWifiName: String { lastWifiHostLabel.isEmpty ? "your PC" : lastWifiHostLabel }
 
-    private var disconnectedDashboard: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                rowLayout {
-                    Label {
-                        Text("ScreenCasting").font(.headline)
-                    } icon: {
-                        Image(systemName: "rectangle.on.rectangle").foregroundStyle(Color.inkAccent)
-                    }
-                    if !typeSize.isAccessibilitySize { Spacer() }
-                    iPadAddressChip
-                }
-                VStack(alignment: .leading, spacing: 16) {
-                    statusLine
-                    Text(ConnectScreenStatus.connectionRecommendation(networkManager.connectionSwitchState))
-                        .font(.footnote).foregroundStyle(Color.inkSecondary)
-                        .accessibilityIdentifier("connectionRecommendation")
-                    // Hidden, not faded, while a connect or USB wait runs: a faded card read as broken.
-                    if networkManager.connectionSwitchState.offersReconnect {
-                        Button("Reconnect over Wi-Fi") {
-                            usbChosen = false; enteredPIN = ""
-                            networkManager.reconnectConnectionOverWifi()
-                        }
-                        .buttonStyle(.bordered).controlSize(.large).tint(Color.inkAccent)
-                        .frame(minHeight: 44)
-                        .disabled(!networkManager.hasReconnectTarget)
-                    } else if networkManager.hasReconnectTarget && !isConnectBusy { reconnectButton }
-                    discoveredPCs
-                    usbCard
-                    ipEntry
-                }
-                .frame(maxWidth: 520, alignment: .leading)
-                .frame(maxWidth: .infinity)
-            }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 28)
-        }
-        .foregroundStyle(Color.inkText)
-        .accessibilityHidden(isPINPhase || isHostIdentityPhase)
-        .transition(.opacity)
+    private var disconnectedDashboard: DisconnectedDashboard {
+        DisconnectedDashboard(owner: self)
     }
 
     private var iPadAddressChip: some View {
@@ -787,54 +602,8 @@ public struct ContentView: View {
         .accessibilityHint("Copies the address")
     }
 
-    private var statusLine: some View {
-        let status = connectStatus
-        let color: Color = status.tone == .warning ? .inkWarning : status.tone == .danger ? .inkDanger : .inkText
-        return rowLayout {
-            HStack(alignment: .center, spacing: 10) {
-                Group {
-                    switch status.tone {
-                    case .busy: ProgressView().tint(Color.inkSecondary)
-                    case .warning: Image(systemName: "arrow.triangle.2.circlepath")
-                    case .danger: Image(systemName: "exclamationmark.triangle")
-                    case .ready: Image(systemName: "checkmark.circle")
-                    case .neutral: Image(systemName: "wifi")
-                    }
-                }
-                .foregroundStyle(color)
-                .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(status.text).font(.subheadline).foregroundStyle(color)
-                    if let detail = status.detail {
-                        Text(detail).font(.caption).foregroundStyle(Color.inkSecondary).lineLimit(2)
-                    }
-                }
-                .accessibilityElement(children: .combine)
-            }
-            if !typeSize.isAccessibilitySize { Spacer(minLength: 8) }
-            // A USB wait is stopped from the USB-C card, so the status line does not repeat its Stop.
-            if status.action != .none && !(status.action == .stop && networkManager.connectionState == .listening) {
-                Button(status.action == .retry ? "Retry" : status.action == .restartUSB ? "Start again"
-                       : status.action == .stop ? "Stop" : "Cancel") {
-                    switch status.action {
-                    case .retry:
-                        usbChosen = false
-                        enteredPIN = ""
-                        networkManager.reconnectLastPC()
-                    case .restartUSB:
-                        startUSB()
-                    case .cancel, .stop:
-                        enteredPIN = ""
-                        networkManager.stop()
-                    case .none:
-                        break
-                    }
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.large)
-                .tint(Color.inkAccent)
-            }
-        }
+    private var statusLine: StatusLine {
+        StatusLine(owner: self)
     }
 
     private var reconnectButton: some View {
@@ -863,54 +632,8 @@ public struct ContentView: View {
         .accessibilityHint("Connects to the PC you used last")
     }
 
-    private var discoveredPCs: some View {
-        let hosts = discoveryManager.discoveredHosts
-        return VStack(alignment: .leading, spacing: 8) {
-            Text("PCs on this Wi-Fi").font(.footnote).foregroundStyle(Color.inkSecondary)
-            if hosts.isEmpty {
-                Text("None found yet. Open ScreenCasting on the PC and make sure both are on the same Wi-Fi.")
-                    .font(.footnote)
-                    .foregroundStyle(Color.inkSecondary)
-                    .padding(14)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.inkSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            } else {
-                VStack(spacing: 0) {
-                    ForEach(Array(hosts.enumerated()), id: \.element.id) { index, host in
-                        Button {
-                            usbChosen = false
-                            enteredPIN = ""
-                            lastHostLabel = host.name
-                            lastWifiHostLabel = host.name
-                            networkManager.connect(to: host.endpoint)
-                        } label: {
-                            HStack(spacing: 12) {
-                                Image(systemName: "desktopcomputer").font(.title3).foregroundStyle(Color.inkAccent)
-                                    .accessibilityHidden(true)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(host.name).font(.subheadline.weight(.semibold)).lineLimit(2)
-                                    if host.name == lastWifiHostLabel {
-                                        Text("Last used").font(.caption).foregroundStyle(Color.inkSecondary)
-                                    }
-                                }
-                                Spacer(minLength: 8)
-                                Image(systemName: "chevron.right").foregroundStyle(Color.inkSecondary).accessibilityHidden(true)
-                            }
-                            .padding(.horizontal, 14)
-                            .frame(minHeight: 56)
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(isConnectBusy)
-                        .accessibilityHint("Connects to this PC")
-                        if index < hosts.count - 1 {
-                            Rectangle().fill(Color.inkHairline).frame(height: 0.5)
-                        }
-                    }
-                }
-                .background(Color.inkSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            }
-        }
+    private var discoveredPCs: DiscoveredPCs {
+        DiscoveredPCs(owner: self)
     }
 
     private var usbCard: some View {
@@ -939,103 +662,8 @@ public struct ContentView: View {
         .background(Color.inkSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
-    private var ipEntry: some View {
-        DisclosureGroup(isExpanded: $showIPEntry) {
-            VStack(alignment: .leading, spacing: 8) {
-                if !recentRemoteHosts.isEmpty {
-                    Text("Recent").font(.footnote).foregroundStyle(Color.inkSecondary)
-                    VStack(spacing: 0) {
-                        ForEach(Array(recentRemoteHosts.enumerated()), id: \.element.id) { index, entry in
-                            Button {
-                                usbChosen = false
-                                enteredPIN = ""
-                                remoteControlMode = entry.remoteControl
-                                hostIP = entry.host
-                                lastHostLabel = entry.host
-                                lastWifiHostLabel = entry.host
-                                recentRemoteHosts = RecentRemoteHostStore.record(host: entry.host, remoteControl: entry.remoteControl)
-                                networkManager.connect(to: entry.host, port: entry.port)
-                            } label: {
-                                rowLayout {
-                                    Image(systemName: "desktopcomputer").font(.title3).foregroundStyle(Color.inkAccent)
-                                        .accessibilityHidden(true)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(entry.host).font(.subheadline.weight(.semibold))
-                                            .lineLimit(typeSize.isAccessibilitySize ? nil : 2)
-                                        Text(entry.remoteControl ? "Whole PC" : "Casting display")
-                                            .font(.caption).foregroundStyle(Color.inkSecondary)
-                                    }
-                                    if !typeSize.isAccessibilitySize { Spacer(minLength: 8) }
-                                    Image(systemName: "chevron.right").foregroundStyle(Color.inkSecondary).accessibilityHidden(true)
-                                }
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, typeSize.isAccessibilitySize ? 10 : 0)
-                                .frame(maxWidth: .infinity, minHeight: 56, alignment: .leading)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(isConnectBusy)
-                            .accessibilityHint("Connects to this PC using the saved mode")
-                            .contextMenu {
-                                Button("Forget", role: .destructive) {
-                                    recentRemoteHosts = RecentRemoteHostStore.remove(host: entry.host, remoteControl: entry.remoteControl)
-                                }
-                                .disabled(isConnectBusy)
-                            }
-                            if index < recentRemoteHosts.count - 1 {
-                                Rectangle().fill(Color.inkHairline).frame(height: 0.5)
-                            }
-                        }
-                    }
-                    .background(Color.inkSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                }
-                rowLayout {
-                    TextField("192.168.1.20 or pc-name", text: $hostIP)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.URL)
-                        .textContentType(.URL)
-                        .padding(.horizontal, 12)
-                        .frame(minHeight: 44)
-                        .background(Color.inkRaised, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.inkHairline, lineWidth: 0.5))
-                        .accessibilityLabel("PC address")
-                    Button("Connect") {
-                        guard let host = normalizedManualHost else { return }
-                        usbChosen = false
-                        enteredPIN = ""
-                        lastHostLabel = host
-                        lastWifiHostLabel = host
-                        recentRemoteHosts = RecentRemoteHostStore.record(host: host, remoteControl: remoteControlMode)
-                        networkManager.connect(
-                            to: host,
-                            port: remoteControlMode ? NetworkManager.remoteControlPort : 27015)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.large)
-                    .tint(Color.inkAccent)
-                    .disabled(normalizedManualHost == nil || isConnectBusy)
-                }
-                // Remote host service (SPEC-host-runtime): the PC's real screen, also at the
-                // sign-in screen, instead of the casting display.
-                Toggle("Control the whole PC", isOn: $remoteControlMode)
-                    .font(.subheadline)
-                    .tint(Color.inkAccent)
-                    .frame(minHeight: 44)
-                    .accessibilityHint("Connects to the remote control service on port 27020")
-                if !hostIP.isEmpty && normalizedManualHost == nil {
-                    Text("Enter an IP address or a PC name, like 100.64.0.10 or office-pc.")
-                        .font(.caption)
-                        .foregroundStyle(Color.inkWarning)
-                }
-            }
-            .padding(.top, 8)
-        } label: {
-            Text("Connect by address").font(.subheadline)
-                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                .contentShape(Rectangle())
-        }
-        .tint(Color.inkSecondary)
+    private var ipEntry: AddressEntry {
+        AddressEntry(owner: self)
     }
 
     // MARK: - Streaming HUD
@@ -1063,5 +691,470 @@ public struct ContentView: View {
             }
         }
         .allowsHitTesting(false)
+    }
+
+
+    @MainActor private struct SessionLifecycle: ViewModifier {
+        let owner: ContentView
+        func body(content: Content) -> some View {
+            content
+                .onAppear {
+                    owner.remoteInput.bind(owner.networkManager)
+                    owner.remoteInput.configure(owner.remoteInputConfiguration)
+                    owner.recentRemoteHosts = RecentRemoteHostStore.load()
+                    UIApplication.shared.isIdleTimerDisabled = true
+                    owner.setWifiBrowsing(true)
+                    owner.networkManager.setDesiredPipelineMode(
+                        owner.gameModeEnabled ? .game : .office)
+                    owner.networkManager.applicationDidBecomeActive()
+                }
+                .onChange(of: owner.gameModeEnabled) { _, enabled in
+                    owner.networkManager.setDesiredPipelineMode(
+                        enabled ? .game : .office)
+                }
+                .onChange(of: owner.isSessionPanelOpen) { _, _ in owner.inputSession.releaseAll() }
+                .onDisappear {
+                    owner.inputSession.releaseAll()
+                    UIApplication.shared.isIdleTimerDisabled = false
+                    owner.setWifiBrowsing(false)
+                }
+        }
+    }
+
+    @MainActor private struct AuthenticationOverlay: View {
+        let owner: ContentView
+        @ViewBuilder var body: some View {
+            if owner.isHostIdentityPhase {
+                HostIdentityConfirmationView(
+                    identityCode: owner.networkManager.hostIdentityCode ?? "Unavailable",
+                    onConfirm: {
+                        owner.networkManager.confirmHostIdentity()
+                    },
+                    onCancel: {
+                        owner.enteredPIN = ""
+                        owner.networkManager.stop()
+                    }
+                )
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                .zIndex(10)
+            } else if owner.isPINPhase {
+                PINEntryView(
+                    pin: owner.$enteredPIN,
+                    authFailed: owner.isAuthFailed,
+                    failureReason: owner.authFailureReason,
+                    onSubmit: {
+                        owner.networkManager.sendAuthPIN(owner.enteredPIN)
+                    },
+                    onCancel: {
+                        owner.enteredPIN = ""
+                        owner.networkManager.stop()
+                    }
+                )
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                .zIndex(10)
+            }
+        }
+    }
+
+    @MainActor private struct RootGeometryObserver: View {
+        let owner: ContentView
+        var body: some View {
+            GeometryReader { proxy in
+                Color.clear
+                    .onAppear {
+                        owner.updateDisplayOrientation(for: proxy.size)
+                    }
+                    .onChange(of: proxy.size) { _, size in
+                        owner.updateDisplayOrientation(for: size)
+                    }
+            }
+        }
+    }
+
+    @MainActor private struct RecentHosts: View {
+        let owner: ContentView
+        @ViewBuilder var body: some View {
+            if !owner.recentRemoteHosts.isEmpty {
+                Text("Recent").font(.footnote).foregroundStyle(Color.inkSecondary)
+                VStack(spacing: 0) {
+                    ForEach(Array(owner.recentRemoteHosts.enumerated()), id: \.element.id) { index, entry in
+                        Button {
+                            owner.usbChosen = false
+                            owner.enteredPIN = ""
+                            owner.remoteControlMode = entry.remoteControl
+                            owner.hostIP = entry.host
+                            owner.lastHostLabel = entry.host
+                            owner.lastWifiHostLabel = entry.host
+                            owner.recentRemoteHosts = RecentRemoteHostStore.record(host: entry.host, remoteControl: entry.remoteControl)
+                            owner.networkManager.connect(to: entry.host, port: entry.port)
+                        } label: {
+                            owner.rowLayout {
+                                Image(systemName: "desktopcomputer").font(.title3).foregroundStyle(Color.inkAccent)
+                                    .accessibilityHidden(true)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(entry.host).font(.subheadline.weight(.semibold))
+                                        .lineLimit(owner.typeSize.isAccessibilitySize ? nil : 2)
+                                    Text(entry.remoteControl ? "Whole PC" : "Casting display")
+                                        .font(.caption).foregroundStyle(Color.inkSecondary)
+                                }
+                                if !owner.typeSize.isAccessibilitySize { Spacer(minLength: 8) }
+                                Image(systemName: "chevron.right").foregroundStyle(Color.inkSecondary).accessibilityHidden(true)
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, owner.typeSize.isAccessibilitySize ? 10 : 0)
+                            .frame(maxWidth: .infinity, minHeight: 56, alignment: .leading)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(owner.isConnectBusy)
+                        .accessibilityHint("Connects to this PC using the saved mode")
+                        .contextMenu {
+                            Button("Forget", role: .destructive) {
+                                owner.recentRemoteHosts = RecentRemoteHostStore.remove(host: entry.host, remoteControl: entry.remoteControl)
+                            }
+                            .disabled(owner.isConnectBusy)
+                        }
+                        if index < owner.recentRemoteHosts.count - 1 {
+                            Rectangle().fill(Color.inkHairline).frame(height: 0.5)
+                        }
+                    }
+                }
+                .background(Color.inkSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
+        }
+    }
+    // Nominal view types bound metadata expansion across independently rendered sections.
+    @MainActor private struct ForegroundLayer: View {
+        let owner: ContentView
+        @ViewBuilder var body: some View {
+            if owner.streamManager.isConnected {
+                ZStack {
+                    owner.streamingHUD
+                    VStack {
+                        CaptureAvailabilityNotice(message: owner.networkManager.captureAvailabilityNotice)
+                            .padding(.top, owner.sessionPillHeight + (owner.isHudVisible && !owner.isSessionPanelOpen ? 48 : 24))
+                            .padding(.horizontal, 24)
+                        Spacer()
+                    }
+                    .allowsHitTesting(false)
+                    SessionPanelOverlay(
+                        networkManager: owner.networkManager,
+                        hostLabel: SessionPanelSnapshot.sessionHost(current: owner.lastHostLabel, lastWifi: owner.lastWifiHostLabel,
+                                                                    usb: owner.usbChosen),
+                        isOpen: owner.$isSessionPanelOpen,
+                        remoteInput: owner.remoteInput,
+                        tailnetTarget: RemoteHostAddress.parse(owner.hostIP.isEmpty ? owner.lastWifiHostLabel : owner.hostIP)?.isTailnet ?? false,
+                        performance: owner.isHudVisible ? SessionPerformanceReadout(fps: Double(owner.streamManager.currentFPS),
+                            frameReceiveMs: Double(owner.streamManager.frameReceiveMs), videoRxMbps: owner.networkManager.hudTelemetry.videoRxMbps) : nil,
+                        onPillHeightChange: { owner.sessionPillHeight = $0 },
+                        onFiles: { owner.isTransferPresented = true },
+                        onSettings: { owner.isSettingsPresented = true },
+                        onGestures: { owner.showGestureGuide = true })
+                    VStack {
+                        Spacer()
+                        if let toast = owner.gestureToast {
+                            GestureToastView(hint: toast.hint, text: toast.text)
+                                .padding(.bottom, 28)
+                                .transition(.opacity)
+                        }
+                    }
+                    .allowsHitTesting(false)
+                    .animation(.easeOut(duration: 0.2), value: owner.gestureToast)
+                    if owner.showGestureGuide {
+                        GestureGuideCard(mode: .input(owner.inputSession.touchMode), onDone: {
+                            owner.gestureGuideSeen = true
+                            owner.showGestureGuide = false
+                        })
+                        .transition(.opacity)
+                    }
+                }
+                .animation(.easeOut(duration: 0.2), value: owner.showGestureGuide)
+            } else {
+                owner.disconnectedDashboard
+            }
+        }
+    }
+
+    @MainActor private struct ConnectedVideoSurface: View {
+        let owner: ContentView
+        @ViewBuilder var body: some View {
+            GeometryReader { proxy in
+                let frame = FullscreenSurfaceLayout.edgeToEdgeFrame(
+                    proposedBounds: proxy.frame(in: .local),
+                    safeAreaInsets: proxy.safeAreaInsets)
+
+                ConnectedPresentationSurface(
+                    networkManager: owner.networkManager,
+                    gameModeEnabled: owner.gameModeEnabled,
+                    remoteKeyboardActive: owner.streamManager.isConnected && owner.scenePhase == .active && !owner.isSheetPresented && !owner.showGestureGuide,
+                    onKeyboardInput: { command in
+                        owner.networkManager.sendKeyboardInput(command)
+                    },
+                    onTextCommit: { text in
+                        owner.networkManager.sendTextCommit(text)
+                    },
+                    onFrameRendered: {
+                        owner.streamManager.registerFrameRendered()
+                    },
+                    onContentViewportChanged: { viewport in
+                        owner.renderedContentViewport = viewport
+                    },
+                    onGeometrySnapshotChanged: { snapshot in
+                        owner.rendererGeometrySnapshot = snapshot
+                        if let presentationGeometry = owner.presentationGeometry {
+                            owner.emitGeometrySnapshot(snapshot, presentationGeometry)
+                        }
+                    },
+                    onPresentationGeometryChanged: { geometry in
+                        owner.presentationGeometry = geometry
+                        if let rendererGeometrySnapshot = owner.rendererGeometrySnapshot {
+                            owner.emitGeometrySnapshot(rendererGeometrySnapshot, geometry)
+                        }
+                    },
+                    onTouchBoundsChanged: { _ in },
+                    onPencilInput: { _ in },
+                    onSendTouchEvent: { type, x, y, pressure in
+                        owner.networkManager.sendTouchEvent(
+                            type: type,
+                            x: x,
+                            y: y,
+                            pressure: pressure)
+                    },
+                    onDirectTouchContact: { command in
+                        owner.networkManager.sendDirectTouchContact(command)
+                    },
+                    onPointerInput: { command in
+                        owner.networkManager.sendPointerInput(command)
+                    },
+                    onOpenSettings: {
+                        // The 3-finger tap opens the session panel; Settings is one tap inside it.
+                        isSessionPanelOpen = true
+                    })
+                    .remoteSessionInput(owner.remoteInput)
+                    .iPadInputSession(owner.inputSession)
+                    .gestureHints { hint in owner.showGestureToast(hint) }
+                    .frame(width: frame.width, height: frame.height)
+                    .offset(x: frame.minX, y: frame.minY)
+                    .allowsHitTesting(true)
+                    .ignoresSafeArea(.keyboard)
+                    // This container has the committed drawable size. Publish
+                    // it as an orientation source so capabilities-first startup
+                    // cannot miss the initial portrait request.
+                    .onAppear {
+                        owner.updateDisplayOrientation(for: proxy.size)
+                    }
+                    .onChange(of: proxy.size) { _, size in
+                        owner.updateDisplayOrientation(for: size)
+                    }
+            }
+            .ignoresSafeArea(.container, edges: .all)
+        }
+    }
+
+    @MainActor private struct DisconnectedDashboard: View {
+        let owner: ContentView
+        var body: some View {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    owner.rowLayout {
+                        Label {
+                            Text("ScreenCasting").font(.headline)
+                        } icon: {
+                            Image(systemName: "rectangle.on.rectangle").foregroundStyle(Color.inkAccent)
+                        }
+                        if !owner.typeSize.isAccessibilitySize { Spacer() }
+                        owner.iPadAddressChip
+                    }
+                    VStack(alignment: .leading, spacing: 16) {
+                        owner.statusLine
+                        Text(ConnectScreenStatus.connectionRecommendation(owner.networkManager.connectionSwitchState))
+                            .font(.footnote).foregroundStyle(Color.inkSecondary)
+                            .accessibilityIdentifier("connectionRecommendation")
+                        // Hidden, not faded, while a connect or USB wait runs: a faded card read as broken.
+                        if owner.networkManager.connectionSwitchState.offersReconnect {
+                            Button("Reconnect over Wi-Fi") {
+                                owner.usbChosen = false; owner.enteredPIN = ""
+                                owner.networkManager.reconnectConnectionOverWifi()
+                            }
+                            .buttonStyle(.bordered).controlSize(.large).tint(Color.inkAccent)
+                            .frame(minHeight: 44)
+                            .disabled(!owner.networkManager.hasReconnectTarget)
+                        } else if owner.networkManager.hasReconnectTarget && !owner.isConnectBusy { owner.reconnectButton }
+                        owner.discoveredPCs
+                        owner.usbCard
+                        owner.ipEntry
+                    }
+                    .frame(maxWidth: 520, alignment: .leading)
+                    .frame(maxWidth: .infinity)
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 28)
+            }
+            .foregroundStyle(Color.inkText)
+            .accessibilityHidden(owner.isPINPhase || owner.isHostIdentityPhase)
+            .transition(.opacity)
+        }
+    }
+
+    @MainActor private struct StatusLine: View {
+        let owner: ContentView
+        var body: some View {
+            let status = owner.connectStatus
+                    let color: Color = status.tone == .warning ? .inkWarning : status.tone == .danger ? .inkDanger : .inkText
+                    return owner.rowLayout {
+                        HStack(alignment: .center, spacing: 10) {
+                            Group {
+                                switch status.tone {
+                                case .busy: ProgressView().tint(Color.inkSecondary)
+                                case .warning: Image(systemName: "arrow.triangle.2.circlepath")
+                                case .danger: Image(systemName: "exclamationmark.triangle")
+                                case .ready: Image(systemName: "checkmark.circle")
+                                case .neutral: Image(systemName: "wifi")
+                                }
+                            }
+                            .foregroundStyle(color)
+                            .accessibilityHidden(true)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(status.text).font(.subheadline).foregroundStyle(color)
+                                if let detail = status.detail {
+                                    Text(detail).font(.caption).foregroundStyle(Color.inkSecondary).lineLimit(2)
+                                }
+                            }
+                            .accessibilityElement(children: .combine)
+                        }
+                        if !owner.typeSize.isAccessibilitySize { Spacer(minLength: 8) }
+                        // A USB wait is stopped from the USB-C card, so the status line does not repeat its Stop.
+                        if status.action != .none && !(status.action == .stop && owner.networkManager.connectionState == .listening) {
+                            Button(status.action == .retry ? "Retry" : status.action == .restartUSB ? "Start again"
+                                   : status.action == .stop ? "Stop" : "Cancel") {
+                                switch status.action {
+                                case .retry:
+                                    owner.usbChosen = false
+                                    owner.enteredPIN = ""
+                                    owner.networkManager.reconnectLastPC()
+                                case .restartUSB:
+                                    owner.startUSB()
+                                case .cancel, .stop:
+                                    owner.enteredPIN = ""
+                                    owner.networkManager.stop()
+                                case .none:
+                                    break
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.large)
+                            .tint(Color.inkAccent)
+                        }
+                    }
+        }
+    }
+
+    @MainActor private struct DiscoveredPCs: View {
+        let owner: ContentView
+        var body: some View {
+            let hosts = owner.discoveryManager.discoveredHosts
+                    return VStack(alignment: .leading, spacing: 8) {
+                        Text("PCs on this Wi-Fi").font(.footnote).foregroundStyle(Color.inkSecondary)
+                        if hosts.isEmpty {
+                            Text("None found yet. Open ScreenCasting on the PC and make sure both are on the same Wi-Fi.")
+                                .font(.footnote)
+                                .foregroundStyle(Color.inkSecondary)
+                                .padding(14)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color.inkSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        } else {
+                            VStack(spacing: 0) {
+                                ForEach(Array(hosts.enumerated()), id: \.element.id) { index, host in
+                                    Button {
+                                        owner.usbChosen = false
+                                        owner.enteredPIN = ""
+                                        owner.lastHostLabel = host.name
+                                        owner.lastWifiHostLabel = host.name
+                                        owner.networkManager.connect(to: host.endpoint)
+                                    } label: {
+                                        HStack(spacing: 12) {
+                                            Image(systemName: "desktopcomputer").font(.title3).foregroundStyle(Color.inkAccent)
+                                                .accessibilityHidden(true)
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(host.name).font(.subheadline.weight(.semibold)).lineLimit(2)
+                                                if host.name == owner.lastWifiHostLabel {
+                                                    Text("Last used").font(.caption).foregroundStyle(Color.inkSecondary)
+                                                }
+                                            }
+                                            Spacer(minLength: 8)
+                                            Image(systemName: "chevron.right").foregroundStyle(Color.inkSecondary).accessibilityHidden(true)
+                                        }
+                                        .padding(.horizontal, 14)
+                                        .frame(minHeight: 56)
+                                        .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .disabled(owner.isConnectBusy)
+                                    .accessibilityHint("Connects to this PC")
+                                    if index < hosts.count - 1 {
+                                        Rectangle().fill(Color.inkHairline).frame(height: 0.5)
+                                    }
+                                }
+                            }
+                            .background(Color.inkSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        }
+                    }
+        }
+    }
+
+    @MainActor private struct AddressEntry: View {
+        let owner: ContentView
+        var body: some View {
+            DisclosureGroup(isExpanded: owner.$showIPEntry) {
+                VStack(alignment: .leading, spacing: 8) {
+                    RecentHosts(owner: owner)
+                    owner.rowLayout {
+                        TextField("192.168.1.20 or pc-name", text: owner.$hostIP)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .keyboardType(.URL)
+                            .textContentType(.URL)
+                            .padding(.horizontal, 12)
+                            .frame(minHeight: 44)
+                            .background(Color.inkRaised, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.inkHairline, lineWidth: 0.5))
+                            .accessibilityLabel("PC address")
+                        Button("Connect") {
+                            guard let host = owner.normalizedManualHost else { return }
+                            owner.usbChosen = false
+                            owner.enteredPIN = ""
+                            owner.lastHostLabel = host
+                            owner.lastWifiHostLabel = host
+                            owner.recentRemoteHosts = RecentRemoteHostStore.record(host: host, remoteControl: owner.remoteControlMode)
+                            owner.networkManager.connect(
+                                to: host,
+                                port: owner.remoteControlMode ? NetworkManager.remoteControlPort : 27015)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.large)
+                        .tint(Color.inkAccent)
+                        .disabled(owner.normalizedManualHost == nil || owner.isConnectBusy)
+                    }
+                    // Remote host service (SPEC-host-runtime): the PC's real screen, also at the
+                    // sign-in screen, instead of the casting display.
+                    Toggle("Control the whole PC", isOn: owner.$remoteControlMode)
+                        .font(.subheadline)
+                        .tint(Color.inkAccent)
+                        .frame(minHeight: 44)
+                        .accessibilityHint("Connects to the remote control service on port 27020")
+                    if !owner.hostIP.isEmpty && owner.normalizedManualHost == nil {
+                        Text("Enter an IP address or a PC name, like 100.64.0.10 or office-pc.")
+                            .font(.caption)
+                            .foregroundStyle(Color.inkWarning)
+                    }
+                }
+                .padding(.top, 8)
+            } label: {
+                Text("Connect by address").font(.subheadline)
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .tint(Color.inkSecondary)
+        }
     }
 }

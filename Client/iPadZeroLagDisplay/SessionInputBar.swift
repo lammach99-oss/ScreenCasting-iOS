@@ -25,6 +25,13 @@ struct SessionWindowsShortcut: Identifiable {
     @Environment(\.dynamicTypeSize) private var typeSize
     let onClose: () -> Void
     @State private var shortcutsExpanded = false
+    private let expandSpecialKeys: Bool
+
+    init(onClose: @escaping () -> Void, expandedSections: Bool = false) {
+        self.onClose = onClose
+        self.expandSpecialKeys = expandedSections
+        _shortcutsExpanded = State(initialValue: expandedSections)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -37,40 +44,8 @@ struct SessionWindowsShortcut: Identifiable {
                 .buttonStyle(.plain)
                 .accessibilityLabel("Hide input bar")
             }
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    if !inputSession.canType {
-                        Text(inputSession.unavailableReason ?? "Ask for control first to type on the PC.")
-                            .font(.footnote).foregroundStyle(Color(uiColor: SessionInk.warning))
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    SessionActionLayout(accessibility: typeSize.isAccessibilitySize) {
-                        ForEach(Array(IPadModifier.allCases.enumerated()), id: \.offset) { entry in
-                            SessionModifierButton(session: inputSession, modifier: entry.element)
-                        }
-                    }
-                    RemoteSpecialKeyBar()
-                    DisclosureGroup(isExpanded: $shortcutsExpanded) {
-                        LazyVGrid(columns: [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? 180 : 100), spacing: 8)], spacing: 8) {
-                            ForEach(SessionWindowsShortcut.all) { shortcut in
-                                shortcutButton(shortcut)
-                            }
-                        }
-                    } label: {
-                        Text("Windows shortcuts").font(.subheadline.weight(.semibold)).frame(minHeight: 44)
-                    }
-                    Text("Command = Ctrl. Hardware keyboard uses the PC input method; the on-screen keyboard uses the iPad input method.")
-                        .font(.footnote).foregroundStyle(Color(uiColor: SessionInk.secondary))
-                        .fixedSize(horizontal: false, vertical: true)
-                    Button { inputSession.releaseAll() } label: {
-                        SessionInputControlLabel(title: "Release all")
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Release all")
-                    .accessibilityHint("Releases held touch, mouse buttons, keys and modifiers")
-                }
-            }
-            .scrollBounceBehavior(.basedOnSize)
+            ScrollView { InputSections(owner: self) }
+                .scrollBounceBehavior(.basedOnSize)
         }
         .padding(12)
         .foregroundStyle(Color(uiColor: SessionInk.text))
@@ -79,6 +54,59 @@ struct SessionWindowsShortcut: Identifiable {
             .stroke(Color(uiColor: SessionInk.hairline), lineWidth: 0.5))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("session.input.bar")
+    }
+
+    @MainActor private struct InputSections: View {
+        let owner: SessionInputBar
+        var body: some View {
+            VStack(alignment: .leading, spacing: 8) {
+                ModifierSection(owner: owner)
+                RemoteSpecialKeyBar(expanded: owner.expandSpecialKeys, functionsExpanded: owner.expandSpecialKeys)
+                WindowsShortcuts(owner: owner)
+                Text("Command = Ctrl. Hardware keyboard uses the PC input method; the on-screen keyboard uses the iPad input method.")
+                    .font(.footnote).foregroundStyle(Color(uiColor: SessionInk.secondary))
+                    .fixedSize(horizontal: false, vertical: true)
+                Button { owner.inputSession.releaseAll() } label: {
+                    SessionInputControlLabel(title: "Release all")
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Release all")
+                .accessibilityHint("Releases held touch, mouse buttons, keys and modifiers")
+            }
+        }
+    }
+
+    @MainActor private struct ModifierSection: View {
+        let owner: SessionInputBar
+        var body: some View {
+            Group {
+                if !owner.inputSession.canType {
+                    Text(owner.inputSession.unavailableReason ?? "Ask for control first to type on the PC.")
+                        .font(.footnote).foregroundStyle(Color(uiColor: SessionInk.warning))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                SessionActionLayout(accessibility: owner.typeSize.isAccessibilitySize) {
+                    ForEach(Array(IPadModifier.allCases.enumerated()), id: \.offset) { entry in
+                        SessionModifierButton(session: owner.inputSession, modifier: entry.element)
+                    }
+                }
+            }
+        }
+    }
+
+    @MainActor private struct WindowsShortcuts: View {
+        let owner: SessionInputBar
+        var body: some View {
+            DisclosureGroup(isExpanded: owner.$shortcutsExpanded) {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: owner.typeSize.isAccessibilitySize ? 180 : 100), spacing: 8)], spacing: 8) {
+                    ForEach(SessionWindowsShortcut.all) { shortcut in
+                        owner.shortcutButton(shortcut)
+                    }
+                }
+            } label: {
+                Text("Windows shortcuts").font(.subheadline.weight(.semibold)).frame(minHeight: 44)
+            }
+        }
     }
 
     private func shortcutButton(_ shortcut: SessionWindowsShortcut) -> some View {
