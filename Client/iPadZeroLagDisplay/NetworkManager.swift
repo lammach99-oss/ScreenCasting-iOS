@@ -262,10 +262,11 @@ public class NetworkManager: ObservableObject {
     private var verifiedHostFingerprint: String?
     private var verifiedHostIdentityCode: String?
     private var hostIdentityConfirmationRequired = false
+    private var wifiAuthentication = WifiAuthenticationState()
     private var hostIdentityConfirmed = false
     private var trustedCredential: TrustedHostCredential?
-    private let trustedCredentialStore = TrustedHostCredentialStore()
-    private let trustedHostFingerprintStore = TrustedHostFingerprintStore()
+    private var trustedCredentialStore = TrustedHostCredentialStore()
+    private var trustedHostFingerprintStore = TrustedHostFingerprintStore()
     private let trustedDeviceID = TrustedDeviceIdentity.loadOrCreate()
     private var isForegroundActive = true
     private var reconnectEnabled = false
@@ -478,6 +479,10 @@ public class NetworkManager: ObservableObject {
             if !self.remoteInputPacketIsCurrent(data) || !self.captureTargetPacketIsCurrent(data) || !self.connectionControlPacketIsCurrent(data) {
                 completion(nil)
                 return
+            }
+            guard self.admitWifiAuthenticationWrite(data) else {
+                completion(.posix(.ECANCELED))
+                self.handleStreamError("Unexpected authentication request stage."); return
             }
             #if targetEnvironment(simulator)
             if let controlSendForAudioTesting = self.controlSendForAudioTesting {
@@ -906,6 +911,7 @@ public class NetworkManager: ObservableObject {
         verifiedHostIdentityCode = nil
         hostIdentityConfirmationRequired = false
         hostIdentityConfirmed = false
+        wifiAuthentication = WifiAuthenticationState()
         reconnectWorkItem?.cancel()
         resetDisplaySession()
         let parameters = buildTLSParameters(for: endpoint)
@@ -1182,6 +1188,7 @@ public class NetworkManager: ObservableObject {
                   self.verifiedHostFingerprint != nil,
                   self.verifiedHostIdentityCode != nil,
                   self.transportState == .awaitingHostIdentity else { return }
+            guard self.wifiAuthentication.confirm() else { return }
             self.hostIdentityConfirmed = true
             self.hostIdentityConfirmationRequired = false
             self.sendTrustedClientHello(generation: self.connectionGeneration)
@@ -1196,6 +1203,7 @@ public class NetworkManager: ObservableObject {
                   (self.transportState == .awaitingPIN || self.isAuthFailedOnQueue),
                   self.activeTransportKind == .usb || self.hostIdentityConfirmed,
                   let pinValue = UInt32(pin), pin.count == 4 else { return }
+            guard self.activeTransportKind == .wifi else { return }
             var packet = Data(count: AuthProtocol.packetSize)
             packet.withUnsafeMutableBytes { buf in
                 buf.storeBytes(of: AuthProtocol.magic.littleEndian, toByteOffset: 0, as: UInt32.self)
@@ -1880,17 +1888,34 @@ public class NetworkManager: ObservableObject {
             sequence: requestID)
     }
 
-    public func forgetTrustedHost() {
+    public func forgetTrustedHost(host: String, port: UInt16) {
+        guard let port = NWEndpoint.Port(rawValue: port) else { return }
+        forgetTrustedHost(endpoint: .hostPort(host: NWEndpoint.Host(host), port: port))
+    }
+    public func forgetTrustedHost(endpoint requestedEndpoint: NWEndpoint? = nil) {
         networkQueue.async { [weak self] in
-            guard let self,
-                  self.transportState == .streaming,
-                  let credential = self.trustedCredential,
-                  credential.deviceID.count == 16 else { return }
-            var payload = Data([1])
-            payload.append(credential.deviceID)
-            DispatchQueue.main.async { self.settingsApplyStatus = "Forgetting…" }
-            self.sendWireMessage(type: .forgetDevice, payload: payload, sequence: 0)
+            guard let self else { return }
+            let endpoint = requestedEndpoint ?? self.connectionSelectedEndpoint ?? self.loadWifiReconnectEndpoint()
+            guard let fingerprint = endpoint.flatMap({ self.trustedHostFingerprintStore.load(endpoint: $0) }) ??
+                    (requestedEndpoint == nil || requestedEndpoint == self.loadWifiReconnectEndpoint()
+                        ? self.trustedCredential?.fingerprint ?? self.trustedHostFingerprintStore.load() : nil) else { return }
+            if self.transportState == .streaming, let credential = self.trustedCredential,
+               credential.fingerprint == fingerprint {
+                var payload = Data([1]); payload.append(credential.deviceID)
+                self.sendWireMessage(type: .forgetDevice, payload: payload, sequence: 0)
+            }
+            self.forgetLocalTrustOnQueue(fingerprint)
         }
+    }
+    private func forgetLocalTrustOnQueue(_ fingerprint: String) {
+        trustedCredentialStore.delete(fingerprint: fingerprint)
+        trustedHostFingerprintStore.delete(fingerprint: fingerprint)
+        trustedCredential = nil
+        reconnectEnabled = false
+        UserDefaults.standard.removeObject(forKey: Self.lastKnownHostKey)
+        WifiReconnectTargetStore.clear()
+        teardownCurrentSession()
+        setState(.idle)
     }
 
     /// Gracefully tears down the connection and resets to .idle.
@@ -2059,17 +2084,10 @@ public class NetworkManager: ObservableObject {
         let generation = listenerGeneration
 
         do {
-            let listener: NWListener
-            if port == 0 {
-                listener = try NWListener(using: .tcp)
-            } else {
-                guard let listenerPort = NWEndpoint.Port(rawValue: port) else {
-                    throw USBListenerError.invalidPort
-                }
-                listener = try NWListener(
-                    using: .tcp,
-                    on: listenerPort)
-            }
+            let parameters = NWParameters.tcp
+            guard let listenerPort = NWEndpoint.Port(rawValue: port) else { throw USBListenerError.invalidPort }
+            parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: listenerPort)
+            let listener = try NWListener(using: parameters)
             usbListener = listener
 
             listener.stateUpdateHandler = { [weak self, weak listener] state in
@@ -2328,6 +2346,7 @@ public class NetworkManager: ObservableObject {
     /// USB identity is authenticated separately by the Windows DPAPI-backed
     /// selected-device pin and must never share this callback.
     private func buildTLSParameters(for endpoint: NWEndpoint) -> NWParameters {
+        let verificationGeneration = connectionGeneration
         let tlsOptions = NWProtocolTLS.Options()
 
         sec_protocol_options_set_min_tls_protocol_version(
@@ -2336,7 +2355,7 @@ public class NetworkManager: ObservableObject {
         sec_protocol_options_set_verify_block(
             tlsOptions.securityProtocolOptions,
             { [weak self] _, securityTrust, completionHandler in
-                guard let self else {
+                guard let self, self.connectionGeneration == verificationGeneration else {
                     completionHandler(false)
                     return
                 }
@@ -2352,12 +2371,15 @@ public class NetworkManager: ObservableObject {
                     .joined(separator: ":")
                 let decision = WifiHostIdentityPolicy.decide(
                     presentedFingerprint: fingerprint,
-                    pinnedFingerprint: self.trustedHostFingerprintStore.load())
+                    pinnedFingerprint: self.trustedHostFingerprintStore.load(endpoint: endpoint) ??
+                        self.trustedHostFingerprintStore.migrateLegacy(endpoint: endpoint, presented: fingerprint,
+                            credential: self.trustedCredentialStore.load(fingerprint: fingerprint)))
                 guard let identityCode = WifiHostIdentityPolicy.identityCode(
                     for: fingerprint) else {
                     completionHandler(false)
                     return
                 }
+                self.wifiAuthentication.begin(confirmed: decision == .trusted)
                 self.verifiedHostFingerprint = fingerprint
                 self.verifiedHostIdentityCode = identityCode
                 DispatchQueue.main.async {
@@ -2594,12 +2616,31 @@ public class NetworkManager: ObservableObject {
 
     // MARK: - Private: Auth Handshake
 
+    private func admitWifiAuthenticationWrite(_ data: Data) -> Bool {
+        guard activeTransportKind == .wifi else { return true }
+        // Advance only at the writer's actual send boundary, not when a UI action queues it.
+        if data.count == AuthProtocol.packetSize,
+           data.loadLittleEndian(UInt32.self, at: 0) == AuthProtocol.magic {
+            return hostIdentityConfirmed && wifiAuthentication.sentPIN()
+        }
+        guard data.count >= WireProtocol.headerSize,
+              data.loadLittleEndian(UInt32.self, at: 0) == WireProtocol.magic else { return true }
+        if data[5] == WireMessageType.clientHello.rawValue {
+            return hostIdentityConfirmed && !hostIdentityConfirmationRequired && wifiAuthentication.sentHello()
+        }
+        if data[5] == WireMessageType.trustedDeviceProof.rawValue {
+            return hostIdentityConfirmed && wifiAuthentication.sentProof()
+        }
+        return true
+    }
+
     private func sendTrustedClientHello(generation: UInt64) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         #if targetEnvironment(simulator)
         testingClientHelloCount += 1
         #endif
         guard generation == connectionGeneration,
+              hostIdentityConfirmed, !hostIdentityConfirmationRequired,
               let fingerprint = verifiedHostFingerprint else {
             handleStreamError("TLS host identity was unavailable after verification.")
             return
@@ -2711,20 +2752,28 @@ public class NetworkManager: ObservableObject {
     }
 
     private func storePairingCredential(_ payload: Data) {
-        guard payload.count == 80,
-              let fingerprint = verifiedHostFingerprint else { return }
+        guard payload.count == 80, hostIdentityConfirmed, !hostIdentityConfirmationRequired,
+              wifiAuthentication.mayPersistPairing,
+              let fingerprint = verifiedHostFingerprint,
+              let endpoint = connectionSelectedEndpoint else {
+            handleStreamError("Unexpected pairing credential."); return
+        }
+        guard wifiAuthentication.receive(.pairingSuccess) else { handleStreamError("Unexpected pairing credential."); return }
         let credential = TrustedHostCredential(
             fingerprint: fingerprint,
             hostID: payload.subdata(in: 0..<16),
             deviceID: payload.subdata(in: 16..<32),
             secret: payload.subdata(in: 48..<80),
             sessionID: payload.subdata(in: 32..<48))
+        guard credential.deviceID == (trustedCredential?.deviceID ?? trustedDeviceID) else {
+            handleStreamError("Pairing credential does not match this device."); return
+        }
         guard trustedCredentialStore.save(credential) else {
             handleStreamError("Unable to save the trusted Host credential in Keychain.")
             return
         }
         trustedCredential = credential
-        guard trustedHostFingerprintStore.save(fingerprint) else {
+        guard trustedHostFingerprintStore.save(fingerprint, endpoint: endpoint, hostID: credential.hostID) else {
             trustedCredentialStore.delete(fingerprint: fingerprint)
             handleStreamError("Unable to save the trusted Host identity in Keychain.")
             return
@@ -3448,7 +3497,14 @@ public class NetworkManager: ObservableObject {
     }
 
     func sendTransferFiles(_ urls: [URL]) { networkQueue.async { [weak self] in self?.dataTransfers?.sendFiles(urls) } }
-    func decideTransfer(_ accepted: Bool) { networkQueue.async { [weak self] in self?.dataTransfers?.decide(accepted) } }
+    func decideTransfer(_ accepted: Bool, consent: DataTransferManager.Consent) {
+        let generation = connectionGenerationClock.current
+        networkQueue.async { [weak self] in
+            guard let self, self.connectionGeneration == generation,
+                  self.wireAuthenticatedGeneration == generation, self.committedTransportGeneration == generation else { return }
+            self.dataTransfers?.decide(accepted, consent: consent)
+        }
+    }
     func cancelTransfer() { networkQueue.async { [weak self] in self?.controlChannelWriter.cancelBulk(); self?.dataTransfers?.cancel() } }
     private func beginDataTransfer(generation: UInt64) {
         guard generation == connectionGeneration, dataTransfers == nil else { return }
@@ -3705,6 +3761,11 @@ public class NetworkManager: ObservableObject {
         case .failure(.oversizedPayload):
             handleStreamError("Wire payload exceeds the 8 MiB limit.")
         case .discardedFixedControl(let header):
+            if activeTransportKind == .wifi,
+               [.authResult, .pairingRequired, .trustedDeviceChallenge, .pairingSuccess,
+                .trustedAuthResult, .sessionResumeResult].contains(header.type) {
+                handleStreamError("Malformed authentication message."); return
+            }
             if activeTransportKind == .usb, wireAuthenticatedGeneration != generation, usbIdentity.pending,
                [.trustedDeviceChallenge, .trustedDeviceProof, .pairingSuccess, .sessionResumeResult].contains(header.type) {
                 usbIdentity.abandon(); finishUsbIdentityOnQueue(generation: generation, identified: false)
@@ -3723,6 +3784,21 @@ public class NetworkManager: ObservableObject {
            wireAuthenticatedGeneration != generation {
             recordDiagnosticLine("[CAPTURE_AVAILABILITY] ignored=unauthenticated")
             return
+        }
+        if activeTransportKind == .wifi,
+           [.pairingRequired, .trustedDeviceChallenge, .authResult, .trustedAuthResult, .sessionResumeResult].contains(header.type) {
+            let validPayload: Bool
+            switch header.type {
+            case .trustedDeviceChallenge: validPayload = payload.count == 112 && header.flags == 0
+            case .pairingRequired, .trustedAuthResult: validPayload = !payload.isEmpty && payload[0] <= 1 && header.flags == 0
+            case .sessionResumeResult: validPayload = payload.count == 17 && payload.first == 1 && header.flags == 0
+            default: validPayload = !payload.isEmpty && payload[0] <= 1 &&
+                header.flags & ~WireProtocol.realtimeNegotiationSupportedFlag == 0
+            }
+            guard hostIdentityConfirmed, !hostIdentityConfirmationRequired, validPayload,
+                  wifiAuthentication.receive(header.type, accepted: payload.first == 1) else {
+                handleStreamError("Unexpected authentication stage."); return
+            }
         }
         guard wireAuthenticatedGeneration == generation else {
             if activeTransportKind == .usb {
@@ -3810,6 +3886,7 @@ public class NetworkManager: ObservableObject {
             catch { dataTransfers?.cancel(failed: true) }
             return
         case .pairingSuccess:
+            guard header.flags == 0 else { handleStreamError("Unexpected pairing flags."); return }
             if connectionHandoffInProgress { failConnectionControlOnQueue(.identityUnavailable); return }
             storePairingCredential(payload)
 
@@ -3844,7 +3921,7 @@ public class NetworkManager: ObservableObject {
             guard payload.count == 2, payload[0] == 1 else { return }
             if payload[1] == 1, let fingerprint = verifiedHostFingerprint {
                 trustedCredentialStore.delete(fingerprint: fingerprint)
-                trustedHostFingerprintStore.delete()
+                trustedHostFingerprintStore.delete(fingerprint: fingerprint)
                 trustedCredential = nil
                 UserDefaults.standard.removeObject(forKey: Self.lastKnownHostKey)
                 reconnectEnabled = false
@@ -5150,6 +5227,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func teardownCurrentSession() {
+        wifiAuthentication = WifiAuthenticationState()
         dispatchPrecondition(condition: .onQueue(networkQueue))
         pairedControlGeneration = nil; trustedProofGeneration = nil; connectionAdvertisement = 0
         if !connectionHandoffInProgress { resetConnectionControlOnQueue(preserveFailure: connectionSwitch.offersReconnect) }
@@ -5999,9 +6077,10 @@ public class NetworkManager: ObservableObject {
               let current = connection, current === usbScdpConnection else { return }
         usbIdentityDeadline?.cancel(); usbIdentityDeadline = nil
         if !identified { usbIdentity.abandon() }
-        if connectionHandoffInProgress && !identified {
-            failConnectionControlOnQueue(.identityUnavailable)
-            teardownCurrentSession(); setState(.disconnected(reason: "Pair this iPad before changing connection"))
+        guard identified else {
+            if connectionHandoffInProgress { failConnectionControlOnQueue(.identityUnavailable) }
+            teardownCurrentSession()
+            setState(.disconnected(reason: "USB host identity could not be verified. Pair over Wi-Fi first or update the PC host."))
             return
         }
         wireAuthenticatedGeneration = generation
@@ -6412,6 +6491,22 @@ public class NetworkManager: ObservableObject {
             wireAuthenticatedGeneration = nil; committedTransportGeneration = nil
         }
     }
+    func configureAuthenticationForTesting(confirmed: Bool, fingerprint: String, endpoint: NWEndpoint,
+                                           credentials: any TrustedHostCredentialBacking,
+                                           pins: any TrustedHostCredentialBacking) {
+        networkQueue.sync {
+            trustedCredentialStore = TrustedHostCredentialStore(backing: credentials)
+            trustedHostFingerprintStore = TrustedHostFingerprintStore(backing: pins)
+            connectionSelectedEndpoint = endpoint
+            wireAuthenticatedGeneration = nil; committedTransportGeneration = nil
+            verifiedHostFingerprint = fingerprint; verifiedHostIdentityCode = "fixture"
+            hostIdentityConfirmed = confirmed; hostIdentityConfirmationRequired = !confirmed
+            wifiAuthentication.begin(confirmed: confirmed)
+            setState(confirmed ? .connecting : .awaitingHostIdentity)
+            if confirmed { sendTrustedClientHello(generation: connectionGeneration) }
+        }
+    }
+    var authenticationDeviceIDForTesting: Data { trustedDeviceID }
     func setConnectionCredentialForTesting(_ credential: TrustedHostCredential) {
         networkQueue.sync { trustedCredential = credential }
     }
@@ -6843,6 +6938,13 @@ struct RemoteSessionInputConfiguration: Equatable {
     let context: RemoteInputContextCommand?
     let ready: Bool
     let revision: UInt64
+    // Closing local UI restores admission. Its controls may have armed a new drag.
+    // Changes to transport or host authority still retire the originating scope.
+    func requiresRetirement(comparedTo old: Self) -> Bool {
+        !active || remote != old.remote || connected != old.connected || generation != old.generation ||
+            features != old.features || context != old.context || ready != old.ready || revision != old.revision
+    }
+
 }
 
 @MainActor final class RemoteSessionInputState: ObservableObject {

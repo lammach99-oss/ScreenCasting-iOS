@@ -48,6 +48,17 @@ enum IPadInputEvent: Equatable {
     private var externalButtons: Set<UInt8> = []
     private var keys: [UInt16: Set<String>] = [:]
     private var physical: Set<UInt16> = []
+    // A modal responder owns these presses until their Up; repeats must not replay on close.
+    private var quarantinedHardware: Set<UInt16> = []
+    private(set) var hardwareCaptureEnabled = true
+    func setHardwareCaptureEnabled(_ active: Bool) {
+        guard hardwareCaptureEnabled != active else { return }
+        hardwareCaptureEnabled = active
+        if !active {
+            quarantinedHardware.formUnion(physical)
+            retire()
+        }
+    }
     private var modifierStates: [IPadModifier: IPadModifierState] = [:]
     private var actionModifiers: Set<IPadModifier> = []
     // Idempotent scopes: a nested key tap cannot finish an admitted contact.
@@ -183,8 +194,9 @@ enum IPadInputEvent: Equatable {
         return body()
     }
     private func restorePointerCommand() {
-        guard enabled, typeEnabled, commandRestorationEnabled else { return }
+        guard enabled, typeEnabled, hardwareCaptureEnabled, commandRestorationEnabled else { return }
         for key: UInt16 in [0xe3,0xe7] {
+            if quarantinedHardware.contains(key) { continue }
             let query = physicalKeyIsDown?(key)
             let down = currentPointerCommand.map { $0 && currentPointerCommandSides.contains(key) }
                 ?? query ?? false
@@ -217,6 +229,14 @@ enum IPadInputEvent: Equatable {
         }
     }
     func hardware(usage original: UInt16, down: Bool) {
+        if !hardwareCaptureEnabled {
+            if down { quarantinedHardware.insert(original) } else { quarantinedHardware.remove(original) }
+            return
+        }
+        if quarantinedHardware.contains(original) {
+            if !down { quarantinedHardware.remove(original) }
+            return
+        }
         lastHardwareEvent = clock()
         let canonical = canonicalPhysical(original)
         if down {
@@ -245,10 +265,13 @@ enum IPadInputEvent: Equatable {
     /// Called before an ordinary Down, or for pressesChanged. Only Command
     /// owners use uncertainty release; other physical modifiers need their Up.
     func hardwareModifiers(command: Bool, control: Bool, alt: Bool, shift: Bool, fresh: Bool = false) {
+        guard hardwareCaptureEnabled else { return }
         lastHardwareEvent = clock()
         for (held, left, right) in [(command, UInt16(0xe3), UInt16(0xe7)),
                                    (control, 0xe0, 0xe4), (alt, 0xe2, 0xe6), (shift, 0xe1, 0xe5)] {
             let sides: [UInt16] = [left,right]
+            if !held { quarantinedHardware.subtract(sides) }
+            if sides.contains(where: { quarantinedHardware.contains($0) }) { continue }
             if !held && isCommand(left) {
                 for key in sides { uncertainModifiers.remove(key); releasePhysical(key) }
             } else if held {

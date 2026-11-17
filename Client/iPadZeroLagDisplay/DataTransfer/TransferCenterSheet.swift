@@ -102,9 +102,10 @@ import UniformTypeIdentifiers
         IncomingSection(owner: self)
     }
     @ViewBuilder private var consentButtons: some View {
-        Button { networkManager.decideTransfer(true) } label: { Label("Accept", systemImage: "checkmark").foregroundStyle(onAccent).frame(minHeight: 44) }
+        let displayedConsent = state.consent
+        Button { if let consent = displayedConsent { networkManager.decideTransfer(true, consent: consent) } } label: { Label("Accept", systemImage: "checkmark").foregroundStyle(onAccent).frame(minHeight: 44) }
             .buttonStyle(.borderedProminent).disabled(!networkManager.isConnected)
-        Button(role: .destructive) { networkManager.decideTransfer(false) } label: { Label("Decline", systemImage: "xmark").frame(minHeight: 44) }
+        Button(role: .destructive) { if let consent = displayedConsent { networkManager.decideTransfer(false, consent: consent) } } label: { Label("Decline", systemImage: "xmark").frame(minHeight: 44) }
             .buttonStyle(.bordered)
     }
     private var transfer: TransferSection {

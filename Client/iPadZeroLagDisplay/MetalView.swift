@@ -731,6 +731,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     var onPencilInput: ((PencilPacket) -> Void)?
     var onSendTouchEvent: ((TouchEventType, UInt16, UInt16, UInt8) -> Void)?
     var remoteKeyboardActive: Bool
+    var sessionInputActive: Bool?
     private var remoteInput: RemoteSessionInputState?
     private var sharedInput: IPadInputSession?
     var onKeyboardInput: ((KeyboardInputCommand) -> Void)?
@@ -744,6 +745,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         networkManager: NetworkManager,
         gameModeEnabled: Bool = false,
         remoteKeyboardActive: Bool = false,
+        sessionInputActive: Bool? = nil,
         onKeyboardInput: ((KeyboardInputCommand) -> Void)? = nil,
         onTextCommit: ((String) -> Void)? = nil,
         onFrameRendered: (() -> Void)? = nil,
@@ -767,6 +769,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         self.onPencilInput = onPencilInput
         self.onSendTouchEvent = onSendTouchEvent
         self.remoteKeyboardActive = remoteKeyboardActive
+        self.sessionInputActive = sessionInputActive
         self.onKeyboardInput = onKeyboardInput
         self.onTextCommit = onTextCommit
         self.onDirectTouchContact = onDirectTouchContact
@@ -977,7 +980,8 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             sharedInput.clearTextHistory = { [weak container] in container?.softwareTextView.clearCommittedHistory() }
             sharedInput.requestSoftwareKeyboard = { [weak container] in container?.showSoftwareKeyboardFromInputBar() }
             sharedInput.engine.openSettings = { [weak touchView] in touchView?.onOpenSettings?() }
-            sharedInput.bind(networkManager, active: remoteKeyboardActive)
+            sharedInput.engine.setHardwareCaptureEnabled(remoteKeyboardActive && !networkManager.captureInputBlocked)
+            sharedInput.bind(networkManager, active: sessionInputActive ?? remoteKeyboardActive)
             container.softwareTextView.keySourceRoutingEnabled = true
         }
         let metalView = container.metalView

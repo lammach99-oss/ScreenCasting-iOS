@@ -5,7 +5,10 @@ final class DataTransferManager {
     // Serial receive backlog: <= 2 MiB of maximum-size chunk payloads.
     static let maxPendingPackets = 32
     enum Phase: String { case idle = "Connect to your PC first.", offering = "Waiting for approval", awaitingDecision = "Incoming files", sending = "Sending", receiving = "Receiving", verifying = "Verifying", awaitingAck = "Waiting for confirmation", completed = "Completed", rejected = "Rejected", cancelled = "Cancelled", failed = "Failed", retired = "Disconnected" }
+    struct Consent: Equatable { let sessionID: UUID; let transferID: UUID }
+    private let sessionID = UUID()
     struct Snapshot {
+        var consent: Consent?
         var outgoing = false
         var stage = "idle"
         var transport = "Connected to PC"
@@ -167,12 +170,26 @@ final class DataTransferManager {
             throw CocoaError(.fileWriteOutOfSpace)
         }
     }
-    func decide(_ accepted: Bool) {
-        queue.async { [weak self] in self?.decideOnQueue(accepted, expectedTransferID: nil) }
+    func decide(_ accepted: Bool, consent: Consent) {
+        queue.async { [weak self] in
+            guard let self, consent.sessionID == self.sessionID else { return }
+            self.decideOnQueue(accepted, expectedTransferID: consent.transferID)
+        }
     }
-    private func decideOnQueue(_ accepted: Bool, expectedTransferID: UUID?, policyToken: UInt64? = nil) {
+    #if targetEnvironment(simulator)
+    // Existing IO tests capture the currently published owner before queueing a decision.
+    func consentForTesting() -> Consent? {
+        admission.lock(); defer { admission.unlock() }
+        return wireOwner.map { Consent(sessionID: sessionID, transferID: $0.0) }
+    }
+    func decide(_ accepted: Bool) {
+        guard let consent = consentForTesting() else { return }
+        decide(accepted, consent: consent)
+    }
+    #endif
+    private func decideOnQueue(_ accepted: Bool, expectedTransferID: UUID, policyToken: UInt64? = nil) {
         guard !retired, let active=owner, !active.outgoing, !active.accepted,
-              expectedTransferID == nil || expectedTransferID == active.id else { return }
+              expectedTransferID == active.id else { return }
         if let policyToken, !ownsAutoAcceptToken(policyToken) { return }
         do {
             if accepted {
@@ -204,6 +221,7 @@ final class DataTransferManager {
     private func packet(_ active: Owner,_ kind: TransferKind) -> TransferPacket {TransferPacket(kind:kind,generation:active.generation,id:active.id)}
     private func current(_ active: Owner) -> Bool {!retired && owner === active}
     private func publish(_ phase: Phase) {
+        snapshot.consent = owner.flatMap { !$0.outgoing && !$0.accepted && phase == .awaitingDecision ? Consent(sessionID: sessionID, transferID: $0.id) : nil }
         snapshot.phase=phase
         snapshot.transport=transport
         snapshot.stage = diagnosticStage

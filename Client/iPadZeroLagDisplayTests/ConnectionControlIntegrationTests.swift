@@ -10,6 +10,23 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         var snapshot: [Data] { lock.lock(); defer { lock.unlock() }; return storage }
     }
     #if targetEnvironment(simulator)
+    @MainActor func testUnidentifiedUsbPingNeverCommitsAuthority() async {
+        let network = NetworkManager()
+        var now: TimeInterval = 0
+        network.connectionControlNowForTesting = { now }
+        network.controlSendForAudioTesting = { _, done in done(nil) }
+        network.usbIdentityCredentialLoadForTesting = { ConnectionControlProtocolTests.usbCredential }
+        _ = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        network.beginTransferWriterForTesting(); network.configureUsbIdentityForTesting()
+        network.receiveIdentityWireForTesting(type: .ping, payload: Data(repeating: 0, count: 16))
+        network.networkQueueForTesting.sync { now = 10 }
+        await drain(network)
+        XCTAssertNil(network.usbSessionSnapshot().authenticatedGeneration)
+        XCTAssertNil(network.usbSessionSnapshot().committedGeneration)
+        XCTAssertNil(network.usbSessionSnapshot().connection)
+        XCTAssertFalse(network.usbIdentityBoundForTesting)
+        network.stopForTesting()
+    }
     private var previousEngineStart: (() -> Void)?
     private var previousEngineRunning: (() -> Bool)?
     override func setUp() {
@@ -231,12 +248,9 @@ final class ConnectionControlIntegrationTests: XCTestCase {
             XCTAssertFalse(network.usbIdentityBoundForTesting)
             XCTAssertFalse(writes.snapshot.contains { (76...79).contains($0[5]) })
             XCTAssertFalse(writes.snapshot.contains { $0[5] == 24 })
-            if scenario == 0 {
-                // No identity offer: retain the original legacy auth-result dispatch.
-                network.receiveIdentityWireForTesting(type: .trustedAuthResult, payload: Data([0]))
-                await drain(network)
-                XCTAssertEqual(network.connectionState, .authFailed(reason: "Trusted device authentication failed."))
-            }
+            XCTAssertNil(network.usbSessionSnapshot().authenticatedGeneration)
+            XCTAssertNil(network.usbSessionSnapshot().committedGeneration)
+            XCTAssertNil(network.usbSessionSnapshot().connection)
             network.stopForTesting()
         }
     }

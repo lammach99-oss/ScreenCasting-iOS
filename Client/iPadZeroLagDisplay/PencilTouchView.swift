@@ -968,6 +968,10 @@ public class PencilUIKitView: UIView {
     @discardableResult
     func handleHardwareKey(_ usage: UIKeyboardHIDUsage, action: KeyboardInputAction) -> Bool {
         if let session = inputSession {
+            guard session.engine.hardwareCaptureEnabled else {
+                session.engine.hardware(usage: UInt16(clamping: usage.rawValue), down: action == .keyDown)
+                return false // UIKit owns panel/sheet text fields while surface capture is suspended.
+            }
             if action == .keyDown && hardwareKeyActivityEnabled { onHardwareKeyActivity?() }
             session.clearTextHistory?()
             session.engine.hardware(usage: UInt16(clamping: usage.rawValue), down: action == .keyDown)
@@ -1024,7 +1028,7 @@ public class PencilUIKitView: UIView {
                     inputSession?.engine.withPointerCommand(false) {}
                 }
                 guard let usage = hardwareKeyUsage(for: press) else { return true }
-                if action == .keyDown && !(0xe0...0xe7).contains(usage.rawValue) {
+                if inputSession?.engine.hardwareCaptureEnabled == true && action == .keyDown && !(0xe0...0xe7).contains(usage.rawValue) {
                     refreshHardwareModifiers(from: press)
                 }
                 return !handleHardwareKey(usage, action: action)

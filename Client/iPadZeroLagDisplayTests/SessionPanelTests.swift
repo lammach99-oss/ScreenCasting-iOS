@@ -5,6 +5,100 @@ import SwiftUI
 
 /// The session pill is the one visible handle for every session: what it says, and how Disconnect is confirmed.
 final class SessionPanelTests: XCTestCase {
+    func testExtractedCallbacksUseTheirActualOwnerAndLocalIcon() throws {
+        let app = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("iPadZeroLagDisplay")
+        let content = try String(contentsOf: app.appendingPathComponent("ContentView.swift"), encoding: .utf8)
+        let panel = try String(contentsOf: app.appendingPathComponent("SessionPanelOverlay.swift"), encoding: .utf8)
+        let video = try XCTUnwrap(content.components(separatedBy: "struct ConnectedVideoSurface: View").last?
+            .components(separatedBy: "struct DisconnectedDashboard:").first)
+        XCTAssertTrue(video.contains("owner.isSessionPanelOpen = true"))
+        XCTAssertFalse(video.contains("\n                        isSessionPanelOpen = true"))
+        let action = try XCTUnwrap(panel.components(separatedBy: "struct PanelActionButton: View").last?
+            .components(separatedBy: "struct RouteAndControl:").first)
+        XCTAssertTrue(action.contains("Image(systemName: icon)"))
+        XCTAssertFalse(action.contains("Image(systemName: owner.icon)"))
+    }
+
+    @MainActor func testPanelBlocksSurfaceHardwareDelegatesToUIKitAndDoesNotReplayHeldKeys() {
+        var now: TimeInterval = 0
+        let session = IPadInputSession(clock: { now }, automaticallyTicks: false)
+        var events: [IPadInputEvent] = []
+        session.configure(identity: "panel", point: true, type: true, direct: true, zoom: true,
+                          reason: nil, sink: { events.append($0) })
+        let view = PencilUIKitView(frame: .zero); view.inputSession = session
+        XCTAssertTrue(view.handleHardwareKey(.keyboardA, action: .keyDown))
+        session.panelPresentationChanged(true)
+        XCTAssertEqual(events.last, .key(4, 1)); events.removeAll()
+        XCTAssertFalse(view.handleHardwareKey(.keyboardB, action: .keyDown))
+        XCTAssertTrue(events.isEmpty)
+        session.tapKey(hidUsage: 0x50) // Intentional on-screen actions still work.
+        XCTAssertEqual(events, [.key(0x50, 0), .key(0x50, 1)]); events.removeAll()
+        now = 10; session.panelPresentationChanged(false)
+        XCTAssertTrue(view.handleHardwareKey(.keyboardA, action: .keyDown))
+        XCTAssertTrue(view.handleHardwareKey(.keyboardB, action: .keyDown))
+        XCTAssertTrue(events.isEmpty, "Held/repeating keys cannot cross the panel boundary")
+        _ = view.handleHardwareKey(.keyboardA, action: .keyUp)
+        _ = view.handleHardwareKey(.keyboardB, action: .keyUp)
+        _ = view.handleHardwareKey(.keyboardA, action: .keyDown)
+        _ = view.handleHardwareKey(.keyboardA, action: .keyUp)
+        XCTAssertEqual(events, [.key(4, 0), .key(4, 1)])
+        session.panelPresentationChanged(true)
+        session.panelPresentationChanged(false, surfaceActive: false)
+        XCTAssertFalse(view.handleHardwareKey(.keyboardC, action: .keyDown), "A sheet/guide still owns input")
+    }
+
+    @MainActor func testPanelClosePreservesDragArmedOrLatchedInsidePanel() {
+        for mode in [IPadTouchMode.direct, .trackpad] {
+            for latched in [false, true] {
+                let session = IPadInputSession(clock: { 0 }, automaticallyTicks: false)
+                var events: [IPadInputEvent] = []
+                session.configure(identity: "panel", point: true, type: true, direct: true, zoom: true,
+                                  reason: nil, sink: { events.append($0) })
+                session.engine.mode = mode
+                session.panelPresentationChanged(true); session.beginDrag()
+                if latched { session.click(.left); session.moveAccessibleTarget(.right, coarse: true) }
+                XCTAssertEqual(session.dragState, latched ? .latched : .armed)
+                let before = events
+                session.panelPresentationChanged(false)
+                XCTAssertEqual(session.dragState, latched ? .latched : .armed)
+                XCTAssertEqual(events, before)
+                session.releaseAll(); XCTAssertEqual(session.dragState, .idle)
+            }
+        }
+    }
+
+    @MainActor func testPanelOpeningRetiresPointerBeforePhysicalModifier() {
+        let session = IPadInputSession(clock: { 0 }, automaticallyTicks: false)
+        var events: [IPadInputEvent] = []
+        session.configure(identity: "panel", point: true, type: true, direct: true, zoom: true,
+                          reason: nil, sink: { events.append($0) })
+        session.engine.mode = .direct
+        session.engine.hardware(usage: 0xe0, down: true)
+        session.engine.begin(id: 1, pencil: false, point: .zero, normalized: .zero)
+        events.removeAll()
+        session.panelPresentationChanged(true)
+        XCTAssertEqual(events, [.touch(.cancel, 1, .zero, 255), .key(0xe0, 1)])
+        session.panelPresentationChanged(false)
+        events.removeAll()
+        session.engine.hardware(usage: 0xe0, down: true)
+        XCTAssertTrue(events.isEmpty, "A held modifier cannot replay across the panel boundary")
+        session.engine.hardware(usage: 0xe0, down: false)
+        session.engine.hardware(usage: 0xe0, down: true)
+        XCTAssertEqual(events, [.key(0xe0, 0)])
+    }
+
+    func testOnlyActiveResumeAvoidsRemoteConfigurationRetirement() {
+        let paused = RemoteSessionInputConfiguration(remote: true, connected: true, active: false,
+            generation: 1, features: 0x1f, context: nil, ready: true, revision: 1)
+        let resumed = RemoteSessionInputConfiguration(remote: true, connected: true, active: true,
+            generation: 1, features: 0x1f, context: nil, ready: true, revision: 1)
+        XCTAssertFalse(resumed.requiresRetirement(comparedTo: paused))
+        XCTAssertTrue(paused.requiresRetirement(comparedTo: resumed))
+        let replaced = RemoteSessionInputConfiguration(remote: true, connected: true, active: true,
+            generation: 2, features: 0x1f, context: nil, ready: true, revision: 1)
+        XCTAssertTrue(replaced.requiresRetirement(comparedTo: paused))
+    }
     func testPanelBuildersHaveBoundedMetadataComposition() throws {
         let app = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().appendingPathComponent("iPadZeroLagDisplay")

@@ -3,6 +3,122 @@ import Network
 import Metal
 @testable import iPadCasting
 
+final class AuthenticationStageRegressionTests: XCTestCase {
+    #if targetEnvironment(simulator)
+    func testQueuedButUnsentPINCannotAuthorizeASuccess() {
+        let network = NetworkManager(), credentials = MemoryBacking(), pins = MemoryBacking()
+        // Keep Hello in flight so the PIN can be queued but cannot reach the sender.
+        network.controlSendForAudioTesting = { _, _ in }
+        _ = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        network.beginTransferWriterForTesting()
+        network.configureAuthenticationForTesting(confirmed: true, fingerprint: "fixture-pin",
+            endpoint: .service(name: "fixture", type: "_fixture._tcp", domain: "local", interface: nil),
+            credentials: credentials, pins: pins)
+        network.receiveIdentityWireForTesting(type: .pairingRequired, payload: Data([0]))
+        network.sendAuthPIN("1234"); network.networkQueueForTesting.sync {}
+        network.receiveIdentityWireForTesting(type: .authResult, payload: Data([1]))
+        XCTAssertNil(network.wifiSessionSnapshotForTesting().committedGeneration)
+        network.networkQueueForTesting.sync { XCTAssertTrue(credentials.values.isEmpty); XCTAssertTrue(pins.values.isEmpty) }
+        network.stopForTesting()
+    }
+    func testRealReceivePathRejectsUnconfirmedOrUnrequestedAuthenticationWithoutPersistence() {
+        for confirmed in [false, true] {
+            let network = NetworkManager(), credentials = MemoryBacking(), pins = MemoryBacking()
+            network.controlSendForAudioTesting = { _, done in done(nil) }
+            _ = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+            network.beginTransferWriterForTesting()
+            network.configureAuthenticationForTesting(confirmed: confirmed, fingerprint: "fixture-pin",
+                endpoint: .service(name: "fixture", type: "_fixture._tcp", domain: "local", interface: nil),
+                credentials: credentials, pins: pins)
+            network.receiveIdentityWireForTesting(type: .authResult, payload: Data([1]))
+            network.receiveIdentityWireForTesting(type: .pairingSuccess, payload: Data(repeating: 1, count: 80))
+            XCTAssertNil(network.wifiSessionSnapshotForTesting().committedGeneration)
+            network.networkQueueForTesting.sync {
+                XCTAssertTrue(credentials.values.isEmpty); XCTAssertTrue(pins.values.isEmpty)
+            }
+            network.stopForTesting()
+        }
+    }
+    func testConfirmedPINFlowPersistsOnlyItsOwnCredentialAndOfflineForgetDeletesIt() {
+        let network = NetworkManager(), credentials = MemoryBacking(), pins = MemoryBacking()
+        let endpoint = NWEndpoint.service(name: "fixture", type: "_fixture._tcp", domain: "local", interface: nil)
+        network.controlSendForAudioTesting = { _, done in done(nil) }
+        _ = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        network.beginTransferWriterForTesting()
+        network.configureAuthenticationForTesting(confirmed: true, fingerprint: "fixture-pin", endpoint: endpoint,
+            credentials: credentials, pins: pins)
+        network.receiveIdentityWireForTesting(type: .pairingRequired, payload: Data([0]))
+        network.sendAuthPIN("1234"); network.networkQueueForTesting.sync {}
+        // Negotiation prevents media/audio commit in this authentication-only test.
+        network.receiveIdentityWireForTesting(type: .authResult, payload: Data([1]), flags: WireProtocol.realtimeNegotiationSupportedFlag)
+        let payload = Data(repeating: 1, count: 16) + network.authenticationDeviceIDForTesting +
+            Data(repeating: 2, count: 16) + Data(repeating: 3, count: 32)
+        network.receiveIdentityWireForTesting(type: .pairingSuccess, payload: payload)
+        network.networkQueueForTesting.sync {
+            XCTAssertNotNil(TrustedHostCredentialStore(backing: credentials).load(fingerprint: "fixture-pin"))
+            XCTAssertEqual(TrustedHostFingerprintStore(backing: pins).load(endpoint: endpoint), "fixture-pin")
+        }
+        XCTAssertNil(network.wifiSessionSnapshotForTesting().committedGeneration)
+        network.forgetTrustedHost(endpoint: endpoint); network.networkQueueForTesting.sync {}
+        network.networkQueueForTesting.sync {
+            XCTAssertNil(TrustedHostCredentialStore(backing: credentials).load(fingerprint: "fixture-pin"))
+            XCTAssertNil(TrustedHostFingerprintStore(backing: pins).load(endpoint: endpoint))
+        }
+        network.stopForTesting()
+    }
+    #endif
+    func testUnsolicitedResultsCannotCrossIdentityGate() {
+        for message in [WireMessageType.authResult, .pairingSuccess, .trustedDeviceChallenge] {
+            var auth = WifiAuthenticationState()
+            auth.begin(confirmed: false)
+            XCTAssertFalse(auth.receive(message, accepted: true))
+            XCTAssertFalse(auth.mayPersistPairing)
+            XCTAssertFalse(auth.sentHello())
+        }
+    }
+    func testPINAndProofResultsRequireTheirOwnRequestsAndAreOneUse() {
+        var auth = WifiAuthenticationState(); auth.begin(confirmed: true)
+        XCTAssertTrue(auth.sentHello())
+        XCTAssertFalse(auth.receive(.authResult, accepted: true))
+        auth.begin(confirmed: true)
+        XCTAssertTrue(auth.sentHello()); XCTAssertTrue(auth.receive(.pairingRequired))
+        XCTAssertTrue(auth.sentPIN()); XCTAssertTrue(auth.receive(.authResult, accepted: true))
+        XCTAssertTrue(auth.mayPersistPairing)
+        XCTAssertTrue(auth.receive(.pairingSuccess)); XCTAssertFalse(auth.receive(.pairingSuccess))
+        auth.begin(confirmed: true)
+        XCTAssertTrue(auth.sentHello()); XCTAssertTrue(auth.receive(.trustedDeviceChallenge))
+        XCTAssertTrue(auth.sentProof()); XCTAssertTrue(auth.receive(.authResult, accepted: true))
+        XCTAssertFalse(auth.mayPersistPairing)
+        XCTAssertTrue(auth.receive(.trustedAuthResult, accepted: true))
+        XCTAssertTrue(auth.receive(.sessionResumeResult, accepted: true))
+        XCTAssertFalse(auth.receive(.sessionResumeResult, accepted: true))
+    }
+    private final class MemoryBacking: TrustedHostCredentialBacking {
+        var values: [String: Data] = [:]
+        func load(fingerprint: String) -> Data? { values[fingerprint] }
+        func save(_ data: Data, fingerprint: String) -> Bool { values[fingerprint] = data; return true }
+        func delete(fingerprint: String) { values.removeValue(forKey: fingerprint) }
+    }
+    func testEndpointPinsAndLegacyMigrationCannotTrustAnotherHost() throws {
+        let memory = MemoryBacking(), store = TrustedHostFingerprintStore(backing: MemoryBacking())
+        let pins = TrustedHostFingerprintStore(backing: memory)
+        let a = NWEndpoint.service(name: "fixture-a", type: "_fixture._tcp", domain: "local", interface: nil)
+        let b = NWEndpoint.service(name: "fixture-b", type: "_fixture._tcp", domain: "local", interface: nil)
+        XCTAssertTrue(pins.save("pin-a", endpoint: a, hostID: Data(repeating: 1, count: 16)))
+        XCTAssertEqual(pins.load(endpoint: a), "pin-a"); XCTAssertNil(pins.load(endpoint: b))
+        XCTAssertTrue(pins.save("pin-b", endpoint: b, hostID: Data(repeating: 2, count: 16)))
+        pins.delete(fingerprint: "pin-a")
+        XCTAssertNil(pins.load(endpoint: a)); XCTAssertEqual(pins.load(endpoint: b), "pin-b")
+        XCTAssertNil(store.load(endpoint: a))
+        memory.values["selected-host"] = Data("legacy".utf8)
+        XCTAssertNil(pins.migrateLegacy(endpoint: a, presented: "other", credential: nil))
+        let credential = TrustedHostCredential(fingerprint: "legacy", hostID: Data(repeating: 1, count: 16),
+            deviceID: Data(repeating: 2, count: 16), secret: Data(repeating: 3, count: 32), sessionID: Data(repeating: 4, count: 16))
+        XCTAssertEqual(pins.migrateLegacy(endpoint: a, presented: "legacy", credential: credential), "legacy")
+        XCTAssertNil(pins.load(endpoint: NWEndpoint.service(name: "fixture-c", type: "_fixture._tcp", domain: "local", interface: nil)))
+    }
+}
+
 final class UsbBindCompletionOwnershipTests: XCTestCase {
     func testEveryBindIdentityComponentIsRequired() throws {
         let queue = DispatchQueue(label: "UsbBindCompletionOwnershipTests.identity")

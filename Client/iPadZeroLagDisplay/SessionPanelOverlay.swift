@@ -914,7 +914,7 @@ private extension Color {
         var body: some View {
             Button(action: action) {
                 VStack(spacing: 6) {
-                    Image(systemName: owner.icon).accessibilityHidden(true).font(.title3).foregroundStyle(Color(ink: SessionInk.accent))
+                    Image(systemName: icon).accessibilityHidden(true).font(.title3).foregroundStyle(Color(ink: SessionInk.accent))
                     Text(title).font(.footnote.weight(.medium)).fixedSize(horizontal: false, vertical: true)
                         .multilineTextAlignment(.center)
                 }

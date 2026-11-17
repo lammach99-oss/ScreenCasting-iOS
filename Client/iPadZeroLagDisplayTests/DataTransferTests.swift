@@ -223,6 +223,25 @@ final class DataTransferTests: XCTestCase {
         let enabled = await MainActor.run { f.network.autoAcceptIncomingFiles }
         XCTAssertEqual(enabled, expected, file: file, line: line)
     }
+    func testDisplayedOfferConsentCannotApproveReplacementOrAnotherSession() async throws {
+        let f = try UX02Session(), a = UUID(), b = UUID()
+        await ux02Offer(f, id: a)
+        let consent = try XCTUnwrap(f.manager.consentForTesting())
+        await ux03Post(TransferPacket(kind: .cancel, generation: 7, id: a), to: f.manager)
+        await ux02Offer(f, id: b)
+        f.network.decideTransfer(true, consent: consent)
+        f.network.networkQueueForTesting.sync {}
+        await ux03Barrier(f.manager)
+        XCTAssertTrue(f.responses(b).isEmpty)
+        let current = try XCTUnwrap(f.manager.consentForTesting())
+        f.manager.decide(true, consent: .init(sessionID: UUID(), transferID: current.transferID))
+        await ux03Barrier(f.manager); XCTAssertTrue(f.responses(b).isEmpty)
+        f.network.decideTransfer(false, consent: current)
+        f.network.networkQueueForTesting.sync {}
+        await ux03Barrier(f.manager); await ux03Barrier(f.manager)
+        XCTAssertEqual(f.responses(b).count, 1)
+        await ux02Finish(f)
+    }
     private func ux02Toggle(_ f: UX02Session, _ enabled: Bool) async {
         f.network.setAutoAcceptIncomingFiles(enabled)
         f.network.networkQueueForTesting.sync { }

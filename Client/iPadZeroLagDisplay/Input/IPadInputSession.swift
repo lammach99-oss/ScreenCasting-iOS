@@ -121,6 +121,11 @@ enum IPadNudgeDirection { case up, down, left, right }
         engine.withoutCommandRestoration { engine.armDrag() }
     }
     func releaseDrag() { engine.releaseDrag() }
+    /// Panel controls keep their own authority; only physical surface typing is fenced.
+    func panelPresentationChanged(_ open: Bool, surfaceActive: Bool = true) {
+        engine.setHardwareCaptureEnabled(!open && surfaceActive)
+        if open { releaseAll() }
+    }
     func releaseAll() {
         tickTimer?.invalidate(); tickTimer = nil
         clearTextHistory?(); retireQueuedInput?(); engine.retire()

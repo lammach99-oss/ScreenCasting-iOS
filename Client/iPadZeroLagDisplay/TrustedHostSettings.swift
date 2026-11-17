@@ -21,7 +21,8 @@ protocol TrustedHostCredentialBacking {
 }
 
 struct SecurityTrustedHostCredentialBacking: TrustedHostCredentialBacking {
-    private let service = "com.screencasting.trusted-host.v1"
+    let service: String
+    init(service: String = "com.screencasting.trusted-host.v1") { self.service = service }
 
     func load(fingerprint: String) -> Data? {
         let query: [String: Any] = [
@@ -100,53 +101,94 @@ struct TrustedHostCredentialStore {
     }
 }
 
+/// Endpoint mappings are indexes into independently pinned host identities.
 struct TrustedHostFingerprintStore {
-    private let service = "com.screencasting.trusted-host-identity.v1"
-    private let account = "selected-host"
-
+    private let backing: any TrustedHostCredentialBacking
+    init(backing: any TrustedHostCredentialBacking = SecurityTrustedHostCredentialBacking(service: "com.screencasting.trusted-host-identity.v1")) {
+        self.backing = backing
+    }
+    private struct Record: Codable { let fingerprint: String; let hostID: Data }
+    private func key(_ endpoint: NWEndpoint) -> String? {
+        guard let target = WifiReconnectTargetPolicy.target(from: endpoint) else { return nil }
+        // Encode deterministically: JSON object key ordering is otherwise unspecified.
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        guard let stable = try? encoder.encode(target) else { return nil }
+        return "endpoint." + SHA256.hash(data: stable).map { String(format: "%02x", $0) }.joined()
+    }
+    func load(endpoint: NWEndpoint) -> String? {
+        guard let key = key(endpoint), let bytes = backing.load(fingerprint: key),
+              let record = try? JSONDecoder().decode(Record.self, from: bytes),
+              record.hostID.count == 16,
+              backing.load(fingerprint: "identity." + record.fingerprint) == record.hostID else { return nil }
+        return record.fingerprint
+    }
+    // Selected identity is only for USB's existing proof protocol, never a Wi-Fi endpoint pin.
     func load() -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data,
-              let fingerprint = String(data: data, encoding: .utf8) else {
-            return nil
+        guard let bytes = backing.load(fingerprint: "selected-identity") ?? backing.load(fingerprint: "selected-host") else { return nil }
+        return String(data: bytes, encoding: .utf8)
+    }
+    func save(_ fingerprint: String, endpoint: NWEndpoint, hostID: Data) -> Bool {
+        guard !fingerprint.isEmpty, hostID.count == 16, let key = key(endpoint),
+              let bytes = try? JSONEncoder().encode(Record(fingerprint: fingerprint, hostID: hostID)) else { return false }
+        var keys = endpointKeys(fingerprint)
+        if !keys.contains(key) { keys.append(key) }
+        guard let index = try? JSONEncoder().encode(keys),
+              backing.save(hostID, fingerprint: "identity." + fingerprint),
+              backing.save(index, fingerprint: "index." + fingerprint),
+              backing.save(bytes, fingerprint: key),
+              backing.save(Data(fingerprint.utf8), fingerprint: "selected-identity") else { return false }
+        return true
+    }
+    func migrateLegacy(endpoint: NWEndpoint, presented: String, credential: TrustedHostCredential?) -> String? {
+        guard let legacy = backing.load(fingerprint: "selected-host"), String(data: legacy, encoding: .utf8) == presented,
+              let credential, credential.fingerprint == presented, credential.hostID.count == 16,
+              credential.deviceID.count == 16, credential.secret.count == 32, credential.sessionID.count == 16,
+              save(presented, endpoint: endpoint, hostID: credential.hostID) else { return nil }
+        backing.delete(fingerprint: "selected-host")
+        return presented
+    }
+    private func endpointKeys(_ fingerprint: String) -> [String] {
+        guard let data = backing.load(fingerprint: "index." + fingerprint) else { return [] }
+        return (try? JSONDecoder().decode([String].self, from: data)) ?? []
+    }
+    func delete(fingerprint: String) {
+        for key in endpointKeys(fingerprint) {
+            // A reused endpoint might now belong to a different, explicitly confirmed host.
+            if let data = backing.load(fingerprint: key),
+               let record = try? JSONDecoder().decode(Record.self, from: data), record.fingerprint == fingerprint {
+                backing.delete(fingerprint: key)
+            }
         }
-        return fingerprint
+        backing.delete(fingerprint: "index." + fingerprint)
+        backing.delete(fingerprint: "identity." + fingerprint)
+        for key in ["selected-identity", "selected-host"] {
+            if backing.load(fingerprint: key) == Data(fingerprint.utf8) { backing.delete(fingerprint: key) }
+        }
     }
+}
 
-    func save(_ fingerprint: String) -> Bool {
-        guard !fingerprint.isEmpty,
-              let data = fingerprint.data(using: .utf8) else { return false }
-        let key: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        let values: [String: Any] = [
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-        ]
-        let update = SecItemUpdate(key as CFDictionary, values as CFDictionary)
-        if update == errSecSuccess { return true }
-        guard update == errSecItemNotFound else { return false }
-        var add = key
-        values.forEach { add[$0.key] = $0.value }
-        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
-    }
-
-    func delete() {
-        SecItemDelete([
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ] as CFDictionary)
+/// Serialized on NetworkManager.networkQueue. A server cannot advance a local request stage.
+struct WifiAuthenticationState {
+    enum Stage { case identity, ready, hello, pin, pinResult, challenge, proofResult, paired, trusted, resume, complete, failed }
+    private(set) var stage: Stage = .failed
+    mutating func begin(confirmed: Bool) { stage = confirmed ? .ready : .identity }
+    mutating func confirm() -> Bool { guard stage == .identity else { return false }; stage = .ready; return true }
+    mutating func sentHello() -> Bool { guard stage == .ready else { return false }; stage = .hello; return true }
+    mutating func sentPIN() -> Bool { guard stage == .pin else { return false }; stage = .pinResult; return true }
+    mutating func sentProof() -> Bool { guard stage == .challenge else { return false }; stage = .proofResult; return true }
+    var mayPersistPairing: Bool { stage == .paired }
+    mutating func receive(_ type: WireMessageType, accepted: Bool = false) -> Bool {
+        switch (stage, type) {
+        case (.hello, .pairingRequired): stage = .pin
+        case (.hello, .trustedDeviceChallenge): stage = .challenge
+        case (.pinResult, .authResult): stage = accepted ? .paired : .pin
+        case (.proofResult, .authResult): stage = accepted ? .trusted : .failed
+        case (.paired, .pairingSuccess): stage = .resume
+        case (.trusted, .trustedAuthResult): stage = accepted ? .resume : .failed
+        case (.resume, .sessionResumeResult): stage = accepted ? .complete : .failed
+        default: stage = .failed; return false
+        }
+        return true
     }
 }
 

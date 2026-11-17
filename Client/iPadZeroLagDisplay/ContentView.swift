@@ -351,8 +351,9 @@ struct HostIdentityConfirmationView: View {
         .onChange(of: connectStatus.text) { _, text in
             if !streamManager.isConnected { UIAccessibility.post(notification: .announcement, argument: text) }
         }
-        .onChange(of: remoteInputConfiguration) { _, value in
-            inputSession.releaseAll()
+        .onChange(of: remoteInputConfiguration) { old, value in
+            inputSession.engine.setHardwareCaptureEnabled(value.active && !networkManager.captureInputBlocked)
+            if value.requiresRetirement(comparedTo: old) { inputSession.releaseAll() }
             remoteInput.bind(networkManager)
             remoteInput.configure(value)
         }
@@ -445,7 +446,7 @@ struct HostIdentityConfirmationView: View {
     private var remoteInputConfiguration: RemoteSessionInputConfiguration {
         RemoteSessionInputConfiguration(remote: networkManager.isRemoteControlSession,
             connected: streamManager.isConnected,
-            active: scenePhase == .active && !isSheetPresented && !showGestureGuide,
+            active: scenePhase == .active && !isSheetPresented && !showGestureGuide && !isSessionPanelOpen,
             generation: networkManager.remoteKeyboardGeneration,
             features: networkManager.remoteInputFeatures, context: networkManager.remoteInputContext,
             ready: networkManager.remoteInputReady, revision: networkManager.remoteInputRevision)
@@ -712,7 +713,10 @@ struct HostIdentityConfirmationView: View {
                     owner.networkManager.setDesiredPipelineMode(
                         enabled ? .game : .office)
                 }
-                .onChange(of: owner.isSessionPanelOpen) { _, _ in owner.inputSession.releaseAll() }
+                .onChange(of: owner.isSessionPanelOpen) { _, open in
+                    owner.inputSession.panelPresentationChanged(open, surfaceActive:
+                        owner.streamManager.isConnected && owner.scenePhase == .active && !owner.isSheetPresented && !owner.showGestureGuide)
+                }
                 .onDisappear {
                     owner.inputSession.releaseAll()
                     UIApplication.shared.isIdleTimerDisabled = false
@@ -810,6 +814,7 @@ struct HostIdentityConfirmationView: View {
                         .accessibilityHint("Connects to this PC using the saved mode")
                         .contextMenu {
                             Button("Forget", role: .destructive) {
+                                owner.networkManager.forgetTrustedHost(host: entry.host, port: entry.port)
                                 owner.recentRemoteHosts = RecentRemoteHostStore.remove(host: entry.host, remoteControl: entry.remoteControl)
                             }
                             .disabled(owner.isConnectBusy)
@@ -886,7 +891,8 @@ struct HostIdentityConfirmationView: View {
                 ConnectedPresentationSurface(
                     networkManager: owner.networkManager,
                     gameModeEnabled: owner.gameModeEnabled,
-                    remoteKeyboardActive: owner.streamManager.isConnected && owner.scenePhase == .active && !owner.isSheetPresented && !owner.showGestureGuide,
+                    remoteKeyboardActive: owner.streamManager.isConnected && owner.scenePhase == .active && !owner.isSheetPresented && !owner.showGestureGuide && !owner.isSessionPanelOpen,
+                    sessionInputActive: owner.streamManager.isConnected && owner.scenePhase == .active && !owner.isSheetPresented && !owner.showGestureGuide,
                     onKeyboardInput: { command in
                         owner.networkManager.sendKeyboardInput(command)
                     },
@@ -928,7 +934,7 @@ struct HostIdentityConfirmationView: View {
                     },
                     onOpenSettings: {
                         // The 3-finger tap opens the session panel; Settings is one tap inside it.
-                        isSessionPanelOpen = true
+                        owner.isSessionPanelOpen = true
                     })
                     .remoteSessionInput(owner.remoteInput)
                     .iPadInputSession(owner.inputSession)
@@ -980,6 +986,11 @@ struct HostIdentityConfirmationView: View {
                             .frame(minHeight: 44)
                             .disabled(!owner.networkManager.hasReconnectTarget)
                         } else if owner.networkManager.hasReconnectTarget && !owner.isConnectBusy { owner.reconnectButton }
+                        if owner.networkManager.hasReconnectTarget && !owner.isConnectBusy {
+                            Button("Forget last PC", role: .destructive) { owner.networkManager.forgetTrustedHost() }
+                                .buttonStyle(.bordered).frame(minHeight: 44)
+                                .accessibilityHint("Removes this PC's saved trust so you can pair again")
+                        }
                         owner.discoveredPCs
                         owner.usbCard
                         owner.ipEntry
