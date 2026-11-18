@@ -5731,6 +5731,10 @@ public class NetworkManager: ObservableObject {
             resetAutoAcceptOnQueue()
             advanceReceivedRevisionOnQueue()
             resetDirectTouchSessionOnQueue()
+            // Match production Wi-Fi setup: each connection has its own settings revisions and retry budget.
+            clientSettingsState.resetHostGeneration()
+            settingsReconciliationGate.reset()
+            settingsSyncPolicy.reset()
             connection?.cancel()
             wifiBackgroundDisconnectWorkItem?.cancel()
             wifiBackgroundDisconnectWorkItem = nil
