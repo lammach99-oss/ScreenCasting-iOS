@@ -30,6 +30,27 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         XCTAssertEqual(ClientStreamSettingsStore.load(defaults: defaults), legacy)
     }
 
+    func testCastingBitrateMigrationPreservesOldDefaultAndSeedsNewPairings() throws {
+        let suite = "CastingBitrateMigration." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let existingA = Data(repeating: 1, count: 16)
+        let existingB = Data(repeating: 2, count: 16)
+        let newHost = Data(repeating: 3, count: 16)
+        ClientStreamSettingsStore.save(.normalized(bitrateMbps: 31, audioEnabled: false), defaults: defaults)
+        ClientStreamSettingsStore.migrateCastingBitrate(defaults: defaults)
+        ClientStreamSettingsStore.save(.normalized(bitrateMbps: 12, audioEnabled: false), hostID: existingA, defaults: defaults)
+        XCTAssertEqual(ClientStreamSettingsStore.load(defaults: defaults).bitrateMbps, 31)
+        ClientStreamSettingsStore.save(.normalized(bitrateMbps: 24, audioEnabled: false), defaults: defaults)
+        let reopened = try XCTUnwrap(UserDefaults(suiteName: suite))
+        ClientStreamSettingsStore.migrateCastingBitrate(defaults: reopened)
+        ClientStreamSettingsStore.initializeCastingBitrateForNewPairing(hostID: existingA, defaults: reopened)
+        ClientStreamSettingsStore.initializeCastingBitrateForNewPairing(hostID: newHost, defaults: reopened)
+        XCTAssertEqual(ClientStreamSettingsStore.load(hostID: existingA, defaults: reopened).bitrateMbps, 12)
+        XCTAssertEqual(ClientStreamSettingsStore.load(hostID: existingB, defaults: reopened).bitrateMbps, 31)
+        XCTAssertEqual(ClientStreamSettingsStore.load(hostID: newHost, defaults: reopened).bitrateMbps, 24)
+    }
+
     func fixtures() throws -> [String: String] {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "AdaptiveMediaV1Golden", withExtension: "json"))
         return try JSONDecoder().decode([String: String].self, from: Data(contentsOf: url))
@@ -673,11 +694,22 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let hostID = Data(repeating: 1, count: 16)
+        let otherHostID = Data(repeating: 2, count: 16)
         ClientStreamSettingsStore.saveAutoQuality(true, hostID: hostID, defaults: defaults)
         ClientStreamSettingsStore.save(.normalized(bitrateMbps: 31, audioEnabled: false, adaptiveBitrateEnabled: true),
                                        defaults: defaults)
         let network = NetworkManager(userDefaults: defaults)
         network.realtimeAudioPlaybackForTesting = { enabled in XCTAssertFalse(enabled) }
+        network.controlSendForAudioTesting = { _, done in done(nil) }
+        for (editedHost, bitrate) in [(hostID, 12.0), (otherHostID, 27.0)] {
+            _ = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+            network.setAdaptiveHostForTesting(editedHost)
+            network.beginTransferWriterForTesting()
+            network.setDesiredStreamSettings(bitrateMbps: bitrate, audioEnabled: false, adaptiveBitrateEnabled: true)
+            network.networkQueueForTesting.sync {}
+            network.stopForTesting()
+        }
+        XCTAssertEqual(ClientStreamSettingsStore.load(defaults: defaults).bitrateMbps, 31)
         var now = 0.0
         var priorOwner: UInt64?
         for (mode, usb, oldHost, pairedHost) in [
@@ -685,7 +717,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
             (RealtimeTransportMode.legacyTLS, false, false, hostID),
             (RealtimeTransportMode.legacyTLS, true, false, hostID),
             (RealtimeTransportMode.wifiRTP, false, true, hostID),
-            (RealtimeTransportMode.wifiRTP, false, false, Data(repeating: 2, count: 16)),
+            (RealtimeTransportMode.wifiRTP, false, false, otherHostID),
             (RealtimeTransportMode.wifiRTP, false, false, hostID)
         ] {
             defer { network.stopForTesting() }
@@ -755,7 +787,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
                 let policy = writes.filter { $0[5] == 95 }
                 if pairedHost == hostID {
                     XCTAssertEqual(policy.map { $0[56] }, [2])
-                    XCTAssertEqual(policy.first?.loadLittleEndian(UInt32.self, at: 60), 31_000_000)
+                    XCTAssertEqual(policy.first?.loadLittleEndian(UInt32.self, at: 60), 12_000_000)
                     if let priorOwner {
                         XCTAssertNotEqual(owner, priorOwner)
                     } else {
@@ -773,15 +805,30 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
                         XCTAssertTrue(network.savedAutoQualityEnabled)
                         XCTAssertTrue(writes.dropFirst(beforeFallback).allSatisfy { !(93...99).contains($0[5]) })
                         XCTAssertTrue(writes.dropFirst(beforeFallback).contains { $0[5] == WireMessageType.settingsGet.rawValue })
-                        XCTAssertEqual(writes.last { $0[5] == WireMessageType.settingsUpdate.rawValue }?[19], 0)
+                        let update = try XCTUnwrap(writes.last { $0[5] == WireMessageType.settingsUpdate.rawValue })
+                        XCTAssertEqual(update[19], 0)
+                        XCTAssertEqual(update.loadLittleEndian(UInt32.self, at: 32), 12_000_000)
                         priorOwner = owner
                         continue
                     }
                 } else {
                     XCTAssertTrue(policy.isEmpty)
                 }
+                XCTAssertEqual(network.desiredBitrateMbps, pairedHost == hostID ? 12 : 27)
                 XCTAssertTrue(network.adaptiveQualityAvailable)
                 XCTAssertEqual(network.autoQualityEnabled, pairedHost == hostID)
+                if pairedHost == otherHostID {
+                    let beforeFallback = writes.count
+                    XCTAssertTrue(network.networkQueueForTesting.sync {
+                        network.fallbackCommittedWifiToLegacy(generation: peer.generation)
+                    })
+                    reportLegacyAutoBitrate()
+                    await drain()
+                    let fallback = writes.dropFirst(beforeFallback)
+                    XCTAssertTrue(fallback.contains { $0[5] == WireMessageType.settingsGet.rawValue })
+                    let update = try XCTUnwrap(fallback.last { $0[5] == WireMessageType.settingsUpdate.rawValue })
+                    XCTAssertEqual(update.loadLittleEndian(UInt32.self, at: 32), 27_000_000)
+                }
                 continue
             }
             network.setAutoQualityEnabled(false)
@@ -793,7 +840,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
             XCTAssertTrue(writes.allSatisfy { !(93...99).contains($0[5]) })
             let update = try XCTUnwrap(writes.last { $0[5] == WireMessageType.settingsUpdate.rawValue })
             XCTAssertEqual(update[19], 0, "Fallback sends Manual, even with legacy Automatic bitrate saved")
-            XCTAssertEqual(update.loadLittleEndian(UInt32.self, at: 32), 31_000_000)
+            XCTAssertEqual(update.loadLittleEndian(UInt32.self, at: 32), 12_000_000)
             XCTAssertTrue(ClientStreamSettingsStore.loadAutoQuality(hostID: hostID, defaults: defaults))
         }
     }

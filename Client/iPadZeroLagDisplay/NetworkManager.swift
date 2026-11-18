@@ -774,6 +774,7 @@ public class NetworkManager: ObservableObject {
         networkQueue.setSpecific(key: networkQueueKey, value: true)
         clientDebugLoggingEnabled = ClientDebugLoggingPreference.load(
             defaults: userDefaults)
+        ClientStreamSettingsStore.migrateCastingBitrate(defaults: userDefaults)
         let desired = ClientStreamSettingsStore.load(defaults: userDefaults)
         clientSettingsState = ClientSettingsStateModel(desired: desired)
         desiredBitrateMbps = desired.bitrateMbps
@@ -1834,17 +1835,20 @@ public class NetworkManager: ObservableObject {
             bitrateMbps: bitrateMbps,
             audioEnabled: audioEnabled,
             adaptiveBitrateEnabled: adaptiveBitrateEnabled)
-        ClientStreamSettingsStore.save(desired, defaults: streamSettingsDefaults)
-        DispatchQueue.main.async {
-            self.desiredBitrateMbps = desired.bitrateMbps
-            self.desiredAudioEnabled = desired.audioEnabled
-            self.desiredAdaptiveBitrateEnabled = desired.adaptiveBitrateEnabled
-        }
+        let generation = connectionGenerationClock.current
         networkQueue.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.connectionGeneration == generation,
+                  !self.awaitingCastingSettingsIdentity else { return }
             let audioChanged = desired.audioEnabled != self.clientSettingsState.desired.audioEnabled
             let legacyAutoChanged = desired.adaptiveBitrateEnabled != self.clientSettingsState.desired.adaptiveBitrateEnabled
+            ClientStreamSettingsStore.save(desired, hostID: self.qualityHostID, defaults: self.streamSettingsDefaults)
             self.clientSettingsState.setDesired(desired)
+            DispatchQueue.main.async {
+                guard self.connectionGenerationClock.current == generation else { return }
+                self.desiredBitrateMbps = desired.bitrateMbps
+                self.desiredAudioEnabled = desired.audioEnabled
+                self.desiredAdaptiveBitrateEnabled = desired.adaptiveBitrateEnabled
+            }
             if !self.remoteInputConnection, self.qualitySession?.current != nil, !audioChanged, !legacyAutoChanged {
                 self.qualityPolicyDirty = true
                 self.sendAdaptivePolicyOnQueue(auto:self.qualityAutoOptIn)
@@ -1874,7 +1878,8 @@ public class NetworkManager: ObservableObject {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard transportState == .streaming,
               wireAuthenticatedGeneration == connectionGeneration,
-              committedTransportGeneration == connectionGeneration else {
+              committedTransportGeneration == connectionGeneration,
+              !awaitingCastingSettingsIdentity else {
             let result = DesiredSettingsSendResult.waitingForHost
             DispatchQueue.main.async {
                 self.settingsApplyStatus = DesiredSettingsSendPolicy.status(for: result)
@@ -2806,6 +2811,7 @@ public class NetworkManager: ObservableObject {
         guard credential.deviceID == (trustedCredential?.deviceID ?? trustedDeviceID) else {
             handleStreamError("Pairing credential does not match this device."); return
         }
+        let isNewPairing = trustedCredential?.hostID != credential.hostID
         guard trustedCredentialStore.save(credential) else {
             handleStreamError("Unable to save the trusted Host credential in Keychain.")
             return
@@ -2815,6 +2821,9 @@ public class NetworkManager: ObservableObject {
             trustedCredentialStore.delete(fingerprint: fingerprint)
             handleStreamError("Unable to save the trusted Host identity in Keychain.")
             return
+        }
+        if !remoteInputConnection, isNewPairing {
+            ClientStreamSettingsStore.initializeCastingBitrateForNewPairing(hostID: credential.hostID, defaults: streamSettingsDefaults)
         }
         if activeTransportKind == .wifi {
             pairedControlGeneration = connectionGeneration
@@ -5221,7 +5230,7 @@ public class NetworkManager: ObservableObject {
         reconcileRealtimeAudioPlayback(
             generation: generation, mode: RealtimeTransportMode.legacyTLS,
             audioEnabled: clientSettingsState.effective.audioEnabled)
-        if qualityAutoOptIn {
+        if qualityHostID != nil {
             settingsReconciliationGate.reset()
             settingsSyncPolicy.reset()
             requestCurrentSettingsIfNeeded(generation: generation)
@@ -6956,6 +6965,20 @@ public class NetworkManager: ObservableObject {
     private var adaptiveQualityTransport: Bool {
         !remoteInputConnection && activeTransportKind == .wifi && committedRealtimeMode == RealtimeTransportMode.wifiRTP
     }
+    private var awaitingCastingSettingsIdentity: Bool {
+        !remoteInputConnection && activeTransportKind == .wifi &&
+            wireAuthenticatedGeneration == connectionGeneration &&
+            (wifiAuthentication.stage == .paired || wifiAuthentication.stage == .trusted)
+    }
+    private func loadCastingStreamSettingsOnQueue(hostID: Data?) {
+        let desired = ClientStreamSettingsStore.load(hostID: hostID, defaults: streamSettingsDefaults)
+        clientSettingsState.setDesired(desired)
+        let generation = connectionGeneration
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.connectionGenerationClock.current == generation else { return }
+            self.desiredBitrateMbps = desired.bitrateMbps
+        }
+    }
     private func refreshAdaptiveQualityPreferenceOnQueue() {
         guard !remoteInputConnection, wireAuthenticatedGeneration == connectionGeneration,
               committedTransportGeneration == connectionGeneration,
@@ -6965,13 +6988,13 @@ public class NetworkManager: ObservableObject {
         }
         if qualityHostID != hostID {
             qualityHostID = hostID
+            loadCastingStreamSettingsOnQueue(hostID: hostID)
             qualityAutoOptIn = ClientStreamSettingsStore.loadAutoQuality(hostID: hostID, defaults: streamSettingsDefaults)
             qualityPolicyDirty = qualityAutoOptIn
-            // Pairing can complete after a legacy transport has committed.
-            // Refresh v1 state if its first request went out before we knew
-            // this PC's saved choice.
-            if qualityAutoOptIn && settingsSyncPolicy.lastSettingsGetGeneration == connectionGeneration &&
-                !adaptiveQualityTransport {
+            // The first v1 read may have been requested before pairing finished.
+            // Reconcile again with the authenticated host's settings, including
+            // on Wi-Fi RTP when the host does not support DS2.
+            if settingsSyncPolicy.lastSettingsGetGeneration == connectionGeneration {
                 settingsReconciliationGate.reset()
                 settingsSyncPolicy.reset()
                 requestCurrentSettingsIfNeeded(generation: connectionGeneration)
@@ -6985,7 +7008,10 @@ public class NetworkManager: ObservableObject {
         qualityFeedbackTimer?.cancel(); qualityFeedbackTimer = nil
         qualityProbe = AdaptiveMediaProbe(); qualitySession = nil; qualityConnectionID = nil; sourceRollback = nil
         qualityFeedbackIdentity = nil
-        if !preserveHostPreference { qualityHostID = nil; qualityAutoOptIn = false }
+        if !preserveHostPreference {
+            if qualityHostID != nil { loadCastingStreamSettingsOnQueue(hostID: nil) }
+            qualityHostID = nil; qualityAutoOptIn = false
+        }
         qualityWindow = AdaptiveMediaWindow(started:adaptiveNow()); qualityPolicyDirty = false
         qualityRttSeconds = 0; qualityOwnsPolicy = false; decoder.clearAdaptiveMedia()
         publishAdaptiveStateOnQueue()
