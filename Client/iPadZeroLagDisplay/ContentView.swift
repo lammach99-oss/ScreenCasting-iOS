@@ -841,8 +841,8 @@ struct HostIdentityConfirmationView: View {
                             .padding(.horizontal, 24)
                         if owner.networkManager.effectiveQualitySummary?.contains("text sharpness reduced") == true {
                             Text("text sharpness reduced")
-                                .font(.caption.weight(.semibold)).foregroundStyle(Color(ink: SessionInk.text))
-                                .shadow(color: Color(ink: SessionInk.canvas), radius: 0.5, x: 0, y: 1)
+                                .font(.caption.weight(.semibold)).foregroundStyle(Color.inkText)
+                                .shadow(color: .inkCanvas, radius: 0.5, x: 0, y: 1)
                                 .accessibilityIdentifier("session.reducedSharpness")
                         }
                         Spacer()
