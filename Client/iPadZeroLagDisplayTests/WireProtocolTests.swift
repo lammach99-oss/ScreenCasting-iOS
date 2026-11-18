@@ -4056,24 +4056,42 @@ final class USBListenerLifetimeTests: XCTestCase {
     func testHealthyCommittedSessionRejectsCandidateOnlyAfterMatchingLivenessPong() throws {
         manager.manualUsbCandidateDeadlineForTesting = true
         let incumbent = try connect()
-        manager.simulateSessionAuthenticatedAndCommitted()
-        let generation = manager.usbSessionSnapshot().generation
-        var pings: [Data] = []
+        let probe = LegacyPcmProbe()
         manager.networkQueueForTesting.sync {
             manager.controlSendForAudioTesting = { data, completion in
-                if data.count == 32, data[5] == WireMessageType.ping.rawValue {
-                    pings.append(Data(data.dropFirst(16)))
+                if data.count == WireProtocol.headerSize + 16, data[5] == WireMessageType.ping.rawValue {
+                    probe.recordPing(Data(data.dropFirst(WireProtocol.headerSize)))
                 }
                 completion(nil)
             }
         }
+        manager.commitAudioTransportForTesting(mode: RealtimeTransportMode.legacyTLS, audioAvailable: false)
+        let generation = manager.usbSessionSnapshot().generation
+        let telemetryNonce = try XCTUnwrap(manager.sendTelemetryPingForTesting())
         let candidate = try connect()
-        manager.networkQueueForTesting.sync { }
-        XCTAssertEqual(pings.count, 1, "Committed owner must prove liveness, not merely report ready")
-        let challenge = try XCTUnwrap(pings.first)
+        let nonce = try XCTUnwrap(manager.usbCandidateArbitrationForTesting?.nonce)
+        XCTAssertNotEqual(nonce, telemetryNonce)
+        func matchingPings() -> [Data] {
+            probe.pings.filter { payload in
+                payload.withUnsafeBytes {
+                    $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self).littleEndian
+                } == nonce
+            }
+        }
+        // Other Ping purposes share the writer. Wait for the challenge itself
+        // to be written instead of treating the first Ping as liveness proof.
+        let challengeSent = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in !matchingPings().isEmpty }, object: nil)
+        wait(for: [challengeSent], timeout: 5)
+        XCTAssertEqual(matchingPings().count, 1, "Committed owner must send a liveness challenge")
+        let challenge = try XCTUnwrap(matchingPings().first)
+        manager.receiveUsbWireForTesting(type: .pong, payload: c2Pong(telemetryNonce),
+                                        generation: generation, connection: incumbent)
+        XCTAssertEqual(manager.usbCandidateArbitrationForTesting?.nonce, nonce,
+                       "Non-liveness Pong must not reject the candidate")
         manager.receiveUsbWireForTesting(type: .pong, payload: challenge,
                                         generation: generation, connection: incumbent)
-        manager.networkQueueForTesting.sync { }
+        XCTAssertNil(manager.usbCandidateArbitrationForTesting)
         XCTAssertTrue(manager.usbSessionSnapshot().connection === incumbent)
         XCTAssertEqual(manager.usbSessionSnapshot().generation, generation)
         XCTAssertNil(candidate.stateUpdateHandler)
@@ -4118,10 +4136,15 @@ final class USBListenerLifetimeTests: XCTestCase {
             wait(for: [sent], timeout: 5)
             return try XCTUnwrap(matchingPing())
         }
+        let sendingManager = try XCTUnwrap(manager)
+        // The freshness expectation observes only the PCM probe. After that
+        // proof, collect other Ping purposes to test telemetry and arbitration.
+        var waitingForFreshness = true
         manager.networkQueueForTesting.sync {
-            manager.controlSendForAudioTesting = { data, completion in
-                if data.count == 32, data[5] == WireMessageType.ping.rawValue {
-                    probe.recordPing(Data(data.dropFirst(16)))
+            manager.controlSendForAudioTesting = { [weak sendingManager] data, completion in
+                if data.count == WireProtocol.headerSize + 16, data[5] == WireMessageType.ping.rawValue,
+                   !waitingForFreshness || sendingManager?.isLegacyPcmFreshFencePingForTesting(data) == true {
+                    probe.recordPing(Data(data.dropFirst(WireProtocol.headerSize)))
                 }
                 completion(nil)
             }
@@ -4142,6 +4165,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         XCTAssertEqual(audio.audioQueueForTesting.sync { engineStarts }, 1,
                        "Only the matching freshness Pong requests playback")
         XCTAssertNil(audio.legacyOwnershipForTesting.suspended)
+        manager.networkQueueForTesting.sync { waitingForFreshness = false }
         let telemetryNonce = try XCTUnwrap(manager.sendTelemetryPingForTesting(), "Ordinary telemetry resumes after the proof")
         _ = try waitForPing(telemetryNonce)
         probe.clearPings()
