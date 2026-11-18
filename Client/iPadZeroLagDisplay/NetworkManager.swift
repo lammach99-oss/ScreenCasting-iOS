@@ -571,6 +571,7 @@ public class NetworkManager: ObservableObject {
     #endif
     private var qualityProbe = AdaptiveMediaProbe()
     private var qualitySession: AdaptiveMediaSession?
+    private var sourceRollback: (request: CaptureTargetRequest, identity: AdaptiveMediaIdentity, firstFrame: UInt32, decoder: UInt64)?
     private var qualityProbeDeadline: DispatchWorkItem?
     private var qualityWindow = AdaptiveMediaWindow(started: 0)
     private var qualityRttSeconds: TimeInterval = 0
@@ -4114,16 +4115,23 @@ public class NetworkManager: ObservableObject {
                   header.flags == 0 else { return }
             do {
                 let value=try CaptureTargetResult.decode(payload)
-                let wasAccepted=captureTargets.pending?.accepted == true
+                let selection=captureTargets.pending
+                let wasAccepted=selection?.accepted == true
                 guard captureTargets.receiveResult(value, session: captureTargets.session) else { return }
                 if value.status == .accepted {
-                    if !wasAccepted { retireCaptureTargetDecoderOnQueue() }
+                    if !wasAccepted {
+                        if sourceRollback != nil { retirePendingAdaptiveOnQueue() }
+                        retireCaptureTargetDecoderOnQueue()
+                    }
                 } else if value.status == .applied, captureTargets.applied != nil {
                     if let applied=captureTargets.applied,
                        captureTargets.catalogue?.epoch != applied.epoch || captureTargets.catalogue?.state != 1 {
                         abandonCaptureTargetPresentationOnQueue()
                     } else { advanceCaptureTargetVideoOnQueue();startCaptureTargetRecoveryOnQueue() }
-                } else { retireCaptureTargetDecoderOnQueue() }
+                } else if !restoreCaptureTargetAfterRollbackOnQueue(value, selection: selection) {
+                    retireCaptureTargetDecoderOnQueue()
+                }
+                if captureTargets.pending == nil { sourceRollback=nil }
                 if captureTargets.needsCatalogueRefresh { refreshCaptureTargetsOnQueue() }
                 publishMirrorStateOnQueue()
             } catch { handleStreamError("Invalid capture source switch result.") }
@@ -5411,9 +5419,12 @@ public class NetworkManager: ObservableObject {
             guard generation == connectionGeneration, activeControlConnection === owner,
                   wireAuthenticatedGeneration == generation, committedTransportGeneration == generation,
                   committedRealtimeMode == RealtimeTransportMode.wifiRTP else { return }
+            let receivedAt = CACurrentMediaTime()
+            guard adaptiveIncomingOnQueue(data, sequence: sequence, isIDR: isIDR,
+                                          receivedAt: receivedAt, receiveUs: nil) else { return }
             captureAvailability.noteFrameReceived(sequence: sequence)
             _=consumeCaptureTargetVideoOnQueue(data, sequence: sequence, isIDR: isIDR,
-                                               lengthPrefixed: true, receivedAt: CACurrentMediaTime())
+                                               lengthPrefixed: true, receivedAt: receivedAt)
         }
     }
     func receiveRemoteMonitorContextForTesting(_ context: RemoteInputContextCommand, keyframe: Bool) {
@@ -5971,8 +5982,11 @@ public class NetworkManager: ObservableObject {
         if let last=captureTargetLastVideoSequence, !MirrorControlCodec.sequenceAtOrAfter(frame.sequence, last &+ 1) { return }
         guard admitCaptureContinuationOnQueue(sequence: frame.sequence, decoder: owner.decoder, isIDR: frame.isIDR) else { return }
         captureTargetLastVideoSequence=frame.sequence
+        submitCaptureTargetFrameOnQueue(frame, generation: owner.decoder)
+    }
+    private func submitCaptureTargetFrameOnQueue(_ frame: CaptureTargetVideoBuffer.Frame, generation: UInt64) {
         #if targetEnvironment(simulator)
-        if let decode=captureTargetDecodeForTesting { decode(frame.data, frame.sequence, owner.decoder);return }
+        if let decode=captureTargetDecodeForTesting { decode(frame.data, frame.sequence, generation);return }
         #endif
         decoder.processInputData(frame.data, sequence: frame.sequence, isIDR: frame.isIDR,
                                  isLengthPrefixed: frame.lengthPrefixed, receivedAt: frame.receivedAt)
@@ -5985,6 +5999,15 @@ public class NetworkManager: ObservableObject {
                                                 lengthPrefixed: lengthPrefixed, receivedAt: receivedAt)
         if let pending=captureTargets.pending {
             if pending.accepted { captureTargetVideo.append(frame) }
+            else if let rollback=sourceRollback, rollback.request == pending.request,
+                    rollback.decoder == decoder.currentSessionGeneration,
+                    rollback.identity == (qualitySession?.pending ?? qualitySession?.current)?.identity {
+                if let last=captureTargetLastVideoSequence, !MirrorControlCodec.sequenceAtOrAfter(sequence, last &+ 1) { return true }
+                if admitCaptureContinuationOnQueue(sequence: sequence, decoder: rollback.decoder, isIDR: isIDR) {
+                    captureTargetLastVideoSequence=sequence
+                    submitCaptureTargetFrameOnQueue(frame, generation: rollback.decoder)
+                }
+            }
             return true
         }
         if captureTargets.awaitingReattachIDR {
@@ -5994,6 +6017,28 @@ public class NetworkManager: ObservableObject {
               MirrorControlCodec.sequenceAtOrAfter(sequence, applied.firstFrame) else { return true }
         if captureTargetDecodeStarted { decodeCaptureTargetFrameOnQueue(frame) }
         else { captureTargetVideo.append(frame);advanceCaptureTargetVideoOnQueue() }
+        return true
+    }
+    private func restoreCaptureTargetAfterRollbackOnQueue(_ result: CaptureTargetResult, selection: CaptureTargetState.Pending?) -> Bool {
+        guard let selection, !selection.accepted, let rollback=sourceRollback, rollback.request == selection.request,
+              qualitySession?.applied?.identity == rollback.identity, rollback.decoder == decoder.currentSessionGeneration,
+              let state=mirrorControl.currentState, state.revision > 0, let kind=result.kind else { return false }
+        if kind == .extend {
+            guard state.mode == .virtualDisplay else { return false }
+        } else {
+            guard state.epoch == result.epoch, state.source == result.source, state.geometry != nil,
+                  state.firstFrame != nil, state.mode == .viewOnly || state.mode == .awaitingPresentation || state.mode == .active else { return false }
+        }
+        guard captureTargets.restoreRollbackPresentation(result, previous: selection.previousCatalogue,
+                                                         firstFrame: rollback.firstFrame) else { return false }
+        // The host confirmed the same source after the rollback presented. Keep that decoder
+        // and its dependency chain for the next inter frame while the normal input fences hold.
+        captureTargetMirrorRevisionAtTap=state.revision-1
+        let owner=CaptureTargetDecoderOwner(session: captureTargets.session, generation: connectionGeneration,
+            transaction: result.transaction, owner: result.owner, epoch: result.epoch, source: result.source,
+            decoder: rollback.decoder, kind: kind, mirrorEpoch: state.epoch)
+        mirrorDecoderLock.lock();captureTargetDecoderOwner=owner;mirrorDecoderOwner=nil;mirrorDecoderLock.unlock()
+        captureTargetDecodeStarted=true
         return true
     }
     private func sendCaptureTargetRecoveryOnQueue(_ applied: CaptureTargetResult) {
@@ -6880,6 +6925,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func retirePendingAdaptiveOnQueue() {
+        sourceRollback = nil
         guard qualitySession?.pending != nil else { return }
         qualitySession?.retirePendingConfiguration()
         decoder.clearAdaptiveMedia()
@@ -6887,7 +6933,7 @@ public class NetworkManager: ObservableObject {
     }
     private func resetAdaptiveMediaOnQueue() {
         qualityProbeDeadline?.cancel(); qualityProbeDeadline = nil
-        qualityProbe = AdaptiveMediaProbe(); qualitySession = nil; qualityConnectionID = nil
+        qualityProbe = AdaptiveMediaProbe(); qualitySession = nil; qualityConnectionID = nil; sourceRollback = nil
         qualityWindow = AdaptiveMediaWindow(started:adaptiveNow()); qualityPolicyDirty = qualityAutoOptIn
         qualityRttSeconds = 0; qualityOwnsPolicy = false; decoder.clearAdaptiveMedia()
         publishAdaptiveStateOnQueue()
@@ -6946,13 +6992,18 @@ public class NetworkManager: ObservableObject {
         if type == .qualityConfiguration {
             // Source/route selection owns decoder lifetime. A pure media change
             // must not reset those transactions or retire their input tickets.
-            guard !connectionHandoffInProgress, !mirrorSwitchPending, captureTargets.pending == nil,
-                  qualitySession?.configure(value) == true else { return }
+            let selection=captureTargets.pending
+            guard !connectionHandoffInProgress, !mirrorSwitchPending, selection?.accepted != true,
+                  qualitySession?.configure(value, restoringSource: selection != nil) == true else { return }
             qualityWindow=AdaptiveMediaWindow(started:adaptiveNow())
             // Synchronous decode/render fence retains the held drawable. Ready
             // is sent only when a renderer has accepted the encoded geometry.
             guard decoder.prepareAdaptiveMedia(value) else {
                 if let ack=qualitySession?.failed(reason:10) { sendAdaptiveOnQueue(ack) }; return
+            }
+            if let selection {
+                sourceRollback=(selection.request,value.identity,UInt32(truncatingIfNeeded:value.firstFrame),decoder.currentSessionGeneration)
+                captureTargetLastVideoSequence=nil
             }
             sendAdaptiveOnQueue(AdaptiveMediaProtocol.ack(value,status:0))
             let identity=value.identity

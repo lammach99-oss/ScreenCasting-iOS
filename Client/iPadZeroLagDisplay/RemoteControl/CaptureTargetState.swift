@@ -5,6 +5,7 @@ public struct CaptureTargetState: Equatable {
     public struct Pending: Equatable {
         public let request: CaptureTargetRequest
         public let entry: CaptureTargetEntry
+        let previousCatalogue: CaptureTargetCatalogue
         public fileprivate(set) var accepted = false
     }
     public private(set) var session = UUID()
@@ -98,7 +99,8 @@ public struct CaptureTargetState: Equatable {
         nextTransaction += 1
         let request = CaptureTargetRequest(transaction: nextTransaction, owner: catalogue.owner,
                                           revision: catalogue.revision, targetId: id)
-        pending = Pending(request: request, entry: entry); applied = nil; issue = nil; unknownOutcome = false
+        pending = Pending(request: request, entry: entry, previousCatalogue: catalogue)
+        applied = nil; issue = nil; unknownOutcome = false
         inputBlocked = true
         return request
     }
@@ -133,6 +135,21 @@ public struct CaptureTargetState: Equatable {
     @discardableResult public mutating func expire(transaction: UInt64, session: UUID) -> Bool {
         guard session == self.session, pending?.request.transaction == transaction else { return false }
         pending = nil; applied = nil; unknownOutcome = true; inputBlocked = true; needsCatalogueRefresh = true
+        return true
+    }
+    /// A terminal rejection can confirm that the source that presented the rollback is still current.
+    mutating func restoreRollbackPresentation(_ result: CaptureTargetResult, previous: CaptureTargetCatalogue,
+                                              firstFrame: UInt32) -> Bool {
+        guard pending == nil, applied == nil, issue == result.status, result.state == 1,
+              let kind = result.kind, result.owner == previous.owner, result.currentId == previous.currentId,
+              result.epoch == previous.epoch, result.source != 0,
+              let catalogue, catalogue.revision == result.revision, catalogue.epoch == result.epoch,
+              catalogue.state == 1, catalogue.currentId == result.currentId,
+              previous.entries.contains(where: { $0.id == result.currentId && $0.kind == kind }) else { return false }
+        applied = CaptureTargetResult(status: .applied, state: result.state, kind: kind, transaction: result.transaction,
+            owner: result.owner, revision: result.revision, currentId: result.currentId, epoch: result.epoch,
+            source: result.source, firstFrame: firstFrame)
+        inputBlocked = true
         return true
     }
     /// Called only for the owned decoder after Applied, never for reception/decode/write acknowledgements.

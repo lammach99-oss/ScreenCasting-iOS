@@ -190,7 +190,16 @@ struct AdaptiveMediaSession {
         if value.status == 0 { applied = value; appliedFloor = frameFloor }
         return true
     }
-    mutating func configure(_ value: AdaptiveMediaEffective) -> Bool {
+    mutating func configure(_ value: AdaptiveMediaEffective, restoringSource: Bool = false) -> Bool {
+        if restoringSource {
+            // A rollback prepares a fresh media epoch for the last applied source and geometry.
+            // A new adaptation must not take over while the source request is in flight.
+            guard value.status == 2, value.reason == 7, let applied,
+                  value.identity.source == applied.identity.source, value.identity.media > applied.identity.media,
+                  value.revision > applied.revision, value.desktopSize == applied.desktopSize,
+                  value.encodedSize == applied.encodedSize, value.content == applied.content,
+                  value.fps == applied.fps, value.scale == applied.scale else { return false }
+        }
         guard let caps = capabilities, value.identity.owner == owner,
               value.bitrate >= caps.u32(28), value.bitrate <= caps.u32(32),
               value.encodedSize.width <= CGFloat(caps.u32(36)), value.encodedSize.height <= CGFloat(caps.u32(40)),

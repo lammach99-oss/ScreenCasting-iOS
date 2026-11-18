@@ -287,6 +287,106 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
             await drain(); XCTAssertEqual(writes.filter { $0[5] == 93 }.count,1)
         }
     }
+    @MainActor func testSourceRequestLetsRollbackPresentAndKeepsOldVideoAfterBusy() async throws {
+        for mode in [RealtimeTransportMode.wifiRTP, RealtimeTransportMode.legacyTLS] {
+            let network = NetworkManager()
+            network.adaptiveMediaClockForTesting = { 0 }
+            network.captureTargetScheduleForTesting = { _, _ in }
+            network.realtimeAudioPlaybackForTesting = { _ in XCTFail("No audio in DS2 tests") }
+            var writes: [Data] = [], decodes: [(UInt32, UInt64)] = []
+            network.controlSendForAudioTesting = { bytes, done in writes.append(bytes); done(nil) }
+            network.captureTargetDecodeForTesting = { _, sequence, generation in decodes.append((sequence, generation)) }
+            let peer = network.simulateCommittedWifiSessionForTesting(mode: mode)
+            defer { network.stopForTesting() }
+            network.beginTransferWriterForTesting()
+            network.decoder.onAdaptiveMedia = { _ in true }
+            network.beginAdaptiveMediaForTesting()
+            func drain() async {
+                for _ in 0..<4 {
+                    network.networkQueueForTesting.sync {}
+                    let ready = expectation(description: "source and rollback publication")
+                    DispatchQueue.main.async { ready.fulfill() }
+                    await fulfillment(of: [ready], timeout: 2)
+                }
+                network.networkQueueForTesting.sync {}
+            }
+            func receive(_ type: WireMessageType, _ data: Data, flags: UInt16 = 0, sequence: UInt32 = 0) {
+                network.receiveCaptureTargetWireForTesting(type: type, payload: data, flags: flags, sequence: sequence,
+                    generation: peer.generation, connection: peer.connection)
+            }
+            func video(_ sequence: UInt32, isIDR: Bool) {
+                if mode == RealtimeTransportMode.wifiRTP {
+                    network.receiveCaptureTargetVideoForTesting(Data([1]), sequence: sequence, isIDR: isIDR,
+                        generation: peer.generation, connection: peer.connection)
+                } else {
+                    receive(.video, Data([1]), flags: isIDR ? 3 : 2, sequence: sequence)
+                }
+            }
+
+            await drain()
+            let ping = try XCTUnwrap(writes.first { $0[5] == WireMessageType.ping.rawValue && $0[7] & 2 != 0 })
+            receive(.pong, Data(ping.suffix(16)), flags: AdaptiveMediaProtocol.probeFlag)
+            await drain()
+            let hello = try XCTUnwrap(writes.first { $0[5] == WireMessageType.qualityHello.rawValue })
+            let owner = hello.loadLittleEndian(UInt64.self, at: 40)
+            var caps = bytes(try XCTUnwrap(try fixtures()["94"]))
+            caps.storeLittleEndian(hello.loadLittleEndian(UInt64.self, at: 32), at: 8)
+            caps.storeLittleEndian(owner, at: 16); caps[51] = 0
+            caps.storeLittleEndian(UInt32(3_000_000), at: 28)
+            receive(.qualityCapabilities, caps)
+            var baseline = try effective().packet.encoded
+            baseline.storeLittleEndian(owner, at: 8)
+            receive(.qualityState, baseline)
+            var proposed = try effective(98, media: 4, first: 80).packet.encoded
+            proposed.storeLittleEndian(owner, at: 8); proposed[44] = 2
+            receive(.qualityConfiguration, proposed)
+            receive(.displayCapabilities, CaptureTargetIntegrationTests.modes, flags: 0x7c00)
+            receive(.mirrorState, try CaptureTargetIntegrationTests.mode(revision: 1, epoch: 2, physical: false))
+            receive(.sourceCatalogue, CaptureTargetIntegrationTests.catalogue(revision: 3, current: 1))
+            await drain()
+            network.requestCaptureTarget(4, catalogue: try XCTUnwrap(network.captureTargetState.catalogue))
+            await drain()
+            XCTAssertTrue(network.captureTargetState.inputBlocked)
+            XCTAssertEqual(writes.filter { $0[5] == WireMessageType.sourceSwitchRequest.rawValue }.count, 1)
+            XCTAssertEqual(writes.filter { $0[5] == WireMessageType.qualityConfigurationAck.rawValue }.map { $0[60] }, [0])
+
+            var rollback = proposed
+            rollback.storeLittleEndian(UInt64(5), at: 24)
+            rollback.storeLittleEndian(UInt32(8), at: 40)
+            rollback.storeLittleEndian(UInt64(90), at: 88)
+            receive(.qualityConfiguration, rollback) // Ordinary adaptation still loses to selection.
+            var otherSource = rollback
+            otherSource[47] = 7
+            otherSource.storeLittleEndian(UInt64(3), at: 16)
+            receive(.qualityConfiguration, otherSource)
+            rollback[47] = 7
+            receive(.qualityConfiguration, rollback)
+            video(89, isIDR: true); video(90, isIDR: false); video(90, isIDR: true)
+            await drain()
+            XCTAssertEqual(decodes.map { $0.0 }, [90])
+            let decoder = try XCTUnwrap(decodes.first?.1)
+            network.recordCapturePresentation(sequence: 90, generation: decoder)
+            await drain()
+            let acks = writes.filter { $0[5] == WireMessageType.qualityConfigurationAck.rawValue }
+            XCTAssertEqual(acks.map { $0[60] }, [0, 0, 1])
+            XCTAssertEqual(acks.suffix(2).map { $0.loadLittleEndian(UInt64.self, at: 40) }, [5, 5])
+            XCTAssertNotNil(network.captureTargetState.pending)
+            XCTAssertTrue(network.captureTargetState.inputBlocked)
+
+            rollback[44] = 0
+            rollback.storeLittleEndian(UInt64(0), at: 88)
+            receive(.qualityState, rollback)
+            receive(.sourceCatalogue, CaptureTargetIntegrationTests.catalogue(revision: 4, current: 1))
+            receive(.sourceSwitchResult, CaptureTargetIntegrationTests.result(status: 5, current: 1))
+            video(91, isIDR: false)
+            await drain()
+            XCTAssertNil(network.captureTargetState.pending)
+            XCTAssertEqual(network.captureTargetState.issue, .busy)
+            XCTAssertEqual(decodes.map { $0.0 }, [90, 91])
+            XCTAssertTrue(decodes.allSatisfy { $0.1 == decoder })
+            XCTAssertEqual(writes.filter { $0[5] == WireMessageType.sourceSwitchRequest.rawValue }.count, 1)
+        }
+    }
     @MainActor func testActualConfigurationAckFeedbackAndManualRestoreUseTheCurrentConnection() async throws {
         let suite="AdaptiveMedia."+UUID().uuidString
         let defaults=try XCTUnwrap(UserDefaults(suiteName:suite))
