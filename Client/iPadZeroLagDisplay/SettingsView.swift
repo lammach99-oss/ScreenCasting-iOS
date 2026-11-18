@@ -263,15 +263,15 @@ import SwiftUI
             Section {
                 AdaptiveQualityControls(network:owner.networkManager)
                 Toggle("Automatic bitrate", isOn: Binding(
-                    get: { owner.draftAdaptiveBitrateEnabled && owner.supportsAudioAndAuto },
+                    get: { owner.draftAdaptiveBitrateEnabled && owner.supportsAudioAndAuto && !owner.networkManager.savedAutoQualityEnabled },
                     set: { value in
                         if !owner.supportsAudioAndAuto { return }
                         owner.draftAdaptiveBitrateEnabled = value
                         owner.saveDesiredSettings()
                     }))
                     .tint(owner.switchTint)
-                    .disabled(!owner.supportsAudioAndAuto || owner.networkManager.autoQualityEnabled)
-                if !(owner.draftAdaptiveBitrateEnabled && owner.supportsAudioAndAuto) {
+                    .disabled(!owner.supportsAudioAndAuto || owner.networkManager.savedAutoQualityEnabled)
+                if !owner.draftAdaptiveBitrateEnabled || !owner.supportsAudioAndAuto || owner.networkManager.savedAutoQualityEnabled {
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
                             Text("Bitrate")
@@ -412,13 +412,17 @@ import SwiftUI
         if !network.isRemoteControlSession {
             Toggle("Auto quality",isOn:Binding(get:{ network.autoQualityEnabled },set:{ network.setAutoQualityEnabled($0) }))
                 .disabled(!network.adaptiveQualityAvailable)
-            Text("Adjusts encoded bitrate, frame rate and size. Manual target stays saved.")
-                .font(.footnote).foregroundStyle(.secondary)
+            if network.adaptiveQualityAvailable {
+                Text("Your quality choice is saved for this PC.").font(.footnote).foregroundStyle(.secondary)
+            } else {
+                Text(network.adaptiveQualityUnavailableReason).font(.footnote).foregroundStyle(.secondary)
+                if network.savedAutoQualityEnabled {
+                    Text("Auto is saved for this PC. Using Manual for this connection.").font(.footnote).foregroundStyle(.secondary)
+                }
+            }
             if let summary=network.effectiveQualitySummary {
                 Text(summary).font(.footnote).foregroundStyle(.secondary)
                     .accessibilityLabel("Effective quality: " + summary)
-            } else if !network.adaptiveQualityAvailable {
-                Text("Requires an updated casting host.").font(.footnote).foregroundStyle(.secondary)
             }
         }
     }

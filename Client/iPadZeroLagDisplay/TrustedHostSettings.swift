@@ -379,10 +379,10 @@ struct ClientStreamSettingsPreference: Equatable {
     static let remoteUnsupportedReason = "Auto and PC audio are not available in remote sessions."
     static func supportsAudioAndAuto(remote: Bool) -> Bool { !remote }
 
-    func forSession(remote: Bool) -> ClientStreamSettingsPreference {
+    func forSession(remote: Bool, manualFallback: Bool = false) -> ClientStreamSettingsPreference {
         ClientStreamSettingsPreference(bitrateMbps: bitrateMbps,
             audioEnabled: remote ? false : audioEnabled,
-            adaptiveBitrateEnabled: remote ? false : adaptiveBitrateEnabled)
+            adaptiveBitrateEnabled: !remote && !manualFallback && adaptiveBitrateEnabled)
     }
 
     /// A whole-Mbps control must not rewrite a host's fractional readback just
@@ -415,6 +415,20 @@ enum ClientStreamSettingsStore {
 
     private static let adaptiveKey =
         "ScreenCasting.client.desiredAdaptiveBitrateEnabled.v1"
+
+    // Keep structural Auto consent scoped to the paired PC across routes.
+    // The former app-wide flag cannot identify which PC the user chose.
+    private static func autoQualityKey(hostID: Data) -> String {
+        "ScreenCasting.client.hostSettings.v1." + hostID.base64EncodedString() + ".autoQuality"
+    }
+
+    static func loadAutoQuality(hostID: Data, defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: autoQualityKey(hostID: hostID))
+    }
+
+    static func saveAutoQuality(_ enabled: Bool, hostID: Data, defaults: UserDefaults = .standard) {
+        defaults.set(enabled, forKey: autoQualityKey(hostID: hostID))
+    }
 
     static func load(
         defaults: UserDefaults = .standard
