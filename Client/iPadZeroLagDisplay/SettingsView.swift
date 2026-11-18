@@ -261,6 +261,7 @@ import SwiftUI
         let owner: SettingsView
         var body: some View {
             Section {
+                AdaptiveQualityControls(network:owner.networkManager)
                 Toggle("Automatic bitrate", isOn: Binding(
                     get: { owner.draftAdaptiveBitrateEnabled && owner.supportsAudioAndAuto },
                     set: { value in
@@ -269,7 +270,7 @@ import SwiftUI
                         owner.saveDesiredSettings()
                     }))
                     .tint(owner.switchTint)
-                    .disabled(!owner.supportsAudioAndAuto)
+                    .disabled(!owner.supportsAudioAndAuto || owner.networkManager.autoQualityEnabled)
                 if !(owner.draftAdaptiveBitrateEnabled && owner.supportsAudioAndAuto) {
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
@@ -400,6 +401,25 @@ import SwiftUI
                 }
             }
             .listRowBackground(owner.rowBackground)
+        }
+    }
+}
+
+/// Explicit consent is separate from legacy AutoBitrate and the saved manual target.
+@MainActor private struct AdaptiveQualityControls: View {
+    @ObservedObject var network: NetworkManager
+    var body: some View {
+        if !network.isRemoteControlSession {
+            Toggle("Auto quality",isOn:Binding(get:{ network.autoQualityEnabled },set:{ network.setAutoQualityEnabled($0) }))
+                .disabled(!network.adaptiveQualityAvailable)
+            Text("Adjusts encoded bitrate, frame rate and size. Manual target stays saved.")
+                .font(.footnote).foregroundStyle(.secondary)
+            if let summary=network.effectiveQualitySummary {
+                Text(summary).font(.footnote).foregroundStyle(.secondary)
+                    .accessibilityLabel("Effective quality: " + summary)
+            } else if !network.adaptiveQualityAvailable {
+                Text("Requires an updated casting host.").font(.footnote).foregroundStyle(.secondary)
+            }
         }
     }
 }

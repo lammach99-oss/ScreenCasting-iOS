@@ -251,6 +251,13 @@ final class WireStreamParser {
             flags: flags,
             payloadLength: payloadLength,
             sequence: sequence)
+        if (93...99).contains(type.rawValue),
+           flags != 0 || payloadLength != AdaptiveMediaProtocol.size(type.rawValue) {
+            payload = Data(); payloadOffset = 0
+            if payloadLength == 0 { resetForNextHeader(); onEvent(.discardedFixedControl(header)) }
+            else { state = .draining(header, remaining: payloadLength) }
+            return
+        }
         // This advisory extension ignores bounded malformed traffic instead of
         // turning a security-prompt notice into a session failure.
         switch type {

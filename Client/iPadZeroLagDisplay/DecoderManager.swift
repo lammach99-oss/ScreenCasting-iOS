@@ -367,6 +367,16 @@ public final class DecoderManager {
     public var onDecodeCompleted: ((UInt32, UInt64, Bool) -> Void)?
     public var onSessionBegan: ((UInt64) -> Void)?
     var onCaptureFenced: ((UInt64) -> Void)?
+    var onAdaptiveMedia: ((AdaptiveMediaEffective?) -> Bool)?
+    var onAdaptiveDecoded: ((UInt32, UInt64, UInt32, UInt32) -> Void)?
+    private var adaptiveFrames: Set<UInt32> = []
+    private var adaptiveMediaActive = false
+    private var adaptiveMediaValue: AdaptiveMediaEffective?
+    private var adaptiveRendererActive: (() -> Bool)?
+    var adaptivePresentationActive: Bool {
+        captureDeliveryLock.lock(); defer { captureDeliveryLock.unlock() }
+        return adaptiveRendererActive?() == true
+    }
     private let captureDeliveryLock = NSLock()
     private var captureOutputFenced = false
     private struct CaptureOutputKey: Hashable { let sequence: UInt32; let generation: UInt64 }
@@ -490,7 +500,41 @@ public final class DecoderManager {
         captureDeliveryLock.lock()
         defer { captureDeliveryLock.unlock() }
         let key = CaptureOutputKey(sequence: sequence, generation: generation)
+        if adaptiveMediaActive && adaptiveFrames.remove(sequence) == nil { return }
         if !captureOutputFenced || captureOutputs.remove(key) != nil { delivery() }
+    }
+
+    // The initial State may precede SwiftUI surface construction. Rehydrate
+    // the renderer under the same output lock without rebuilding VT or input.
+    func installAdaptiveMediaRenderer(isActive: @escaping () -> Bool = { true }, _ sink: @escaping (AdaptiveMediaEffective?) -> Bool) {
+        captureDeliveryLock.lock(); defer { captureDeliveryLock.unlock() }
+        onAdaptiveMedia = sink; adaptiveRendererActive = isActive
+        if let value=adaptiveMediaValue { _ = sink(value) }
+    }
+    func updateAdaptiveMedia(_ value: AdaptiveMediaEffective) {
+        captureDeliveryLock.lock(); defer { captureDeliveryLock.unlock() }
+        adaptiveMediaActive = true; adaptiveMediaValue = value; _ = onAdaptiveMedia?(value)
+    }
+    @discardableResult
+    func prepareAdaptiveMedia(_ value: AdaptiveMediaEffective) -> Bool {
+        captureDeliveryLock.lock()
+        defer { captureDeliveryLock.unlock() }
+        adaptiveMediaActive = true; adaptiveMediaValue = value; adaptiveFrames.removeAll()
+        mailboxStateLock.lock()
+        mailbox.beginSession(generation:localSessionGeneration)
+        mailboxStateLock.unlock()
+        onCaptureFenced?(currentSessionGeneration)
+        return onAdaptiveMedia?(value) == true
+    }
+    func authorizeAdaptiveFrame(sequence: UInt32) {
+        captureDeliveryLock.lock(); defer { captureDeliveryLock.unlock() }
+        guard adaptiveMediaActive else { return }
+        if adaptiveFrames.count >= 512 { adaptiveFrames.removeAll() }
+        adaptiveFrames.insert(sequence)
+    }
+    func clearAdaptiveMedia() {
+        captureDeliveryLock.lock(); defer { captureDeliveryLock.unlock() }
+        adaptiveMediaActive=false; adaptiveMediaValue=nil; adaptiveFrames.removeAll(); _ = onAdaptiveMedia?(nil)
     }
 
     /// Changes only the bounded decode age policy; never waits for the decoder queue.
@@ -977,6 +1021,9 @@ public final class DecoderManager {
             // Serialize enqueue with the synchronous render fence. A completion
             // already past mailbox.complete must not slip behind that fence.
             deliverCaptureOutput(sequence: lifetime.sequence, generation: ticket.sessionGeneration) {
+                onAdaptiveDecoded?(lifetime.sequence, ticket.sessionGeneration,
+                    AdaptiveMediaWindow.us(max(0,decodeStartedAt-ticket.unit.receivedAt)),
+                    AdaptiveMediaWindow.us(CACurrentMediaTime()-decodeStartedAt))
                 onFrameDecoded?(imageBuffer, lifetime.sequence, ticket.sessionGeneration)
             }
         }

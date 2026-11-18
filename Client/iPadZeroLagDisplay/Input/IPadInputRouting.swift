@@ -25,7 +25,7 @@ extension IPadInputSession {
         trackpadAvailable = remote || pointerV2
         if remote, let context { sourceSize = CGSize(width: CGFloat(context.width),height: CGFloat(context.height)) }
         else if let geometry = network.mirrorControlState?.geometry { sourceSize = CGSize(width: CGFloat(geometry.width),height: CGFloat(geometry.height)) }
-        else { sourceSize = nil }
+        else { sourceSize = network.adaptiveDesktopSize }
         let identity = "\(generation):\(revision):\(remote):\(network.remoteInputRevision):\(context?.token ?? 0):\(context?.desktopEpoch ?? 0):\(features):\(pointerV2)"
         let route = IPadInputRoute(generation: generation,revision: revision,remote: remote,
             features: features,context: context,ticket: ticket,pointerV2: pointerV2)

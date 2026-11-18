@@ -8,7 +8,8 @@ struct VertexOutput {
 
 // Vertex Shader
 vertex VertexOutput yuvVertexShader(uint vertexID [[vertex_id]],
-                                    constant float2& aspectScale [[buffer(0)]]) {
+                                    constant float2& aspectScale [[buffer(0)]],
+                                    constant float4& contentRect [[buffer(1)]]) {
     // Full-screen quad triangle strip: (-1, -1), (1, -1), (-1, 1), (1, 1)
     const float2 positions[4] = {
         float2(-1.0, -1.0),
@@ -26,7 +27,7 @@ vertex VertexOutput yuvVertexShader(uint vertexID [[vertex_id]],
 
     VertexOutput out;
     out.position = float4(positions[vertexID] * aspectScale, 0.0, 1.0);
-    out.texCoord = texCoords[vertexID];
+    out.texCoord = contentRect.xy + texCoords[vertexID] * contentRect.zw;
     return out;
 }
 // Fragment Shader: Hardware Zero-Copy NV12 YUV -> RGB Color Conversion

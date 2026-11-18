@@ -741,6 +741,11 @@ final class TransportTelemetry {
         _ = marker
     }
 
+    private var adaptiveReceiveTimes: [TelemetryFrameKey: UInt32] = [:]
+    func adaptiveReceiveDuration(sequence: UInt32, generation: UInt64) -> UInt32? {
+        lock.lock(); defer { lock.unlock() }
+        return adaptiveReceiveTimes.removeValue(forKey: TelemetryFrameKey(generation:generation,sequence:sequence))
+    }
     func recordWifiReassembly(
         outcome: HevcReassemblyOutcome,
         observedAt: TimeInterval,
@@ -767,6 +772,8 @@ final class TransportTelemetry {
             let receiveDurationMs = max(
                 0,
                 (state.lastArrival - state.firstArrival) * 1_000.0)
+            if adaptiveReceiveTimes.count >= pendingLimit { adaptiveReceiveTimes.removeAll() }
+            adaptiveReceiveTimes[key] = AdaptiveMediaWindow.us(receiveDurationMs/1000)
             receive.add(receiveDurationMs)
             exportReceive.add(receiveDurationMs)
             sessionReceive.add(receiveDurationMs)
@@ -1227,6 +1234,7 @@ final class TransportTelemetry {
     private func resetSessionMetrics() {
         sequenceReporter.reset()
         lock.lock()
+        adaptiveReceiveTimes.removeAll()
         freshRateWindow = FreshFrameRateWindow()
         receive.removeAll()
         decode.removeAll()

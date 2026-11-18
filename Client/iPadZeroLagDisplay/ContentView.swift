@@ -839,6 +839,12 @@ struct HostIdentityConfirmationView: View {
                         CaptureAvailabilityNotice(message: owner.networkManager.captureAvailabilityNotice)
                             .padding(.top, owner.sessionPillHeight + (owner.isHudVisible && !owner.isSessionPanelOpen ? 48 : 24))
                             .padding(.horizontal, 24)
+                        if owner.networkManager.effectiveQualitySummary?.contains("text sharpness reduced") == true {
+                            Text("text sharpness reduced")
+                                .font(.caption.weight(.semibold)).foregroundStyle(Color(ink: SessionInk.text))
+                                .shadow(color: Color(ink: SessionInk.canvas), radius: 0.5, x: 0, y: 1)
+                                .accessibilityIdentifier("session.reducedSharpness")
+                        }
                         Spacer()
                     }
                     .allowsHitTesting(false)

@@ -55,6 +55,9 @@ public struct MetalView: UIViewRepresentable {
         self.onGeometrySnapshotChanged = onGeometrySnapshotChanged
     }
 
+    public static func dismantleUIView(_ uiView: MTKView, coordinator: Coordinator) {
+        coordinator.renderer?.setPresentationSurfaceActive(false)
+    }
     public func makeCoordinator() -> Coordinator {
         Coordinator(
             onFrameRendered: onFrameRendered,
@@ -106,6 +109,9 @@ public struct MetalView: UIViewRepresentable {
             }
             networkManager.decoder.onCaptureFenced = { [weak renderer] generation in
                 renderer?.fenceCaptureContinuation(generation: generation)
+            }
+            networkManager.decoder.installAdaptiveMediaRenderer(isActive: { [weak renderer] in renderer?.isPresentationSurfaceActive == true }) { [weak renderer] geometry in
+                guard let renderer else { return false }; renderer.setAdaptiveMediaGeometry(geometry); return true
             }
             networkManager.decoder.onFrameDecoded = {
                 [weak renderer] pixelBuffer, sequence, generation in
@@ -795,6 +801,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     }
 
     public static func dismantleUIView(_ uiView: ConnectedPresentationContainer, coordinator: Coordinator) {
+        coordinator.renderer?.setPresentationSurfaceActive(false)
         uiView.touchView.inputSession?.releaseAll()
         uiView.touchView.remoteSessionInput?.suspend(reason: 0)
         uiView.touchView.discardRemoteTouches()
@@ -1048,6 +1055,9 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         }
         networkManager.decoder.onCaptureFenced = { [weak renderer] generation in
             renderer?.fenceCaptureContinuation(generation: generation)
+        }
+        networkManager.decoder.installAdaptiveMediaRenderer(isActive: { [weak renderer] in renderer?.isPresentationSurfaceActive == true }) { [weak renderer] geometry in
+            guard let renderer else { return false }; renderer.setAdaptiveMediaGeometry(geometry); return true
         }
         networkManager.decoder.onFrameDecoded = { [weak renderer] pixelBuffer, sequence, generation in
             renderer?.updateFrame(

@@ -642,6 +642,20 @@ public class Renderer: NSObject, MTKViewDelegate {
     }
 
     private var lastDecodedFrameSize: CGSize?
+    private var adaptiveMediaGeometry: AdaptiveMediaEffective?
+    private var presentationSurfaceActive = true
+    var isPresentationSurfaceActive: Bool {
+        lock.lock(); defer { lock.unlock() }; return presentationSurfaceActive
+    }
+    func setPresentationSurfaceActive(_ active: Bool) {
+        lock.lock(); presentationSurfaceActive=active; lock.unlock()
+    }
+    private var adaptiveAwaitingPresentation: UInt32?
+    func setAdaptiveMediaGeometry(_ geometry: AdaptiveMediaEffective?) {
+        lock.lock(); adaptiveMediaGeometry=geometry
+        adaptiveAwaitingPresentation = geometry?.packet.type == 98 ? geometry.map { UInt32(truncatingIfNeeded:$0.firstFrame) } : nil
+        lock.unlock()
+    }
     private var lastGeometryIdentity: RenderFrameIdentity?
     private var pendingGeometryPublication: RendererGeometryPublishToken?
     private weak var geometryPublicationView: MTKView?
@@ -718,6 +732,7 @@ public class Renderer: NSObject, MTKViewDelegate {
         gameLookAheadFrame = nil
         gameLastPresentedFrame = nil
         freshness.beginSession(generation: generation)
+        adaptiveAwaitingPresentation = nil
         cadenceCounters = RenderCadenceCounters()
         cadenceWindowStartedAt = CACurrentMediaTime()
         let shouldResetContentViewport = publishedContentViewport != nil
@@ -844,6 +859,7 @@ public class Renderer: NSObject, MTKViewDelegate {
         var replacedPending = false
         var gameOffer: GamePresentationOfferResult?
         lock.lock()
+        if let first = adaptiveAwaitingPresentation, sequence != first { lock.unlock(); onFrameDropped?(sequence,generation); return }
         let decision = freshness.offer(sequence, generation: generation)
         switch decision {
         case .accepted:
@@ -963,12 +979,20 @@ public class Renderer: NSObject, MTKViewDelegate {
         lock.unlock()
         let pixelBuffer = selectedFrame.pixelBuffer
         let identity = selectedFrame.identity
+        lock.lock(); let adaptiveGeometry=adaptiveMediaGeometry; lock.unlock()
         let reportsFrameDrop = drawKind != .gameRepeated
 
         guard let textureCache,
               let pipelineState,
               let drawable = view.currentDrawable,
               let renderPassDescriptor = view.currentRenderPassDescriptor else {
+            lock.lock()
+            if adaptiveAwaitingPresentation == identity.sequence, freshness.isCurrent(identity) {
+                if presentationCadenceMode == .game { _ = gameHandoff.offer(identity); gameReadyFrame = selectedFrame }
+                else if presentationCadenceMode == .office { _ = officeHandoff.offer(identity); officeReadyFrame = OfficeFrame(pixelBuffer:pixelBuffer,identity:identity) }
+                lock.unlock(); return
+            }
+            lock.unlock()
             abandon(identity, reportFrameDrop: reportsFrameDrop)
             return
         }
@@ -977,6 +1001,10 @@ public class Renderer: NSObject, MTKViewDelegate {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         let decodedFrameSize = CGSize(width: width, height: height)
+        if let adaptiveGeometry, decodedFrameSize != adaptiveGeometry.encodedSize {
+            abandon(identity,reportFrameDrop:reportsFrameDrop); return
+        }
+        let sourceFrameSize = adaptiveGeometry?.desktopSize ?? decodedFrameSize
         guard CVPixelBufferGetPixelFormatType(pixelBuffer) == DecoderOutputBufferAttributes.pixelFormat else {
             print("[Renderer] Metal presentation rejected: pixelFormat=\(CVPixelBufferGetPixelFormatType(pixelBuffer)) expected=\(DecoderOutputBufferAttributes.pixelFormat)")
             abandon(identity, reportFrameDrop: reportsFrameDrop)
@@ -1024,7 +1052,7 @@ public class Renderer: NSObject, MTKViewDelegate {
 
         guard let contentViewport = Self.contentViewport(
             forDrawableSize: view.drawableSize,
-            videoSize: decodedFrameSize) else {
+            videoSize: sourceFrameSize) else {
             abandon(identity, reportFrameDrop: reportsFrameDrop)
             return
         }
@@ -1040,6 +1068,8 @@ public class Renderer: NSObject, MTKViewDelegate {
             Float(contentViewport.rect.height))
         encoder.setRenderPipelineState(pipelineState)
         encoder.setVertexBytes(&scale, length: MemoryLayout<SIMD2<Float>>.size, index: 0)
+        var textureRect = adaptiveGeometry?.textureRect ?? SIMD4<Float>(0,0,1,1)
+        encoder.setVertexBytes(&textureRect, length: MemoryLayout<SIMD4<Float>>.size, index: 1)
         encoder.setFragmentTexture(yTexture, index: 0)
         encoder.setFragmentTexture(uvTexture, index: 1)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
@@ -1055,9 +1085,10 @@ public class Renderer: NSObject, MTKViewDelegate {
             guard let self, CapturePresentationPolicy.confirmed(time: presented.presentedTime) else { return }
             self.lock.lock()
             let current = self.freshness.isCurrent(identity)
+            if current, self.adaptiveAwaitingPresentation == identity.sequence { self.adaptiveAwaitingPresentation = nil }
             self.lock.unlock()
             guard current else { return }
-            self.onFramePresented?(identity.sequence, identity.generation)
+            if drawKind != .gameRepeated { self.onFramePresented?(identity.sequence, identity.generation) }
         }
         #endif
 
@@ -1094,6 +1125,9 @@ public class Renderer: NSObject, MTKViewDelegate {
                 isCurrent = self.freshness.isCurrent(identity)
             } else {
                 isCurrent = self.freshness.markPresented(identity)
+                #if targetEnvironment(simulator)
+                if isCurrent, self.adaptiveAwaitingPresentation == identity.sequence { self.adaptiveAwaitingPresentation = nil }
+                #endif
                 if isCurrent, drawKind == .gameFresh,
                    let generation = self.freshness.sessionGeneration {
                     self.gameHandoff.markPresented(
@@ -1103,7 +1137,7 @@ public class Renderer: NSObject, MTKViewDelegate {
                 }
             }
             if isCurrent, self.freshness.presentedSequence == identity.sequence {
-                self.lastDecodedFrameSize = decodedFrameSize
+                self.lastDecodedFrameSize = sourceFrameSize
                 self.lastGeometryIdentity = identity
             }
             self.lock.unlock()
@@ -1111,13 +1145,13 @@ public class Renderer: NSObject, MTKViewDelegate {
             #if targetEnvironment(simulator)
             // Simulator SDKs omit addPresentedHandler/presentedTime. Completion
             // after present is a proxy, not confirmation of physical display scanout.
-            if CapturePresentationPolicy.simulatorCompleted(
+            if drawKind != .gameRepeated, CapturePresentationPolicy.simulatorCompleted(
                 succeeded: RenderCommandCompletionPolicy.succeeded(completedBuffer.status), current: isCurrent) {
                 self.onFramePresented?(identity.sequence, identity.generation)
             }
             #endif
             self.publishGeometrySnapshot(for: view, identity: identity,
-                decodedFrameSize: decodedFrameSize, drawableSize: presentedDrawableSize,
+                decodedFrameSize: sourceFrameSize, drawableSize: presentedDrawableSize,
                 contentViewport: contentViewport)
             if drawKind == .gameRepeated {
                 self.recordCadence(

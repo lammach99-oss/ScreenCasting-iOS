@@ -64,6 +64,8 @@ enum WireMessageType: UInt8 {
     case connectionHello = 76, connectionState = 77, connectionSelectRequest = 78, connectionSelectResult = 79
     case captureAvailabilityHello = 80, captureAvailability = 81
     case remoteDirectTouch = 82, iPadPointerV2 = 83
+    case qualityHello = 93, qualityCapabilities = 94, qualityPolicySet = 95
+    case qualityState = 96, qualityFeedback = 97, qualityConfiguration = 98, qualityConfigurationAck = 99
 }
 
 /// Toolbar actions the remote host runs on the PC. Payload: [version 1, command, flags(bit0 confirm)].
