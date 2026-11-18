@@ -157,6 +157,7 @@ struct AdaptiveMediaSession {
     private var requested: Data?
     private var policyPending: UInt32?
     private var awaitingRollback = false
+    var mediaRecoveryActive: Bool { awaitingRollback || pending != nil }
     var supportsAuto: Bool { capabilities.map { $0.u32(24) & 7 == 7 } ?? false }
     mutating func acceptCapabilities(_ p: AdaptiveMediaPacket) -> Bool {
         guard capabilities == nil, p.type == 94, p.u64(8) == nonce, p.u64(16) == owner, p.encoded[51] == 0 else { return false }
@@ -279,56 +280,104 @@ struct AdaptiveMediaSession {
 /// Counts unique stage progress within a one-second window. Unknown stages keep
 /// their validity bit clear; local presentation age is receive-to-fresh-present.
 struct AdaptiveMediaWindow {
+    // Bound reordering and duplicate detection across window boundaries. An
+    // older callback outside this sequence range is stale.
+    private struct RecentFrames {
+        private static let capacity: UInt64 = 512
+        private var slots: [UInt64: UInt64] = [:]
+        private(set) var last: UInt64 = 0
+
+        mutating func insert(_ frame: UInt64) -> Bool {
+            guard last <= frame || last - frame < Self.capacity else { return false }
+            let slot = frame % Self.capacity
+            guard slots[slot] != frame else { return false }
+            slots[slot] = frame
+            last = max(last, frame)
+            return true
+        }
+    }
+
     private var started: TimeInterval
     private var window: UInt64 = 0
     private var bytes: UInt64 = 0, receivedCount: UInt64 = 0, decodedCount: UInt64 = 0, presentedCount: UInt64 = 0
-    private var lastReceived: UInt64 = 0, lastDecoded: UInt64 = 0, lastPresented: UInt64 = 0
+    private var receivedFrames = RecentFrames(), decodedFrames = RecentFrames(), presentedFrames = RecentFrames()
     private var receiveTimes: [UInt64: TimeInterval] = [:]
-    private var decodeTimes: [UInt32] = [], presentationTimes: [UInt32] = []
+    private var decodeTimes: [UInt32] = []
+    private var presentationAgeUs: UInt32?
     private var receiveUs: UInt32 = 0, queueUs: UInt32 = 0
+    private var receiveTimingComplete = true
     private var validity: UInt32 = 0
     private var drops: [UInt32] = [0,0,0,0]
     private var rtt: (UInt32,TimeInterval)?
     init(started: TimeInterval) { self.started = started }
     static func us(_ seconds: TimeInterval) -> UInt32 { UInt32(max(0,min(Double(UInt32.max),(seconds*1_000_000).rounded()))) }
     mutating func received(frame: UInt64, bytes: Int, now: TimeInterval, receiveUs: UInt32?) {
-        guard frame > lastReceived else { return }
-        lastReceived = frame; receivedCount &+= 1; self.bytes &+= UInt64(max(0,bytes))
+        guard receivedFrames.insert(frame) else { return }
+        receivedCount &+= 1; self.bytes &+= UInt64(max(0,bytes))
         if receiveTimes.count >= 512 { receiveTimes.removeValue(forKey: receiveTimes.keys.min() ?? frame) }
         receiveTimes[frame] = now
-        if let receiveUs { self.receiveUs = self.receiveUs.addingReportingOverflow(receiveUs).overflow ? .max : self.receiveUs + receiveUs; validity |= 1 }
+        if let receiveUs {
+            let (total, overflow) = self.receiveUs.addingReportingOverflow(receiveUs)
+            self.receiveUs = total
+            receiveTimingComplete = receiveTimingComplete && !overflow
+        } else {
+            receiveTimingComplete = false
+        }
     }
     mutating func decoded(frame: UInt64, queueUs: UInt32?, decodeUs: UInt32?) {
-        guard frame > lastDecoded else { return }; lastDecoded = frame; decodedCount &+= 1
+        guard decodedFrames.insert(frame) else { return }
+        decodedCount &+= 1
         if let queueUs { self.queueUs = max(self.queueUs,queueUs); validity |= 16 }
         if let decodeUs { decodeTimes.append(decodeUs); if decodeTimes.count > 512 { decodeTimes.removeFirst() }; validity |= 2 }
     }
     mutating func presented(frame: UInt64, now: TimeInterval) {
-        guard frame > lastPresented else { return }; lastPresented = frame; presentedCount &+= 1
-        if let received = receiveTimes.removeValue(forKey:frame) {
-            presentationTimes.append(Self.us(now-received)); validity |= 4
-            if presentationTimes.count > 512 { presentationTimes.removeFirst() }
-        }
+        guard presentedFrames.insert(frame) else { return }
+        presentedCount &+= 1
+        presentationAgeUs = receiveTimes.removeValue(forKey: frame).map { Self.us(now - $0) }
     }
     mutating func drop(_ cause: Int) { guard drops.indices.contains(cause) else { return }; if drops[cause] != .max { drops[cause] += 1 }; validity |= 32 }
     mutating func recordRtt(us: UInt32, now: TimeInterval) { rtt = (us,now) }
+    mutating func restart(started: TimeInterval) {
+        let nextWindow = window
+        let latestRtt = rtt
+        self = Self(started: started)
+        window = nextWindow
+        rtt = latestRtt
+    }
+    private mutating func resetMeasurements(started: TimeInterval) {
+        self.started = started
+        bytes = 0; receivedCount = 0; decodedCount = 0; presentedCount = 0
+        decodeTimes.removeAll(keepingCapacity: true)
+        presentationAgeUs = nil
+        drops = [0,0,0,0]; validity = 0; receiveUs = 0; queueUs = 0
+        receiveTimingComplete = true
+    }
     mutating func sample(identity: AdaptiveMediaIdentity, now: TimeInterval, activity: UInt8) -> AdaptiveMediaPacket? {
-        guard identity.valid, now-started >= 1 else { return nil }
+        let elapsed = now - started
+        guard identity.valid, elapsed >= 1 else { return nil }
+        guard elapsed <= 10 else {
+            resetMeasurements(started: now)
+            receiveTimes.removeAll(keepingCapacity: true)
+            return nil
+        }
         func p95(_ values: [UInt32]) -> UInt32 { let s=values.sorted(); return s.isEmpty ? 0 : s[max(0,Int(ceil(Double(s.count)*0.95))-1)] }
         var d=AdaptiveMediaProtocol.empty(97); AdaptiveMediaProtocol.putIdentity(identity,&d)
-        d.storeLittleEndian(window,at:32); d.storeLittleEndian(min(10_000_000,Self.us(now-started)),at:40)
-        // A timer delayed past the maximum window cannot label old counters as fresh.
-        var valid = now-started <= 10 ? validity : 0
+        d.storeLittleEndian(window,at:32); d.storeLittleEndian(Self.us(elapsed),at:40)
+        let validReceive = receiveTimingComplete && receiveUs > 0
+        var valid = validity
+        if validReceive { valid |= 1 }
+        if presentationAgeUs != nil { valid |= 4 }
         if let rtt { valid |= 8; d.storeLittleEndian(rtt.0,at:112); d.storeLittleEndian(Self.us(now-rtt.1),at:116) }
         d.storeLittleEndian(valid,at:44); d.storeLittleEndian(bytes,at:48); d.storeLittleEndian(receivedCount,at:56)
         d.storeLittleEndian(decodedCount,at:64); d.storeLittleEndian(presentedCount,at:72)
         for i in 0..<4 { d.storeLittleEndian(drops[i],at:80+i*4) }
-        d.storeLittleEndian(receiveUs,at:96); d.storeLittleEndian(queueUs,at:100)
-        d.storeLittleEndian(p95(decodeTimes),at:104); d.storeLittleEndian(p95(presentationTimes),at:108)
-        d.storeLittleEndian(lastReceived,at:120); d.storeLittleEndian(lastDecoded,at:128); d.storeLittleEndian(lastPresented,at:136); d[144]=activity
-        window &+= 1; started=now; bytes=0; receivedCount=0; decodedCount=0; presentedCount=0
-        decodeTimes.removeAll(keepingCapacity:true); presentationTimes.removeAll(keepingCapacity:true)
-        drops=[0,0,0,0]; validity=0; receiveUs=0; queueUs=0
-        return AdaptiveMediaProtocol.decode(type:97,data:d)
+        d.storeLittleEndian(validReceive ? receiveUs : 0,at:96); d.storeLittleEndian(queueUs,at:100)
+        d.storeLittleEndian(p95(decodeTimes),at:104); d.storeLittleEndian(presentationAgeUs ?? 0,at:108)
+        d.storeLittleEndian(receivedFrames.last,at:120); d.storeLittleEndian(decodedFrames.last,at:128)
+        d.storeLittleEndian(presentedFrames.last,at:136); d[144]=activity
+        guard let packet = AdaptiveMediaProtocol.decode(type: 97, data: d) else { return nil }
+        window &+= 1
+        resetMeasurements(started: now)
+        return packet
     }
 }

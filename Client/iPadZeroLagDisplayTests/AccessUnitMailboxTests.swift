@@ -162,6 +162,7 @@ final class AccessUnitMailboxTests: XCTestCase {
             clock: { 0 },
             onDrop: { drops.append(($0, $1, $2)) })
         mailbox.beginSession(generation: 1)
+        XCTAssertFalse(mailbox.recoveryActive, "Waiting for startup IDR alone is not a recovery episode")
         let bootstrap = unwrap(mailbox.publish(simpleUnit(1, idr: true)))
         XCTAssertEqual(mailbox.complete(bootstrap, succeeded: true).disposition, .deliver)
         bootstrap.unit.owner.release()
@@ -170,6 +171,7 @@ final class AccessUnitMailboxTests: XCTestCase {
         XCTAssertNil(mailbox.publish(simpleUnit(3, idr: true)))
         XCTAssertTrue(mailbox.waitingForIDR)
         XCTAssertNil(mailbox.publish(simpleUnit(4, idr: false)))
+        XCTAssertTrue(mailbox.recoveryActive)
         XCTAssertTrue(drops.contains {
             $0.0 == 4 && $0.1 == 1 && $0.2 == .waitingForIDR
         })
@@ -179,12 +181,14 @@ final class AccessUnitMailboxTests: XCTestCase {
         XCTAssertEqual(completion.next?.unit.sequence, 3)
         XCTAssertTrue(completion.next?.unit.isIDR == true)
         XCTAssertTrue(mailbox.waitingForIDR)
+        XCTAssertTrue(mailbox.recoveryActive)
         XCTAssertNil(mailbox.publish(simpleUnit(5, idr: false)))
         let candidate = unwrap(completion.next)
         let candidateCompletion = mailbox.complete(candidate, succeeded: true)
         XCTAssertEqual(candidateCompletion.disposition, .deliver)
         candidate.unit.owner.release()
         XCTAssertFalse(mailbox.waitingForIDR)
+        XCTAssertFalse(mailbox.recoveryActive)
         let dependent = unwrap(candidateCompletion.next)
         XCTAssertEqual(dependent.unit.sequence, 5)
         XCTAssertEqual(

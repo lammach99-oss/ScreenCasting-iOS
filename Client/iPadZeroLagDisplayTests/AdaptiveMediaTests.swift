@@ -126,6 +126,78 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         XCTAssertEqual(idle.u32(44) & 7, 0, "Silence is not a healthy zero measurement")
     }
 
+    func testFeedbackCountsReorderedFramesOnceAcrossWindowBoundaries() throws {
+        var window = AdaptiveMediaWindow(started: 0)
+        let identity = AdaptiveMediaIdentity(owner: 1, source: 2, media: 3)
+        window.received(frame: 11, bytes: 200, now: 0.25, receiveUs: 300)
+        window.received(frame: 10, bytes: 100, now: 0.50, receiveUs: 200)
+        window.decoded(frame: 11, queueUs: 10, decodeUs: 300)
+        window.decoded(frame: 10, queueUs: 20, decodeUs: 600)
+        window.presented(frame: 11, now: 0.5)
+        let first = try XCTUnwrap(window.sample(identity: identity, now: 1.125, activity: 3))
+        XCTAssertEqual(first.u32(40), 1_125_000)
+        XCTAssertEqual(first.u64(48), 300)
+        XCTAssertEqual(first.u64(56), 2)
+        XCTAssertEqual(first.u64(64), 2)
+        XCTAssertEqual(first.u64(72), 1)
+        XCTAssertEqual(first.u32(96), 500)
+        XCTAssertEqual(first.u32(104), 600)
+        XCTAssertEqual(first.u32(108), 250_000)
+        for offset in [120, 128, 136] { XCTAssertEqual(first.u64(offset), 11) }
+        XCTAssertNil(window.sample(identity: identity, now: 1.25, activity: 3))
+
+        window.received(frame: 10, bytes: 100, now: 1.5, receiveUs: 200)
+        window.decoded(frame: 10, queueUs: 20, decodeUs: 600)
+        window.presented(frame: 11, now: 1.5)
+        let second = try XCTUnwrap(window.sample(identity: identity, now: 2.25, activity: 3))
+        XCTAssertEqual(second.u64(32), first.u64(32) &+ 1)
+        for offset in [48, 56, 64, 72] { XCTAssertEqual(second.u64(offset), 0) }
+        XCTAssertEqual(second.u32(44) & 7, 0)
+    }
+
+    func testFeedbackWithPartialReceiveTimingDoesNotReportValidGoodput() throws {
+        var window = AdaptiveMediaWindow(started: 0)
+        let identity = AdaptiveMediaIdentity(owner: 1, source: 2, media: 3)
+        window.received(frame: 1, bytes: 100, now: 0.25, receiveUs: 100)
+        window.received(frame: 2, bytes: 200, now: 0.5, receiveUs: nil)
+        let partial = try XCTUnwrap(window.sample(identity: identity, now: 1, activity: 3))
+        XCTAssertEqual(partial.u64(48), 300)
+        XCTAssertEqual(partial.u64(56), 2)
+        XCTAssertEqual(partial.u32(44) & 1, 0)
+        XCTAssertEqual(partial.u32(96), 0)
+
+        window.received(frame: 3, bytes: 100, now: 1.25, receiveUs: 0)
+        let zero = try XCTUnwrap(window.sample(identity: identity, now: 2, activity: 3))
+        XCTAssertEqual(zero.u32(44) & 1, 0)
+        XCTAssertEqual(zero.u32(96), 0)
+    }
+
+    func testFeedbackReportsAgeOfLastFreshPresentation() throws {
+        var window = AdaptiveMediaWindow(started: 0)
+        let identity = AdaptiveMediaIdentity(owner: 1, source: 2, media: 3)
+        window.received(frame: 1, bytes: 100, now: 0.125, receiveUs: 100)
+        window.presented(frame: 1, now: 0.625)
+        window.received(frame: 2, bytes: 100, now: 0.75, receiveUs: 100)
+        window.presented(frame: 2, now: 0.875)
+        let feedback = try XCTUnwrap(window.sample(identity: identity, now: 1, activity: 3))
+        XCTAssertEqual(feedback.u32(44) & 4, 4)
+        XCTAssertEqual(feedback.u32(108), 125_000)
+        XCTAssertEqual(feedback.u64(136), 2)
+    }
+
+    func testFeedbackDiscardsOversizedWindowAndStartsFresh() throws {
+        var window = AdaptiveMediaWindow(started: 0)
+        let identity = AdaptiveMediaIdentity(owner: 1, source: 2, media: 3)
+        window.received(frame: 1, bytes: 500, now: 0.5, receiveUs: 100)
+        XCTAssertNil(window.sample(identity: identity, now: 20, activity: 3))
+        window.received(frame: 2, bytes: 100, now: 20.25, receiveUs: 100)
+        let fresh = try XCTUnwrap(window.sample(identity: identity, now: 21, activity: 3))
+        XCTAssertEqual(fresh.u32(40), 1_000_000)
+        XCTAssertEqual(fresh.u64(48), 100)
+        XCTAssertEqual(fresh.u64(56), 1)
+        XCTAssertEqual(fresh.u32(44) & 1, 1)
+    }
+
     func castingSession() throws -> AdaptiveMediaSession {
         let vectors=try fixtures(); var caps=bytes(try XCTUnwrap(vectors["94"]))
         caps[51]=0; caps.storeLittleEndian(UInt32(3_000_000),at:28)
@@ -425,6 +497,10 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         receive(.qualityState,baseline); await drain()
         XCTAssertTrue(network.adaptiveQualityAvailable); XCTAssertFalse(network.autoQualityEnabled)
         XCTAssertFalse(writes.contains { $0[5] == 95 },"Negotiation alone is not opt-in")
+        now = 1
+        network.sendAdaptiveFeedbackForTesting(); await drain()
+        let baselineWindow = Data(try XCTUnwrap(writes.last { $0[5] == 97 }).dropFirst(16))
+        XCTAssertTrue(network.admitAdaptiveFrameForTesting(79, isIDR: true))
         network.setAutoQualityEnabled(true); await drain()
         XCTAssertTrue(defaults.bool(forKey:"ScreenCasting.client.autoQuality.v1"))
         XCTAssertEqual(writes.filter { $0[5] == 95 }.count,1)
@@ -432,8 +508,21 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         configuration.storeLittleEndian(UInt32(1),at:32)
         receive(.qualityConfiguration,configuration); await drain()
         XCTAssertEqual(writes.filter { $0[5] == 99 }.map { $0[16+44] },[0])
+        now = 1.99
+        network.sendAdaptiveFeedbackForTesting(); await drain()
+        XCTAssertEqual(writes.filter { $0[5] == 97 }.count, 1)
+        now = 2.125
+        network.sendAdaptiveFeedbackForTesting(); await drain()
+        let cutoverWindow = Data(try XCTUnwrap(writes.last { $0[5] == 97 }).dropFirst(16))
+        XCTAssertEqual(cutoverWindow.loadLittleEndian(UInt64.self,at:24),4)
+        XCTAssertEqual(cutoverWindow.loadLittleEndian(UInt64.self,at:32),baselineWindow.loadLittleEndian(UInt64.self,at:32) &+ 1)
+        XCTAssertEqual(cutoverWindow.loadLittleEndian(UInt64.self,at:56),0, "Discard unsent receive counts from the old epoch")
+        XCTAssertEqual(cutoverWindow.loadLittleEndian(UInt64.self,at:120),0)
+        XCTAssertEqual(cutoverWindow[144] & 0x0C, 4, "Recovery is active during a cutover; saturation is host-derived")
         XCTAssertFalse(network.admitAdaptiveFrameForTesting(79,isIDR:true))
-        XCTAssertTrue(network.admitAdaptiveFrameForTesting(80,isIDR:true))
+        let frameBytes = 25_000
+        let frameReceiveUs: UInt32 = 4_000
+        XCTAssertTrue(network.admitAdaptiveFrameForTesting(80,isIDR:true,bytes:frameBytes,receiveUs:frameReceiveUs))
         network.decoder.onAdaptiveDecoded?(80,network.decoder.currentSessionGeneration,200,300)
         network.recordCapturePresentation(sequence:80,generation:network.decoder.currentSessionGeneration)
         await drain()
@@ -442,14 +531,114 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         receive(.qualityState,applied); await drain()
         XCTAssertTrue(network.effectiveQualitySummary?.contains("text sharpness reduced") == true)
         XCTAssertFalse(network.admitAdaptiveFrameForTesting(79,isIDR:true))
-        now=1; network.sendAdaptiveFeedbackForTesting(); await drain()
+        network.decoder.installAdaptiveMediaRenderer { _ in true }
+        for frame in UInt32(81)..<110 {
+            XCTAssertTrue(network.admitAdaptiveFrameForTesting(frame, isIDR: false, bytes: frameBytes, receiveUs: frameReceiveUs))
+            network.decoder.onAdaptiveDecoded?(frame, network.decoder.currentSessionGeneration, 200, 300)
+            network.recordCapturePresentation(sequence: frame, generation: network.decoder.currentSessionGeneration)
+        }
+        now=3.25; network.sendAdaptiveFeedbackForTesting(); await drain()
         let feedback=Data(try XCTUnwrap(writes.last { $0[5] == 97 }).dropFirst(16))
-        XCTAssertEqual(feedback.loadLittleEndian(UInt64.self,at:72),1)
+        XCTAssertEqual(feedback[144], 3)
+        XCTAssertEqual(feedback.loadLittleEndian(UInt32.self,at:40),1_125_000)
+        XCTAssertEqual(feedback.loadLittleEndian(UInt32.self,at:44) & 7,7)
+        XCTAssertEqual(feedback.loadLittleEndian(UInt32.self,at:96),120_000)
+        XCTAssertEqual(feedback.loadLittleEndian(UInt64.self,at:48),750_000)
+        for offset in [56,64,72] {
+            XCTAssertEqual(feedback.loadLittleEndian(UInt64.self,at:offset),30)
+        }
+        let sentWindows = writes.filter { $0[5] == 97 }.count
+        network.sendAdaptiveFeedbackForTesting(); await drain()
+        XCTAssertEqual(writes.filter { $0[5] == 97 }.count, sentWindows)
         network.setAutoQualityEnabled(false); await drain()
         receive(.qualityState,applied); await drain()
         let policies=writes.filter { $0[5] == 95 }
         XCTAssertEqual(policies.count,2); XCTAssertEqual(policies.last?[16+40],0)
         XCTAssertEqual(policies.last?.loadLittleEndian(UInt32.self,at:16+44),UInt32(network.desiredBitrateMbps*1_000_000))
+    }
+
+    @MainActor func testRollbackConnectionLossDropsOldEpochBeforeReconnecting() async throws {
+        let suite = "AdaptiveMediaReconnect." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let network = NetworkManager(userDefaults: defaults)
+        defer { network.stopForTesting() }
+        var now = 0.0
+        var writes: [Data] = []
+        network.adaptiveMediaClockForTesting = { now }
+        network.captureTargetScheduleForTesting = { _, _ in }
+        network.controlSendForAudioTesting = { data, done in writes.append(data); done(nil) }
+        network.realtimeAudioPlaybackForTesting = { _ in XCTFail("No audio in DS2 tests") }
+        var decoderGeometry: [AdaptiveMediaIdentity?] = []
+        network.decoder.installAdaptiveMediaRenderer { decoderGeometry.append($0?.identity); return true }
+        func drain() async {
+            for _ in 0..<4 {
+                let ready = expectation(description: "control queue barrier")
+                network.networkQueueForTesting.async { ready.fulfill() }
+                await fulfillment(of: [ready], timeout: 2)
+            }
+        }
+        var peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        func receive(_ type: WireMessageType, _ data: Data, flags: UInt16 = 0) {
+            network.receiveCaptureTargetWireForTesting(type: type, payload: data, flags: flags,
+                                                       generation: peer.generation, connection: peer.connection)
+        }
+        func negotiate() async throws -> UInt64 {
+            network.beginTransferWriterForTesting()
+            network.beginAdaptiveMediaForTesting()
+            await drain()
+            let probe = try XCTUnwrap(writes.last { $0[5] == 6 && $0.loadLittleEndian(UInt16.self, at: 6) & 0x0200 != 0 })
+            receive(.pong, Data(probe.suffix(16)), flags: 0x0200)
+            await drain()
+            let hello = Data(try XCTUnwrap(writes.last { $0[5] == 93 }).dropFirst(16))
+            let owner = hello.loadLittleEndian(UInt64.self, at: 24)
+            var caps = bytes(try XCTUnwrap(try fixtures()["94"]))
+            caps.storeLittleEndian(hello.loadLittleEndian(UInt64.self, at: 16), at: 8)
+            caps.storeLittleEndian(owner, at: 16)
+            caps[51] = 0
+            caps.storeLittleEndian(UInt32(3_000_000), at: 28)
+            receive(.qualityCapabilities, caps)
+            var baseline = try effective().packet.encoded
+            baseline.storeLittleEndian(owner, at: 8)
+            receive(.qualityState, baseline)
+            return owner
+        }
+        let oldOwner = try await negotiate()
+        let oldDecoder = network.decoder.currentSessionGeneration
+        var rollback = try effective(98, media: 4, first: 80).packet.encoded
+        rollback.storeLittleEndian(oldOwner, at: 8)
+        rollback[44] = 2
+        rollback[47] = 7
+        receive(.qualityConfiguration, rollback)
+        await drain()
+        XCTAssertTrue(writes.contains { $0[5] == 99 && $0[16+44] == 0 })
+        XCTAssertEqual(decoderGeometry.last.flatMap { $0 }?.media, 4)
+        XCTAssertTrue(network.admitAdaptiveFrameForTesting(80, isIDR: true))
+
+        let invalidations = network.decoder.invalidateCountForTesting
+        network.simulateWifiControlReceiveErrorForTesting(generation: peer.generation, connection: peer.connection)
+        XCTAssertGreaterThan(network.decoder.invalidateCountForTesting, invalidations)
+        XCTAssertNil(decoderGeometry.last.flatMap { $0 })
+        peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        let newOwner = try await negotiate()
+        XCTAssertNotEqual(newOwner, oldOwner)
+        XCTAssertNotEqual(network.decoder.currentSessionGeneration, oldDecoder)
+        receive(.qualityConfiguration, rollback)
+        network.decoder.onAdaptiveDecoded?(80, oldDecoder, 100, 100)
+        network.recordCapturePresentation(sequence: 80, generation: oldDecoder)
+        now = 1
+        network.sendAdaptiveFeedbackForTesting()
+        await drain()
+        XCTAssertEqual(decoderGeometry.last.flatMap { $0 }?.owner, newOwner)
+        XCTAssertEqual(writes.filter { $0[5] == 99 }.count, 1, "Late rollback cannot affect the replacement")
+        let feedback = Data(try XCTUnwrap(writes.last { $0[5] == 97 }).dropFirst(16))
+        XCTAssertEqual(feedback.loadLittleEndian(UInt64.self, at: 8), newOwner)
+        XCTAssertEqual(feedback.loadLittleEndian(UInt64.self, at: 24), 3)
+        XCTAssertEqual(feedback.loadLittleEndian(UInt64.self, at: 32), 0)
+        for offset in [48, 56, 64, 72] {
+            XCTAssertEqual(feedback.loadLittleEndian(UInt64.self, at: offset), 0)
+        }
+        XCTAssertTrue(network.admitAdaptiveFrameForTesting(1, isIDR: true), "The retired FirstFrame floor must not survive")
     }
     #endif
 

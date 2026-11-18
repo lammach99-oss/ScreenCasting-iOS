@@ -178,6 +178,12 @@ final class AccessUnitMailbox {
         return waitingForIDRStorage
     }
 
+    var recoveryActive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return recoveryNotified
+    }
+
     @discardableResult
     func configureRefreshRate(_ refreshHz: UInt32) -> Bool {
         guard refreshHz == 60 || refreshHz == 120 else { return false }

@@ -377,6 +377,11 @@ public final class DecoderManager {
         captureDeliveryLock.lock(); defer { captureDeliveryLock.unlock() }
         return adaptiveRendererActive?() == true
     }
+    var adaptiveDecodeRecoveryActive: Bool {
+        mailboxStateLock.lock()
+        defer { mailboxStateLock.unlock() }
+        return mailbox.recoveryActive
+    }
     private let captureDeliveryLock = NSLock()
     private var captureOutputFenced = false
     private struct CaptureOutputKey: Hashable { let sequence: UInt32; let generation: UInt64 }

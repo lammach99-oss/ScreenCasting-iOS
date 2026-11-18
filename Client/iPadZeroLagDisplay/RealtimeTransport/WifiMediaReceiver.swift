@@ -1316,6 +1316,11 @@ final class WifiMediaReceiver {
     }
     #endif
 
+    func isRecovering(generation: UInt64) -> Bool {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        return activeGeneration == generation && dependencyBreakActive
+    }
+
     func requestImmediateRecoveryFeedback(generation: UInt64) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard activeGeneration == generation, !captureSuspended else { return }
