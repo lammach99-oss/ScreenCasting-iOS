@@ -582,6 +582,11 @@ public class NetworkManager: ObservableObject {
     private var qualityAutoOptIn = false
     private var qualityPolicyDirty = false
     private var qualityOwnsPolicy = false
+    private var remoteManualRestorePending = false
+    private var remoteManualOverride = false
+    private var remoteSettingsReady = false
+    private var remoteSettingsGetID: UInt32?
+    private var remoteManualRequestID: UInt32?
     private let streamSettingsDefaults: UserDefaults
     @Published public private(set) var adaptiveQualityAvailable = false
     @Published public private(set) var autoQualityEnabled = false
@@ -776,6 +781,7 @@ public class NetworkManager: ObservableObject {
         clientDebugLoggingEnabled = ClientDebugLoggingPreference.load(
             defaults: userDefaults)
         ClientStreamSettingsStore.migrateCastingBitrate(defaults: userDefaults)
+        ClientStreamSettingsStore.migrateRemoteBitrate(defaults: userDefaults)
         let desired = ClientStreamSettingsStore.load(defaults: userDefaults)
         clientSettingsState = ClientSettingsStateModel(desired: desired)
         desiredBitrateMbps = desired.bitrateMbps
@@ -1840,6 +1846,23 @@ public class NetworkManager: ObservableObject {
         networkQueue.async { [weak self] in
             guard let self, self.connectionGeneration == generation,
                   !self.awaitingCastingSettingsIdentity else { return }
+            if self.remoteInputConnection {
+                let manual = desired.forSession(remote: true)
+                if let hostID = self.qualityHostID {
+                    ClientStreamSettingsStore.save(manual, hostID: hostID, remote: true, defaults: self.streamSettingsDefaults)
+                }
+                self.clientSettingsState.setDesired(manual)
+                DispatchQueue.main.async {
+                    guard self.connectionGenerationClock.current == generation else { return }
+                    self.desiredBitrateMbps = manual.bitrateMbps
+                }
+                // Editing the fallback in Auto does not override host adaptation.
+                guard !self.qualityAutoOptIn || !self.remoteQualityNegotiated else { return }
+                self.remoteManualRestorePending = true
+                self.remoteManualOverride = true
+                self.restoreRemoteManualIfReady()
+                return
+            }
             let audioChanged = desired.audioEnabled != self.clientSettingsState.desired.audioEnabled
             let legacyAutoChanged = desired.adaptiveBitrateEnabled != self.clientSettingsState.desired.adaptiveBitrateEnabled
             ClientStreamSettingsStore.save(desired, hostID: self.qualityHostID, defaults: self.streamSettingsDefaults)
@@ -1926,6 +1949,7 @@ public class NetworkManager: ObservableObject {
         print(
             "[IPAD][SETTINGS_SYNC_REQUEST] " +
             "generation=\(generation) request=\(requestID)")
+        if remoteInputConnection { remoteSettingsGetID = requestID }
         sendWireMessage(
             type: .settingsGet,
             payload: ClientSettingsWireCodec.get(requestID: requestID),
@@ -2822,8 +2846,9 @@ public class NetworkManager: ObservableObject {
             handleStreamError("Unable to save the trusted Host identity in Keychain.")
             return
         }
-        if !remoteInputConnection, isNewPairing {
-            ClientStreamSettingsStore.initializeCastingBitrateForNewPairing(hostID: credential.hostID, defaults: streamSettingsDefaults)
+        if isNewPairing {
+            ClientStreamSettingsStore.initializeCastingBitrateForNewPairing(hostID: credential.hostID,
+                                                                            remote: remoteInputConnection, defaults: streamSettingsDefaults)
         }
         if activeTransportKind == .wifi {
             pairedControlGeneration = connectionGeneration
@@ -2944,6 +2969,18 @@ public class NetworkManager: ObservableObject {
                 "[IPAD][SETTINGS_RUNTIME_RECOVERY] " +
                 "generation=\(state.generation) " +
                 "action=suppress_already_retried")
+        }
+        if remoteInputConnection {
+            let requestID = payload.loadLittleEndian(UInt32.self, at: 4)
+            if outcome == .state, requestID == remoteSettingsGetID {
+                remoteSettingsReady = true
+                remoteSettingsGetID = nil
+            }
+            if outcome != .state, requestID == remoteManualRequestID {
+                remoteManualRequestID = nil
+            }
+            restoreRemoteManualIfReady()
+            sendAdaptivePolicyOnQueue(auto: qualityAutoOptIn)
         }
     }
 
@@ -3878,7 +3915,6 @@ public class NetworkManager: ObservableObject {
             let reason = String(data: payload.dropFirst(), encoding: .utf8) ?? ""
             if accepted {
                 // Casting can authenticate and deliver a baseline on every failed cutover retry.
-                if remoteInputConnection { reconnectAttempt = 0 }
                 reconnectWorkItem?.cancel()
                 reconnectWorkItem = nil
                 print("[IPAD][AUTO_RECONNECT_SUCCESS] generation=\(generation)")
@@ -4194,9 +4230,15 @@ public class NetworkManager: ObservableObject {
                 // exact host commit must arrive first on authenticated TLS.
                 return
             }
-            guard adaptiveIncomingOnQueue(payload, sequence: header.sequence,
-                isIDR: header.flags & WireProtocol.videoFlagIDR != 0, receivedAt: CACurrentMediaTime(),
-                receiveUs: AdaptiveMediaWindow.us(CACurrentMediaTime()-message.firstByteAt)) else { return }
+            let isIDR = header.flags & WireProtocol.videoFlagIDR != 0
+            let lengthPrefixed = header.flags & WireProtocol.videoFlagLengthPrefixed != 0
+            if remoteQualityNegotiated {
+                guard admitRemoteAdaptiveVideoOnQueue(payload, sequence: header.sequence, isIDR: isIDR,
+                                                      lengthPrefixed: lengthPrefixed) else { return }
+            }
+            let receivedAt = CACurrentMediaTime()
+            guard adaptiveIncomingOnQueue(payload, sequence: header.sequence, isIDR: isIDR,
+                receivedAt: adaptiveNow(), receiveUs: AdaptiveMediaWindow.us(receivedAt-message.firstByteAt)) else { return }
             captureAvailability.noteFrameReceived(sequence: header.sequence)
             if consumeConnectionVideoOnQueue(payload, sequence: header.sequence,
                 isIDR: header.flags & WireProtocol.videoFlagIDR != 0,
@@ -4205,7 +4247,6 @@ public class NetworkManager: ObservableObject {
             if !captureTargetOwnsPresentation {
                 guard mirrorControl.permitsVideoSequence(header.sequence) else { return }
             }
-            let receivedAt = CACurrentMediaTime()
             if remoteInputConnection, header.flags & WireProtocol.videoFlagIDR != 0, !remoteFeatures.inputReady {
                 remoteFeatures.keyframeArrived()
                 publishRemoteInputOnQueue(contextChanged: false)
@@ -4229,6 +4270,12 @@ public class NetworkManager: ObservableObject {
                 receivedAt: receivedAt) { return }
             guard admitCaptureContinuationOnQueue(sequence: header.sequence, decoder: decoder.currentSessionGeneration,
                 isIDR: header.flags & WireProtocol.videoFlagIDR != 0) else { return }
+            #if targetEnvironment(simulator)
+            if remoteInputConnection, let decode = captureTargetDecodeForTesting {
+                decode(payload, header.sequence, decoder.currentSessionGeneration)
+                return
+            }
+            #endif
             decoder.processInputData(
                 payload,
                 sequence: header.sequence,
@@ -4322,7 +4369,7 @@ public class NetworkManager: ObservableObject {
             }
 
         case .qualityCapabilities, .qualityState, .qualityConfiguration:
-            receiveAdaptiveOnQueue(type: header.type, payload: payload, flags: header.flags)
+            receiveAdaptiveOnQueue(type: header.type, payload: payload, flags: header.flags, sequence: header.sequence)
         case .qualityHello, .qualityPolicySet, .qualityFeedback, .qualityConfigurationAck:
             return
         case .videoFeedback:
@@ -6970,7 +7017,45 @@ public class NetworkManager: ObservableObject {
         if let applied=qualitySession?.applied { _ = decoder.prepareAdaptiveMedia(applied) }
     }
     private var adaptiveQualityTransport: Bool {
-        !remoteInputConnection && activeTransportKind == .wifi && committedRealtimeMode == RealtimeTransportMode.wifiRTP
+        activeTransportKind == .wifi && (remoteInputConnection
+            ? committedRealtimeMode == RealtimeTransportMode.legacyTLS
+            : committedRealtimeMode == RealtimeTransportMode.wifiRTP)
+    }
+    private var remoteQualityNegotiated: Bool {
+        qualitySession?.remote == true && qualitySession?.current != nil
+    }
+    private func restoreRemoteManualIfReady() {
+        guard remoteInputConnection, remoteSettingsReady, remoteManualRestorePending,
+              remoteManualRequestID == nil,
+              qualityProbe.phase != .waiting,
+              qualityProbe.phase != .enabled || remoteQualityNegotiated else { return }
+        if remoteQualityNegotiated && qualityAutoOptIn && qualitySession?.supportsAuto == true {
+            remoteManualRestorePending = false
+            remoteManualOverride = false
+            return
+        }
+        let desired = clientSettingsState.desired.bitrateMbps
+        let effective = clientSettingsState.effective.bitrateMbps
+        let send = remoteManualOverride || desired != effective
+        remoteManualRestorePending = false
+        remoteManualOverride = false
+        if send, case .sent(let requestID) = sendDesiredSettingsIfPossible(reason: "remote_manual_target") {
+            remoteManualRequestID = requestID
+            let generation = connectionGeneration
+            networkQueue.asyncAfter(deadline: .now() + 5) { [weak self] in
+                guard let self, self.connectionGeneration == generation,
+                      self.remoteManualRequestID == requestID else { return }
+                self.remoteManualRequestID = nil
+                // The service may have applied the write. Check readback and
+                // leave a new change to the user rather than resending it.
+                self.remoteManualRestorePending = false
+                self.remoteManualOverride = false
+                self.remoteSettingsReady = false
+                self.qualityPolicyDirty = false
+                self.settingsSyncPolicy.reset()
+                self.requestCurrentSettingsIfNeeded(generation: generation)
+            }
+        }
     }
     private var usesManualQualityFallback: Bool {
         qualityAutoOptIn || qualityProbe.phase == .backoff
@@ -6980,8 +7065,8 @@ public class NetworkManager: ObservableObject {
             wireAuthenticatedGeneration == connectionGeneration &&
             (wifiAuthentication.stage == .paired || wifiAuthentication.stage == .trusted)
     }
-    private func loadCastingStreamSettingsOnQueue(hostID: Data?) {
-        let desired = ClientStreamSettingsStore.load(hostID: hostID, defaults: streamSettingsDefaults)
+    private func loadCastingStreamSettingsOnQueue(hostID: Data?, remote: Bool = false) {
+        let desired = ClientStreamSettingsStore.load(hostID: hostID, remote: remote, defaults: streamSettingsDefaults)
         clientSettingsState.setDesired(desired)
         let generation = connectionGeneration
         DispatchQueue.main.async { [weak self] in
@@ -6990,7 +7075,7 @@ public class NetworkManager: ObservableObject {
         }
     }
     private func refreshAdaptiveQualityPreferenceOnQueue() {
-        guard !remoteInputConnection, wireAuthenticatedGeneration == connectionGeneration,
+        guard wireAuthenticatedGeneration == connectionGeneration,
               committedTransportGeneration == connectionGeneration,
               pairedControlGeneration == connectionGeneration, let hostID = trustedCredential?.hostID else {
             publishAdaptiveStateOnQueue()
@@ -6998,9 +7083,17 @@ public class NetworkManager: ObservableObject {
         }
         if qualityHostID != hostID {
             qualityHostID = hostID
-            loadCastingStreamSettingsOnQueue(hostID: hostID)
-            qualityAutoOptIn = ClientStreamSettingsStore.loadAutoQuality(hostID: hostID, defaults: streamSettingsDefaults)
+            loadCastingStreamSettingsOnQueue(hostID: hostID, remote: remoteInputConnection)
+            qualityAutoOptIn = ClientStreamSettingsStore.loadAutoQuality(hostID: hostID, remote: remoteInputConnection,
+                                                                       defaults: streamSettingsDefaults)
             qualityPolicyDirty = qualityAutoOptIn
+            if remoteInputConnection {
+                remoteManualRestorePending = true
+                restoreRemoteManualIfReady()
+                sendAdaptivePolicyOnQueue(auto: qualityAutoOptIn)
+                publishAdaptiveStateOnQueue()
+                return
+            }
             // The first v1 read may have been requested before pairing finished.
             // Reconcile again with the authenticated host's settings, including
             // on Wi-Fi RTP when the host does not support DS2.
@@ -7022,6 +7115,8 @@ public class NetworkManager: ObservableObject {
         if !preserveHostPreference {
             if qualityHostID != nil { loadCastingStreamSettingsOnQueue(hostID: nil) }
             qualityHostID = nil; qualityAutoOptIn = false
+            remoteManualRestorePending = false; remoteManualOverride = false; remoteSettingsReady = false
+            remoteSettingsGetID = nil; remoteManualRequestID = nil
         }
         qualityWindow = AdaptiveMediaWindow(started:adaptiveNow()); qualityPolicyDirty = false
         qualityRttSeconds = 0; qualityOwnsPolicy = false; decoder.clearAdaptiveMedia()
@@ -7035,19 +7130,20 @@ public class NetworkManager: ObservableObject {
         if backingOff {
             reason = "Auto temporarily unavailable after a failed quality switch"
         } else if !adaptiveQualityTransport {
-            reason = "Auto quality requires Wi-Fi RTP."
+            reason = remoteInputConnection ? "Auto quality requires a remote TLS connection." : "Auto quality requires Wi-Fi RTP."
         } else if qualitySession?.supportsAuto != true {
-            reason = "Auto quality requires an updated casting host."
+            reason = remoteInputConnection ? "Auto quality is unavailable on this remote PC." : "Auto quality requires an updated casting host."
         } else {
             reason = "Pair this PC to save its quality choice."
         }
-        let applied = qualitySession?.applied, saved = qualityAutoOptIn
+        let applied = qualitySession?.applied, saved = qualityAutoOptIn, remote = remoteInputConnection
         DispatchQueue.main.async { [weak self] in
             guard let self, self.connectionGenerationClock.current == generation else { return }
             self.adaptiveQualityAvailable = available; self.autoQualityEnabled = available && saved
             self.adaptiveQualityBackoffActive = backingOff
             self.savedAutoQualityEnabled = saved; self.adaptiveQualityUnavailableReason = reason
-            self.effectiveQualitySummary=applied?.summary; self.adaptiveDesktopSize=applied?.desktopSize
+            self.effectiveQualitySummary = applied?.displaySummary(remote: remote)
+            self.adaptiveDesktopSize = applied?.desktopSize
         }
     }
     private func beginAdaptiveProbeOnQueue() {
@@ -7063,7 +7159,10 @@ public class NetworkManager: ObservableObject {
         let work=DispatchWorkItem { [weak self] in
             guard let self, self.connectionGeneration == generation, self.qualityConnectionID == identity else { return }
             self.qualityProbe.tick(now:self.adaptiveNow())
-            if self.qualityProbe.phase == .legacy { self.reconnectAttempt = 0 }
+            if self.qualityProbe.phase == .legacy {
+                self.reconnectAttempt = 0
+                self.restoreRemoteManualIfReady()
+            }
         }
         qualityProbeDeadline=work; networkQueue.asyncAfter(deadline:.now()+2,execute:work)
     }
@@ -7076,7 +7175,8 @@ public class NetworkManager: ObservableObject {
         let timer = DispatchSource.makeTimerSource(queue: networkQueue)
         // Poll faster than the window interval. A slightly early tick must not
         // make the host wait another full second for a fresh window.
-        timer.schedule(deadline: .now() + 0.2, repeating: 0.2)
+        let interval: TimeInterval = remoteInputConnection ? 0.1 : 0.2
+        timer.schedule(deadline: .now() + interval, repeating: interval)
         timer.setEventHandler { [weak self] in
             guard let self, self.connectionGeneration == generation else { return }
             self.sendAdaptiveFeedbackOnQueue()
@@ -7095,10 +7195,13 @@ public class NetworkManager: ObservableObject {
         switch phase {
         case .legacy:
             reconnectAttempt = 0
+            restoreRemoteManualIfReady()
         case .backoff:
             // An early SettingsState may already have reconciled legacy AutoBitrate.
             // Re-read to switch it off when the backoff changes the desired policy.
-            if !qualityAutoOptIn && clientSettingsState.desired.adaptiveBitrateEnabled {
+            if remoteInputConnection {
+                restoreRemoteManualIfReady()
+            } else if !qualityAutoOptIn && clientSettingsState.desired.adaptiveBitrateEnabled {
                 settingsReconciliationGate.reset()
                 settingsSyncPolicy.reset()
                 requestCurrentSettingsIfNeeded(generation: connectionGeneration)
@@ -7106,9 +7209,24 @@ public class NetworkManager: ObservableObject {
             publishAdaptiveStateOnQueue()
         case .enabled:
             let owner = UInt64.random(in: 1...UInt64.max), nonce = UInt64.random(in: 1...UInt64.max)
-            qualitySession = AdaptiveMediaSession(owner: owner, nonce: nonce)
+            qualitySession = AdaptiveMediaSession(owner: owner, nonce: nonce, remote: remoteInputConnection)
             qualityPolicyDirty = qualityAutoOptIn
             sendAdaptiveOnQueue(AdaptiveMediaProtocol.hello(owner: owner, nonce: nonce))
+            if remoteInputConnection {
+                let generation = connectionGeneration
+                let work = DispatchWorkItem { [weak self] in
+                    guard let self, self.connectionGeneration == generation,
+                          self.qualitySession?.owner == owner, !self.remoteQualityNegotiated else { return }
+                    self.qualitySession = nil
+                    self.qualityProbe.retire()
+                    self.qualityProbeDeadline = nil
+                    self.qualityFeedbackTimer?.cancel(); self.qualityFeedbackTimer = nil
+                    self.restoreRemoteManualIfReady()
+                    self.publishAdaptiveStateOnQueue()
+                }
+                qualityProbeDeadline = work
+                networkQueue.asyncAfter(deadline: .now() + 8, execute: work)
+            }
         case .waiting, .idle: break
         }
     }
@@ -7119,7 +7237,7 @@ public class NetworkManager: ObservableObject {
               let type=WireMessageType(rawValue:packet.type) else { return }
         sendWireMessage(type:type,payload:packet.encoded,sequence:0)
     }
-    private func receiveAdaptiveOnQueue(type: WireMessageType, payload: Data, flags: UInt16) {
+    private func receiveAdaptiveOnQueue(type: WireMessageType, payload: Data, flags: UInt16, sequence: UInt32) {
         guard adaptiveQualityTransport, qualityProbe.phase == .enabled,
               wireAuthenticatedGeneration == connectionGeneration, committedTransportGeneration == connectionGeneration,
               let connection=activeControlConnection, qualityConnectionID == ObjectIdentifier(connection),
@@ -7135,12 +7253,18 @@ public class NetworkManager: ObservableObject {
             // must not reset those transactions or retire their input tickets.
             let selection=captureTargets.pending
             guard !connectionHandoffInProgress, !mirrorSwitchPending, selection?.accepted != true,
-                  qualitySession?.configure(value, restoringSource: selection != nil) == true else { return }
+                  qualitySession?.configure(value, restoringSource: selection != nil, controlSequence: sequence) == true else { return }
             updateAdaptiveFeedbackEpochOnQueue()
             // Synchronous decode/render fence retains the held drawable. Ready
             // is sent only when a renderer has accepted the encoded geometry.
-            guard decoder.prepareAdaptiveMedia(value) else {
-                failAdaptiveConfigurationOnQueue(reason: 10); return
+            if remoteInputConnection {
+                // Reject queued old output now, but switch the texture/decoder
+                // contract only when the reserved SCST IDR actually arrives.
+                decoder.fenceCaptureContinuation()
+            } else {
+                guard decoder.prepareAdaptiveMedia(value) else {
+                    failAdaptiveConfigurationOnQueue(reason: 10); return
+                }
             }
             if let selection {
                 sourceRollback=(selection.request,value.identity,UInt32(truncatingIfNeeded:value.firstFrame),decoder.currentSessionGeneration)
@@ -7169,7 +7293,13 @@ public class NetworkManager: ObservableObject {
                 if previous == nil { decoder.updateAdaptiveMedia(value) }
                 else { _ = decoder.prepareAdaptiveMedia(value) }
                 qualityPolicyDirty = qualityAutoOptIn
-            } else if value.status == 0 { decoder.updateAdaptiveMedia(value) }
+            } else if value.status == 0 || remoteInputConnection && pending?.identity == value.identity {
+                decoder.updateAdaptiveMedia(value)
+            }
+            if remoteInputConnection {
+                qualityProbeDeadline?.cancel(); qualityProbeDeadline = nil
+                restoreRemoteManualIfReady()
+            }
             publishAdaptiveStateOnQueue()
             if value.status == 0 || value.status == 1 { sendAdaptivePolicyOnQueue(auto:qualityAutoOptIn) }
         }
@@ -7190,14 +7320,23 @@ public class NetworkManager: ObservableObject {
         networkQueue.async { [weak self] in
             guard let self, self.connectionGeneration == generation, self.adaptiveQualityTransport,
                   self.qualitySession?.supportsAuto == true, let hostID = self.qualityHostID else { return }
-            ClientStreamSettingsStore.saveAutoQuality(enabled, hostID: hostID, defaults: self.streamSettingsDefaults)
+            guard enabled != self.qualityAutoOptIn else { return }
+            ClientStreamSettingsStore.saveAutoQuality(enabled, hostID: hostID, remote: self.remoteInputConnection,
+                                                      defaults: self.streamSettingsDefaults)
             self.qualityAutoOptIn = enabled
+            if self.remoteInputConnection {
+                self.qualitySession?.permitRemoteAutoRequestAgain()
+                self.remoteManualRestorePending = !enabled
+                self.remoteManualOverride = !enabled
+                self.restoreRemoteManualIfReady()
+            }
             self.qualityPolicyDirty=true; self.publishAdaptiveStateOnQueue()
             self.sendAdaptivePolicyOnQueue(auto:enabled)
         }
     }
     private func sendAdaptivePolicyOnQueue(auto: Bool) {
         guard adaptiveQualityTransport, qualityPolicyDirty, !captureAvailability.inputBlocked,
+              !remoteInputConnection || (auto && remoteSettingsReady && remoteManualRequestID == nil),
               let packet=qualitySession?.makePolicy(auto:auto,
                 manualBps:UInt32(clientSettingsState.desired.bitrateMbps*1_000_000),game:desiredPipelineMode == .game) else { return }
         qualityPolicyDirty=false; qualityOwnsPolicy=true; sendAdaptiveOnQueue(packet)
@@ -7207,6 +7346,37 @@ public class NetworkManager: ObservableObject {
               let floor=qualitySession?.frameFloor,
               let frame=qualitySession?.frameIdentity(sequence), frame >= floor else { return nil }
         return frame
+    }
+    private func admitRemoteAdaptiveVideoOnQueue(_ data: Data, sequence: UInt32, isIDR: Bool,
+                                                 lengthPrefixed: Bool) -> Bool {
+        let hasParameterSets: Bool
+        if qualitySession?.remoteNeedsParameterSets == true, isIDR, lengthPrefixed,
+           let ranges = LengthPrefixedNALScanner.ranges(in: data) {
+            var kinds = Set<UInt8>()
+            for range in ranges { kinds.insert((data[range.lowerBound] >> 1) & 0x3f) }
+            hasParameterSets = kinds.contains(32) && kinds.contains(33) && kinds.contains(34) &&
+                (kinds.contains(19) || kinds.contains(20))
+        } else {
+            hasParameterSets = false
+        }
+        switch qualitySession?.admitRemote(sequence: sequence, isIDR: isIDR, hasParameterSets: hasParameterSets) {
+        case .regular?: return true
+        case .cutover(let value)?:
+            // The ordered decoder queue cleans up VT before decoding this IDR.
+            // Keep the presentation owner and held drawable across media epochs.
+            decoder.invalidate(waitForCompletion: false)
+            guard decoder.prepareAdaptiveMedia(value) else {
+                failAdaptiveConfigurationOnQueue(reason: 10)
+                return false
+            }
+            return true
+        case .missingFirstFrame?:
+            failAdaptiveConfigurationOnQueue(reason: 7)
+            return false
+        case .discard?, nil:
+            qualityWindow.drop(3)
+            return false
+        }
     }
     private func adaptiveIncomingOnQueue(_ data: Data, sequence: UInt32, isIDR: Bool,
                                         receivedAt: TimeInterval, receiveUs: UInt32?) -> Bool {
@@ -7233,6 +7403,10 @@ public class NetworkManager: ObservableObject {
     }
     private func sendAdaptiveFeedbackOnQueue() {
         guard adaptiveQualityTransport, let identity = qualityFeedbackIdentity else { return }
+        if remoteInputConnection {
+            guard qualitySession?.pending == nil, qualitySession?.applied?.mode == 2,
+                  remoteManualRequestID == nil else { return }
+        }
         var activity: UInt8 = isForegroundActive ? 1 : 0
         if isForegroundActive && decoder.adaptivePresentationActive && !captureAvailability.inputBlocked { activity |= 2 }
         if captureAvailability.inputBlocked || captureTargetRecoveryToken != nil ||
@@ -7240,7 +7414,8 @@ public class NetworkManager: ObservableObject {
             qualitySession?.mediaRecoveryActive == true || wifiMediaReceiver.isRecovering(generation: connectionGeneration) {
             activity |= 4
         }
-        if let feedback = qualityWindow.sample(identity: identity, now: adaptiveNow(), activity: activity) {
+        if let feedback = qualityWindow.sample(identity: identity, now: adaptiveNow(), activity: activity,
+                                              remote: remoteInputConnection) {
             sendAdaptiveOnQueue(feedback)
         }
     }
@@ -7256,6 +7431,14 @@ public class NetworkManager: ObservableObject {
         }
     }
     func beginAdaptiveMediaForTesting() { networkQueue.sync { beginAdaptiveProbeOnQueue() } }
+    func receiveRemoteQualityFrameForTesting(_ bytes: Data, generation: UInt64, connection: NWConnection) {
+        networkQueue.sync {
+            guard remoteInputConnection, generation == connectionGeneration,
+                  activeControlConnection === connection, wireAuthenticatedGeneration == generation else { return }
+            let parser = WireStreamParser(generation: generation)
+            parser.consume(bytes, generation: generation) { handleWireParserEvent($0, generation: generation) }
+        }
+    }
     func admitAdaptiveFrameForTesting(_ sequence: UInt32, isIDR: Bool, bytes: Int = 1, receiveUs: UInt32 = 100) -> Bool {
         networkQueue.sync {
             adaptiveIncomingOnQueue(Data(count: bytes), sequence: sequence, isIDR: isIDR,

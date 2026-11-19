@@ -42,10 +42,14 @@ struct AdaptiveMediaEffective: Equatable {
               Float(content.width / encodedSize.width), Float(content.height / encodedSize.height))
     }
     var summary: String {
+        displaySummary(remote: false)
+    }
+    func displaySummary(remote: Bool) -> String {
         let reasons = ["initial","manual","network","severe backlog","decoder","recovering",
                        "text sharpness reduced","apply rejected","stale policy","stale epoch","unsupported","suspended","timeout"]
-        return "\(mode == 2 ? "Auto" : mode == 1 ? "Auto bitrate" : "Manual") - \(String(format: "%.0f", Double(bitrate)/1_000_000)) Mbps - \(fps) FPS - \(Int(encodedSize.width))x\(Int(encodedSize.height)) - \(reasons[Int(reason)])" +
-            (scale == 5000 && reason != 6 ? " - text sharpness reduced" : "")
+        let bitrateFormat = remote ? "%.2f" : "%.0f"
+        return "\(mode == 2 ? "Auto" : mode == 1 ? "Auto bitrate" : "Manual") - \(String(format: bitrateFormat, Double(bitrate)/1_000_000)) Mbps - \(fps) FPS - \(Int(encodedSize.width))x\(Int(encodedSize.height)) - \(reasons[Int(reason)])" +
+            ((scale == 5000 || remote && scale < 10000) && reason != 6 ? " - text sharpness reduced" : "")
     }
 }
 
@@ -150,7 +154,10 @@ struct AdaptiveMediaProbe {
 /// authority; pending geometry cannot be published as applied quality.
 struct AdaptiveMediaSession {
     let owner: UInt64, nonce: UInt64
-    init(owner: UInt64, nonce: UInt64) { self.owner=owner; self.nonce=nonce }
+    let remote: Bool
+    init(owner: UInt64, nonce: UInt64, remote: Bool = false) {
+        self.owner = owner; self.nonce = nonce; self.remote = remote
+    }
     private(set) var capabilities: AdaptiveMediaPacket?
     private(set) var current: AdaptiveMediaEffective?
     private(set) var pending: AdaptiveMediaEffective?
@@ -164,14 +171,21 @@ struct AdaptiveMediaSession {
     private var requested: Data?
     private var policyPending: UInt32?
     private var awaitingRollback = false
-    var mediaRecoveryActive: Bool { awaitingRollback || pending != nil }
-    var supportsAuto: Bool { capabilities.map { $0.u32(24) & 7 == 7 } ?? false }
+    private var awaitingRemoteBaselineIDR = false
+    private var remotePreparing = false
+    var mediaRecoveryActive: Bool { awaitingRollback || pending != nil || awaitingRemoteBaselineIDR || remotePreparing }
+    var supportsAuto: Bool {
+        guard let caps = capabilities, caps.u32(24) & 7 == 7 else { return false }
+        return !remote || (applied != nil && caps.u32(28) <= 20_000_000 && caps.encoded[49] & 4 != 0)
+    }
     mutating func acceptCapabilities(_ p: AdaptiveMediaPacket) -> Bool {
-        guard capabilities == nil, p.type == 94, p.u64(8) == nonce, p.u64(16) == owner, p.encoded[51] == 0 else { return false }
+        guard capabilities == nil, p.type == 94, p.u64(8) == nonce, p.u64(16) == owner,
+              p.encoded[51] == (remote ? 1 : 0) else { return false }
         capabilities = p; return true
     }
     mutating func receiveState(_ value: AdaptiveMediaEffective) -> Bool {
         guard capabilities != nil, value.identity.owner == owner else { return false }
+        if remote { return receiveRemoteState(value) }
         if let old = current {
             if value.identity.source == old.identity.source && value.identity.media != old.identity.media && pending == nil { return false }
             guard value.identity.source >= old.identity.source,
@@ -198,7 +212,77 @@ struct AdaptiveMediaSession {
         if value.status == 0 { applied = value; appliedFloor = frameFloor }
         return true
     }
-    mutating func configure(_ value: AdaptiveMediaEffective, restoringSource: Bool = false) -> Bool {
+    private func fitsCapabilities(_ value: AdaptiveMediaEffective) -> Bool {
+        guard let caps = capabilities, value.identity.owner == owner,
+              value.bitrate >= caps.u32(28), value.bitrate <= caps.u32(32),
+              value.encodedSize.width <= CGFloat(caps.u32(36)), value.encodedSize.height <= CGFloat(caps.u32(40)),
+              value.packet.u32(56) % UInt32(caps.u16(44)) == 0,
+              value.packet.u32(60) % UInt32(caps.u16(46)) == 0,
+              caps.encoded[48] & (value.fps == 30 ? 1 : value.fps == 60 ? 2 : 4) != 0,
+              caps.encoded[49] & (value.scale == 5000 ? 1 : value.scale == 7500 ? 2 : 4) != 0 else { return false }
+        return !remote || value.preset == 0
+    }
+    private func sameGeometry(_ a: AdaptiveMediaEffective, _ b: AdaptiveMediaEffective) -> Bool {
+        a.desktopSize == b.desktopSize && a.encodedSize == b.encodedSize &&
+            a.content == b.content && a.fps == b.fps && a.scale == b.scale
+    }
+    private func allowsRemoteMode(_ value: AdaptiveMediaEffective, after prior: AdaptiveMediaEffective) -> Bool {
+        value.mode == 0 || (value.mode == 2 && (prior.mode == 2 ||
+            (value.request == policyPending && value.policy > prior.policy)))
+    }
+    private mutating func receiveRemoteState(_ value: AdaptiveMediaEffective) -> Bool {
+        guard fitsCapabilities(value) else { return false }
+        if let prior = current {
+            guard value.identity.source == prior.identity.source, value.desktopSize == prior.desktopSize,
+                  value.policy >= prior.policy, value.revision >= prior.revision,
+                  allowsRemoteMode(value, after: prior) else { return false }
+            if value.status == 2 {
+                if value.identity == prior.identity, value.request != 0, pending == nil,
+                   value.policy == prior.policy, value.revision == prior.revision,
+                   value.mode == prior.mode, value.bitrate == prior.bitrate, sameGeometry(value, prior) {
+                    remotePreparing = true
+                }
+                return false
+            }
+            guard value.status == 0 || value.status == 1 else { return false }
+            if value.identity != prior.identity {
+                guard let pending, firstPresented, value.identity == pending.identity,
+                      value.request == 0 || value.request == pending.request,
+                      value.policy == pending.policy, value.revision == pending.revision,
+                      value.firstFrame == pending.firstFrame, value.mode == pending.mode,
+                      value.bitrate == pending.bitrate, sameGeometry(value, pending) else { return false }
+            } else {
+                guard sameGeometry(value, prior),
+                      value.status == 1 ? pending == nil : value.revision > prior.revision && pending == nil else { return false }
+                if awaitingRollback {
+                    frameFloor = appliedFloor
+                    frameAnchor = appliedFloor == 0 ? nil : appliedFloor
+                    awaitingRemoteBaselineIDR = true
+                }
+            }
+        } else {
+            guard value.status == 0, value.mode == 0, value.request == 0, value.identity.media == 1,
+                  value.firstFrame == 0, value.scale == 10000 else { return false }
+            awaitingRemoteBaselineIDR = true
+        }
+        remotePreparing = false; awaitingRollback = false
+        pending = nil
+        if value.request == policyPending || value.mode == 0 && value.policy > (current?.policy ?? 0) {
+            policyPending = nil
+        }
+        current = value
+        applied = value
+        appliedFloor = frameFloor
+        return true
+    }
+    mutating func configure(_ value: AdaptiveMediaEffective, restoringSource: Bool = false,
+                            controlSequence: UInt32 = 0) -> Bool {
+        if remote {
+            guard let current, value.status == 2, controlSequence < UInt32.max,
+                  value.firstFrame == UInt64(controlSequence + 1), value.identity.source == current.identity.source,
+                  value.desktopSize == current.desktopSize, value.revision > current.revision,
+                  allowsRemoteMode(value, after: current) else { return false }
+        }
         if restoringSource {
             // A rollback prepares a fresh media epoch for the last applied source and geometry.
             // A new adaptation must not take over while the source request is in flight.
@@ -208,24 +292,34 @@ struct AdaptiveMediaSession {
                   value.encodedSize == applied.encodedSize, value.content == applied.content,
                   value.fps == applied.fps, value.scale == applied.scale else { return false }
         }
-        guard let caps = capabilities, value.identity.owner == owner,
-              value.bitrate >= caps.u32(28), value.bitrate <= caps.u32(32),
-              value.encodedSize.width <= CGFloat(caps.u32(36)), value.encodedSize.height <= CGFloat(caps.u32(40)),
-              value.packet.u32(56) % UInt32(caps.u16(44)) == 0,
-              value.packet.u32(60) % UInt32(caps.u16(46)) == 0,
-              caps.encoded[48] & (value.fps == 30 ? 1 : value.fps == 60 ? 2 : 4) != 0,
-              caps.encoded[49] & (value.scale == 5000 ? 1 : value.scale == 7500 ? 2 : 4) != 0 else { return false }
+        guard fitsCapabilities(value) else { return false }
         if let lastConfiguration, value.identity.source == lastConfiguration.source,
            value.identity.media <= lastConfiguration.media { return false }
         if let old = pending ?? current {
             guard value.identity.source >= old.identity.source,
                   value.identity.source != old.identity.source || value.identity.media > old.identity.media,
-                  value.policy >= old.policy,
+                  value.policy >= (remote ? current?.policy ?? 0 : old.policy),
                   value.identity.source != old.identity.source || value.revision >= old.revision else { return false }
         }
         lastConfiguration = value.identity; awaitingRollback = false
         pending = value; frameFloor = value.firstFrame; frameAnchor = value.firstFrame; firstDecoded = false; firstPresented = false
         return true
+    }
+    enum RemoteVideoAdmission { case regular, cutover(AdaptiveMediaEffective), discard, missingFirstFrame }
+    var remoteNeedsParameterSets: Bool { awaitingRemoteBaselineIDR || pending != nil && !firstDecoded }
+    mutating func admitRemote(sequence: UInt32, isIDR: Bool, hasParameterSets: Bool) -> RemoteVideoAdmission {
+        if awaitingRollback { return .discard }
+        if let pending, !firstDecoded {
+            guard let frame = frameIdentity(sequence), frame >= frameFloor else { return .discard }
+            guard frame == pending.firstFrame, isIDR, hasParameterSets else { return .missingFirstFrame }
+            awaitingRemoteBaselineIDR = false
+            return .cutover(pending)
+        }
+        if awaitingRemoteBaselineIDR {
+            guard isIDR, hasParameterSets else { return .discard }
+            awaitingRemoteBaselineIDR = false
+        }
+        return .regular
     }
     mutating func retirePendingConfiguration() {
         awaitingRollback = false
@@ -265,13 +359,15 @@ struct AdaptiveMediaSession {
         guard let caps = capabilities, let value = current, pending == nil, policyPending == nil, !awaitingRollback,
               !auto || supportsAuto, nextRequest != 0 else { return nil }
         let fpsMask = caps.encoded[48]
-        let maxFps: UInt16 = game && fpsMask & 4 != 0 ? 1200 : fpsMask & 2 != 0 ? 600 : 300
+        let maxFps: UInt16 = !remote && game && fpsMask & 4 != 0 ? 1200 : fpsMask & 2 != 0 ? 600 : 300
         let minFps: UInt16 = fpsMask & 1 != 0 ? 300 : fpsMask & 2 != 0 ? 600 : 1200
         let minScale: UInt16 = caps.encoded[49] & 1 != 0 ? 5000 : caps.encoded[49] & 2 != 0 ? 7500 : 10000
         var d = AdaptiveMediaProtocol.empty(95); AdaptiveMediaProtocol.putIdentity(value.identity,&d)
-        d.storeLittleEndian(value.policy,at:36); d[40] = auto ? 2 : 0; d[41] = game ? 1 : 0
-        d.storeLittleEndian(manualBps,at:44); d.storeLittleEndian(max(3_000_000,caps.u32(28)),at:48)
-        d.storeLittleEndian(min(100_000_000,caps.u32(32)),at:52)
+        d.storeLittleEndian(value.policy,at:36); d[40] = auto ? 2 : 0; d[41] = !remote && game ? 1 : 0
+        d[42] = remote ? 1 : 0
+        let remoteAuto = remote && auto
+        d.storeLittleEndian(manualBps,at:44); d.storeLittleEndian(max(remoteAuto ? 300_000 : 3_000_000,caps.u32(28)),at:48)
+        d.storeLittleEndian(min(remoteAuto ? 20_000_000 : 100_000_000,caps.u32(32)),at:52)
         d.storeLittleEndian(minFps,at:56); d.storeLittleEndian(maxFps,at:58); d.storeLittleEndian(minScale,at:60)
         // Compare user intent independently of request/revision. Repeated State
         // publications cannot enqueue the same toggle or manual restore twice.
@@ -282,6 +378,7 @@ struct AdaptiveMediaSession {
         nextRequest = nextRequest == .max ? 0 : nextRequest+1
         requested = signature; policyPending = packet.u32(32); return packet
     }
+    mutating func permitRemoteAutoRequestAgain() { requested = nil }
 }
 
 /// Counts unique stage progress within a one-second window. Unknown stages keep
@@ -359,10 +456,13 @@ struct AdaptiveMediaWindow {
         drops = [0,0,0,0]; validity = 0; receiveUs = 0; queueUs = 0
         receiveTimingComplete = true
     }
-    mutating func sample(identity: AdaptiveMediaIdentity, now: TimeInterval, activity: UInt8) -> AdaptiveMediaPacket? {
+    mutating func sample(identity: AdaptiveMediaIdentity, now: TimeInterval, activity: UInt8,
+                         remote: Bool = false) -> AdaptiveMediaPacket? {
         let elapsed = now - started
-        guard identity.valid, elapsed >= 1 else { return nil }
-        guard elapsed <= 10 else {
+        guard identity.valid, elapsed >= (remote ? 0.75 : 1) else { return nil }
+        // The service rejects windows over one second. Discard an overdue
+        // window instead of assigning its counters a shorter duration.
+        guard elapsed <= (remote ? 1 : 10) else {
             resetMeasurements(started: now)
             receiveTimes.removeAll(keepingCapacity: true)
             return nil

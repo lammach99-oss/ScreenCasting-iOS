@@ -311,9 +311,11 @@ import SwiftUI
                     if !owner.supportsAudioAndAuto {
                         Text(ClientStreamSettingsPreference.remoteUnsupportedReason)
                     }
-                    Text(SettingsCopy.pcUsing(adaptive: owner.networkManager.isAdaptiveBitrate,
-                                              mbps: owner.networkManager.effectiveBitrateMbps,
-                                              audio: owner.networkManager.effectiveAudioEnabled))
+                    if !owner.networkManager.isRemoteControlSession || owner.networkManager.effectiveQualitySummary == nil {
+                        Text(SettingsCopy.pcUsing(adaptive: owner.networkManager.isAdaptiveBitrate,
+                                                  mbps: owner.networkManager.effectiveBitrateMbps,
+                                                  audio: owner.networkManager.effectiveAudioEnabled))
+                    }
                     if !owner.networkManager.settingsApplyStatus.isEmpty {
                         Text(owner.networkManager.settingsApplyStatus)
                     }
@@ -410,21 +412,21 @@ import SwiftUI
 @MainActor private struct AdaptiveQualityControls: View {
     @ObservedObject var network: NetworkManager
     var body: some View {
-        if !network.isRemoteControlSession {
-            Toggle("Auto quality",isOn:Binding(get:{ network.autoQualityEnabled },set:{ network.setAutoQualityEnabled($0) }))
-                .disabled(!network.adaptiveQualityAvailable)
-            if network.adaptiveQualityAvailable {
-                Text("Your quality choice is saved for this PC.").font(.footnote).foregroundStyle(.secondary)
-            } else {
-                Text(network.adaptiveQualityUnavailableReason).font(.footnote).foregroundStyle(.secondary)
-                if network.savedAutoQualityEnabled {
-                    Text("Auto is saved for this PC. Using Manual for this connection.").font(.footnote).foregroundStyle(.secondary)
-                }
+        Toggle("Auto quality", isOn: Binding(get: { network.autoQualityEnabled }, set: { network.setAutoQualityEnabled($0) }))
+            .disabled(!network.adaptiveQualityAvailable)
+        if network.adaptiveQualityAvailable {
+            Text(network.isRemoteControlSession && network.savedAutoQualityEnabled
+                ? "Auto remembered for this PC." : "Your quality choice is saved for this PC.")
+                .font(.footnote).foregroundStyle(.secondary)
+        } else {
+            Text(network.adaptiveQualityUnavailableReason).font(.footnote).foregroundStyle(.secondary)
+            if network.savedAutoQualityEnabled {
+                Text("Auto is saved for this PC. Using Manual for this connection.").font(.footnote).foregroundStyle(.secondary)
             }
-            if let summary=network.effectiveQualitySummary {
-                Text(summary).font(.footnote).foregroundStyle(.secondary)
-                    .accessibilityLabel("Effective quality: " + summary)
-            }
+        }
+        if let summary = network.effectiveQualitySummary {
+            Text(summary).font(.footnote).foregroundStyle(.secondary)
+                .accessibilityLabel("Effective quality: " + summary)
         }
     }
 }

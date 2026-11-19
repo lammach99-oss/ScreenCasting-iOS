@@ -376,7 +376,7 @@ struct ClientStreamSettingsPreference: Equatable {
     let audioEnabled: Bool
     let adaptiveBitrateEnabled: Bool
 
-    static let remoteUnsupportedReason = "Auto and PC audio are not available in remote sessions."
+    static let remoteUnsupportedReason = "PC audio is not available in remote sessions."
     static func supportsAudioAndAuto(remote: Bool) -> Bool { !remote }
 
     func forSession(remote: Bool, manualFallback: Bool = false) -> ClientStreamSettingsPreference {
@@ -412,6 +412,8 @@ enum ClientStreamSettingsStore {
         "ScreenCasting.client.desiredBitrateMbps.v1"
     private static let migratedCastingBitrateKey =
         "ScreenCasting.client.migratedCastingBitrateMbps.v1"
+    private static let migratedRemoteBitrateKey =
+        "ScreenCasting.client.migratedRemoteBitrateMbps.v1"
     private static let audioKey =
         "ScreenCasting.client.desiredAudioEnabled.v1"
 
@@ -420,16 +422,17 @@ enum ClientStreamSettingsStore {
 
     // Keep structural Auto consent scoped to the paired PC across routes.
     // The former app-wide flag cannot identify which PC the user chose.
-    private static func hostSettingKey(_ setting: String, hostID: Data) -> String {
-        "ScreenCasting.client.hostSettings.v1." + hostID.base64EncodedString() + "." + setting
+    private static func hostSettingKey(_ setting: String, hostID: Data, remote: Bool = false) -> String {
+        let prefix = remote ? "ScreenCasting.client.remoteHostSettings.v1." : "ScreenCasting.client.hostSettings.v1."
+        return prefix + hostID.base64EncodedString() + "." + setting
     }
 
-    static func loadAutoQuality(hostID: Data, defaults: UserDefaults = .standard) -> Bool {
-        defaults.bool(forKey: hostSettingKey("autoQuality", hostID: hostID))
+    static func loadAutoQuality(hostID: Data, remote: Bool = false, defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: hostSettingKey("autoQuality", hostID: hostID, remote: remote))
     }
 
-    static func saveAutoQuality(_ enabled: Bool, hostID: Data, defaults: UserDefaults = .standard) {
-        defaults.set(enabled, forKey: hostSettingKey("autoQuality", hostID: hostID))
+    static func saveAutoQuality(_ enabled: Bool, hostID: Data, remote: Bool = false, defaults: UserDefaults = .standard) {
+        defaults.set(enabled, forKey: hostSettingKey("autoQuality", hostID: hostID, remote: remote))
     }
 
     static func migrateCastingBitrate(defaults: UserDefaults) {
@@ -438,24 +441,29 @@ enum ClientStreamSettingsStore {
         guard defaults.object(forKey: migratedCastingBitrateKey) == nil else { return }
         defaults.set(load(defaults: defaults).bitrateMbps, forKey: migratedCastingBitrateKey)
     }
+    static func migrateRemoteBitrate(defaults: UserDefaults) {
+        guard defaults.object(forKey: migratedRemoteBitrateKey) == nil else { return }
+        defaults.set(load(defaults: defaults).bitrateMbps, forKey: migratedRemoteBitrateKey)
+    }
 
-    static func initializeCastingBitrateForNewPairing(hostID: Data, defaults: UserDefaults) {
-        let key = hostSettingKey("manualBitrateMbps", hostID: hostID)
+    static func initializeCastingBitrateForNewPairing(hostID: Data, remote: Bool = false, defaults: UserDefaults) {
+        let key = hostSettingKey("manualBitrateMbps", hostID: hostID, remote: remote)
         guard defaults.object(forKey: key) == nil else { return }
         defaults.set(load(defaults: defaults).bitrateMbps, forKey: key)
     }
 
     static func load(
         hostID: Data? = nil,
+        remote: Bool = false,
         defaults: UserDefaults = .standard
     ) -> ClientStreamSettingsPreference {
         let defaultBitrate = (defaults.object(forKey: bitrateKey) as? NSNumber)?.doubleValue
             ?? ClientStreamSettingsPreference.defaultBitrateMbps
         let bitrate: Double
         if let hostID {
-            let key = hostSettingKey("manualBitrateMbps", hostID: hostID)
+            let key = hostSettingKey("manualBitrateMbps", hostID: hostID, remote: remote)
             bitrate = (defaults.object(forKey: key) as? NSNumber)?.doubleValue
-                ?? (defaults.object(forKey: migratedCastingBitrateKey) as? NSNumber)?.doubleValue
+                ?? (defaults.object(forKey: remote ? migratedRemoteBitrateKey : migratedCastingBitrateKey) as? NSNumber)?.doubleValue
                 ?? defaultBitrate
         } else {
             bitrate = defaultBitrate
@@ -467,18 +475,24 @@ enum ClientStreamSettingsStore {
         return .normalized(
             bitrateMbps: bitrate,
             audioEnabled: audioEnabled,
-            adaptiveBitrateEnabled: adaptive)
+            adaptiveBitrateEnabled: adaptive).forSession(remote: remote)
     }
 
     static func save(
         _ preference: ClientStreamSettingsPreference,
         hostID: Data? = nil,
+        remote: Bool = false,
         defaults: UserDefaults = .standard
     ) {
         let normalized = ClientStreamSettingsPreference.normalized(
             bitrateMbps: preference.bitrateMbps,
             audioEnabled: preference.audioEnabled,
             adaptiveBitrateEnabled: preference.adaptiveBitrateEnabled)
+        if remote {
+            guard let hostID else { return }
+            defaults.set(normalized.bitrateMbps, forKey: hostSettingKey("manualBitrateMbps", hostID: hostID, remote: true))
+            return
+        }
         let key = hostID.map { hostSettingKey("manualBitrateMbps", hostID: $0) } ?? bitrateKey
         defaults.set(normalized.bitrateMbps, forKey: key)
         defaults.set(normalized.audioEnabled, forKey: audioKey)

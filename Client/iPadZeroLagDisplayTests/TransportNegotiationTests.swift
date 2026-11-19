@@ -1265,7 +1265,7 @@ final class ClientStreamSettingsPreferenceTests: XCTestCase {
     func testRemoteSettingsControlsReportUnsupportedFeaturesAndKeepBitrateAvailable() {
         XCTAssertFalse(ClientStreamSettingsPreference.supportsAudioAndAuto(remote: true))
         XCTAssertTrue(ClientStreamSettingsPreference.supportsAudioAndAuto(remote: false))
-        XCTAssertEqual(ClientStreamSettingsPreference.remoteUnsupportedReason, "Auto and PC audio are not available in remote sessions.")
+        XCTAssertEqual(ClientStreamSettingsPreference.remoteUnsupportedReason, "PC audio is not available in remote sessions.")
     }
 
     func testBitrateV1CeilingAndHostState() {
