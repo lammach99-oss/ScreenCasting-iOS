@@ -50,7 +50,9 @@ final class AuthenticationStageRegressionTests: XCTestCase {
         network.receiveIdentityWireForTesting(type: .pairingRequired, payload: Data([0]))
         network.sendAuthPIN("1234"); network.networkQueueForTesting.sync {}
         // Negotiation prevents media/audio commit in this authentication-only test.
+        network.reconnectAttemptForTesting = 3
         network.receiveIdentityWireForTesting(type: .authResult, payload: Data([1]), flags: WireProtocol.realtimeNegotiationSupportedFlag)
+        XCTAssertEqual(network.reconnectAttemptForTesting, 3, "Casting authentication does not prove recovery from a cutover failure")
         let payload = Data(repeating: 1, count: 16) + network.authenticationDeviceIDForTesting +
             Data(repeating: 2, count: 16) + Data(repeating: 3, count: 32)
         network.receiveIdentityWireForTesting(type: .pairingSuccess, payload: payload)

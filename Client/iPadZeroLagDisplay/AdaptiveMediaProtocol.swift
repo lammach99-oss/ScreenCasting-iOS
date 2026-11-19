@@ -51,6 +51,7 @@ struct AdaptiveMediaEffective: Equatable {
 
 enum AdaptiveMediaProtocol {
     static let probeFlag: UInt16 = 0x0200
+    static let probeBackoffFlag: UInt16 = 0x0040
     static func size(_ type: UInt8) -> Int {
         switch type { case 93: return 32; case 94,95,99: return 64; case 96,98: return 112; case 97: return 160; default: return 0 }
     }
@@ -122,7 +123,7 @@ enum AdaptiveMediaProtocol {
 }
 
 struct AdaptiveMediaProbe {
-    enum Phase { case idle, waiting, enabled, legacy }
+    enum Phase { case idle, waiting, enabled, legacy, backoff }
     private(set) var phase: Phase = .idle
     private var ping = Data(), began: TimeInterval = 0
     mutating func begin(_ payload: Data, now: TimeInterval) -> Bool {
@@ -133,7 +134,13 @@ struct AdaptiveMediaProbe {
     mutating func accept(_ payload: Data, flags: UInt16, now: TimeInterval) -> Bool {
         tick(now: now)
         guard phase == .waiting, ping == payload else { return false }
-        phase = flags & AdaptiveMediaProtocol.probeFlag != 0 ? .enabled : .legacy
+        switch flags & (AdaptiveMediaProtocol.probeFlag | AdaptiveMediaProtocol.probeBackoffFlag) {
+        case AdaptiveMediaProtocol.probeBackoffFlag: phase = .backoff
+        case AdaptiveMediaProtocol.probeFlag: phase = .enabled
+        case 0: phase = .legacy
+        default: return false // The two DS2 markers are mutually exclusive.
+        }
+        ping = Data()
         return phase == .enabled
     }
     mutating func retire() { phase = .legacy; ping = Data() }

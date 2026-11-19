@@ -260,18 +260,19 @@ import SwiftUI
     @MainActor private struct StreamSection: View {
         let owner: SettingsView
         var body: some View {
+            let manualFallback = owner.networkManager.savedAutoQualityEnabled || owner.networkManager.adaptiveQualityBackoffActive
             Section {
                 AdaptiveQualityControls(network:owner.networkManager)
                 Toggle("Automatic bitrate", isOn: Binding(
-                    get: { owner.draftAdaptiveBitrateEnabled && owner.supportsAudioAndAuto && !owner.networkManager.savedAutoQualityEnabled },
+                    get: { owner.draftAdaptiveBitrateEnabled && owner.supportsAudioAndAuto && !manualFallback },
                     set: { value in
-                        if !owner.supportsAudioAndAuto { return }
+                        guard owner.supportsAudioAndAuto, !manualFallback else { return }
                         owner.draftAdaptiveBitrateEnabled = value
                         owner.saveDesiredSettings()
                     }))
                     .tint(owner.switchTint)
-                    .disabled(!owner.supportsAudioAndAuto || owner.networkManager.savedAutoQualityEnabled)
-                if !owner.draftAdaptiveBitrateEnabled || !owner.supportsAudioAndAuto || owner.networkManager.savedAutoQualityEnabled {
+                    .disabled(!owner.supportsAudioAndAuto || manualFallback)
+                if !owner.draftAdaptiveBitrateEnabled || !owner.supportsAudioAndAuto || manualFallback {
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
                             Text("Bitrate")

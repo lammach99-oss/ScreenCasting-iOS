@@ -586,6 +586,7 @@ public class NetworkManager: ObservableObject {
     @Published public private(set) var adaptiveQualityAvailable = false
     @Published public private(set) var autoQualityEnabled = false
     @Published public private(set) var savedAutoQualityEnabled = false
+    @Published private(set) var adaptiveQualityBackoffActive = false
     @Published public private(set) var adaptiveQualityUnavailableReason = "Auto quality requires Wi-Fi RTP."
     @Published public private(set) var effectiveQualitySummary: String?
     @Published public private(set) var adaptiveDesktopSize: CGSize?
@@ -1099,7 +1100,7 @@ public class NetworkManager: ObservableObject {
             print("[IPAD][APP_LIFECYCLE] state=active")
             if self.connection == nil || self.isDisconnectedOnQueue {
                 print("[IPAD][APP_LIFECYCLE] state=active transport=wifi action=reconnect")
-                self.scheduleAutoReconnect(reset: true)
+                self.scheduleAutoReconnect()
             }
         }
     }
@@ -1891,7 +1892,7 @@ public class NetworkManager: ObservableObject {
         if !remoteInputConnection, qualityOwnsPolicy, qualitySession?.current != nil, reason != "user_change" {
             return .waitingForHost
         }
-        let desired = clientSettingsState.desired.forSession(remote: remoteInputConnection, manualFallback: qualityAutoOptIn)
+        let desired = clientSettingsState.desired.forSession(remote: remoteInputConnection, manualFallback: usesManualQualityFallback)
         let requestID = nextSettingsRequestID
         nextSettingsRequestID &+= 1
         let generation = clientSettingsState.generation
@@ -2630,7 +2631,7 @@ public class NetworkManager: ObservableObject {
                     self.setState(.listening)
                 } else {
                     self.setState(.disconnected(reason: error.localizedDescription))
-                    self.scheduleAutoReconnect(reset: false)
+                    self.scheduleAutoReconnect()
                 }
 
             case .cancelled:
@@ -2648,7 +2649,7 @@ public class NetworkManager: ObservableObject {
                     self.setState(.listening)
                 } else if !wasIdle {
                     self.setState(.disconnected(reason: "Connection cancelled."))
-                    self.scheduleAutoReconnect(reset: false)
+                    self.scheduleAutoReconnect()
                 }
 
             default:
@@ -2741,7 +2742,7 @@ public class NetworkManager: ObservableObject {
         return endpoint
     }
 
-    private func scheduleAutoReconnect(reset: Bool) {
+    private func scheduleAutoReconnect() {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard !connectionHandoffInProgress, !connectionSwitch.offersReconnect else { return }
         guard isForegroundActive,
@@ -2750,7 +2751,6 @@ public class NetworkManager: ObservableObject {
             publishAutoReconnectAttempt(0) // Nothing is scheduled, so the screen must not say "Reconnecting".
             return
         }
-        if reset { reconnectAttempt = 0 }
         reconnectWorkItem?.cancel()
         let delay = TrustedReconnectPolicy.delay(forAttempt: reconnectAttempt)
         reconnectAttempt += 1
@@ -2870,7 +2870,7 @@ public class NetworkManager: ObservableObject {
         } else {
             resolvedOutcome = outcome
         }
-        let desiredForSession = clientSettingsState.desired.forSession(remote: remoteInputConnection, manualFallback: qualityAutoOptIn)
+        let desiredForSession = clientSettingsState.desired.forSession(remote: remoteInputConnection, manualFallback: usesManualQualityFallback)
         let decision = settingsReconciliationGate.decision(
             hostGeneration: state.generation,
             desired: desiredForSession,
@@ -3877,7 +3877,8 @@ public class NetworkManager: ObservableObject {
             let accepted = payload[0] != 0
             let reason = String(data: payload.dropFirst(), encoding: .utf8) ?? ""
             if accepted {
-                reconnectAttempt = 0
+                // Casting can authenticate and deliver a baseline on every failed cutover retry.
+                if remoteInputConnection { reconnectAttempt = 0 }
                 reconnectWorkItem?.cancel()
                 reconnectWorkItem = nil
                 print("[IPAD][AUTO_RECONNECT_SUCCESS] generation=\(generation)")
@@ -4990,6 +4991,7 @@ public class NetworkManager: ObservableObject {
               committedTransportGeneration != generation else { return }
         committedTransportGeneration = generation
         committedRealtimeMode = mode
+        if !adaptiveQualityTransport { reconnectAttempt = 0 }
         refreshAdaptiveQualityPreferenceOnQueue()
         beginDataTransfer(generation: generation)
         committedTransportAudioAvailable = audioEnabled
@@ -5261,7 +5263,7 @@ public class NetworkManager: ObservableObject {
         teardownCurrentSession()
         print("[NetworkManager] ⚠️ \(reason)")
         setState(.disconnected(reason: reason))
-        scheduleAutoReconnect(reset: false)
+        scheduleAutoReconnect()
     }
 
     private func teardownUsbSession(
@@ -5772,6 +5774,11 @@ public class NetworkManager: ObservableObject {
 
     func stopForTesting() {
         networkQueue.sync { self.stopOnQueue() }
+    }
+
+    var reconnectAttemptForTesting: Int {
+        get { networkQueue.sync { reconnectAttempt } }
+        set { networkQueue.sync { reconnectAttempt = newValue } }
     }
 
     func publishHudSnapshotForTesting(_ snapshot: TransportHudSnapshot) {
@@ -6965,6 +6972,9 @@ public class NetworkManager: ObservableObject {
     private var adaptiveQualityTransport: Bool {
         !remoteInputConnection && activeTransportKind == .wifi && committedRealtimeMode == RealtimeTransportMode.wifiRTP
     }
+    private var usesManualQualityFallback: Bool {
+        qualityAutoOptIn || qualityProbe.phase == .backoff
+    }
     private var awaitingCastingSettingsIdentity: Bool {
         !remoteInputConnection && activeTransportKind == .wifi &&
             wireAuthenticatedGeneration == connectionGeneration &&
@@ -7006,7 +7016,8 @@ public class NetworkManager: ObservableObject {
     private func resetAdaptiveMediaOnQueue(preserveHostPreference: Bool = false) {
         qualityProbeDeadline?.cancel(); qualityProbeDeadline = nil
         qualityFeedbackTimer?.cancel(); qualityFeedbackTimer = nil
-        qualityProbe = AdaptiveMediaProbe(); qualitySession = nil; qualityConnectionID = nil; sourceRollback = nil
+        if !preserveHostPreference || qualityProbe.phase != .backoff { qualityProbe = AdaptiveMediaProbe() }
+        qualitySession = nil; qualityConnectionID = nil; sourceRollback = nil
         qualityFeedbackIdentity = nil
         if !preserveHostPreference {
             if qualityHostID != nil { loadCastingStreamSettingsOnQueue(hostID: nil) }
@@ -7019,13 +7030,22 @@ public class NetworkManager: ObservableObject {
     private func publishAdaptiveStateOnQueue() {
         let generation = connectionGeneration
         let available = adaptiveQualityTransport && qualityHostID != nil && qualitySession?.supportsAuto == true
-        let reason = !adaptiveQualityTransport ? "Auto quality requires Wi-Fi RTP." :
-            qualitySession?.supportsAuto != true ? "Auto quality requires an updated casting host." :
-            "Pair this PC to save its quality choice."
+        let backingOff = qualityProbe.phase == .backoff
+        let reason: String
+        if backingOff {
+            reason = "Auto temporarily unavailable after a failed quality switch"
+        } else if !adaptiveQualityTransport {
+            reason = "Auto quality requires Wi-Fi RTP."
+        } else if qualitySession?.supportsAuto != true {
+            reason = "Auto quality requires an updated casting host."
+        } else {
+            reason = "Pair this PC to save its quality choice."
+        }
         let applied = qualitySession?.applied, saved = qualityAutoOptIn
         DispatchQueue.main.async { [weak self] in
             guard let self, self.connectionGenerationClock.current == generation else { return }
             self.adaptiveQualityAvailable = available; self.autoQualityEnabled = available && saved
+            self.adaptiveQualityBackoffActive = backingOff
             self.savedAutoQualityEnabled = saved; self.adaptiveQualityUnavailableReason = reason
             self.effectiveQualitySummary=applied?.summary; self.adaptiveDesktopSize=applied?.desktopSize
         }
@@ -7043,6 +7063,7 @@ public class NetworkManager: ObservableObject {
         let work=DispatchWorkItem { [weak self] in
             guard let self, self.connectionGeneration == generation, self.qualityConnectionID == identity else { return }
             self.qualityProbe.tick(now:self.adaptiveNow())
+            if self.qualityProbe.phase == .legacy { self.reconnectAttempt = 0 }
         }
         qualityProbeDeadline=work; networkQueue.asyncAfter(deadline:.now()+2,execute:work)
     }
@@ -7066,11 +7087,30 @@ public class NetworkManager: ObservableObject {
     private func receiveAdaptivePongOnQueue(_ payload: Data, flags: UInt16) {
         guard adaptiveQualityTransport, let connection=activeControlConnection,
               qualityConnectionID == ObjectIdentifier(connection),
-              qualityProbe.accept(payload,flags:flags,now:self.adaptiveNow()) else { return }
-        qualityProbeDeadline?.cancel(); qualityProbeDeadline=nil
-        let owner=UInt64.random(in:1...UInt64.max), nonce=UInt64.random(in:1...UInt64.max)
-        qualitySession=AdaptiveMediaSession(owner:owner,nonce:nonce); qualityPolicyDirty=qualityAutoOptIn
-        sendAdaptiveOnQueue(AdaptiveMediaProtocol.hello(owner:owner,nonce:nonce))
+              qualityProbe.phase == .waiting else { return }
+        _ = qualityProbe.accept(payload, flags: flags, now: adaptiveNow())
+        let phase = qualityProbe.phase
+        guard phase != .waiting else { return }
+        qualityProbeDeadline?.cancel(); qualityProbeDeadline = nil
+        switch phase {
+        case .legacy:
+            reconnectAttempt = 0
+        case .backoff:
+            // An early SettingsState may already have reconciled legacy AutoBitrate.
+            // Re-read to switch it off when the backoff changes the desired policy.
+            if !qualityAutoOptIn && clientSettingsState.desired.adaptiveBitrateEnabled {
+                settingsReconciliationGate.reset()
+                settingsSyncPolicy.reset()
+                requestCurrentSettingsIfNeeded(generation: connectionGeneration)
+            }
+            publishAdaptiveStateOnQueue()
+        case .enabled:
+            let owner = UInt64.random(in: 1...UInt64.max), nonce = UInt64.random(in: 1...UInt64.max)
+            qualitySession = AdaptiveMediaSession(owner: owner, nonce: nonce)
+            qualityPolicyDirty = qualityAutoOptIn
+            sendAdaptiveOnQueue(AdaptiveMediaProtocol.hello(owner: owner, nonce: nonce))
+        case .waiting, .idle: break
+        }
     }
     private func sendAdaptiveOnQueue(_ packet: AdaptiveMediaPacket) {
         guard adaptiveQualityTransport, qualityProbe.phase == .enabled,
@@ -7115,7 +7155,13 @@ public class NetworkManager: ObservableObject {
             }
         } else {
             let previous=qualitySession?.current
+            let pending = qualitySession?.pending
             guard qualitySession?.receiveState(value) == true else { return }
+            // receiveState admits a matching pending epoch only after Presented.
+            // Reason 7 is rollback (ApplyRejected), which cannot clear retries.
+            if value.status == 0, let pending, pending.reason != 7, pending.identity == value.identity {
+                reconnectAttempt = 0
+            }
             updateAdaptiveFeedbackEpochOnQueue()
             if value.status == 0, previous?.identity != value.identity, previous == nil || previous?.identity.source != value.identity.source {
                 // A baseline after reconnect/new source may already be scaled.
