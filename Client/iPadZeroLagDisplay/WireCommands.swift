@@ -66,6 +66,9 @@ enum WireMessageType: UInt8 {
     case remoteDirectTouch = 82, iPadPointerV2 = 83
     case qualityHello = 93, qualityCapabilities = 94, qualityPolicySet = 95
     case qualityState = 96, qualityFeedback = 97, qualityConfiguration = 98, qualityConfigurationAck = 99
+    case remoteFileControl = 100, remoteFileState = 101, remoteFilePacket = 102, remoteFileWindow = 103
+    case remoteAudioSet = 104, remoteAudioState = 105, remoteAudioPacket = 106, remoteTimedVideo = 107
+    case remoteSecureDesktopRequest = 108, remoteSecureDesktopState = 109
 }
 
 /// Toolbar actions the remote host runs on the PC. Payload: [version 1, command, flags(bit0 confirm)].

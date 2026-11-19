@@ -4598,6 +4598,10 @@ public class NetworkManager: ObservableObject {
                         offer.audioCodec != AudioCodecCapabilities.none)
             }
 
+        case .remoteFileControl, .remoteFileState, .remoteFilePacket, .remoteFileWindow,
+             .remoteAudioSet, .remoteAudioState, .remoteAudioPacket, .remoteTimedVideo,
+             .remoteSecureDesktopRequest, .remoteSecureDesktopState:
+            handleStreamError("Unnegotiated remote feature message.")
         case .remoteFeaturesResult:
             guard remoteInputConnection, remoteFeatures.result(flags: header.flags, payload: payload) else {
                 handleStreamError("Invalid remote feature result."); return

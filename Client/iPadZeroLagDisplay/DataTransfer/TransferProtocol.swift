@@ -31,22 +31,24 @@ enum TransferProtocol {
         if stem.count == 4 && (stem.hasPrefix("COM") || stem.hasPrefix("LPT")) && "123456789¹²³".contains(stem.last!) { return false }
         return true
     }
-    static func validate(_ files: [TransferFile]) throws -> UInt64 {
+    static func validate(_ files: [TransferFile],
+                         nameValidator: (String) -> Bool = TransferProtocol.validName) throws -> UInt64 {
         guard (1...maxFiles).contains(files.count) else { throw Failure.invalid }
         var total: UInt64 = 0
         for file in files {
-            guard validName(file.name), file.length <= maxFileBytes, file.length <= maxTotalBytes - total else { throw Failure.invalid }
+            guard nameValidator(file.name), file.length <= maxFileBytes, file.length <= maxTotalBytes - total else { throw Failure.invalid }
             total += file.length
         }
         return total
     }
-    static func encode(_ packet: TransferPacket) throws -> Data {
+    static func encode(_ packet: TransferPacket,
+                       nameValidator: (String) -> Bool = TransferProtocol.validName) throws -> Data {
         guard packet.generation != 0, packet.id != UUID(uuid: (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)) else { throw Failure.invalid }
         var w = Writer(); w.put(UInt8(1)); w.put(packet.generation)
         var uuid = packet.id.uuid; withUnsafeBytes(of: &uuid) { w.data.append(contentsOf: $0) }
         switch packet.kind {
         case .offer:
-            let total = try validate(packet.files); w.put(UInt16(packet.files.count)); w.put(total)
+            let total = try validate(packet.files, nameValidator: nameValidator); w.put(UInt16(packet.files.count)); w.put(total)
             for (index,file) in packet.files.enumerated() { let name = Data(file.name.utf8); w.put(UInt16(index)); w.put(UInt16(name.count)); w.data.append(name); w.put(file.length) }
         case .response:
             guard packet.accepted == (packet.reason == .ok) else { throw Failure.invalid }
@@ -64,7 +66,8 @@ enum TransferProtocol {
         }
         return w.data
     }
-    static func decode(_ kind: TransferKind, _ data: Data) throws -> TransferPacket {
+    static func decode(_ kind: TransferKind, _ data: Data,
+                       nameValidator: (String) -> Bool = TransferProtocol.validName) throws -> TransferPacket {
         guard data.count >= 25, data.count <= maxPayloadBytes else { throw Failure.invalid }
         var r = Reader(data: data)
         guard try r.u8() == 1 else { throw Failure.invalid }
@@ -82,7 +85,7 @@ enum TransferProtocol {
                 let length = Int(try r.u16()); guard (1...maxNameBytes).contains(length), let name = String(data: try r.take(length), encoding: .utf8) else { throw Failure.invalid }
                 p.files.append(TransferFile(name: name,length: try r.u64()))
             }
-            guard try validate(p.files) == total else { throw Failure.invalid }
+            guard try validate(p.files, nameValidator: nameValidator) == total else { throw Failure.invalid }
         case .response:
             let accepted = try r.u8(); guard accepted <= 1 else { throw Failure.invalid }
             p.accepted = accepted == 1; p.reason = try r.reason()

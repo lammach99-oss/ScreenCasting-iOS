@@ -124,6 +124,11 @@
 		AD2200010000000000000001 /* AdaptiveMediaProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2200020000000000000001 /* AdaptiveMediaProtocol.swift */; };
 		AD2200010000000000000002 /* AdaptiveMediaTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2200020000000000000002 /* AdaptiveMediaTests.swift */; };
 		AD2200010000000000000003 /* AdaptiveMediaV1Golden.json in Resources */ = {isa = PBXBuildFile; fileRef = AD2200020000000000000003 /* AdaptiveMediaV1Golden.json */; };
+		AD2300010000000000000001 /* RemoteFileProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2300020000000000000001 /* RemoteFileProtocol.swift */; };
+		AD2300010000000000000002 /* RemoteAudioProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2300020000000000000002 /* RemoteAudioProtocol.swift */; };
+		AD2300010000000000000003 /* RemoteSecureDesktopProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2300020000000000000003 /* RemoteSecureDesktopProtocol.swift */; };
+		AD2300010000000000000004 /* RemoteFeatureCodecTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2300020000000000000004 /* RemoteFeatureCodecTests.swift */; };
+		AD2300010000000000000005 /* remote-ds5-ds7-golden.json in Resources */ = {isa = PBXBuildFile; fileRef = AD2300020000000000000005 /* remote-ds5-ds7-golden.json */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -257,6 +262,11 @@
 		AD2200020000000000000001 /* AdaptiveMediaProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AdaptiveMediaProtocol.swift; sourceTree = "<group>"; };
 		AD2200020000000000000002 /* AdaptiveMediaTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AdaptiveMediaTests.swift; sourceTree = "<group>"; };
 		AD2200020000000000000003 /* AdaptiveMediaV1Golden.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = Fixtures/AdaptiveMediaV1Golden.json; sourceTree = "<group>"; };
+		AD2300020000000000000001 /* RemoteFileProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteFileProtocol.swift; sourceTree = "<group>"; };
+		AD2300020000000000000002 /* RemoteAudioProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteAudioProtocol.swift; sourceTree = "<group>"; };
+		AD2300020000000000000003 /* RemoteSecureDesktopProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteSecureDesktopProtocol.swift; sourceTree = "<group>"; };
+		AD2300020000000000000004 /* RemoteFeatureCodecTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteFeatureCodecTests.swift; sourceTree = "<group>"; };
+		AD2300020000000000000005 /* remote-ds5-ds7-golden.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = Fixtures/remote-ds5-ds7-golden.json; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -288,6 +298,9 @@
 				1A0700030000000000000004 /* IPadInputRouting.swift */,
 				1A0700030000000000000010 /* PencilMouseState.swift */,
 				AD2200020000000000000001 /* AdaptiveMediaProtocol.swift */,
+				AD2300020000000000000001 /* RemoteFileProtocol.swift */,
+				AD2300020000000000000002 /* RemoteAudioProtocol.swift */,
+				AD2300020000000000000003 /* RemoteSecureDesktopProtocol.swift */,
 				1A0700030000000000000003 /* IPadInputSession.swift */,
 				1A0700030000000000000002 /* IPadInputEngine.swift */,
 				1A0700030000000000000001 /* IPadInputCodec.swift */,
@@ -371,6 +384,8 @@
 				1A0700030000000000000009 /* IPadInputV2Golden.json */,
 				AD2200020000000000000003 /* AdaptiveMediaV1Golden.json */,
 				AD2200020000000000000002 /* AdaptiveMediaTests.swift */,
+				AD2300020000000000000004 /* RemoteFeatureCodecTests.swift */,
+				AD2300020000000000000005 /* remote-ds5-ds7-golden.json */,
 				1A0700030000000000000008 /* InputBarAccessibilityTests.swift */,
 				1A0700030000000000000007 /* IPadInputV2Tests.swift */,
 				1A0700030000000000000011 /* PencilMouseTests.swift */,
@@ -506,6 +521,7 @@
 			files = (
 				1A0700040000000000000009 /* IPadInputV2Golden.json in Resources */,
 				AD2200010000000000000003 /* AdaptiveMediaV1Golden.json in Resources */,
+				AD2300010000000000000005 /* remote-ds5-ds7-golden.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -521,6 +537,9 @@
 				1A0700040000000000000004 /* IPadInputRouting.swift in Sources */,
 				1A0700040000000000000010 /* PencilMouseState.swift in Sources */,
 				AD2200010000000000000001 /* AdaptiveMediaProtocol.swift in Sources */,
+				AD2300010000000000000001 /* RemoteFileProtocol.swift in Sources */,
+				AD2300010000000000000002 /* RemoteAudioProtocol.swift in Sources */,
+				AD2300010000000000000003 /* RemoteSecureDesktopProtocol.swift in Sources */,
 				1A0700040000000000000003 /* IPadInputSession.swift in Sources */,
 				1A0700040000000000000002 /* IPadInputEngine.swift in Sources */,
 				1A0700040000000000000001 /* IPadInputCodec.swift in Sources */,
@@ -597,6 +616,7 @@
 				1A0700040000000000000007 /* IPadInputV2Tests.swift in Sources */,
 				1A0700040000000000000011 /* PencilMouseTests.swift in Sources */,
 				AD2200010000000000000002 /* AdaptiveMediaTests.swift in Sources */,
+				AD2300010000000000000004 /* RemoteFeatureCodecTests.swift in Sources */,
 				FA2300000000000000000003 /* PhysicalMirrorControlTests.swift in Sources */,
 				FA2300000000000000000004 /* PencilKeyboardTests.swift in Sources */,
 				FA2300000000000000000005 /* SessionPanelTests.swift in Sources */,

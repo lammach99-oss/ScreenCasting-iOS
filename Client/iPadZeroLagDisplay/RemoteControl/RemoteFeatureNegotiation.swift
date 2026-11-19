@@ -117,10 +117,17 @@ public struct RemoteCommittedTextCommand: Equatable {
 /// Connection-scoped, networkQueue owned. No unknown ID is sent until marked Pong.
 struct RemoteFeatureNegotiation {
     static let supportedFlag: UInt16 = 0x4000
-    static let knownFeatures: UInt64 = 0x1f
+    static let phaseAFeaturesEnabled = false
+    static let remoteFileFeature: UInt64 = 0x100
+    static let remoteAudioFeature: UInt64 = 0x200
+    static let remoteSecureDesktopFeature: UInt64 = 0x400
+    static let phaseAFeatures = remoteFileFeature | remoteAudioFeature | remoteSecureDesktopFeature
+    static let knownFeatures: UInt64 = 0x1f | phaseAFeatures
     private let requestedFeatures: UInt64
     // Input-only callers retain their mask; remote sessions explicitly request 0x1f.
-    init(requestedFeatures: UInt64 = 3) { self.requestedFeatures = requestedFeatures }
+    init(requestedFeatures: UInt64 = 3) {
+        self.requestedFeatures = Self.phaseAFeaturesEnabled ? requestedFeatures : requestedFeatures & ~Self.phaseAFeatures
+    }
     private enum Phase { case initial, pong, result, legacy, complete }
     private var phase: Phase = .initial
     private var deadline: TimeInterval = 0

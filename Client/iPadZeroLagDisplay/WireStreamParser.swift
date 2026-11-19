@@ -221,9 +221,11 @@ final class WireStreamParser {
             $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self).littleEndian
         }
         let version = headerBytes[4]
+        // Preserve pre-extension behavior while these runtimes are absent.
         guard magic == WireProtocol.magic,
               version == WireProtocol.version,
-              let type = WireMessageType(rawValue: headerBytes[5]) else {
+              let type = WireMessageType(rawValue: headerBytes[5]),
+              !(100...109).contains(type.rawValue) else {
             state = .failed
             payload = Data()
             onEvent(.failure(.invalidHeader))
