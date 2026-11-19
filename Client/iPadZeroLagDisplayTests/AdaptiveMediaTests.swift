@@ -543,7 +543,10 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         var now = 0.0
         network.adaptiveMediaClockForTesting = { now }
         network.controlSendForAudioTesting = { bytes, done in writes.append(bytes); done(nil) }
-        network.realtimeAudioPlaybackForTesting = { _ in XCTFail("No audio in remote quality tests") }
+        // Settings readback can reconcile playback to off.
+        network.realtimeAudioPlaybackForTesting = { enabled in
+            XCTAssertFalse(enabled, "Remote quality negotiation must not start audio playback")
+        }
         func drain() async {
             for _ in 0..<4 {
                 let barrier = expectation(description: "remote writer and UI")
