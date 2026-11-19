@@ -294,6 +294,16 @@ public class NetworkManager: ObservableObject {
     private var activeDirectTouchCommand: DirectTouchContactCommand?
     @Published private(set) var transferSnapshot = DataTransferManager.Snapshot()
     private var dataTransfers: DataTransferManager?
+    @Published private(set) var remoteFileStatus: String?
+    @Published private(set) var remoteFileWaiting = false
+    @Published private(set) var remoteFileCanStart = false
+    private var remoteFileAccess: RemoteFileAccess?
+    private let remoteFileActionClock = ConnectionGenerationClock()
+    private var remoteFileIO: DataTransferManager?
+    private var remoteFileBackgrounded = false
+    private var remoteFilePacing = RemoteFileMediaPacing()
+    private var pendingRemoteFileWrite: DispatchWorkItem?
+    private var remoteFileWriteToken: UUID?
     private let retainedTransferRoot: URL
     private let receivedFilesQueue = DispatchQueue(label: "ScreenCasting.ReceivedFiles.IO", qos: .utility)
     private var receivedStorage: ReceivedFileLibrary? // receivedFilesQueue only.
@@ -473,6 +483,7 @@ public class NetworkManager: ObservableObject {
                 completion(.posix(.ECANCELED))
                 return
             }
+            guard self.remoteFilePacketIsCurrent(data, startingWrite: true) else { completion(.posix(.ECANCELED)); return }
             if self.captureAvailability.inputBlocked && (CaptureAvailabilityProtocol.isNewInputPacket(data) || self.isNewRemoteV2InputPacket(data)) {
                 completion(nil); return
             }
@@ -526,7 +537,7 @@ public class NetworkManager: ObservableObject {
         })
     private lazy var wireParser = WireParserQueueDomain(
         generation: connectionGeneration,
-        queue: networkQueue)
+        queue: networkQueue, allowsRemoteFiles: { [weak self] in self?.mayReceiveRemoteFiles == true })
     private var wireReceiveActiveGeneration: UInt64?
     #if targetEnvironment(simulator)
     private var testingSimulatedWifiSession = false
@@ -1024,6 +1035,8 @@ public class NetworkManager: ObservableObject {
             defer { self.recordAppAudioLifecycleDiagnostic(event: "did_become_active", phase: "applied", foregroundBefore: diagnosticForegroundBefore) }
             let wasForegroundActive = self.isForegroundActive
             self.isForegroundActive = true
+            self.remoteFileBackgrounded = false
+            self.publishRemoteFileAccessOnQueue()
             if !wasForegroundActive,
                self.connection != nil,
                self.transportState == .streaming,
@@ -1130,6 +1143,7 @@ public class NetworkManager: ObservableObject {
             defer { self.recordAppAudioLifecycleDiagnostic(event: "will_resign_active", phase: "applied", foregroundBefore: diagnosticForegroundBefore) }
             self.cancelActiveDirectTouchOnQueue()
             self.isForegroundActive = false
+            self.publishRemoteFileAccessOnQueue()
             self.manualReconnectPresentation = nil
             // Foreground eligibility is closed first; discard its old sample window.
             self.transportTelemetry.beginFreshFrameRate(
@@ -1157,6 +1171,7 @@ public class NetworkManager: ObservableObject {
             self.recordAppAudioLifecycleDiagnostic(event: "did_enter_background", phase: "received", foregroundBefore: diagnosticForegroundBefore)
             defer { self.recordAppAudioLifecycleDiagnostic(event: "did_enter_background", phase: "applied", foregroundBefore: diagnosticForegroundBefore) }
             self.isForegroundActive = false
+            self.backgroundRemoteFilesOnQueue()
             self.manualReconnectPresentation = nil
             // Foreground eligibility is closed first; discard its old sample window.
             self.transportTelemetry.beginFreshFrameRate(
@@ -1508,6 +1523,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func publishRemoteInputOnQueue(contextChanged: Bool = true) {
+        publishRemoteFileAccessOnQueue()
         let generation = connectionGeneration, context = remoteFeatures.context, features = remoteFeatures.accepted
         let ready = remoteFeatures.inputReady
         remoteMonitors.receiveContext(context, session: remoteMonitors.session)
@@ -1519,6 +1535,9 @@ public class NetworkManager: ObservableObject {
         }
     }
     private func resetRemoteInputOnQueue() {
+        remoteFileAccess = nil
+        retireRemoteFileIOOnQueue()
+        remoteFilePacing = RemoteFileMediaPacing()
         remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: 0x1f); remoteFeaturesPingNonce = nil
         remoteMonitors.begin(session: UUID(), acceptedFeatures: 0)
         remoteMonitorControl.update(generation: 0, context: nil, enabled: false)
@@ -1684,6 +1703,13 @@ public class NetworkManager: ObservableObject {
                   self.remoteFeatures.context?.token == command.token, let payload = command.encode() else { return }
             self.remoteFeatures.invalidateInput(); self.publishRemoteInputOnQueue()
             self.sendWireMessage(type: .remoteInputReset, payload: payload, sequence: 0)
+        }
+    }
+
+    @MainActor func endRemoteFileControl(generation: UInt64) {
+        networkQueue.async { [weak self] in
+            guard let self, self.connectionGeneration == generation else { return }
+            self.revokeRemoteFilesOnQueue()
         }
     }
 
@@ -3210,6 +3236,18 @@ public class NetworkManager: ObservableObject {
         #endif
         sendClientPingIfDue()
         let feedback = transportTelemetry.makeFeedback()
+        if mayReceiveRemoteFiles {
+            let now = ProcessInfo.processInfo.systemUptime
+            if remoteFileAccess?.expire(now: now) == true {
+                revokeRemoteFilesOnQueue()
+                remoteFileAccess?.markTimedOut()
+                publishRemoteFileAccessOnQueue()
+            }
+            remoteFilePacing.feedback(now: now, presented: feedback.0,
+                                      queueAge: feedback.4, drops: feedback.5)
+            remoteFileIO?.checkRemoteDeadline(now: now, paused: remoteFilePacing.rate(now: now, unsettled: remoteFileMediaBlocked) == 0)
+            controlChannelWriter.drain()
+        }
         var payload = Data(count: 16)
         payload.withUnsafeMutableBytes { bytes in
             bytes.storeBytes(of: feedback.0.littleEndian, toByteOffset: 0, as: UInt32.self)
@@ -3598,18 +3636,286 @@ public class NetworkManager: ObservableObject {
         }
     }
 
-    func sendTransferFiles(_ urls: [URL]) { networkQueue.async { [weak self] in self?.dataTransfers?.sendFiles(urls) } }
+    struct TransferActionScope: Equatable {
+        let generation: UInt64
+        let remote: Bool
+        let fileEpoch: UInt64
+    }
+
+    @MainActor var transferActionScope: TransferActionScope {
+        TransferActionScope(generation: connectionGenerationClock.current, remote: isRemoteControlSession,
+                            fileEpoch: remoteFileActionClock.current)
+    }
+
+    private func ownsTransferAction(_ scope: TransferActionScope) -> Bool {
+        scope.generation == connectionGeneration && scope.remote == remoteInputConnection &&
+            (!scope.remote || scope.fileEpoch == remoteFileActionClock.current) &&
+            wireAuthenticatedGeneration == scope.generation && committedTransportGeneration == scope.generation
+    }
+
+    func sendTransferFiles(_ urls: [URL], scope: TransferActionScope) {
+        networkQueue.async { [weak self] in
+            guard let self, self.ownsTransferAction(scope), !urls.isEmpty else { return }
+            if scope.remote { self.startRemoteFileActionOnQueue(.upload(urls)) }
+            else { self.dataTransfers?.sendFiles(urls) }
+        }
+    }
+    func requestRemoteFiles(scope: TransferActionScope) {
+        networkQueue.async { [weak self] in
+            guard let self, scope.remote, self.ownsTransferAction(scope) else { return }
+            self.startRemoteFileActionOnQueue(.download)
+        }
+    }
+    func retryRemoteFiles(scope: TransferActionScope) {
+        networkQueue.async { [weak self] in
+            guard let self, scope.remote, self.ownsTransferAction(scope), self.mayStartRemoteFiles,
+                  self.remoteFileAccess?.waiting == false else { return }
+            self.remoteFileIO?.retryRemoteFiles()
+        }
+    }
     func decideTransfer(_ accepted: Bool, consent: DataTransferManager.Consent) {
         let generation = connectionGenerationClock.current
         networkQueue.async { [weak self] in
             guard let self, self.connectionGeneration == generation,
                   self.wireAuthenticatedGeneration == generation, self.committedTransportGeneration == generation else { return }
-            self.dataTransfers?.decide(accepted, consent: consent)
+            if self.remoteInputConnection {
+                guard self.remoteFileAccess?.grant != nil, self.isForegroundActive else { return }
+                self.remoteFileIO?.decide(accepted, consent: consent)
+            } else { self.dataTransfers?.decide(accepted, consent: consent) }
         }
     }
-    func cancelTransfer() { networkQueue.async { [weak self] in self?.controlChannelWriter.cancelBulk(); self?.dataTransfers?.cancel() } }
+    func cancelTransfer(scope: TransferActionScope) {
+        networkQueue.async { [weak self] in
+            guard let self, self.ownsTransferAction(scope) else { return }
+            self.controlChannelWriter.cancelBulk()
+            if scope.remote { self.remoteFileIO?.cancel() }
+            else { self.dataTransfers?.cancel() }
+        }
+    }
+
+    private var mayReceiveRemoteFiles: Bool {
+        remoteInputConnection && wireAuthenticatedGeneration == connectionGeneration &&
+            remoteFeatures.accepted & RemoteFeatureNegotiation.remoteFileFeature != 0
+    }
+
+    private var mayStartRemoteFiles: Bool {
+        mayReceiveRemoteFiles && committedTransportGeneration == connectionGeneration &&
+            isForegroundActive && !remoteFileBackgrounded && !captureAvailability.inputBlocked && remoteFeatures.inputReady &&
+            remoteFeatures.context?.desktop == 1
+    }
+
+    private func publishRemoteFileAccessOnQueue() {
+        let generation = connectionGeneration
+        let status = remoteFileAccess?.status
+        let waiting = remoteFileAccess?.waiting == true
+        let canStart = mayStartRemoteFiles
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.connectionGenerationClock.current == generation else { return }
+            self.remoteFileStatus = status
+            self.remoteFileWaiting = waiting
+            self.remoteFileCanStart = canStart
+        }
+    }
+
+    private func startRemoteFileActionOnQueue(_ selection: RemoteFileAccess.Selection) {
+        guard mayStartRemoteFiles, remoteFileIO?.hasActiveTransfer != true,
+              remoteFileAccess?.waiting == false else { return }
+        if case let .upload(urls) = selection, let access = remoteFileAccess, access.grant != nil, access.mayUpload {
+            remoteFileIO?.sendFiles(urls)
+        } else if let request = remoteFileAccess?.start(selection) {
+            sendRemoteFileMessage(request)
+        }
+        publishRemoteFileAccessOnQueue()
+    }
+
+    private func revokeRemoteFilesOnQueue() {
+        guard remoteFileAccess != nil else { return }
+        _ = remoteFileActionClock.advance()
+        let release = remoteFileAccess?.revoke()
+        retireRemoteFileIOOnQueue()
+        if let release { sendRemoteFileMessage(release) }
+        publishRemoteFileAccessOnQueue()
+    }
+
+    private func backgroundRemoteFilesOnQueue() {
+        remoteFileBackgrounded = true
+        revokeRemoteFilesOnQueue()
+    }
+
+    private func retireRemoteFileIOOnQueue() {
+        guard let manager = remoteFileIO else { return }
+        remoteFileIO = nil
+        pendingRemoteFileWrite?.cancel()
+        pendingRemoteFileWrite = nil
+        remoteFileWriteToken = nil
+        manager.retire()
+        controlChannelWriter.discardPending(where: { data in
+            guard data.count >= WireProtocol.headerSize else { return false }
+            return data[5] == WireMessageType.remoteFilePacket.rawValue ||
+                data[5] == WireMessageType.remoteFileWindow.rawValue
+        }, error: .posix(.ECANCELED))
+        let generation = connectionGeneration
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.connectionGenerationClock.current == generation else { return }
+            self.transferSnapshot = DataTransferManager.Snapshot()
+        }
+    }
+
+    private func sendRemoteFileMessage(_ message: RemoteFileProtocol.Message, completion: @escaping (Bool) -> Void = { _ in }) {
+        guard mayReceiveRemoteFiles, let payload = RemoteFileProtocol.encode(message) else { completion(false); return }
+        let pacedBytes: Int
+        switch message {
+        case let .packet(_, packet) where packet.kind == .chunk: pacedBytes = packet.bytes.count
+        case .window: pacedBytes = WireProtocol.headerSize + payload.count
+        default: pacedBytes = 0
+        }
+        guard pacedBytes > 0 else {
+            sendWireMessage(type: message.type, payload: payload, sequence: 0) { completion($0 == nil) }
+            return
+        }
+        let generation = connectionGeneration
+        let token = UUID()
+        pendingRemoteFileWrite?.cancel()
+        remoteFileWriteToken = token
+        sendPacedRemoteFile(message, payload: payload, bytes: pacedBytes, generation: generation,
+                            token: token, started: ProcessInfo.processInfo.systemUptime, completion: completion)
+    }
+
+    private func sendPacedRemoteFile(_ message: RemoteFileProtocol.Message, payload: Data, bytes: Int, generation: UInt64,
+                                    token: UUID, started: TimeInterval, completion: @escaping (Bool) -> Void) {
+        guard remoteFileWriteToken == token else { completion(false); return }
+        pendingRemoteFileWrite = nil
+        guard connectionGeneration == generation, mayWriteRemoteFileMessage(message, startingWrite: false) else {
+            remoteFileWriteToken = nil
+            completion(false)
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        let rate = remoteFilePacing.rate(now: now, unsettled: remoteFileMediaBlocked)
+        if rate > 0, now >= remoteFilePacing.nextWrite {
+            remoteFilePacing.reserve(bytes: bytes, now: now, rate: rate)
+            remoteFileWriteToken = nil
+            sendWireMessage(type: message.type, payload: payload, sequence: 0, bulk: true) { completion($0 == nil) }
+        } else if now - started < 300 {
+            let work = DispatchWorkItem { [weak self] in
+                self?.sendPacedRemoteFile(message, payload: payload, bytes: bytes, generation: generation,
+                                          token: token, started: started, completion: completion)
+            }
+            pendingRemoteFileWrite = work
+            networkQueue.asyncAfter(deadline: .now() + 0.05, execute: work)
+        } else {
+            remoteFileWriteToken = nil
+            completion(false)
+        }
+    }
+
+    private var remoteFileMediaBlocked: Bool {
+        captureAvailability.inputBlocked || adaptiveMediaUnsettled || qualitySession?.pending != nil
+    }
+
+    private func remoteFilePacketIsCurrent(_ data: Data, startingWrite: Bool = false) -> Bool {
+        guard data.count >= WireProtocol.headerSize,
+              data.loadLittleEndian(UInt32.self, at: 0) == WireProtocol.magic,
+              let type = WireMessageType(rawValue: data[5]), (100...103).contains(type.rawValue) else { return true }
+        guard mayReceiveRemoteFiles,
+              let message = RemoteFileProtocol.decode(type: type, payload: Data(data.dropFirst(WireProtocol.headerSize)), flags: 0) else { return false }
+        return mayWriteRemoteFileMessage(message, startingWrite: startingWrite)
+    }
+
+    private func mayWriteRemoteFileMessage(_ message: RemoteFileProtocol.Message, startingWrite: Bool) -> Bool {
+        switch message {
+        case .control(let operation, let request, _, let grant):
+            if operation == .release { return true }
+            guard !remoteFileBackgrounded, remoteFileAccess?.mayWriteRequest(request) == true else { return false }
+            guard operation == .requestGrant || remoteFileAccess?.grant == grant else { return false }
+            if startingWrite { remoteFileAccess?.didStartRequest(request) }
+            return true
+        case .packet(let grant, let packet):
+            guard !remoteFileBackgrounded, remoteFileAccess?.grant == grant, let manager = remoteFileIO else { return false }
+            // Busy and terminal packets may outlive the batch that produced them.
+            return packet.kind == .cancel || packet.kind == .ack || (packet.kind == .response && !packet.accepted) || manager.owns(packet)
+        case .window(let grant, let offer, let index, let consumed, let limit, let chunks):
+            guard !remoteFileBackgrounded, remoteFileAccess?.grant == grant, let manager = remoteFileIO else { return false }
+            let window = DataTransferManager.FileWindow(offer: offer, file: index, consumed: consumed, limit: limit, chunks: chunks)
+            return manager.authorizeRemoteWindow(window, beginWrite: startingWrite)
+        case .state: return false
+        }
+    }
+
+    private func beginRemoteFileIOOnQueue(grant: UUID) {
+        retireRemoteFileIOOnQueue()
+        let generation = connectionGeneration
+        let identity = remoteFileAccess?.identity
+        let send: (RemoteFileProtocol.Message, @escaping (Bool) -> Void) -> Void = { [weak self] message, completion in
+            guard let self else { completion(false); return }
+            self.networkQueue.async {
+                guard self.connectionGeneration == generation, self.remoteFileAccess?.identity == identity,
+                      self.remoteFileAccess?.grant == grant, !self.remoteFileBackgrounded else { completion(false); return }
+                self.sendRemoteFileMessage(message, completion: completion)
+            }
+        }
+        let manager = DataTransferManager(generation: generation, directory: retainedTransferRoot, transport: "Remote",
+                                          receivedLibrary: retainedFileLibrary,
+                                          onLibraryReady: { [weak self] library in
+            self?.networkQueue.async { [weak self] in self?.retainedFileLibrary = library }
+        }, remoteWindowSender: { window, completion in
+            send(.window(grantId: grant, offerId: window.offer, fileIndex: window.file, consumedOffset: window.consumed,
+                         maxOffset: window.limit, maxChunkIndexExclusive: window.chunks), completion)
+        }) { packet, completion in
+            send(.packet(grantId: grant, transfer: packet), completion)
+        }
+        remoteFileIO = manager
+        observeDataTransfer(manager, generation: generation, transport: "Remote", remote: true)
+    }
+
+    private func receiveRemoteFileOnQueue(_ header: WireHeader, payload: Data) {
+        guard mayReceiveRemoteFiles, let message = RemoteFileProtocol.decode(type: header.type, payload: payload, flags: header.flags) else {
+            handleStreamError("Invalid remote file message."); return
+        }
+        switch message {
+        case .state:
+            let oldGrant = remoteFileAccess?.grant
+            let effects = remoteFileAccess?.receive(message, allowed: !remoteFileBackgrounded) ?? []
+            if oldGrant != nil, remoteFileAccess?.grant == nil { _ = remoteFileActionClock.advance() }
+            if let grant = remoteFileAccess?.grant, grant != oldGrant { beginRemoteFileIOOnQueue(grant: grant) }
+            for effect in effects {
+                switch effect {
+                case .send(let outgoing): sendRemoteFileMessage(outgoing)
+                case .upload(let urls): remoteFileIO?.sendFiles(urls)
+                case .retire: retireRemoteFileIOOnQueue()
+                }
+            }
+            publishRemoteFileAccessOnQueue()
+        case let .packet(grant, packet):
+            guard grant == remoteFileAccess?.grant, !remoteFileBackgrounded, let manager = remoteFileIO else { return }
+            if packet.kind == .offer {
+                guard remoteFileAccess?.takeIncomingOffer(grant: grant, offer: packet.id) == true else { return }
+                publishRemoteFileAccessOnQueue()
+            }
+            if packet.kind == .cancel && manager.owns(packet) { controlChannelWriter.cancelBulk() }
+            postRemoteFileWork { manager.post(packet, completion: $0) }
+        case let .window(grant, offer, file, consumed, limit, chunks):
+            guard grant == remoteFileAccess?.grant, !remoteFileBackgrounded, let manager = remoteFileIO else { return }
+            let window = DataTransferManager.FileWindow(offer: offer, file: file, consumed: consumed, limit: limit, chunks: chunks)
+            postRemoteFileWork { manager.postRemoteFileWindow(window, completion: $0) }
+        case .control: handleStreamError("Unexpected remote file command.")
+        }
+    }
+
+    private func postRemoteFileWork(_ post: (@escaping () -> Void) -> Bool) {
+        let generation = connectionGeneration
+        transferReceivePending += 1
+        if !post({ [weak self] in
+            self?.networkQueue.async { [weak self] in
+                guard let self, self.connectionGeneration == generation else { return }
+                self.transferReceivePending = max(0, self.transferReceivePending - 1)
+                if self.transferReceiveHasCapacity { self.receiveWireChunk(generation: generation) }
+            }
+        }) { transferReceivePending -= 1 }
+    }
+
     private func beginDataTransfer(generation: UInt64) {
-        guard generation == connectionGeneration, dataTransfers == nil else { return }
+        guard !remoteInputConnection, generation == connectionGeneration, dataTransfers == nil else { return }
         let manager = DataTransferManager(generation: generation, directory: retainedTransferRoot,
                                           transport: activeTransportKind == .usb ? "USB-C" : "Wi-Fi",
                                           receivedLibrary: retainedFileLibrary,
@@ -3625,14 +3931,19 @@ public class NetworkManager: ObservableObject {
                 self.sendWireMessage(type: kind, payload: payload, sequence: 0, bulk: true) { completion($0 == nil) }
             }
         }
-        let transferTransport = activeTransportKind == .usb ? "USBC" : "WiFi"
+        dataTransfers = manager
+        observeDataTransfer(manager, generation: generation, transport: activeTransportKind == .usb ? "USBC" : "WiFi", remote: false)
+        refreshAutoAcceptPolicyOnQueue()
+    }
+
+    private func observeDataTransfer(_ manager: DataTransferManager, generation: UInt64, transport: String, remote: Bool) {
         manager.diagnostic = { [weak self] line in
-            self?.recordDiagnosticLine(line + " transport=\(transferTransport)")
+            self?.recordDiagnosticLine(line + " transport=\(transport)")
         }
         manager.changed = { [weak self, weak manager] snapshot in
             guard let self else { return }
             self.networkQueue.async {
-                guard let manager, self.dataTransfers === manager,
+                guard let manager, (remote ? self.remoteFileIO : self.dataTransfers) === manager,
                       self.connectionGeneration == generation else { return }
                 let event = "\(generation)|\(snapshot.phase.rawValue)|\(snapshot.published)|\(snapshot.count)|\(snapshot.outgoing)"
                 if self.receivedTransferEvent != event {
@@ -3644,8 +3955,6 @@ public class NetworkManager: ObservableObject {
                 }
             }
         }
-        dataTransfers = manager
-        refreshAutoAcceptPolicyOnQueue()
     }
     private func sendWireMessage(
         type: WireMessageType,
@@ -3678,7 +3987,7 @@ public class NetworkManager: ObservableObject {
             completion: { [weak self] error in
                 // Queued bulk cancellation is terminal for its transfer owner,
                 // not a transport send failure. Preserve the authenticated session.
-                if bulk, case .posix(.ECANCELED)? = error {
+                if bulk || (100...103).contains(type.rawValue), case .posix(.ECANCELED)? = error {
                     completion(error)
                     return
                 }
@@ -3724,8 +4033,15 @@ public class NetworkManager: ObservableObject {
         let generation = connectionGeneration
         networkQueue.async { [weak self] in
             guard let self, generation == self.connectionGeneration, self.adaptivePacketIsCurrent(data) else { return }
+            guard self.remoteFilePacketIsCurrent(data) else { completion(.posix(.ECANCELED)); return }
             if bulk {
-                if !self.controlChannelWriter.enqueueBulk(data, completion: completion) { completion(.posix(.ENOBUFS)) }
+                let remote = data.count >= WireProtocol.headerSize && self.remoteInputConnection
+                let ready: (() -> Bool)? = remote ? { [weak self] in
+                    guard let self, self.remoteFilePacketIsCurrent(data) else { return true }
+                    return self.remoteFilePacing.rate(now: ProcessInfo.processInfo.systemUptime,
+                                                     unsettled: self.remoteFileMediaBlocked) > 0
+                } : nil
+                if !self.controlChannelWriter.enqueueBulk(data, ready: ready, completion: completion) { completion(.posix(.ENOBUFS)) }
             } else if telemetry {
                 self.controlChannelWriter.enqueueTelemetry(data, completion: completion)
             } else if movement {
@@ -3961,7 +4277,7 @@ public class NetworkManager: ObservableObject {
 
         switch header.type {
         case .transferOffer, .transferResponse, .transferChunk, .transferFileEnd, .transferFileAck, .transferCancel, .transferEnd, .transferAck:
-            guard wireAuthenticatedGeneration == generation, committedTransportGeneration == generation,
+            guard !remoteInputConnection, wireAuthenticatedGeneration == generation, committedTransportGeneration == generation,
                   let kind = TransferKind(rawValue: header.type.rawValue) else { return }
             do {
                 let packet = try TransferProtocol.decode(kind,payload)
@@ -4243,6 +4559,7 @@ public class NetworkManager: ObservableObject {
                 return
             }
             let isIDR = header.flags & WireProtocol.videoFlagIDR != 0
+            if mayReceiveRemoteFiles { remoteFilePacing.received(bytes: payload.count) }
             let lengthPrefixed = header.flags & WireProtocol.videoFlagLengthPrefixed != 0
             let receivedAt = CACurrentMediaTime()
             let qualityReceivedAt = adaptiveNow()
@@ -4350,7 +4667,8 @@ public class NetworkManager: ObservableObject {
             }
             if remoteInputConnection, remoteFeaturesPingNonce == nonce {
                 remoteFeaturesPingNonce = nil
-                if let request = remoteFeatures.pong(flags: header.flags, now: ProcessInfo.processInfo.systemUptime) {
+                if let request = remoteFeatures.pong(flags: header.flags, now: ProcessInfo.processInfo.systemUptime,
+                                                     requestRemoteFiles: true) {
                     sendWireMessage(type: .remoteFeaturesRequest, payload: request, sequence: 0)
                 }
             }
@@ -4609,7 +4927,9 @@ public class NetworkManager: ObservableObject {
                         offer.audioCodec != AudioCodecCapabilities.none)
             }
 
-        case .remoteFileControl, .remoteFileState, .remoteFilePacket, .remoteFileWindow,
+        case .remoteFileState, .remoteFilePacket, .remoteFileWindow:
+            receiveRemoteFileOnQueue(header, payload: payload)
+        case .remoteFileControl,
              .remoteAudioSet, .remoteAudioState, .remoteAudioPacket, .remoteTimedVideo,
              .remoteSecureDesktopRequest, .remoteSecureDesktopState:
             handleStreamError("Unnegotiated remote feature message.")
@@ -4618,12 +4938,17 @@ public class NetworkManager: ObservableObject {
                 handleStreamError("Invalid remote feature result."); return
             }
             remoteMonitors.begin(session: UUID(), acceptedFeatures: remoteFeatures.accepted)
+            if mayReceiveRemoteFiles { remoteFileAccess = RemoteFileAccess() }
             remoteMonitorAdmission = nil
             publishRemoteInputOnQueue()
             requestRemoteCatalogueOnQueue()
         case .remoteInputContext:
             guard remoteInputConnection, remoteFeatures.receiveContext(flags: header.flags, payload: payload) else {
                 handleStreamError("Invalid remote input context."); return
+            }
+            if let context = remoteFeatures.context,
+               remoteFileAccess?.desktopRequiresRevocation(context) == true {
+                revokeRemoteFilesOnQueue()
             }
             publishRemoteInputOnQueue()
         case .remoteMonitorCatalogue:
@@ -5540,16 +5865,19 @@ public class NetworkManager: ObservableObject {
             self.sendWireMessage(type: .remoteMonitorSelectRequest, payload: payload, sequence: 0)
         }
     }
-    func beginRemoteMonitorForTesting(acceptedFeatures: UInt64) {
+    func beginRemoteMonitorForTesting(acceptedFeatures: UInt64, requestRemoteFiles: Bool = false) {
         networkQueue.sync {
             remoteInputConnection = true
             resetRemoteInputOnQueue()
             _ = remoteFeatures.begin(now: 0)
-            _ = remoteFeatures.pong(flags: 0x4000, now: 1)
+            _ = remoteFeatures.pong(flags: 0x4000, now: 1, requestRemoteFiles: requestRemoteFiles)
             let payload = RemoteFeaturesMessage(features: acceptedFeatures).encode()
             handleWireMessage(WireMessage(header: WireHeader(type: .remoteFeaturesResult, flags: 0,
                 payloadLength: payload.count, sequence: 0), payload: payload, firstByteAt: 0), generation: connectionGeneration)
         }
+    }
+    func backgroundRemoteFilesForTesting() {
+        networkQueue.sync { backgroundRemoteFilesOnQueue() }
     }
     func beginMirrorControlForTesting(generation:UInt64, monitorSelection:Bool=false, terminal:Bool=false) {
         mirrorControl.beginSession(generation)
@@ -7902,6 +8230,9 @@ struct RemoteSessionInputConfiguration: Equatable {
     }
 
     func suspend(reason: UInt8) {
+        if reason == 1 || reason == 2 {
+            boundNetwork?.endRemoteFileControl(generation: generation)
+        }
         guard enabled, usesScanKeyboard || usesEnhancedPointer else { return }
         defer { publishMonitorControl() }
         let t = token, g = generation

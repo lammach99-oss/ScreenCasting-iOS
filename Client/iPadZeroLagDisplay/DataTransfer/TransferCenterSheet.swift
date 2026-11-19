@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
     @ObservedObject var networkManager: NetworkManager
     @Environment(\.dismiss) private var dismiss
     @State private var importing = false
+    @State private var importScope: NetworkManager.TransferActionScope?
     @State private var exportFile: ExportFile?
     @State private var localError: String?
     @State private var exportLease: UUID?
@@ -52,8 +53,12 @@ import UniformTypeIdentifiers
         .preferredColorScheme(.dark)
         .tint(Color(uiColor: SessionInk.accent))
         .fileImporter(isPresented: $importing, allowedContentTypes: [.data,.content], allowsMultipleSelection: true) { result in
+            let scope = importScope
+            importScope = nil
             switch result {
-            case .success(let urls): localError=nil; networkManager.sendTransferFiles(urls)
+            case .success(let urls):
+                localError = nil
+                if let scope { networkManager.sendTransferFiles(urls, scope: scope) }
             case .failure: localError="Files could not be opened. Choose them again."
             }
         }
@@ -90,9 +95,34 @@ import UniformTypeIdentifiers
         }
     }
     private var sendButton: some View {
-        Button { importing=true } label: { Label("Send to PC", systemImage: "arrow.up.doc").foregroundStyle(onAccent).frame(minHeight: 44) }
+        Button {
+            importScope = networkManager.transferActionScope
+            importing = true
+        } label: { Label("Send to PC", systemImage: "arrow.up.doc").foregroundStyle(onAccent).frame(minHeight: 44) }
             .buttonStyle(.borderedProminent)
-            .disabled(!networkManager.isConnected || TransferPresentation.active(state.phase))
+            .disabled(!canStart)
+    }
+    private var canStart: Bool {
+        networkManager.isConnected && !TransferPresentation.active(state.phase) &&
+            (!networkManager.isRemoteControlSession || (networkManager.remoteFileCanStart && !networkManager.remoteFileWaiting))
+    }
+    private var remoteActions: some View {
+        VStack(alignment: .leading) {
+            let scope = networkManager.transferActionScope
+            Button { networkManager.requestRemoteFiles(scope: scope) } label: {
+                Label("Request files", systemImage: "arrow.down.doc").frame(minHeight: 44)
+            }
+            .buttonStyle(.bordered).disabled(!canStart)
+            if let status = networkManager.remoteFileStatus {
+                Text(status).font(.footnote).foregroundStyle(.secondary)
+            } else if networkManager.remoteInputFeatures & RemoteFeatureNegotiation.remoteFileFeature == 0 {
+                Text("This PC does not offer remote file transfer.").font(.footnote).foregroundStyle(.secondary)
+            } else if !networkManager.remoteFileCanStart {
+                Text("Turn on Control on the PC to transfer files.").font(.footnote).foregroundStyle(.secondary)
+            } else {
+                Text("The person at the PC approves access and chooses files to send.").font(.footnote).foregroundStyle(.secondary)
+            }
+        }
     }
     private func receivedButton(_ action: @escaping () -> Void) -> some View {
         Button(action: action) { Label("Received Files (\(retained.retainedCount))", systemImage: "tray.and.arrow.down").frame(minHeight: 44) }
@@ -128,23 +158,35 @@ import UniformTypeIdentifiers
                             HStack { owner.sendButton; owner.receivedButton { reader.scrollTo("received", anchor: .top) } }
                             VStack(alignment: .leading) { owner.sendButton; owner.receivedButton { reader.scrollTo("received", anchor: .top) } }
                         }
-                        Toggle("Auto Accept incoming files", isOn: Binding(
-                            get: { owner.networkManager.autoAcceptIncomingFiles },
-                            set: { owner.networkManager.setAutoAcceptIncomingFiles($0) }))
-                            .disabled(!owner.networkManager.canEnableAutoAccept)
-                            .accessibilityLabel("Auto Accept incoming files for this PC connection")
-                            .frame(minHeight: 44)
-                        Text("For this connection only; turns off when disconnected.")
-                            .font(.footnote).foregroundStyle(.secondary)
+                        if owner.networkManager.isRemoteControlSession { owner.remoteActions }
+                        else { CastingConsent(owner: owner) }
                         if !owner.networkManager.isConnected {
                             Text("Connect to your PC before sending or accepting files. Saved files remain available.").foregroundStyle(.secondary)
                         }
                         if let error = owner.localError { Label(error, systemImage: "exclamationmark.triangle").foregroundStyle(Color(uiColor: SessionInk.warning)) }
                         if owner.state.phase == .awaitingDecision { owner.incoming }
                         else if owner.state.count > 0 { owner.transfer }
+                        else if owner.state.phase == .failed && owner.networkManager.isRemoteControlSession {
+                            Text(TransferPresentation.failure(owner.state)).foregroundStyle(Color(uiColor: SessionInk.warning))
+                        }
                         owner.received.id("received")
                     }.padding(24).frame(maxWidth: 700, alignment: .leading).frame(maxWidth: .infinity)
                 }
+            }
+        }
+    }
+    @MainActor private struct CastingConsent: View {
+        let owner: TransferCenterSheet
+        var body: some View {
+            VStack(alignment: .leading) {
+                Toggle("Auto Accept incoming files", isOn: Binding(
+                    get: { owner.networkManager.autoAcceptIncomingFiles },
+                    set: { owner.networkManager.setAutoAcceptIncomingFiles($0) }))
+                    .disabled(!owner.networkManager.canEnableAutoAccept)
+                    .accessibilityLabel("Auto Accept incoming files for this PC connection")
+                    .frame(minHeight: 44)
+                Text("For this connection only; turns off when disconnected.")
+                    .font(.footnote).foregroundStyle(.secondary)
             }
         }
     }
@@ -184,7 +226,13 @@ import UniformTypeIdentifiers
                     ProgressView(value: TransferPresentation.progress(owner.state))
                         .accessibilityLabel(owner.state.outgoing ? "Sending progress" : "Receiving progress")
                     Text("\(TransferPresentation.size(owner.state.bytes)) of \(TransferPresentation.size(owner.state.total))").font(.subheadline).foregroundStyle(.secondary)
-                    Button("Cancel transfer", role: .destructive) { owner.networkManager.cancelTransfer() }.frame(minHeight: 44)
+                    let scope = owner.networkManager.transferActionScope
+                    Button("Cancel transfer", role: .destructive) { owner.networkManager.cancelTransfer(scope: scope) }.frame(minHeight: 44)
+                }
+                if owner.state.retryCount > 0, owner.networkManager.isRemoteControlSession {
+                    let scope = owner.networkManager.transferActionScope
+                    Button("Resend missing files") { owner.networkManager.retryRemoteFiles(scope: scope) }
+                        .disabled(!owner.canStart).frame(minHeight: 44)
                 }
             }.padding(18).background(Color(uiColor: SessionInk.raised), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         }

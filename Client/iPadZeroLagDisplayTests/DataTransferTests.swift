@@ -1344,7 +1344,7 @@ final class DataTransferTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("coalesced.bin")), payload)
     }
 
-    func testBulkCancellationDoesNotRetireAuthenticatedSession() async {
+    @MainActor func testBulkCancellationDoesNotRetireAuthenticatedSession() async {
         let network = NetworkManager(), session = network.simulateCommittedWifiSessionForTesting()
         defer { network.stopForTesting() }
         var sends: [UInt8] = [], callbacks: [(NWError?) -> Void] = []
@@ -1356,7 +1356,7 @@ final class DataTransferTests: XCTestCase {
         network.enqueueTransferWireForTesting(bulk: true) { error in queued += 1; XCTAssertNotNil(error) }
         network.enqueueTransferWireForTesting(bulk: false) { error in control += 1; XCTAssertNil(error); done.fulfill() }
         network.networkQueueForTesting.sync {}
-        network.cancelTransfer(); network.networkQueueForTesting.sync {}
+        network.cancelTransfer(scope: network.transferActionScope); network.networkQueueForTesting.sync {}
         XCTAssertEqual(queued, 1); XCTAssertEqual(active, 0); XCTAssertEqual(control, 0)
         XCTAssertEqual(network.wifiLifecycleSnapshotForTesting().authenticatedGeneration, session.generation)
         network.networkQueueForTesting.sync { callbacks.removeFirst()(nil) }

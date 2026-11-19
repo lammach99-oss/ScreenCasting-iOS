@@ -27,7 +27,8 @@ enum RemoteFileProtocol {
     static let maxFiles = 32, maxChunkBytes = 8192, maxPendingChunks = 2
     static let maxFileBytes: UInt64 = 1 << 30, maxBatchBytes: UInt64 = 2 << 30
     private static let controlSize = 32, stateSize = 56, windowSize = 64
-    private static let packetPrefix = 20, inner = packetPrefix + 25
+    static let packetPrefix = 20
+    private static let inner = packetPrefix + 25
     private static let maxOfferBytes = inner + 10 + maxFiles * (12 + TransferProtocol.maxNameBytes)
 
     static func isValidLength(type: WireMessageType, length: Int) -> Bool {
@@ -40,7 +41,7 @@ enum RemoteFileProtocol {
         }
     }
 
-    private static func isValidPacketLength(kind: TransferKind, length: Int) -> Bool {
+    static func isValidPacketLength(kind: TransferKind, length: Int) -> Bool {
         switch kind {
         case .offer: return ((inner + 23)...maxOfferBytes).contains(length)
         case .response: return length == inner + 2
@@ -183,7 +184,7 @@ enum RemoteFileProtocol {
             && maxChunkIndex <= maxFileBytes && (maxChunkIndex != 0 || maxOffset == 0)
     }
 
-    private static func validTransfer(_ transfer: TransferPacket) -> Bool {
+    static func validTransfer(_ transfer: TransferPacket) -> Bool {
         switch transfer.kind {
         case .offer:
             guard (1...maxFiles).contains(transfer.files.count) else { return false }

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import XCTest
 @testable import iPadCasting
@@ -110,4 +111,343 @@ final class RemoteFeatureCodecTests: XCTestCase {
             XCTAssertEqual(parser.allocatedPayloadBytes, 0)
         }
     }
+
+    func testRemoteFilesRequestRequiresMarkedTimelyPongAndMatchingResult() throws {
+        var oldHost = RemoteFeatureNegotiation(requestedFeatures: 0x1f)
+        XCTAssertTrue(oldHost.begin(now: 0))
+        XCTAssertNil(oldHost.pong(flags: 0, now: 1, requestRemoteFiles: true))
+        var late = RemoteFeatureNegotiation(requestedFeatures: 0x1f)
+        XCTAssertTrue(late.begin(now: 0))
+        XCTAssertNil(late.pong(flags: 0x4000, now: 2, requestRemoteFiles: true))
+        for mask in [UInt64(0x1f), 0x11f] {
+            var peer = RemoteFeatureNegotiation(requestedFeatures: 0x1f)
+            XCTAssertTrue(peer.begin(now: 0))
+            let request = try XCTUnwrap(peer.pong(flags: 0x4000, now: 1, requestRemoteFiles: true))
+            XCTAssertEqual(RemoteFeaturesMessage.decode(request)?.features, 0x11f)
+            XCTAssertEqual(peer.accepted, 0)
+            XCTAssertTrue(peer.result(flags: 0, payload: RemoteFeaturesMessage(features: mask).encode()))
+            XCTAssertEqual(peer.accepted & 0x100, mask & 0x100)
+        }
+    }
+
+    func testRemoteFileGoldenGrantRequiresConsentAndRetiredGrantCannotAdmit() throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "remote-ds5-ds7-golden", withExtension: "json"))
+        let fixture = try JSONDecoder().decode(Fixture.self, from: Data(contentsOf: url))
+        let vector = try XCTUnwrap(fixture.vectors.first { $0.name == "file-granted" })
+        let reply = try XCTUnwrap(RemoteFileProtocol.decode(type: .remoteFileState, payload: vector.payload(), flags: vector.flags))
+        guard case let .state(_, id, _, _, grant) = reply else { return XCTFail("Expected grant") }
+        var session = RemoteFileAccess()
+        XCTAssertTrue(session.receive(reply, allowed: true).isEmpty)
+        for prior in 1..<id {
+            _ = try XCTUnwrap(session.start(.download))
+            session.didStartRequest(prior)
+            _ = session.receive(.state(phase: .denied, requestId: prior, reason: .userDeclined,
+                                       directions: .none, grantId: RemoteFileProtocol.emptyID), allowed: true)
+        }
+        let request = try XCTUnwrap(session.start(.download))
+        XCTAssertEqual(RemoteFileProtocol.encode(request)?.count, 32)
+        XCTAssertTrue(session.receive(reply, allowed: true).isEmpty)
+        session.didStartRequest(id)
+        XCTAssertEqual(session.receive(reply, allowed: true).count, 1)
+        XCTAssertEqual(session.grant, grant)
+        XCTAssertFalse(session.takeIncomingOffer(grant: grant, offer: UUID()))
+        let revoked = RemoteFileProtocol.Message.state(phase: .revoked, requestId: 0, reason: .scopeLost,
+                                                        directions: .none, grantId: grant)
+        _ = session.receive(revoked, allowed: true)
+        XCTAssertNil(session.grant)
+        XCTAssertTrue(session.receive(reply, allowed: true).isEmpty)
+    }
+
+    func testRemoteFileGrantArrivingAfterBackgroundIsReleasedWithoutStarting() throws {
+        var session = RemoteFileAccess()
+        _ = try XCTUnwrap(session.start(.download))
+        session.didStartRequest(1)
+        XCTAssertNil(session.revoke())
+        let id = UUID()
+        let reply = RemoteFileProtocol.Message.state(phase: .granted, requestId: 1, reason: .none,
+                                                      directions: .both, grantId: id)
+        let actions = session.receive(reply, allowed: false)
+        XCTAssertNil(session.grant)
+        XCTAssertEqual(actions.count, 1)
+        guard case let .send(.control(operation, request, _, grant))? = actions.first else {
+            return XCTFail("Expected Release")
+        }
+        XCTAssertEqual(operation, .release)
+        XCTAssertEqual(request, 2)
+        XCTAssertEqual(grant, id)
+    }
+
+    private func goldenFile(_ name: String) throws -> RemoteFileProtocol.Message {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "remote-ds5-ds7-golden", withExtension: "json"))
+        let fixture = try JSONDecoder().decode(Fixture.self, from: Data(contentsOf: url))
+        let vector = try XCTUnwrap(fixture.vectors.first { $0.name == name && $0.valid })
+        let type = try XCTUnwrap(WireMessageType(rawValue: vector.id))
+        return try XCTUnwrap(RemoteFileProtocol.decode(type: type, payload: vector.payload(), flags: vector.flags))
+    }
+
+    func testRemoteFileParserBoundsPrefixBeforeAllocation() throws {
+        let payload = try XCTUnwrap(RemoteFileProtocol.encode(goldenFile("file-chunk")))
+        let frame = ConnectionControlProtocol.frame(type: 102, payload: payload)
+        let parser = WireStreamParser(generation: 1, allowsRemoteFiles: { true })
+        parser.consume(Data(frame.prefix(WireProtocol.headerSize)), generation: 1) { _ in XCTFail("Premature event") }
+        XCTAssertEqual(parser.allocatedPayloadBytes, 20)
+        var received = 0
+        parser.consume(Data(frame.dropFirst(WireProtocol.headerSize)), generation: 1) {
+            if case .message(let message) = $0 { XCTAssertEqual(message.payload, payload); received += 1 }
+        }
+        XCTAssertEqual(received, 1)
+        var bad = frame
+        bad[WireProtocol.headerSize + 1] = TransferKind.end.rawValue
+        parser.consume(Data(bad.prefix(WireProtocol.headerSize + 20)), generation: 1) {
+            if case .failure(.invalidHeader) = $0 { received += 1 }
+        }
+        XCTAssertEqual(received, 2)
+        XCTAssertEqual(parser.allocatedPayloadBytes, 0)
+    }
+
+    func testRemoteFilesDownloadNeedsCorrelatedPickerAndIgnoresReplayedOffer() throws {
+        let grantMessage = try goldenFile("file-granted")
+        let ready = try goldenFile("file-host-files-ready")
+        let offer = try goldenFile("file-offer")
+        guard case let .packet(grant, packet) = offer else { return XCTFail("Expected offer") }
+        var access = RemoteFileAccess()
+        for id in 1...2 {
+            _ = try XCTUnwrap(access.start(.download, now: 0))
+            access.didStartRequest(UInt64(id))
+            _ = access.receive(.state(phase: .denied, requestId: UInt64(id), reason: .policy,
+                                      directions: .none, grantId: RemoteFileProtocol.emptyID), allowed: true)
+        }
+        XCTAssertNotNil(access.start(.download, now: 1))
+        XCTAssertTrue(access.expire(now: 61))
+        access.didStartRequest(3)
+        _ = access.receive(grantMessage, allowed: true, now: 2)
+        access.didStartRequest(4)
+        _ = access.receive(ready, allowed: true)
+        let early = UUID()
+        XCTAssertFalse(access.takeIncomingOffer(grant: grant, offer: early))
+        _ = access.receive(.state(phase: .denied, requestId: 4, reason: .userDeclined,
+                                  directions: .none, grantId: RemoteFileProtocol.emptyID), allowed: true)
+        XCTAssertEqual(RemoteFileProtocol.encode(try XCTUnwrap(access.start(.download))),
+                       RemoteFileProtocol.encode(try goldenFile("file-request-host-files")))
+        access.didStartRequest(5)
+        _ = access.receive(ready, allowed: true)
+        XCTAssertFalse(access.takeIncomingOffer(grant: grant, offer: early))
+        XCTAssertTrue(access.takeIncomingOffer(grant: grant, offer: packet.id))
+        XCTAssertFalse(access.takeIncomingOffer(grant: grant, offer: packet.id))
+    }
+
+    func testRemoteFileCreditRequiresBothBoundsAndExactConsumption() throws {
+        guard case let .packet(_, chunk) = try goldenFile("file-chunk") else { return XCTFail("Expected chunk") }
+        let window = DataTransferManager.FileWindow(offer: chunk.id, file: 0, consumed: 0, limit: 1, chunks: 1)
+        var credit = DataTransferManager.DownloadCredit(generation: chunk.generation, window: window, offset: 0, chunk: 0)
+        var future = chunk
+        future.bytes.append(0)
+        XCTAssertFalse(credit.admit(future))
+        XCTAssertTrue(credit.admit(chunk))
+        XCTAssertFalse(credit.admit(chunk))
+        XCTAssertEqual(credit.offset, 1)
+        XCTAssertEqual(credit.chunk, 1)
+    }
+
+    func testRemoteFilePacingSuspendsForQualityAndStaleVideo() {
+        var pacing = RemoteFileMediaPacing()
+        pacing.feedback(now: 0, presented: 0, queueAge: 0, drops: 0)
+        pacing.received(bytes: 1_000_000)
+        pacing.feedback(now: 1, presented: 10, queueAge: 0, drops: 0)
+        XCTAssertEqual(pacing.rate(now: 1, unsettled: false), 100_000)
+        XCTAssertEqual(pacing.rate(now: 1, unsettled: true), 0)
+        XCTAssertEqual(pacing.rate(now: 4, unsettled: false), 0)
+    }
+
+    #if targetEnvironment(simulator)
+    @MainActor func testRemoteFileRealWriterKeepsGrantDuringUIPauseAndReleasesOnBackground() async throws {
+        let network = NetworkManager()
+        let owner = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS, remote: true)
+        defer { network.stopForTesting() }
+        var writes: [Data] = []
+        network.controlSendForAudioTesting = { data, done in writes.append(data); done(nil) }
+        network.beginTransferWriterForTesting()
+        network.beginRemoteMonitorForTesting(acceptedFeatures: 0x103, requestRemoteFiles: true)
+        let context = RemoteInputContextCommand(state: 1, desktop: 1, token: 12, desktopEpoch: 1,
+            left: 0, top: 0, width: 100, height: 100)
+        network.receiveRemoteMonitorContextForTesting(context, keyframe: true)
+        let published = expectation(description: "Authenticated remote connection published")
+        DispatchQueue.main.async { published.fulfill() }
+        await fulfillment(of: [published], timeout: 2)
+
+        let scope = network.transferActionScope
+        network.requestRemoteFiles(scope: scope)
+        for _ in 0..<3 { network.networkQueueForTesting.sync {} }
+        func controls() -> [RemoteFileProtocol.Message] {
+            network.networkQueueForTesting.sync {
+                writes.filter { $0[5] == 100 }.compactMap {
+                    RemoteFileProtocol.decode(type: .remoteFileControl, payload: Data($0.dropFirst(16)), flags: 0)
+                }
+            }
+        }
+        guard case let .control(.requestGrant, request, .both, _)? = controls().first else {
+            return XCTFail("Expected RequestGrant on the authenticated writer")
+        }
+        let grant = UUID()
+        let reply = RemoteFileProtocol.Message.state(phase: .granted, requestId: request, reason: .none,
+                                                     directions: .both, grantId: grant)
+        network.receiveMirrorWireForTesting(type: .remoteFileState, payload: try XCTUnwrap(RemoteFileProtocol.encode(reply)),
+                                            generation: owner.generation, connection: owner.connection)
+        for _ in 0..<3 { network.networkQueueForTesting.sync {} }
+        let input = RemoteSessionInputState()
+        input.bind(network)
+        func inputConfiguration(_ active: Bool) -> RemoteSessionInputConfiguration {
+            .init(remote: true, connected: true, active: active, generation: owner.generation,
+                features: 0x103, context: context, ready: true, revision: 1)
+        }
+        input.configure(inputConfiguration(true))
+        input.configure(inputConfiguration(false))
+        for _ in 0..<3 { network.networkQueueForTesting.sync {} }
+        XCTAssertFalse(input.pointerEnabled)
+        XCTAssertEqual(controls().count, 2)
+        let sentFocusReset = network.networkQueueForTesting.sync {
+            writes.contains { $0[5] == WireMessageType.remoteInputReset.rawValue &&
+                RemoteInputResetCommand.decode(Data($0.dropFirst(16)))?.reason == 0 }
+        }
+        XCTAssertTrue(sentFocusReset)
+        network.backgroundRemoteFilesForTesting()
+        for _ in 0..<3 { network.networkQueueForTesting.sync {} }
+        guard case let .control(.release, _, _, released)? = controls().last else {
+            return XCTFail("Background must release the grant")
+        }
+        XCTAssertEqual(released, grant)
+        XCTAssertNotEqual(network.transferActionScope, scope)
+        network.requestRemoteFiles(scope: scope)
+        for _ in 0..<3 { network.networkQueueForTesting.sync {} }
+        XCTAssertEqual(controls().count, 3)
+    }
+
+    func testRemoteFileFakeHostUploadWaitsForCreditAndResendStartsAtZero() throws {
+        guard case let .packet(grant, fixtureResponse) = try goldenFile("file-response"),
+              case let .window(_, _, _, _, limit, maxChunks) = try goldenFile("file-window") else {
+            return XCTFail("Expected fixture response and window")
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("sample.bin")
+        try Data(repeating: 0x55, count: 4097).write(to: source)
+        var sent: [TransferPacket] = []
+        let manager = DataTransferManager(generation: 4, directory: root.appendingPathComponent("received"),
+                                          remoteWindowSender: { _, done in XCTFail("Upload must not grant credit"); done(false) }) { packet, done in
+            let data = RemoteFileProtocol.encode(.packet(grantId: grant, transfer: packet))
+            if let data, case let .packet(_, decoded)? = RemoteFileProtocol.decode(type: .remoteFilePacket, payload: data, flags: 0) {
+                sent.append(decoded)
+                done(true)
+            } else { XCTFail("Invalid wire packet"); done(false) }
+        }
+        defer { manager.retire(); manager.drainRemoteIOForTesting() }
+        manager.sendFiles([source])
+        manager.drainRemoteIOForTesting()
+        let first = try XCTUnwrap(sent.first)
+        var accepted = TransferPacket(kind: fixtureResponse.kind, generation: first.generation, id: first.id)
+        accepted.accepted = fixtureResponse.accepted
+        XCTAssertTrue(manager.post(accepted))
+        manager.drainRemoteIOForTesting()
+        XCTAssertEqual(sent.map(\.kind), [.offer])
+        XCTAssertTrue(manager.postRemoteFileWindow(.init(offer: first.id, file: 0, consumed: 0, limit: min(limit, 4097), chunks: maxChunks)) {})
+        for _ in 0..<4 { manager.drainRemoteIOForTesting() }
+        XCTAssertEqual(sent.map(\.kind), [.offer, .chunk, .chunk, .fileEnd])
+        XCTAssertEqual(sent.filter { $0.kind == .chunk }.map(\.offset), [0, 4096])
+        manager.cancel()
+        manager.drainRemoteIOForTesting()
+        manager.retryRemoteFiles()
+        manager.drainRemoteIOForTesting()
+        let second = try XCTUnwrap(sent.last)
+        XCTAssertEqual(second.kind, .offer)
+        XCTAssertNotEqual(second.id, first.id)
+        accepted = TransferPacket(kind: .response, generation: second.generation, id: second.id, accepted: true)
+        XCTAssertTrue(manager.post(accepted))
+        XCTAssertTrue(manager.postRemoteFileWindow(.init(offer: second.id, file: 0, consumed: 0, limit: 1, chunks: 1)) {})
+        manager.drainRemoteIOForTesting()
+        XCTAssertEqual(sent.last?.kind, .chunk)
+        XCTAssertEqual(sent.last?.offset, 0)
+    }
+
+    func testRemoteFileFakeHostDownloadsOnlyAfterCurrentConsentAndCleansRevokedStage() throws {
+        guard case let .packet(grant, template) = try goldenFile("file-offer"),
+              case let .packet(_, chunk) = try goldenFile("file-chunk") else { return XCTFail("Expected fixture packets") }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var manager: DataTransferManager!
+        var events: [String] = []
+        var published: [URL] = []
+        manager = DataTransferManager(generation: 7, directory: root, remoteWindowSender: { window, done in
+            let message = RemoteFileProtocol.Message.window(grantId: grant, offerId: window.offer, fileIndex: window.file,
+                consumedOffset: window.consumed, maxOffset: window.limit, maxChunkIndexExclusive: window.chunks)
+            XCTAssertNotNil(RemoteFileProtocol.encode(message))
+            if window.consumed == 1 {
+                let stage = try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+                    .first { $0.pathExtension == "part" }
+                XCTAssertEqual(stage.flatMap { try? Data(contentsOf: $0) }, chunk.bytes)
+            }
+            XCTAssertTrue(manager.authorizeRemoteWindow(window, beginWrite: true))
+            events.append("credit-\(window.consumed)")
+            done(true)
+        }) { packet, done in
+            XCTAssertNotNil(RemoteFileProtocol.encode(.packet(grantId: grant, transfer: packet)))
+            events.append("\(packet.kind)")
+            done(true)
+        }
+        manager.changed = { if $0.phase == .completed { published = $0.received } }
+        defer { manager.retire(); manager.drainRemoteIOForTesting(); manager = nil }
+        var offer = template
+        offer.files = [.init(name: "sample.bin", length: 2)]
+        XCTAssertTrue(manager.post(offer))
+        manager.drainRemoteIOForTesting()
+        let consent = try XCTUnwrap(manager.consentForTesting())
+        manager.decide(true, consent: .init(sessionID: consent.sessionID, transferID: UUID()))
+        manager.drainRemoteIOForTesting()
+        XCTAssertTrue(events.isEmpty)
+        manager.decide(true, consent: consent)
+        for _ in 0..<3 { manager.drainRemoteIOForTesting() }
+        XCTAssertEqual(events, ["response", "credit-0"])
+        XCTAssertTrue(manager.post(chunk))
+        manager.drainRemoteIOForTesting()
+        XCTAssertEqual(events, ["response", "credit-0", "credit-1"])
+        var secondChunk = chunk
+        secondChunk.chunkIndex = 1
+        secondChunk.offset = 1
+        XCTAssertTrue(manager.post(secondChunk))
+        manager.drainRemoteIOForTesting()
+        var last = TransferPacket(kind: .fileEnd, generation: offer.generation, id: offer.id)
+        last.offset = 2
+        last.bytes = Data(SHA256.hash(data: chunk.bytes + secondChunk.bytes))
+        XCTAssertTrue(manager.post(last))
+        manager.drainRemoteIOForTesting()
+        XCTAssertEqual(events.last, "fileAck")
+        XCTAssertTrue(manager.post(.init(kind: .end, generation: offer.generation, id: offer.id)))
+        for _ in 0..<3 { manager.drainRemoteIOForTesting() }
+        XCTAssertEqual(events.last, "ack")
+        let saved = try XCTUnwrap(published.first)
+        XCTAssertEqual(try Data(contentsOf: saved), chunk.bytes + secondChunk.bytes)
+
+        var interrupted = TransferPacket(kind: .offer, generation: offer.generation, id: UUID())
+        interrupted.files = [.init(name: "interrupted.bin", length: 2)]
+        XCTAssertTrue(manager.post(interrupted))
+        manager.drainRemoteIOForTesting()
+        manager.decide(true, consent: try XCTUnwrap(manager.consentForTesting()))
+        for _ in 0..<3 { manager.drainRemoteIOForTesting() }
+        manager.retire()
+        manager.drainRemoteIOForTesting()
+        XCTAssertFalse(manager.post(chunk))
+        let urls = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        XCTAssertTrue(urls.contains(saved))
+        XCTAssertFalse(urls.contains { $0.pathExtension == "part" || $0.lastPathComponent == "interrupted.bin" })
+    }
+
+    func testRemoteFileQuotaUsesSharedRetainedLimits() {
+        XCTAssertThrowsError(try DataTransferManager.validateRetainedQuota(count: 256, bytes: 0,
+            incomingCount: 1, incomingBytes: 1, availableCapacity: nil))
+        XCTAssertThrowsError(try DataTransferManager.validateRetainedQuota(count: 0, bytes: 8 << 30,
+            incomingCount: 1, incomingBytes: 1, availableCapacity: nil))
+        XCTAssertNoThrow(try DataTransferManager.validateRetainedQuota(count: 255, bytes: (8 << 30) - 1,
+            incomingCount: 1, incomingBytes: 1, availableCapacity: nil))
+    }
+    #endif
 }

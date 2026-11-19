@@ -123,7 +123,7 @@ struct RemoteFeatureNegotiation {
     static let remoteSecureDesktopFeature: UInt64 = 0x400
     static let phaseAFeatures = remoteFileFeature | remoteAudioFeature | remoteSecureDesktopFeature
     static let knownFeatures: UInt64 = 0x1f | phaseAFeatures
-    private let requestedFeatures: UInt64
+    private var requestedFeatures: UInt64
     // Input-only callers retain their mask; remote sessions explicitly request 0x1f.
     init(requestedFeatures: UInt64 = 3) {
         self.requestedFeatures = Self.phaseAFeaturesEnabled ? requestedFeatures : requestedFeatures & ~Self.phaseAFeatures
@@ -142,16 +142,17 @@ struct RemoteFeatureNegotiation {
     mutating func expire(now: TimeInterval) {
         if phase == .pong && now >= deadline { phase = .legacy }
     }
-    mutating func pong(flags: UInt16, now: TimeInterval) -> Data? {
+    mutating func pong(flags: UInt16, now: TimeInterval, requestRemoteFiles: Bool = false) -> Data? {
         guard phase == .pong else { return nil }
         guard now < deadline, flags & Self.supportedFlag != 0 else { phase = .legacy; return nil }
+        if requestRemoteFiles, requestedFeatures & 3 == 3 { requestedFeatures |= Self.remoteFileFeature }
         phase = .result; return RemoteFeaturesMessage(features: requestedFeatures).encode()
     }
     mutating func result(flags: UInt16, payload: Data) -> Bool {
         guard phase == .result else { return false }; phase = .legacy
         guard flags == 0, let message = RemoteFeaturesMessage.decode(payload),
               message.features & ~Self.knownFeatures == 0, message.features & ~requestedFeatures == 0,
-              message.features & 4 == 0 || message.features & 3 == 3 else { return false }
+              message.features & (4 | Self.remoteFileFeature) == 0 || message.features & 3 == 3 else { return false }
         accepted = message.features; phase = .complete; return true
     }
     mutating func receiveContext(flags: UInt16, payload: Data) -> Bool {

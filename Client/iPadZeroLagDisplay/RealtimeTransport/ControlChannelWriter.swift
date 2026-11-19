@@ -27,6 +27,7 @@ final class ControlChannelWriter {
         let priority: Priority
         let generation: UInt64
         let diagnostic: DiagnosticContext?
+        let ready: (() -> Bool)?
         let completion: (NWError?) -> Void
     }
 
@@ -69,17 +70,18 @@ final class ControlChannelWriter {
             priority: .reliable,
             generation: generation,
             diagnostic: diagnostic,
+            ready: nil,
             completion: completion))
         drain()
         return true
     }
 
     @discardableResult
-    func enqueueBulk(_ data: Data, completion: @escaping (NWError?) -> Void) -> Bool {
+    func enqueueBulk(_ data: Data, ready: (() -> Bool)? = nil, completion: @escaping (NWError?) -> Void) -> Bool {
         dispatchPrecondition(condition: .onQueue(queue))
         let count = pending.filter { $0.priority == .bulk }.count + (inFlight?.priority == .bulk ? 1 : 0)
         guard count < 2 else { return false }
-        pending.append(Pending(data: data, priority: .bulk, generation: generation, diagnostic: nil, completion: completion))
+        pending.append(Pending(data: data, priority: .bulk, generation: generation, diagnostic: nil, ready: ready, completion: completion))
         drain()
         return true
     }
@@ -97,6 +99,7 @@ final class ControlChannelWriter {
             priority: .telemetry,
             generation: generation,
             diagnostic: diagnostic,
+            ready: nil,
             completion: completion))
         drain()
     }
@@ -116,6 +119,7 @@ final class ControlChannelWriter {
             priority: .movement,
             generation: generation,
             diagnostic: diagnostic,
+            ready: nil,
             completion: completion))
         drain()
     }
@@ -125,6 +129,7 @@ final class ControlChannelWriter {
         dispatchPrecondition(condition: .onQueue(queue))
         guard !sending, !pending.isEmpty else { return }
         let index = pending.firstIndex { $0.priority != .bulk } ?? 0
+        if pending[index].ready?() == false { return }
         let next = pending.remove(at: index)
         sending = true
         inFlight = next
@@ -146,11 +151,11 @@ final class ControlChannelWriter {
 
     /// Drop unsent input at a local eligibility boundary, retaining terminal events
     /// and the active write. Settle discarded work successfully: suspension is not a socket fault.
-    func discardPending(where predicate: (Data) -> Bool) {
+    func discardPending(where predicate: (Data) -> Bool, error: NWError? = nil) {
         dispatchPrecondition(condition: .onQueue(queue))
         let removed = pending.filter { predicate($0.data) }
         pending.removeAll { predicate($0.data) }
-        for item in removed { item.completion(nil) }
+        for item in removed { item.completion(error) }
     }
 
     /// Retires queued transfer frames without disturbing reliable input or the active write.

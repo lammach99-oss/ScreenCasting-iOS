@@ -4,6 +4,7 @@ import CryptoKit
 
 /// Serial worker-owned single-file stage in app-private storage.
 final class TransferStore {
+    enum VerificationFailure: Error { case length, digest }
     private let directory: URL
     private let metadata: TransferFile
     private let temporary: URL
@@ -29,17 +30,21 @@ final class TransferStore {
         do { try handle.write(contentsOf: bytes); hasher.update(data: bytes); written += UInt64(bytes.count); nextChunk += 1 }
         catch { retire(); throw error }
     }
-    func publish(length: UInt64, digest: Data) throws -> URL {
+    func publish(length: UInt64, digest: Data,
+                 publishLink: (() -> Int32) throws -> Int32 = { $0() }) throws -> URL {
         guard !terminal, let handle else { throw TransferProtocol.Failure.invalid }
         do {
-            guard length == metadata.length, written == length, digest.count == 32, Data(hasher.finalize()) == digest else { throw TransferProtocol.Failure.invalid }
+            guard length == metadata.length, written == length else { throw VerificationFailure.length }
+            guard digest.count == 32, Data(hasher.finalize()) == digest else { throw VerificationFailure.digest }
             try handle.synchronize(); try handle.close(); self.handle = nil
             let original = URL(fileURLWithPath: metadata.name), ext = original.pathExtension, stem = original.deletingPathExtension().lastPathComponent
             for suffix in 0..<10000 {
                 let name = suffix == 0 ? metadata.name : stem + " (\(suffix))" + (ext.isEmpty ? "" : "." + ext)
                 let final = directory.appendingPathComponent(name)
                 // link() publishes atomically on the same app-owned volume and fails if the name exists.
-                let result = temporary.path.withCString { source in final.path.withCString { target in link(source,target) } }
+                let result = try publishLink {
+                    temporary.path.withCString { source in final.path.withCString { target in link(source,target) } }
+                }
                 if result == 0 { try FileManager.default.removeItem(at: temporary); terminal = true; return final }
                 if errno != EEXIST { throw CocoaError(.fileWriteUnknown) }
             }

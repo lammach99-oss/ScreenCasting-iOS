@@ -91,12 +91,14 @@ enum WireParserEvent {
 final class WireStreamParser {
     private enum State {
         case header
+        case remoteFilePrefix(WireHeader)
         case payload(WireHeader)
         case draining(WireHeader, remaining: Int)
         case failed
     }
 
     private var generation: UInt64
+    private let allowsRemoteFiles: () -> Bool
     private var state: State = .header
     private var headerBytes = Data(count: WireProtocol.headerSize)
     private var headerOffset = 0
@@ -105,8 +107,9 @@ final class WireStreamParser {
     private var messageFirstByteAt: TimeInterval = 0
     private(set) var maximumDrainChunkObserved = 0
 
-    init(generation: UInt64) {
+    init(generation: UInt64, allowsRemoteFiles: @escaping () -> Bool = { false }) {
         self.generation = generation
+        self.allowsRemoteFiles = allowsRemoteFiles
     }
 
     var allocatedPayloadBytes: Int { payload.count }
@@ -115,6 +118,8 @@ final class WireStreamParser {
         switch state {
         case .header:
             return WireProtocol.receiveChunkSize
+        case .remoteFilePrefix:
+            return RemoteFileProtocol.packetPrefix - payloadOffset
         case .payload(let header):
             return max(1, min(
                 WireProtocol.receiveChunkSize,
@@ -170,9 +175,9 @@ final class WireStreamParser {
                         preparePayload(onEvent: onEvent)
                     }
 
-                case .payload(let header):
+                case .remoteFilePrefix(let header), .payload(let header):
                     let copied = min(
-                        header.payloadLength - payloadOffset,
+                        payload.count - payloadOffset,
                         source.count - sourceOffset)
                     payload.withUnsafeMutableBytes { destination in
                         destination.baseAddress!
@@ -183,7 +188,17 @@ final class WireStreamParser {
                     }
                     payloadOffset += copied
                     sourceOffset += copied
-                    if payloadOffset == header.payloadLength {
+                    if case .remoteFilePrefix = state, payloadOffset == RemoteFileProtocol.packetPrefix {
+                        guard payload[0] == 1, payload[2] == 0, payload[3] == 0,
+                              let kind = TransferKind(rawValue: payload[1]),
+                              RemoteFileProtocol.isValidPacketLength(kind: kind, length: header.payloadLength) else {
+                            state = .failed; payload = Data()
+                            onEvent(.failure(.invalidHeader))
+                            continue
+                        }
+                        payload.append(Data(count: header.payloadLength - payloadOffset))
+                        state = .payload(header)
+                    } else if payloadOffset == header.payloadLength {
                         let completedPayload = payload
                         let firstByteAt = messageFirstByteAt
                         resetForNextHeader()
@@ -221,11 +236,9 @@ final class WireStreamParser {
             $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self).littleEndian
         }
         let version = headerBytes[4]
-        // Preserve pre-extension behavior while these runtimes are absent.
         guard magic == WireProtocol.magic,
               version == WireProtocol.version,
-              let type = WireMessageType(rawValue: headerBytes[5]),
-              !(100...109).contains(type.rawValue) else {
+              let type = WireMessageType(rawValue: headerBytes[5]) else {
             state = .failed
             payload = Data()
             onEvent(.failure(.invalidHeader))
@@ -253,6 +266,20 @@ final class WireStreamParser {
             flags: flags,
             payloadLength: payloadLength,
             sequence: sequence)
+        if (100...109).contains(type.rawValue) {
+            guard (101...103).contains(type.rawValue), allowsRemoteFiles(), flags == 0,
+                  RemoteFileProtocol.isValidLength(type: type, length: payloadLength) else {
+                state = .failed; payload = Data()
+                onEvent(.failure(.invalidHeader))
+                return
+            }
+            if type == .remoteFilePacket {
+                payload = Data(count: RemoteFileProtocol.packetPrefix)
+                payloadOffset = 0
+                state = .remoteFilePrefix(header)
+                return
+            }
+        }
         if (93...99).contains(type.rawValue),
            flags != 0 || payloadLength != AdaptiveMediaProtocol.size(type.rawValue) {
             payload = Data(); payloadOffset = 0
@@ -421,9 +448,9 @@ final class WireParserQueueDomain {
     private let queue: DispatchQueue
     private let parser: WireStreamParser
 
-    init(generation: UInt64, queue: DispatchQueue) {
+    init(generation: UInt64, queue: DispatchQueue, allowsRemoteFiles: @escaping () -> Bool = { false }) {
         self.queue = queue
-        parser = WireStreamParser(generation: generation)
+        parser = WireStreamParser(generation: generation, allowsRemoteFiles: allowsRemoteFiles)
     }
 
     var suggestedReceiveLength: Int {

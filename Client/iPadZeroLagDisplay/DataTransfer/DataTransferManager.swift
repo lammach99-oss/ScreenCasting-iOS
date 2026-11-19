@@ -24,6 +24,7 @@ final class DataTransferManager {
         var bytes: UInt64 = 0, total: UInt64 = 0
         var name = ""
         var received: [URL] = []
+        var retryCount = 0
     }
     struct FailureDetail: Equatable {
         let reason: String
@@ -34,12 +35,36 @@ final class DataTransferManager {
             let domain = [NSCocoaErrorDomain, NSPOSIXErrorDomain, NSURLErrorDomain].contains(native.domain) ? native.domain : "Transfer"
             let reason: String
             if native.domain == NSCocoaErrorDomain && native.code == CocoaError.fileWriteOutOfSpace.rawValue { reason = "STORAGE_FULL" }
-            else if error is TransferProtocol.Failure { reason = "INVALID_TRANSFER" }
+            else if error is TransferProtocol.Failure || error is TransferStore.VerificationFailure { reason = "INVALID_TRANSFER" }
             else { reason = ["stage_create":"STAGING_CREATE", "write":"WRITE_FAILED", "verify_publish":"VERIFY_OR_PUBLISH_FAILED", "send":"SEND_FAILED", "receipt_commit":"RECEIPT_COMMIT_FAILED"][stage] ?? "TRANSFER_FAILED" }
             return FailureDetail(reason: reason, domain: domain, code: native.code)
         }
     }
     typealias Sender = (TransferPacket, @escaping (Bool) -> Void) -> Void
+    struct FileWindow: Equatable {
+        let offer: UUID
+        let file: UInt16
+        let consumed: UInt64
+        let limit: UInt64
+        let chunks: UInt64
+    }
+    struct DownloadCredit {
+        let generation: UInt64
+        let window: FileWindow
+        var offset: UInt64
+        var chunk: UInt64
+
+        mutating func admit(_ packet: TransferPacket) -> Bool {
+            guard packet.id == window.offer, packet.generation == generation, packet.fileIndex == window.file,
+                  packet.chunkIndex == chunk, packet.offset == offset, offset <= window.limit,
+                  chunk < window.chunks, !packet.bytes.isEmpty,
+                  packet.bytes.count <= RemoteFileProtocol.maxChunkBytes,
+                  UInt64(packet.bytes.count) <= window.limit - offset else { return false }
+            offset += UInt64(packet.bytes.count)
+            chunk += 1
+            return true
+        }
+    }
     private final class Owner {
         let id: UUID, generation: UInt64, outgoing: Bool, files: [TransferFile]
         var sources: [URL] = [], scoped: [URL] = []
@@ -52,6 +77,14 @@ final class DataTransferManager {
         var initialDate: Date?
         var lastProgress: TimeInterval = 0
         var waiting: TransferKind?
+        var credit: FileWindow?
+        var sentEnds: [UInt64] = []
+        var consumedChunks: UInt64 = 0
+        var chunkInFlight = false
+        var windowInFlight = false
+        var nextWindow: (file: Int, consumed: UInt64, chunks: UInt64)?
+        var progressAt = ProcessInfo.processInfo.systemUptime
+        var pausedAt: TimeInterval?
         var received: [URL] = []
         var releaseStorage: (() -> Void)?
         init(id: UUID, generation: UInt64, outgoing: Bool, files: [TransferFile]) { self.id=id;self.generation=generation;self.outgoing=outgoing;self.files=files }
@@ -65,6 +98,16 @@ final class DataTransferManager {
     private let queue = DispatchQueue(label: "ScreenCasting.DataTransfer.IO", qos: .utility)
     private let admission = NSLock()
     private var pending = 0
+    private var remoteRetired = false
+    private var remoteUploadQueued = false
+    private var downloadCredit: DownloadCredit?
+    private var proposedDownloadCredit: DownloadCredit?
+    private var deadlineCheckQueued = false
+    private let remoteWindowSender: ((FileWindow, @escaping (Bool) -> Void) -> Void)?
+    private var remoteIsLive: Bool {
+        admission.lock(); defer { admission.unlock() }
+        return !remoteRetired
+    }
     // Short admission-lock state only; no IO or callbacks while locked.
     private var autoAcceptEnabled = false
     private var autoAcceptRevision: UInt64 = 0
@@ -83,6 +126,10 @@ final class DataTransferManager {
         return autoAcceptEnabled && token == autoAcceptRevision
     }
     private var wireOwner: (UUID,UInt64)?
+    var hasActiveTransfer: Bool {
+        admission.lock(); defer { admission.unlock() }
+        return wireOwner != nil || pending > 0 || remoteUploadQueued
+    }
     func owns(_ packet: TransferPacket) -> Bool {admission.lock();defer{admission.unlock()};return wireOwner?.0 == packet.id && wireOwner?.1 == packet.generation}
     private let generation: UInt64, directory: URL, sender: Sender
     private let transport: String
@@ -97,10 +144,13 @@ final class DataTransferManager {
     private var droppedDiagnostics = 0
     private var diagnosticStage = "idle"
     private var verifiedFiles: [URL] = []
+    private var retrySources: [URL] = []
     init(generation: UInt64, directory: URL, transport: String = "Connected to PC",
          receivedLibrary: ReceivedFileLibrary? = nil, onLibraryReady: ((ReceivedFileLibrary) -> Void)? = nil,
+         remoteWindowSender: ((FileWindow, @escaping (Bool) -> Void) -> Void)? = nil,
          sender: @escaping Sender) {
         self.generation=generation;self.directory=directory;self.sender=sender;self.transport=transport
+        self.remoteWindowSender = remoteWindowSender
         self.receivedLibrary = receivedLibrary
         queue.async {
             if self.receivedLibrary == nil { self.receivedLibrary = try? ReceivedFileLibrary(directory: directory) }
@@ -114,7 +164,24 @@ final class DataTransferManager {
         }
     }
     @discardableResult func post(_ packet: TransferPacket, completion: @escaping () -> Void = {}) -> Bool {
-        admission.lock();guard pending < Self.maxPendingPackets else {
+        admission.lock()
+        if remoteRetired { admission.unlock(); return false }
+        if remoteWindowSender != nil, packet.kind == .chunk {
+            guard wireOwner?.0 == packet.id, wireOwner?.1 == packet.generation else {
+                admission.unlock(); return false
+            }
+            guard downloadCredit?.admit(packet) == true else {
+                downloadCredit = nil
+                admission.unlock()
+                queue.async { [weak self] in
+                    guard let self, let active = self.owner, active.id == packet.id,
+                          active.generation == packet.generation else { return }
+                    self.fail(reason: .invalidChunk)
+                }
+                return false
+            }
+        }
+        guard pending < Self.maxPendingPackets else {
             admission.unlock()
             queue.async { [weak self] in
                 guard let self else { return }
@@ -128,29 +195,176 @@ final class DataTransferManager {
         queue.async { [weak self] in
             guard let self else {return}
             defer {self.admission.lock();self.pending -= 1;self.admission.unlock();completion()}
-            do {try self.receive(packet, autoAcceptToken: policyToken)} catch {self.fail(error: error)}
+            do { try self.receive(packet, autoAcceptToken: policyToken) }
+            catch {
+                let reason: TransferReason
+                if self.remoteWindowSender != nil, let problem = error as? TransferStore.VerificationFailure {
+                    switch problem {
+                    case .length: reason = .lengthMismatch
+                    case .digest: reason = .hashMismatch
+                    }
+                } else { reason = .cancelled }
+                self.fail(error: error, reason: reason)
+            }
         }
         return true
     }
-    func sendFiles(_ urls: [URL]) {
+    func postRemoteFileWindow(_ window: FileWindow, completion: @escaping () -> Void) -> Bool {
+        admission.lock()
+        guard remoteWindowSender != nil, !remoteRetired, pending < Self.maxPendingPackets else {
+            admission.unlock(); return false
+        }
+        pending += 1
+        admission.unlock()
         queue.async { [weak self] in
-            guard let self, !self.retired, self.owner == nil else {return}
-            var scoped: [URL] = []
-            self.resetDiagnostics(outgoing: true)
-            self.diagnosticStage = "source_open"
-            do {
-                let files = try urls.map { url -> TransferFile in
-                    if url.startAccessingSecurityScopedResource() {scoped.append(url)}
-                    let values = try url.resourceValues(forKeys: [.fileSizeKey,.isRegularFileKey])
-                    guard values.isRegularFile == true, let size = values.fileSize, size >= 0 else {throw TransferProtocol.Failure.invalid}
-                    return TransferFile(name: url.lastPathComponent,length: UInt64(size))
+            defer { completion() }
+            guard let self else { return }
+            defer { self.admission.lock(); self.pending -= 1; self.admission.unlock() }
+            guard let active = self.owner, self.current(active), active.outgoing,
+                  window.offer == active.id else { return }
+            self.applySendCredit(window, active: active)
+        }
+        return true
+    }
+
+    private func applySendCredit(_ window: FileWindow, active: Owner) {
+        let previous = active.credit
+        let consumed = active.sentEnds.prefix { $0 <= window.consumed }
+        guard active.index < active.files.count, window.file == UInt16(active.index),
+              active.waiting == nil || active.waiting == .fileAck,
+              window.limit <= active.files[active.index].length,
+              window.consumed == (consumed.last ?? previous?.consumed ?? 0),
+              window.consumed >= (previous?.consumed ?? 0), window.limit >= (previous?.limit ?? 0),
+              window.chunks >= (previous?.chunks ?? 0),
+              window.chunks <= active.consumedChunks + UInt64(consumed.count + RemoteFileProtocol.maxPendingChunks) else {
+            fail(reason: .invalidOffset)
+            return
+        }
+        active.consumedChunks += UInt64(consumed.count)
+        active.sentEnds.removeFirst(consumed.count)
+        active.credit = window
+        if active.waiting == nil { pump(active) }
+    }
+
+    private func grantReceiveCredit(_ active: Owner, consumed: UInt64, chunks: UInt64) {
+        guard let remoteWindowSender, current(active), active.index < active.files.count else { return }
+        let length = active.files[active.index].length
+        guard consumed < length else { return }
+        if active.windowInFlight {
+            active.nextWindow = (active.index, consumed, chunks)
+            return
+        }
+        let window = FileWindow(offer: active.id, file: UInt16(active.index), consumed: consumed,
+                                limit: min(length, consumed + UInt64(RemoteFileProtocol.maxChunkBytes)),
+                                chunks: chunks + 1)
+        admission.lock()
+        guard !remoteRetired else { admission.unlock(); return }
+        proposedDownloadCredit = DownloadCredit(generation: active.generation, window: window, offset: consumed, chunk: chunks)
+        admission.unlock()
+        active.windowInFlight = true
+        remoteWindowSender(window) { [weak self, weak active] ok in
+            guard let self, let active else { return }
+            self.queue.async {
+                guard self.current(active) else { return }
+                active.windowInFlight = false
+                guard ok else { self.fail(); return }
+                let next = active.nextWindow
+                active.nextWindow = nil
+                if let next, next.file == active.index {
+                    self.grantReceiveCredit(active, consumed: next.consumed, chunks: next.chunks)
                 }
-                _ = try TransferProtocol.validate(files)
-                let active=Owner(id: UUID(),generation: self.generation,outgoing: true,files: files)
-                guard self.acquireStorage(active) else { throw CocoaError(.fileLocking) }
-                active.sources=urls;active.scoped=scoped;self.owner=active;self.admission.lock();self.wireOwner=(active.id,active.generation);self.admission.unlock();active.waiting = .response
-                self.publish(.offering);self.send(active,.offer) { _ in }
-            } catch {for url in scoped {url.stopAccessingSecurityScopedResource()};self.snapshot.failure = FailureDetail.classify(error, stage: self.diagnosticStage);self.publish(.failed)}
+            }
+        }
+    }
+    func authorizeRemoteWindow(_ window: FileWindow, beginWrite: Bool) -> Bool {
+        admission.lock(); defer { admission.unlock() }
+        guard !remoteRetired, let credit = proposedDownloadCredit, credit.window == window else { return false }
+        if beginWrite {
+            downloadCredit = credit
+            proposedDownloadCredit = nil
+        }
+        return true
+    }
+
+    func checkRemoteDeadline(now: TimeInterval, paused: Bool) {
+        admission.lock()
+        guard !remoteRetired, !deadlineCheckQueued else { admission.unlock(); return }
+        deadlineCheckQueued = true
+        admission.unlock()
+        queue.async { [weak self] in
+            guard let self else { return }
+            defer { self.admission.lock(); self.deadlineCheckQueued = false; self.admission.unlock() }
+            guard let active = self.owner, self.current(active) else { return }
+            let transferring = active.accepted || (active.outgoing && active.waiting != .response)
+            if transferring && paused {
+                if active.pausedAt == nil { active.pausedAt = now }
+                if let start = active.pausedAt, now - start >= 300 { self.fail() }
+                return
+            }
+            if let start = active.pausedAt {
+                active.progressAt = max(now, active.progressAt)
+                active.pausedAt = nil
+                if now - start >= 300 { self.fail() }
+                return
+            }
+            if now - active.progressAt >= (transferring ? 120 : 60) { self.fail() }
+        }
+    }
+    func sendFiles(_ urls: [URL]) {
+        if remoteWindowSender != nil {
+            admission.lock()
+            guard !remoteRetired, wireOwner == nil, pending == 0, !remoteUploadQueued else { admission.unlock(); return }
+            remoteUploadQueued = true
+            admission.unlock()
+        }
+        queue.async { [weak self] in
+            guard let self else { return }
+            defer { self.admission.lock(); self.remoteUploadQueued = false; self.admission.unlock() }
+            self.startUpload(urls)
+        }
+    }
+    func retryRemoteFiles() {
+        queue.async { [weak self] in
+            guard let self, self.remoteWindowSender != nil, !self.retrySources.isEmpty else { return }
+            self.startUpload(self.retrySources)
+        }
+    }
+    private func startUpload(_ urls: [URL]) {
+        guard !retired, remoteIsLive, owner == nil else { return }
+        retrySources = []
+        snapshot.retryCount = 0
+        var scoped: [URL] = []
+        resetDiagnostics(outgoing: true)
+        diagnosticStage = "source_open"
+        do {
+            if remoteWindowSender != nil, !(1...RemoteFileProtocol.maxFiles).contains(urls.count) {
+                throw TransferProtocol.Failure.invalid
+            }
+            let files = try urls.map { url -> TransferFile in
+                if url.startAccessingSecurityScopedResource() { scoped.append(url) }
+                let values = try url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey])
+                guard values.isRegularFile == true, let size = values.fileSize, size >= 0,
+                      remoteWindowSender == nil || values.isSymbolicLink != true else { throw TransferProtocol.Failure.invalid }
+                return TransferFile(name: url.lastPathComponent, length: UInt64(size))
+            }
+            _ = try TransferProtocol.validate(files)
+            let active = Owner(id: UUID(), generation: generation, outgoing: true, files: files)
+            if remoteWindowSender != nil {
+                var offer = packet(active, .offer)
+                offer.files = files
+                guard RemoteFileProtocol.validTransfer(offer) else { throw TransferProtocol.Failure.invalid }
+            }
+            guard remoteIsLive else { throw TransferProtocol.Failure.invalid }
+            guard acquireStorage(active) else { throw CocoaError(.fileLocking) }
+            active.sources = urls; active.scoped = scoped; owner = active
+            admission.lock(); wireOwner = (active.id, active.generation); admission.unlock()
+            active.waiting = .response
+            publish(.offering)
+            send(active, .offer) { _ in }
+        } catch {
+            for url in scoped { url.stopAccessingSecurityScopedResource() }
+            snapshot.failure = FailureDetail.classify(error, stage: diagnosticStage)
+            publish(.failed)
         }
     }
     private func acquireStorage(_ active: Owner) -> Bool {
@@ -186,9 +400,10 @@ final class DataTransferManager {
         guard let consent = consentForTesting() else { return }
         decide(accepted, consent: consent)
     }
+    func drainRemoteIOForTesting() { queue.sync {} }
     #endif
     private func decideOnQueue(_ accepted: Bool, expectedTransferID: UUID, policyToken: UInt64? = nil) {
-        guard !retired, let active=owner, !active.outgoing, !active.accepted,
+        guard !retired, remoteIsLive, let active=owner, !active.outgoing, !active.accepted,
               expectedTransferID == active.id else { return }
         if let policyToken, !ownsAutoAcceptToken(policyToken) { return }
         do {
@@ -209,17 +424,32 @@ final class DataTransferManager {
                     active.store?.retire(); active.store = nil; return
                 }
                 active.accepted=true;publish(.receiving)
-                var response=packet(active,.response);response.accepted=true;write(active,response) { _ in }
+                var response=packet(active,.response);response.accepted=true
+                write(active,response) { [weak self, weak active] _ in
+                    if let self, let active, active.index == 0 {
+                        self.grantReceiveCredit(active, consumed: 0, chunks: 0)
+                    }
+                }
             } else {
                 var response=packet(active,.response);response.reason = .userRejected
                 write(active,response) { [weak self] ok in if ok {self?.finish(.rejected)} }
             }
-        } catch {fail(error: error)}
+        } catch {
+            let failure = error as NSError
+            let storageFull = failure.domain == NSCocoaErrorDomain && failure.code == CocoaError.fileWriteOutOfSpace.rawValue
+            fail(error: error, reason: remoteWindowSender != nil && storageFull ? .insufficientStorage : .cancelled)
+        }
     }
     func cancel(failed: Bool = false) {queue.async { [weak self] in self?.fail(phase: failed ? .failed : .cancelled) } }
-    func retire() {setAutoAccept(false, localGeneration: generation);queue.async { [weak self] in guard let self else{return};self.retired=true;self.finish(.retired)} }
+    func retire() {
+        setAutoAccept(false, localGeneration: generation)
+        if remoteWindowSender != nil {
+            admission.lock(); remoteRetired = true; downloadCredit = nil; proposedDownloadCredit = nil; admission.unlock()
+        }
+        queue.async { self.retired = true; self.finish(.retired) }
+    }
     private func packet(_ active: Owner,_ kind: TransferKind) -> TransferPacket {TransferPacket(kind:kind,generation:active.generation,id:active.id)}
-    private func current(_ active: Owner) -> Bool {!retired && owner === active}
+    private func current(_ active: Owner) -> Bool {!retired && owner === active && remoteIsLive}
     private func publish(_ phase: Phase) {
         snapshot.consent = owner.flatMap { !$0.outgoing && !$0.accepted && phase == .awaitingDecision ? Consent(sessionID: sessionID, transferID: $0.id) : nil }
         snapshot.phase=phase
@@ -236,30 +466,35 @@ final class DataTransferManager {
         snapshot.bytes=bytes;snapshot.phase=active.outgoing ? .sending : .receiving;changed?(snapshot)
     }
     private func finish(_ phase: Phase) {
-        admission.lock();wireOwner=nil;admission.unlock()
+        admission.lock();wireOwner=nil;downloadCredit=nil;proposedDownloadCredit=nil;admission.unlock()
         if let active=owner {
+            if remoteWindowSender != nil, active.outgoing, [.failed, .cancelled, .rejected].contains(phase) {
+                retrySources = Array(active.sources.dropFirst(active.index))
+            }
             retiredIDs.append(active.id);if retiredIDs.count>256 {retiredIDs.removeFirst()}
             active.close() // Stage/source handles close before the one-use local lease releases.
         }
+        if phase == .retired || phase == .completed { retrySources = [] }
+        snapshot.retryCount = retrySources.count
         refreshRetainedFiles();publish(phase);owner=nil
     }
-    private func fail(phase: Phase = .failed, error: Error? = nil) {
+    private func fail(phase: Phase = .failed, error: Error? = nil, reason: TransferReason = .cancelled) {
         guard let active=owner else {return}
         if phase == .failed {snapshot.failure = error.map {FailureDetail.classify($0, stage: diagnosticStage)} ?? snapshot.failure ?? FailureDetail(reason:"TRANSFER_FAILED",domain:"Transfer",code:0)}
-        var cancel=packet(active,.cancel);cancel.reason = .cancelled;sender(cancel){_ in};finish(phase)
+        var cancel=packet(active,.cancel);cancel.reason = reason;sender(cancel){_ in};finish(phase)
     }
     private func write(_ active: Owner,_ packet: TransferPacket,_ done: @escaping (Bool)->Void) {
         guard current(active) else {return}
         sender(packet) { [weak self,weak active] ok in
             guard let self,let active else{return}
-            self.queue.async {guard self.current(active) else{return};if !ok {self.snapshot.failure=FailureDetail(reason:"SEND_FAILED",domain:"Transfer",code:0);self.event("send_failed");self.fail();return};if packet.kind != .chunk {self.event("send_\(packet.kind)")};done(ok)}
+            self.queue.async {guard self.current(active) else{return};if !ok {self.snapshot.failure=FailureDetail(reason:"SEND_FAILED",domain:"Transfer",code:0);self.event("send_failed");self.fail();return};active.progressAt=ProcessInfo.processInfo.systemUptime;if packet.kind != .chunk {self.event("send_\(packet.kind)")};done(ok)}
         }
     }
     private func send(_ active: Owner,_ kind: TransferKind,_ done: @escaping (Bool)->Void) {
         var p=packet(active,kind);if kind == .offer {p.files=active.files};write(active,p,done)
     }
     private func receive(_ p: TransferPacket, autoAcceptToken: UInt64?) throws {
-        guard !retired else {return}
+        guard !retired, remoteIsLive else {return}
         if p.kind == .offer {
             guard !retiredIDs.contains(p.id), peerGeneration == nil || peerGeneration == p.generation else {return}
             peerGeneration = p.generation
@@ -273,6 +508,7 @@ final class DataTransferManager {
                 busy.reason = .busy;sender(busy){_ in};return
             }
             resetDiagnostics(outgoing:false);owner=active
+            retrySources = []; snapshot.retryCount = 0
             admission.lock();wireOwner=(p.id,p.generation);admission.unlock();event("offer");publish(.awaitingDecision)
             if let token = autoAcceptToken, ownsAutoAcceptToken(token) {
                 decideOnQueue(true, expectedTransferID: p.id, policyToken: token)
@@ -280,6 +516,7 @@ final class DataTransferManager {
             return
         }
         guard let active=owner, active.id==p.id, active.generation==p.generation else {return}
+        active.progressAt = ProcessInfo.processInfo.systemUptime
         if p.kind != .chunk {event("receive_\(p.kind)")}
         if p.kind == .cancel {finish(.cancelled);return}
         if active.outgoing {
@@ -303,10 +540,18 @@ final class DataTransferManager {
             active.receivedChunks += 1
             if p.chunkIndex == 0 {event("first_chunk", updateStage:false)}
             progress(active,bytes:active.bytes+store.written)
+            grantReceiveCredit(active, consumed: store.written, chunks: p.chunkIndex + 1)
         case .fileEnd:
             guard p.fileIndex==active.index,let store=active.store else {throw TransferProtocol.Failure.invalid}
             event("verify_publish");publish(.verifying)
-            let final=try store.publish(length:p.offset,digest:p.bytes);active.store=nil
+            let final = try store.publish(length: p.offset, digest: p.bytes) { link in
+                if self.remoteWindowSender == nil { return link() }
+                // The atomic link and revocation share an order. Hashing and sync happen outside this lock.
+                self.admission.lock(); defer { self.admission.unlock() }
+                guard !self.remoteRetired else { throw TransferProtocol.Failure.invalid }
+                return link()
+            }
+            active.store = nil
             event("receipt_commit")
             do {
                 guard let receivedLibrary else { throw CocoaError(.fileReadUnknown) }
@@ -318,7 +563,14 @@ final class DataTransferManager {
             active.received.append(final);active.bytes+=p.offset;active.published+=1;active.index+=1
             refreshRetainedFiles();event("published")
             if active.index<active.files.count {active.store=try TransferStore(directory:directory,metadata:active.files[active.index],id:active.id)}
-            var ack=packet(active,.fileAck);ack.fileIndex=p.fileIndex;publish(.receiving);write(active,ack){_ in}
+            admission.lock(); downloadCredit = nil; proposedDownloadCredit = nil; admission.unlock()
+            var ack=packet(active,.fileAck);ack.fileIndex=p.fileIndex;publish(.receiving)
+            let nextIndex = active.index
+            write(active,ack) { [weak self, weak active] _ in
+                if let self, let active, active.index == nextIndex {
+                    self.grantReceiveCredit(active, consumed: 0, chunks: 0)
+                }
+            }
         case .end:
             guard active.index==active.files.count,active.store==nil else {throw TransferProtocol.Failure.invalid}
             send(active,.ack){[weak self] ok in if ok {self?.finish(.completed)}}
@@ -327,18 +579,43 @@ final class DataTransferManager {
     }
     private func openNext(_ active: Owner) throws {
         guard current(active) else {return}
-        let url=active.sources[active.index],values=try url.resourceValues(forKeys:[.fileSizeKey,.contentModificationDateKey])
+        let url=active.sources[active.index],values=try url.resourceValues(forKeys:[.fileSizeKey,.contentModificationDateKey,.isRegularFileKey,.isSymbolicLinkKey])
+        guard remoteWindowSender == nil || (values.isRegularFile == true && values.isSymbolicLink != true) else { throw TransferProtocol.Failure.invalid }
         guard let size=values.fileSize,UInt64(size)==active.files[active.index].length else {throw TransferProtocol.Failure.invalid}
-        active.initialDate=values.contentModificationDate;active.handle=try FileHandle(forReadingFrom:url);active.offset=0;active.chunk=0;active.hash=SHA256();publish(.sending);pump(active)
+        active.initialDate=values.contentModificationDate;active.handle=try FileHandle(forReadingFrom:url);active.offset=0;active.chunk=0;active.hash=SHA256()
+        active.credit = nil; active.sentEnds = []; active.consumedChunks = 0; active.chunkInFlight = false
+        publish(.sending);pump(active)
     }
     private func pump(_ active: Owner) {
-        guard current(active) else {return}
+        guard current(active), !active.chunkInFlight else {return}
         do {
             let length=active.files[active.index].length
             if active.offset<length {
-                guard let bytes=try active.handle?.read(upToCount:Int(min(UInt64(TransferProtocol.defaultChunkBytes),length-active.offset))),!bytes.isEmpty else {throw TransferProtocol.Failure.invalid}
+                var size = min(UInt64(TransferProtocol.defaultChunkBytes), length - active.offset)
+                if remoteWindowSender != nil {
+                    guard let credit = active.credit, active.offset < credit.limit, active.chunk < credit.chunks else { return }
+                    size = min(4096, credit.limit - active.offset, length - active.offset)
+                }
+                guard let bytes=try active.handle?.read(upToCount:Int(size)),!bytes.isEmpty else {throw TransferProtocol.Failure.invalid}
                 active.hash.update(data:bytes);var p=packet(active,.chunk);p.fileIndex=UInt16(active.index);p.offset=active.offset;p.chunkIndex=active.chunk;p.bytes=bytes
-                write(active,p){ [weak self,weak active] _ in guard let self,let active else{return};active.offset+=UInt64(bytes.count);active.observedBytes+=UInt64(bytes.count);active.chunk+=1;self.progress(active,bytes:active.bytes+active.offset);self.pump(active) }
+                active.chunkInFlight = true
+                let usesCredit = remoteWindowSender != nil
+                if usesCredit {
+                    active.offset += UInt64(bytes.count)
+                    active.chunk += 1
+                    active.sentEnds.append(active.offset)
+                }
+                write(active, p) { [weak self, weak active] _ in
+                    guard let self, let active else { return }
+                    if !usesCredit {
+                        active.offset += UInt64(bytes.count)
+                        active.chunk += 1
+                    }
+                    active.chunkInFlight = false
+                    active.observedBytes += UInt64(bytes.count)
+                    self.progress(active, bytes: active.bytes + active.offset)
+                    self.pump(active)
+                }
             } else {
                 let values=try active.sources[active.index].resourceValues(forKeys:[.fileSizeKey,.contentModificationDateKey])
                 guard values.fileSize==Int(length),values.contentModificationDate==active.initialDate else {throw TransferProtocol.Failure.invalid}
