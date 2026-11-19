@@ -576,6 +576,10 @@ public class NetworkManager: ObservableObject {
     private var qualityFeedbackTimer: DispatchSourceTimer?
     private var qualityFeedbackIdentity: AdaptiveMediaIdentity?
     private var qualityWindow = AdaptiveMediaWindow(started: 0)
+    private var manualReconnectPresentation: (
+        identity: AdaptiveMediaIdentity, decoder: UInt64, frame: UInt64, started: TimeInterval, at: TimeInterval
+    )?
+    private var manualReconnectHealthy = false
     private var qualityRttSeconds: TimeInterval = 0
     private var qualityConnectionID: ObjectIdentifier?
     private var qualityHostID: Data?
@@ -1120,6 +1124,7 @@ public class NetworkManager: ObservableObject {
             defer { self.recordAppAudioLifecycleDiagnostic(event: "will_resign_active", phase: "applied", foregroundBefore: diagnosticForegroundBefore) }
             self.cancelActiveDirectTouchOnQueue()
             self.isForegroundActive = false
+            self.manualReconnectPresentation = nil
             // Foreground eligibility is closed first; discard its old sample window.
             self.transportTelemetry.beginFreshFrameRate(
                 generation: self.connectionGeneration, at: self.performanceFeedbackTime())
@@ -1146,6 +1151,7 @@ public class NetworkManager: ObservableObject {
             self.recordAppAudioLifecycleDiagnostic(event: "did_enter_background", phase: "received", foregroundBefore: diagnosticForegroundBefore)
             defer { self.recordAppAudioLifecycleDiagnostic(event: "did_enter_background", phase: "applied", foregroundBefore: diagnosticForegroundBefore) }
             self.isForegroundActive = false
+            self.manualReconnectPresentation = nil
             // Foreground eligibility is closed first; discard its old sample window.
             self.transportTelemetry.beginFreshFrameRate(
                 generation: self.connectionGeneration, at: self.performanceFeedbackTime())
@@ -5357,6 +5363,9 @@ public class NetworkManager: ObservableObject {
     private func teardownCurrentSession() {
         wifiAuthentication = WifiAuthenticationState()
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        // Reset only at retirement. A later unresolved cutover must still
+        // preserve the current retry delay.
+        if manualReconnectHealthy, !adaptiveMediaUnsettled { reconnectAttempt = 0 }
         pairedControlGeneration = nil; trustedProofGeneration = nil; connectionAdvertisement = 0
         if !connectionHandoffInProgress { resetConnectionControlOnQueue(preserveFailure: connectionSwitch.offersReconnect) }
         resetRemoteInputOnQueue()
@@ -6745,6 +6754,7 @@ public class NetworkManager: ObservableObject {
             recordDiagnosticLine("[CAPTURE_AVAILABILITY] ignored=\(reason)")
             return
         case .suspended(let retireInput):
+            manualReconnectPresentation = nil
             captureReadinessClock.setSuspended(captureAvailability.inputBlocked, at: connectionControlNow())
             mirrorControl.setCaptureSuspended(captureAvailability.inputBlocked)
             wifiMediaReceiver.setCaptureSuspended(true)
@@ -7021,6 +7031,9 @@ public class NetworkManager: ObservableObject {
             ? committedRealtimeMode == RealtimeTransportMode.legacyTLS
             : committedRealtimeMode == RealtimeTransportMode.wifiRTP)
     }
+    private var adaptiveMediaUnsettled: Bool {
+        qualitySession?.mediaRecoveryActive == true || qualitySession?.current?.status == 2
+    }
     private var remoteQualityNegotiated: Bool {
         qualitySession?.remote == true && qualitySession?.current != nil
     }
@@ -7112,6 +7125,8 @@ public class NetworkManager: ObservableObject {
         if !preserveHostPreference || qualityProbe.phase != .backoff { qualityProbe = AdaptiveMediaProbe() }
         qualitySession = nil; qualityConnectionID = nil; sourceRollback = nil
         qualityFeedbackIdentity = nil
+        manualReconnectPresentation = nil
+        manualReconnectHealthy = false
         if !preserveHostPreference {
             if qualityHostID != nil { loadCastingStreamSettingsOnQueue(hostID: nil) }
             qualityHostID = nil; qualityAutoOptIn = false
@@ -7308,6 +7323,7 @@ public class NetworkManager: ObservableObject {
         let identity = (qualitySession?.pending ?? qualitySession?.current)?.identity
         guard qualityFeedbackIdentity != identity else { return }
         qualityFeedbackIdentity = identity
+        manualReconnectPresentation = nil
         qualityWindow.restart(started: adaptiveNow())
     }
     private func failAdaptiveConfigurationOnQueue(reason: UInt8) {
@@ -7396,10 +7412,27 @@ public class NetworkManager: ObservableObject {
     }
     private func adaptivePresentedOnQueue(sequence: UInt32, decoder: UInt64) {
         guard self.decoder.currentSessionGeneration == decoder, let frame=adaptiveFrameOnQueue(sequence) else { return }
-        qualityWindow.presented(frame:frame,now:self.adaptiveNow())
+        let now = adaptiveNow()
+        qualityWindow.presented(frame:frame,now:now)
+        recordManualReconnectPresentation(frame: frame, decoder: decoder, now: now)
         if let ack=qualitySession?.presented(sequence:sequence) { sendAdaptiveOnQueue(ack) }
         // A toggle made during suspension is applied only after fresh pixels.
         sendAdaptivePolicyOnQueue(auto:qualityAutoOptIn)
+    }
+    private func recordManualReconnectPresentation(frame: UInt64, decoder: UInt64, now: TimeInterval) {
+        guard !manualReconnectHealthy, reconnectAttempt > 0 else { return }
+        guard transportState == .streaming, isForegroundActive, !captureAvailability.inputBlocked,
+              !adaptiveMediaUnsettled, let applied = qualitySession?.applied, applied.mode == 0 else {
+            manualReconnectPresentation = nil
+            return
+        }
+        var started = now
+        if let last = manualReconnectPresentation, last.identity == applied.identity, last.decoder == decoder {
+            guard frame > last.frame else { return }
+            if now - last.at <= 1 { started = last.started }
+        }
+        manualReconnectPresentation = (applied.identity, decoder, frame, started, now)
+        if now - started >= 5 { manualReconnectHealthy = true }
     }
     private func sendAdaptiveFeedbackOnQueue() {
         guard adaptiveQualityTransport, let identity = qualityFeedbackIdentity else { return }

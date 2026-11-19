@@ -432,6 +432,103 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         XCTAssertEqual(out.filter { if case .touch(.up,_,_,_)=$0 { return true }; return false }.count,1)
     }
     #if targetEnvironment(simulator)
+    @MainActor func testManualPlaybackResetsRetryBudgetOnlyAfterSustainedFreshPresentation() async throws {
+        enum Outcome: CaseIterable { case healthy, brief, duplicate, gap, cutover, failedCutover }
+        for remote in [false, true] {
+            for outcome in Outcome.allCases {
+                let label = "\(remote ? "remote TLS" : "casting RTP"), \(outcome)"
+                let suite = "ManualReconnect." + UUID().uuidString
+                let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+                defer { defaults.removePersistentDomain(forName: suite) }
+                let network = NetworkManager(userDefaults: defaults)
+                network.stopForTesting()
+                defer { network.stopForTesting() }
+                var now = 0.0
+                var writes: [Data] = []
+                var remoteBaselineFrames: [UInt32] = []
+                var configurationDeadline: (() -> Void)?
+                network.adaptiveMediaClockForTesting = { now }
+                network.captureTargetScheduleForTesting = { _, callback in configurationDeadline = callback }
+                network.captureTargetDecodeForTesting = { _, sequence, _ in remoteBaselineFrames.append(sequence) }
+                network.realtimeAudioPlaybackForTesting = { enabled in XCTAssertFalse(enabled) }
+                network.controlSendForAudioTesting = { bytes, done in writes.append(bytes); done(nil) }
+                network.decoder.installAdaptiveMediaRenderer { _ in true }
+                let peer = network.simulateCommittedWifiSessionForTesting(
+                    mode: remote ? RealtimeTransportMode.legacyTLS : RealtimeTransportMode.wifiRTP, remote: remote)
+                network.setAdaptiveHostForTesting(Data(repeating: 1, count: 16))
+                network.reconnectAttemptForTesting = 8
+                network.beginTransferWriterForTesting()
+                network.beginAdaptiveMediaForTesting()
+
+                func lastWrite(_ type: WireMessageType) -> Data? {
+                    network.networkQueueForTesting.sync { writes.last { $0[5] == type.rawValue } }
+                }
+                func receive(_ type: WireMessageType, _ data: Data, flags: UInt16 = 0, sequence: UInt32 = 0) {
+                    if remote {
+                        network.receiveRemoteQualityFrameForTesting(remoteWireFrame(type, data, flags: flags, sequence: sequence),
+                            generation: peer.generation, connection: peer.connection)
+                    } else {
+                        network.receiveCaptureTargetWireForTesting(type: type, payload: data, flags: flags, sequence: sequence,
+                            generation: peer.generation, connection: peer.connection)
+                    }
+                }
+                let ping = try XCTUnwrap(lastWrite(.ping), label)
+                receive(.pong, Data(ping.suffix(16)), flags: 0x0200)
+                let hello = try XCTUnwrap(lastWrite(.qualityHello), label)
+                let owner = hello.loadLittleEndian(UInt64.self, at: 40)
+                var caps = bytes(try XCTUnwrap(try fixtures()["94"]))
+                caps.storeLittleEndian(hello.loadLittleEndian(UInt64.self, at: 32), at: 8)
+                caps.storeLittleEndian(owner, at: 16)
+                caps[51] = remote ? 1 : 0
+                if !remote { caps.storeLittleEndian(UInt32(3_000_000), at: 28) }
+                receive(.qualityCapabilities, caps)
+                let baseline = try remoteQualityState(owner: owner)
+                receive(.qualityState, baseline)
+
+                if remote {
+                    let kinds: [UInt8] = [32, 33, 34, 19]
+                    let idr = Data(kinds.flatMap { [0, 0, 0, 2, $0 << 1, 1] })
+                    receive(.video, idr, flags: WireProtocol.videoFlagIDR | WireProtocol.videoFlagLengthPrefixed, sequence: 1)
+                    XCTAssertEqual(remoteBaselineFrames, [1], label)
+                }
+                let decoder = network.decoder.currentSessionGeneration
+                for tick in 0...(outcome == .brief ? 2 : 20) {
+                    network.networkQueueForTesting.sync {
+                        now = Double(tick) * 0.25 + (outcome == .gap && tick > 10 ? 4 : 0)
+                    }
+                    let sequence = outcome == .duplicate ? 2 : UInt32(tick + 2)
+                    XCTAssertTrue(network.admitAdaptiveFrameForTesting(sequence, isIDR: tick == 0), label)
+                    network.recordCapturePresentation(sequence: sequence, generation: decoder)
+                    network.networkQueueForTesting.sync {}
+                }
+                if outcome == .cutover || outcome == .failedCutover {
+                    var cutover = baseline
+                    cutover.storeLittleEndian(UInt64(2), at: 24)
+                    cutover.storeLittleEndian(UInt32(1), at: 32)
+                    cutover.storeLittleEndian(UInt32(2), at: 40)
+                    cutover[44] = 2
+                    cutover.storeLittleEndian(UInt64(81), at: 88)
+                    receive(.qualityConfiguration, cutover, sequence: 80)
+                    let ready = try XCTUnwrap(lastWrite(.qualityConfigurationAck), label)
+                    XCTAssertEqual(ready[60], 0, label)
+                    if outcome == .failedCutover {
+                        try network.networkQueueForTesting.sync {
+                            let expire = try XCTUnwrap(configurationDeadline, label)
+                            now += 3
+                            expire()
+                        }
+                        let failed = try XCTUnwrap(lastWrite(.qualityConfigurationAck), label)
+                        XCTAssertEqual(failed[60], 2, label)
+                    }
+                }
+                network.simulateWifiControlReceiveErrorForTesting(generation: peer.generation, connection: peer.connection)
+                XCTAssertNil(network.wifiSessionSnapshotForTesting().committedGeneration, label)
+                XCTAssertEqual(TrustedReconnectPolicy.delay(forAttempt: network.reconnectAttemptForTesting),
+                               outcome == .healthy ? 0 : 5, label)
+            }
+        }
+    }
+
     @MainActor func testRemoteTLSProbeRestoresOneSavedModePerConnectionAndPreservesManualOnDecline() async throws {
         let suite = "RemoteQuality." + UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
