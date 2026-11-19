@@ -260,7 +260,7 @@ import SwiftUI
     @MainActor private struct StreamSection: View {
         let owner: SettingsView
         var body: some View {
-            let manualFallback = owner.networkManager.savedAutoQualityEnabled || owner.networkManager.adaptiveQualityBackoffActive
+            let manualFallback = owner.networkManager.legacyAutomaticBitrateUnavailable
             Section {
                 AdaptiveQualityControls(network:owner.networkManager)
                 Toggle("Automatic bitrate", isOn: Binding(
@@ -415,7 +415,7 @@ import SwiftUI
         Toggle("Auto quality", isOn: Binding(get: { network.autoQualityEnabled }, set: { network.setAutoQualityEnabled($0) }))
             .disabled(!network.adaptiveQualityAvailable)
         if network.adaptiveQualityAvailable {
-            Text(network.isRemoteControlSession && network.savedAutoQualityEnabled
+            Text(network.savedAutoQualityEnabled
                 ? "Auto remembered for this PC." : "Your quality choice is saved for this PC.")
                 .font(.footnote).foregroundStyle(.secondary)
         } else {

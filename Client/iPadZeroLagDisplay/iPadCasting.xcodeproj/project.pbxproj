@@ -124,6 +124,7 @@
 		AD2200010000000000000001 /* AdaptiveMediaProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2200020000000000000001 /* AdaptiveMediaProtocol.swift */; };
 		AD2200010000000000000002 /* AdaptiveMediaTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2200020000000000000002 /* AdaptiveMediaTests.swift */; };
 		AD2200010000000000000003 /* AdaptiveMediaV1Golden.json in Resources */ = {isa = PBXBuildFile; fileRef = AD2200020000000000000003 /* AdaptiveMediaV1Golden.json */; };
+		AD2400010000000000000001 /* ds8-casting-tls-golden.json in Resources */ = {isa = PBXBuildFile; fileRef = AD2400020000000000000001 /* ds8-casting-tls-golden.json */; };
 		AD2300010000000000000001 /* RemoteFileProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2300020000000000000001 /* RemoteFileProtocol.swift */; };
 		AD2300010000000000000002 /* RemoteAudioProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2300020000000000000002 /* RemoteAudioProtocol.swift */; };
 		AD2300010000000000000003 /* RemoteSecureDesktopProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2300020000000000000003 /* RemoteSecureDesktopProtocol.swift */; };
@@ -262,6 +263,7 @@
 		AD2200020000000000000001 /* AdaptiveMediaProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AdaptiveMediaProtocol.swift; sourceTree = "<group>"; };
 		AD2200020000000000000002 /* AdaptiveMediaTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AdaptiveMediaTests.swift; sourceTree = "<group>"; };
 		AD2200020000000000000003 /* AdaptiveMediaV1Golden.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = Fixtures/AdaptiveMediaV1Golden.json; sourceTree = "<group>"; };
+		AD2400020000000000000001 /* ds8-casting-tls-golden.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = Fixtures/ds8-casting-tls-golden.json; sourceTree = "<group>"; };
 		AD2300020000000000000001 /* RemoteFileProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteFileProtocol.swift; sourceTree = "<group>"; };
 		AD2300020000000000000002 /* RemoteAudioProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteAudioProtocol.swift; sourceTree = "<group>"; };
 		AD2300020000000000000003 /* RemoteSecureDesktopProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteSecureDesktopProtocol.swift; sourceTree = "<group>"; };
@@ -383,6 +385,7 @@
 			children = (
 				1A0700030000000000000009 /* IPadInputV2Golden.json */,
 				AD2200020000000000000003 /* AdaptiveMediaV1Golden.json */,
+				AD2400020000000000000001 /* ds8-casting-tls-golden.json */,
 				AD2200020000000000000002 /* AdaptiveMediaTests.swift */,
 				AD2300020000000000000004 /* RemoteFeatureCodecTests.swift */,
 				AD2300020000000000000005 /* remote-ds5-ds7-golden.json */,
@@ -521,6 +524,7 @@
 			files = (
 				1A0700040000000000000009 /* IPadInputV2Golden.json in Resources */,
 				AD2200010000000000000003 /* AdaptiveMediaV1Golden.json in Resources */,
+				AD2400010000000000000001 /* ds8-casting-tls-golden.json in Resources */,
 				AD2300010000000000000005 /* remote-ds5-ds7-golden.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

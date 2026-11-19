@@ -480,6 +480,7 @@ public final class DecoderManager {
         captureDeliveryLock.lock()
         defer { captureDeliveryLock.unlock() }
         captureOutputFenced = true; captureOutputs.removeAll()
+        adaptiveFrames.removeAll()
         mailboxStateLock.lock()
         mailbox.beginSession(generation: localSessionGeneration)
         let generation = localSessionGeneration
@@ -525,6 +526,7 @@ public final class DecoderManager {
         captureDeliveryLock.lock()
         defer { captureDeliveryLock.unlock() }
         adaptiveMediaActive = true; adaptiveMediaValue = value; adaptiveFrames.removeAll()
+        captureOutputs.removeAll()
         mailboxStateLock.lock()
         mailbox.beginSession(generation:localSessionGeneration)
         mailboxStateLock.unlock()

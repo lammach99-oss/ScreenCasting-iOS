@@ -83,6 +83,85 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         }
         return data
     }
+
+    private func castingTLSFixtures() throws -> [String: WireMessage] {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "ds8-casting-tls-golden", withExtension: "json"))
+        let vectors = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: url))
+        return try vectors.mapValues { hex in
+            var message: WireMessage?
+            let parser = WireStreamParser(generation: 1)
+            parser.consume(bytes(hex), generation: 1) { event in
+                if case .message(let value) = event { message = value }
+            }
+            return try XCTUnwrap(message)
+        }
+    }
+
+    func testCastingTLSGoldenProbeAndReservedVideo() throws {
+        let vectors = try castingTLSFixtures()
+        XCTAssertEqual(vectors.count, 12)
+        for (name, route) in [("wifiRtp", AdaptiveCastingRoute.wifiRTP), ("wifiTls", .wifiTLS), ("usbTls", .usbTLS)] {
+            let ping = try XCTUnwrap(vectors[name + "Ping"])
+            XCTAssertEqual(ping.header.type, .ping)
+            XCTAssertEqual(ping.header.flags, AdaptiveMediaProtocol.probeFlag)
+            XCTAssertEqual(ping.header.sequence, route.rawValue)
+            var probe = AdaptiveMediaProbe()
+            XCTAssertTrue(probe.begin(ping.payload, now: 0, castingRoute: route))
+            let pong = try XCTUnwrap(vectors[route == .wifiRTP ? "wifiTlsPong" : name + "Pong"])
+            if route != .wifiRTP {
+                XCTAssertFalse(probe.accept(pong.payload, flags: pong.header.flags, sequence: 0, now: 0.25))
+                XCTAssertEqual(probe.phase, .waiting)
+            }
+            XCTAssertTrue(probe.accept(pong.payload, flags: pong.header.flags, sequence: pong.header.sequence, now: 0.5))
+        }
+        for (name, phase) in [("usbTlsBackoffPong", AdaptiveMediaProbe.Phase.backoff), ("legacyPong", .legacy)] {
+            let pong = try XCTUnwrap(vectors[name])
+            var probe = AdaptiveMediaProbe()
+            XCTAssertTrue(probe.begin(pong.payload, now: 0, castingRoute: .usbTLS))
+            XCTAssertFalse(probe.accept(pong.payload, flags: pong.header.flags, sequence: pong.header.sequence, now: 1))
+            XCTAssertEqual(probe.phase, phase)
+        }
+
+        let configuration = try XCTUnwrap(vectors["configuration"])
+        let value = try XCTUnwrap(AdaptiveMediaProtocol.decode(type: 98, data: configuration.payload)?.effective)
+        var runtimePayload = configuration.payload
+        runtimePayload.storeLittleEndian(UInt32(8_000_000), at: 84)
+        let runtimeValue = try XCTUnwrap(AdaptiveMediaProtocol.decode(type: 98, data: runtimePayload)?.effective)
+        let reserved = try XCTUnwrap(vectors["video"])
+        let control = try XCTUnwrap(vectors["interleavedPong"])
+        var caps = bytes(try XCTUnwrap(try fixtures()["94"]))
+        caps[51] = 0
+        caps.storeLittleEndian(UInt32(3_000_000), at: 28)
+        func session() throws -> AdaptiveMediaSession {
+            var session = AdaptiveMediaSession(owner: 1, nonce: 4, castingRoute: .wifiTLS)
+            XCTAssertTrue(session.acceptCapabilities(try XCTUnwrap(AdaptiveMediaProtocol.decode(type: 94, data: caps))))
+            var baseline = try manualBaselineState(owner: 1)
+            baseline.storeLittleEndian(value.identity.source, at: 16)
+            XCTAssertTrue(session.receiveState(try XCTUnwrap(AdaptiveMediaProtocol.decode(type: 96, data: baseline)?.effective)))
+            return session
+        }
+        var good = try session()
+        XCTAssertFalse(good.configure(runtimeValue, controlSequence: configuration.header.sequence + 1))
+        XCTAssertTrue(good.configure(runtimeValue, controlSequence: configuration.header.sequence))
+        XCTAssertEqual(AdaptiveMediaProtocol.ack(value, status: 0).encoded, vectors["ready"]?.payload)
+        XCTAssertNil(good.presented(sequence: reserved.header.sequence))
+        XCTAssertEqual(control.header.type, .pong)
+        XCTAssertTrue(control.header.sequence > reserved.header.sequence)
+        guard case .cutover = good.admitCastingTLS(sequence: reserved.header.sequence, isIDR: true, hasParameterSets: true) else {
+            return XCTFail("The reserved IDR must satisfy the barrier")
+        }
+        XCTAssertTrue(good.admit(sequence: reserved.header.sequence, isIDR: true))
+        XCTAssertNil(good.presented(sequence: control.header.sequence))
+        XCTAssertEqual(good.presented(sequence: reserved.header.sequence)?.encoded, vectors["presented"]?.payload)
+        XCTAssertNil(good.presented(sequence: reserved.header.sequence))
+        for (sequence, sets) in [(reserved.header.sequence, false), (reserved.header.sequence - 1, true), (reserved.header.sequence + 1, true)] {
+            var bad = try session()
+            XCTAssertTrue(bad.configure(runtimeValue, controlSequence: configuration.header.sequence))
+            guard case .missingFirstFrame = bad.admitCastingTLS(sequence: sequence, isIDR: true, hasParameterSets: sets) else {
+                return XCTFail("Invalid Video must fail the reserved frame barrier")
+            }
+        }
+    }
     func testAllSevenCodecsRoundTripTheSharedCSharpFixture() throws {
         let vectors = try fixtures()
         for type in UInt8(93)...99 {
@@ -312,6 +391,30 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         data.storeLittleEndian(media,at:24); data.storeLittleEndian(first,at:88); data.storeLittleEndian(UInt32(8_000_000),at:84)
         return try XCTUnwrap(AdaptiveMediaProtocol.decode(type:type,data:data)?.effective)
     }
+    private func manualBaselineState(owner: UInt64) throws -> Data {
+        var baseline = bytes(try XCTUnwrap(try fixtures()["96"]))
+        baseline.storeLittleEndian(owner, at: 8)
+        baseline.storeLittleEndian(UInt64(1), at: 24)
+        baseline.storeLittleEndian(UInt32(0), at: 32)
+        baseline.storeLittleEndian(UInt32(1), at: 36)
+        baseline.storeLittleEndian(UInt32(1), at: 40)
+        baseline[45] = 0; baseline[46] = 0; baseline[47] = 0
+        let width = baseline.loadLittleEndian(UInt32.self, at: 48)
+        let height = baseline.loadLittleEndian(UInt32.self, at: 52)
+        baseline.storeLittleEndian(width, at: 56)
+        baseline.storeLittleEndian(height, at: 60)
+        baseline.storeLittleEndian(UInt32(0), at: 64)
+        baseline.storeLittleEndian(UInt32(0), at: 68)
+        baseline.storeLittleEndian(width, at: 72)
+        baseline.storeLittleEndian(height, at: 76)
+        baseline.storeLittleEndian(UInt16(600), at: 80)
+        baseline.storeLittleEndian(UInt16(10000), at: 82)
+        baseline.storeLittleEndian(UInt32(27_000_000), at: 84)
+        baseline.storeLittleEndian(UInt64(0), at: 88)
+        baseline.storeLittleEndian(UInt32(0), at: 96)
+        return baseline
+    }
+
     func testManualRestoreIsOnePolicyAndDoesNotOverwriteSavedTarget() throws {
         var s=try castingSession(); XCTAssertTrue(s.receiveState(try effective()))
         XCTAssertNil(s.makePolicy(auto:false,manualBps:2_000_000,game:false))
@@ -432,6 +535,303 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         XCTAssertEqual(out.filter { if case .touch(.up,_,_,_)=$0 { return true }; return false }.count,1)
     }
     #if targetEnvironment(simulator)
+    @MainActor func testCastingTLSRequiresARenderedIDRAndDeclinesToSavedManual() async throws {
+        let video = try XCTUnwrap(try castingTLSFixtures()["video"])
+        for tag: UInt32 in [1, 2] {
+            for backoff in [false, true] {
+                let suite = "CastingTLSDecline." + UUID().uuidString
+                let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+                defer { defaults.removePersistentDomain(forName: suite) }
+                let host = Data(repeating: 1, count: 16)
+                ClientStreamSettingsStore.saveAutoQuality(true, hostID: host, defaults: defaults)
+                ClientStreamSettingsStore.save(.normalized(bitrateMbps: 12, audioEnabled: false, adaptiveBitrateEnabled: true),
+                                               hostID: host, defaults: defaults)
+                let network = NetworkManager(userDefaults: defaults)
+                defer { network.stopForTesting() }
+                var writes: [Data] = []
+                var decoded: [UInt32] = []
+                network.adaptiveMediaClockForTesting = { 1 }
+                network.realtimeAudioPlaybackForTesting = { enabled in XCTAssertFalse(enabled) }
+                network.captureTargetDecodeForTesting = { _, sequence, _ in decoded.append(sequence) }
+                network.controlSendForAudioTesting = { data, done in writes.append(data); done(nil) }
+                let peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+                network.setAdaptiveHostForTesting(host, usb: tag == 2)
+                network.beginTransferWriterForTesting()
+                network.reconnectAttemptForTesting = 3
+                func receive(_ type: WireMessageType, _ payload: Data, flags: UInt16 = 0, sequence: UInt32 = 0) {
+                    network.receiveCaptureTargetWireForTesting(type: type, payload: payload, flags: flags, sequence: sequence,
+                                                               generation: peer.generation, connection: peer.connection)
+                }
+                func probes() -> [Data] {
+                    network.networkQueueForTesting.sync {
+                        writes.filter { $0[5] == 6 && $0.loadLittleEndian(UInt16.self, at: 6) == AdaptiveMediaProtocol.probeFlag }
+                    }
+                }
+                network.beginAdaptiveMediaForTesting()
+                receive(.video, video.payload, flags: video.header.flags, sequence: 10)
+                XCTAssertEqual(network.networkQueueForTesting.sync { decoded }, [10])
+                let decoder = network.decoder.currentSessionGeneration
+                network.recordCapturePresentation(sequence: 10, generation: decoder &- 1)
+                network.recordCapturePresentation(sequence: 11, generation: decoder)
+                XCTAssertTrue(probes().isEmpty)
+                network.recordCapturePresentation(sequence: 10, generation: decoder)
+                network.recordCapturePresentation(sequence: 10, generation: decoder)
+                await drainCastingQuality(network)
+                XCTAssertEqual(probes().count, 1)
+                let probe = try XCTUnwrap(probes().first)
+                XCTAssertEqual(probe.loadLittleEndian(UInt32.self, at: 12), tag)
+                let challenge = Data(probe.suffix(16))
+                receive(.pong, challenge, flags: backoff ? 0x0040 : 0, sequence: backoff ? tag : 67)
+                receive(.pong, challenge, flags: 0x0200, sequence: tag)
+                var settings = Data(count: 24)
+                settings[0] = 1; settings[3] = 1
+                settings.storeLittleEndian(UInt64(7), at: 8)
+                settings.storeLittleEndian(UInt32(27_000_000), at: 16)
+                receive(.settingsState, settings)
+                await drainCastingQuality(network)
+                let sent = network.networkQueueForTesting.sync { writes }
+                XCTAssertFalse(sent.contains { (93...99).contains($0[5]) })
+                let update = try XCTUnwrap(sent.last { $0[5] == WireMessageType.settingsUpdate.rawValue })
+                XCTAssertEqual(update[19], 0)
+                XCTAssertEqual(update.loadLittleEndian(UInt32.self, at: 32), 12_000_000)
+                XCTAssertEqual(probes().count, 1)
+                XCTAssertFalse(network.adaptiveQualityAvailable)
+                XCTAssertEqual(network.adaptiveQualityBackoffActive, backoff)
+                XCTAssertTrue(network.legacyAutomaticBitrateUnavailable)
+                XCTAssertTrue(ClientStreamSettingsStore.loadAutoQuality(hostID: host, defaults: defaults))
+                if backoff { XCTAssertEqual(network.reconnectAttemptForTesting, 3) }
+            }
+        }
+    }
+
+    @MainActor func testCastingFallbackAndUSBRebindFenceQualityOwnerAndReservedPresentation() async throws {
+        let vectors = try castingTLSFixtures()
+        let video = try XCTUnwrap(vectors["video"])
+        let suite = "CastingTLSCutover." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let host = Data(repeating: 1, count: 16)
+        ClientStreamSettingsStore.save(.normalized(bitrateMbps: 27, audioEnabled: false), defaults: defaults)
+        ClientStreamSettingsStore.saveAutoQuality(true, hostID: host, defaults: defaults)
+        let network = NetworkManager(userDefaults: defaults)
+        defer { network.stopForTesting() }
+        var writes: [Data] = []
+        var decoded: [UInt32] = []
+        var now = 1.0
+        network.adaptiveMediaClockForTesting = { now }
+        network.realtimeAudioPlaybackForTesting = { enabled in XCTAssertFalse(enabled) }
+        network.captureTargetScheduleForTesting = { _, _ in }
+        network.captureTargetDecodeForTesting = { _, sequence, _ in decoded.append(sequence) }
+        network.decoder.installAdaptiveMediaRenderer { _ in true }
+        network.controlSendForAudioTesting = { data, done in writes.append(data); done(nil) }
+        var peer = network.simulateCommittedWifiSessionForTesting()
+        network.setAdaptiveHostForTesting(host)
+        network.beginTransferWriterForTesting()
+        func packets(_ type: WireMessageType) -> [Data] {
+            network.networkQueueForTesting.sync { writes.filter { $0[5] == type.rawValue } }
+        }
+        func probes() -> [Data] {
+            packets(.ping).filter { $0.loadLittleEndian(UInt16.self, at: 6) == AdaptiveMediaProtocol.probeFlag }
+        }
+        func receive(_ type: WireMessageType, _ payload: Data, flags: UInt16 = 0, sequence: UInt32 = 0) {
+            network.receiveCaptureTargetWireForTesting(type: type, payload: payload, flags: flags, sequence: sequence,
+                                                       generation: peer.generation, connection: peer.connection)
+        }
+        func renderBaseline(_ sequence: UInt32) async {
+            receive(.video, video.payload, flags: video.header.flags, sequence: sequence)
+            network.recordCapturePresentation(sequence: sequence, generation: network.decoder.currentSessionGeneration)
+            await drainCastingQuality(network)
+        }
+        func reply(_ probe: Data) async throws -> UInt64 {
+            let tag = probe.loadLittleEndian(UInt32.self, at: 12)
+            receive(.pong, Data(probe.suffix(16)), flags: 0x0200, sequence: tag)
+            await drainCastingQuality(network)
+            let hello = try XCTUnwrap(packets(.qualityHello).last)
+            let owner = hello.loadLittleEndian(UInt64.self, at: 40)
+            var caps = bytes(try XCTUnwrap(try fixtures()["94"]))
+            caps.storeLittleEndian(hello.loadLittleEndian(UInt64.self, at: 32), at: 8)
+            caps.storeLittleEndian(owner, at: 16)
+            caps.storeLittleEndian(UInt32(3_000_000), at: 28)
+            caps[51] = 0
+            receive(.qualityCapabilities, caps)
+            await drainCastingQuality(network)
+            return owner
+        }
+        network.beginAdaptiveMediaForTesting(baselinePresented: true)
+        await drainCastingQuality(network)
+        let rtpProbe = try XCTUnwrap(probes().last)
+        let rtpOwner = try await reply(rtpProbe)
+        let retiredDecoder = network.decoder.currentSessionGeneration
+        XCTAssertTrue(network.networkQueueForTesting.sync {
+            network.fallbackCommittedWifiToLegacy(generation: peer.generation)
+        })
+        XCTAssertNotEqual(network.decoder.currentSessionGeneration, retiredDecoder)
+        network.recordCapturePresentation(sequence: 10, generation: retiredDecoder)
+        await drainCastingQuality(network)
+        XCTAssertEqual(probes().count, 1)
+        await renderBaseline(10)
+        let tlsProbe = try XCTUnwrap(probes().last)
+        XCTAssertEqual(tlsProbe.loadLittleEndian(UInt32.self, at: 12), 1)
+        XCTAssertNotEqual(tlsProbe.suffix(16), rtpProbe.suffix(16))
+        receive(.pong, Data(rtpProbe.suffix(16)), flags: 0x0200, sequence: 1)
+        receive(.pong, Data(tlsProbe.suffix(16)), flags: 0x0200, sequence: 0)
+        await drainCastingQuality(network)
+        XCTAssertEqual(packets(.qualityHello).count, 1)
+        let tlsOwner = try await reply(tlsProbe)
+        XCTAssertNotEqual(tlsOwner, rtpOwner)
+        XCTAssertTrue(packets(.qualityPolicySet).isEmpty)
+
+        var baseline = try manualBaselineState(owner: tlsOwner)
+        baseline.storeLittleEndian(UInt64(2), at: 16)
+        receive(.qualityState, baseline)
+        receive(.qualityState, baseline)
+        await drainCastingQuality(network)
+        XCTAssertEqual(packets(.qualityPolicySet).count, 1)
+        XCTAssertTrue(network.adaptiveQualityAvailable)
+        let configuration = try XCTUnwrap(vectors["configuration"])
+        var cutover = configuration.payload
+        cutover.storeLittleEndian(tlsOwner, at: 8)
+        cutover.storeLittleEndian(UInt32(8_000_000), at: 84)
+        var missingSets = cutover
+        missingSets.storeLittleEndian(UInt64(2), at: 24)
+        missingSets.storeLittleEndian(UInt64(39), at: 88)
+        receive(.qualityConfiguration, missingSets, sequence: 38)
+        receive(.video, Data(video.payload.suffix(7)), flags: video.header.flags, sequence: 39)
+        await drainCastingQuality(network)
+        XCTAssertEqual(packets(.qualityConfigurationAck).map { $0[60] }, [0, 2])
+        XCTAssertEqual(network.networkQueueForTesting.sync { decoded }, [10])
+        receive(.qualityConfiguration, cutover, sequence: configuration.header.sequence)
+        let control = try XCTUnwrap(vectors["interleavedPong"])
+        receive(.pong, control.payload, flags: control.header.flags, sequence: control.header.sequence)
+        receive(.video, video.payload, flags: video.header.flags, sequence: video.header.sequence)
+        XCTAssertEqual(network.networkQueueForTesting.sync { decoded }, [10, 41])
+        let tlsDecoder = network.decoder.currentSessionGeneration
+        network.recordCapturePresentation(sequence: video.header.sequence, generation: retiredDecoder)
+        network.recordCapturePresentation(sequence: control.header.sequence, generation: tlsDecoder)
+        await drainCastingQuality(network)
+        XCTAssertEqual(packets(.qualityConfigurationAck).map { $0[60] }, [0, 2, 0])
+        network.recordCapturePresentation(sequence: video.header.sequence, generation: tlsDecoder)
+        await drainCastingQuality(network)
+        let acknowledgements = packets(.qualityConfigurationAck)
+        XCTAssertEqual(acknowledgements.map { $0[60] }, [0, 2, 0, 1])
+        XCTAssertEqual(acknowledgements.map { $0.loadLittleEndian(UInt64.self, at: 64) }, [39, 39, 41, 41])
+        var applied = cutover
+        applied[44] = 0
+        applied.storeLittleEndian(UInt64(0), at: 88)
+        receive(.qualityState, applied)
+        await drainCastingQuality(network)
+        XCTAssertEqual(network.adaptiveDesktopSize, CGSize(width: 3840, height: 2160))
+        XCTAssertTrue(network.effectiveQualitySummary?.contains("text sharpness reduced") == true)
+
+        receive(.video, video.payload, flags: video.header.flags, sequence: 43)
+        receive(.video, video.payload, flags: video.header.flags, sequence: 43)
+        network.decoder.onAdaptiveDecoded?(43, tlsDecoder, 150, 300)
+        network.recordCapturePresentation(sequence: 43, generation: tlsDecoder)
+        network.networkQueueForTesting.sync { now += 1.1 }
+        network.sendAdaptiveFeedbackForTesting()
+        await drainCastingQuality(network)
+        let feedback = try XCTUnwrap(packets(.qualityFeedback).last)
+        XCTAssertEqual(feedback.loadLittleEndian(UInt64.self, at: 24), tlsOwner)
+        XCTAssertEqual(feedback.loadLittleEndian(UInt64.self, at: 64), UInt64(video.payload.count * 2))
+        XCTAssertEqual(feedback.loadLittleEndian(UInt64.self, at: 72), 2)
+        XCTAssertEqual(feedback.loadLittleEndian(UInt64.self, at: 80), 1)
+        XCTAssertEqual(feedback.loadLittleEndian(UInt64.self, at: 88), 2)
+        XCTAssertEqual(feedback.loadLittleEndian(UInt32.self, at: 96), 0)
+        XCTAssertEqual(feedback.loadLittleEndian(UInt32.self, at: 120), 300)
+
+        peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        network.setAdaptiveHostForTesting(host, usb: true)
+        network.beginTransferWriterForTesting()
+        network.recordCapturePresentation(sequence: 41, generation: tlsDecoder)
+        await renderBaseline(10)
+        let usbProbe = try XCTUnwrap(probes().last)
+        XCTAssertEqual(usbProbe.loadLittleEndian(UInt32.self, at: 12), 2)
+        XCTAssertNotEqual(usbProbe.suffix(16), tlsProbe.suffix(16))
+        let usbOwner = try await reply(usbProbe)
+        XCTAssertNotEqual(usbOwner, tlsOwner)
+        baseline.storeLittleEndian(usbOwner, at: 8)
+        receive(.qualityState, baseline)
+        await drainCastingQuality(network)
+        XCTAssertEqual(packets(.qualityPolicySet).count, 2)
+        XCTAssertEqual(packets(.qualityConfigurationAck), acknowledgements)
+        network.networkQueueForTesting.sync { now += 1.1 }
+        network.sendAdaptiveFeedbackForTesting()
+        await drainCastingQuality(network)
+        let usbFeedback = try XCTUnwrap(packets(.qualityFeedback).last)
+        XCTAssertEqual(usbFeedback.loadLittleEndian(UInt64.self, at: 24), usbOwner)
+        XCTAssertEqual(usbFeedback.loadLittleEndian(UInt64.self, at: 48), 0)
+        XCTAssertEqual(usbFeedback.loadLittleEndian(UInt64.self, at: 64), 0)
+
+        let usbGeneration = peer.generation
+        let usbDecoder = network.decoder.currentSessionGeneration
+        peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        network.setAdaptiveHostForTesting(host)
+        network.beginTransferWriterForTesting()
+        XCTAssertNotEqual(peer.generation, usbGeneration)
+        network.recordCapturePresentation(sequence: 10, generation: usbDecoder)
+        await drainCastingQuality(network)
+        XCTAssertEqual(probes().count, 3)
+        await renderBaseline(10)
+        let wifiProbe = try XCTUnwrap(probes().last)
+        XCTAssertEqual(wifiProbe.loadLittleEndian(UInt32.self, at: 12), 1)
+        XCTAssertNotEqual(wifiProbe.suffix(16), usbProbe.suffix(16))
+        let wifiOwner = try await reply(wifiProbe)
+        XCTAssertNotEqual(wifiOwner, usbOwner)
+    }
+
+    @MainActor private func drainCastingQuality(_ network: NetworkManager) async {
+        for _ in 0..<4 {
+            let drained = expectation(description: "casting quality writer and UI")
+            network.networkQueueForTesting.async { DispatchQueue.main.async { drained.fulfill() } }
+            await fulfillment(of: [drained], timeout: 2)
+        }
+    }
+
+    @MainActor func testCastingFallbackDropsQualityHelloQueuedBehindAnInFlightWrite() async throws {
+        let suite = "CastingTLSQueuedWrite." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        ClientStreamSettingsStore.save(.normalized(bitrateMbps: 27, audioEnabled: false), defaults: defaults)
+        let network = NetworkManager(userDefaults: defaults)
+        defer { network.stopForTesting() }
+        let peer = network.simulateCommittedWifiSessionForTesting()
+        network.adaptiveMediaClockForTesting = { 1 }
+        network.realtimeAudioPlaybackForTesting = { enabled in XCTAssertFalse(enabled) }
+        var writes: [Data] = []
+        var finishPong: (() -> Void)?
+        network.controlSendForAudioTesting = { frame, done in
+            writes.append(frame)
+            if frame[5] == WireMessageType.pong.rawValue, frame.loadLittleEndian(UInt32.self, at: 12) == 17 {
+                finishPong = { done(nil) }
+            } else { done(nil) }
+        }
+        network.beginTransferWriterForTesting()
+        network.beginAdaptiveMediaForTesting(baselinePresented: true)
+        await drainCastingQuality(network)
+        let probe = try XCTUnwrap(network.networkQueueForTesting.sync {
+            writes.first { $0[5] == WireMessageType.ping.rawValue && $0.loadLittleEndian(UInt16.self, at: 6) == 0x0200 }
+        })
+        network.receiveCaptureTargetWireForTesting(type: .ping, payload: Data(count: 16), sequence: 17,
+            generation: peer.generation, connection: peer.connection)
+        await drainCastingQuality(network)
+        XCTAssertTrue(network.networkQueueForTesting.sync { finishPong != nil })
+        network.receiveCaptureTargetWireForTesting(type: .pong, payload: Data(probe.suffix(16)), flags: 0x0200,
+            generation: peer.generation, connection: peer.connection)
+        await drainCastingQuality(network)
+        XCTAssertTrue(network.networkQueueForTesting.sync {
+            let fellBack = network.fallbackCommittedWifiToLegacy(generation: peer.generation)
+            finishPong?()
+            finishPong = nil
+            return fellBack
+        })
+        network.receiveCaptureTargetWireForTesting(type: .ping, payload: Data(count: 16), sequence: 18,
+            generation: peer.generation, connection: peer.connection)
+        await drainCastingQuality(network)
+        let sent = network.networkQueueForTesting.sync { writes }
+        XCTAssertFalse(sent.contains { $0[5] == WireMessageType.qualityHello.rawValue })
+        XCTAssertTrue(sent.contains { $0[5] == WireMessageType.pong.rawValue && $0.loadLittleEndian(UInt32.self, at: 12) == 18 })
+    }
+
     @MainActor func testManualPlaybackResetsRetryBudgetOnlyAfterSustainedFreshPresentation() async throws {
         enum Outcome: CaseIterable { case healthy, brief, duplicate, gap, cutover, failedCutover }
         for remote in [false, true] {
@@ -458,7 +858,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
                 network.setAdaptiveHostForTesting(Data(repeating: 1, count: 16))
                 network.reconnectAttemptForTesting = 8
                 network.beginTransferWriterForTesting()
-                network.beginAdaptiveMediaForTesting()
+                network.beginAdaptiveMediaForTesting(baselinePresented: true)
 
                 func lastWrite(_ type: WireMessageType) -> Data? {
                     network.networkQueueForTesting.sync { writes.last { $0[5] == type.rawValue } }
@@ -482,7 +882,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
                 caps[51] = remote ? 1 : 0
                 if !remote { caps.storeLittleEndian(UInt32(3_000_000), at: 28) }
                 receive(.qualityCapabilities, caps)
-                let baseline = try remoteQualityState(owner: owner)
+                let baseline = try manualBaselineState(owner: owner)
                 receive(.qualityState, baseline)
 
                 if remote {
@@ -567,7 +967,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
             network.reconnectAttemptForTesting = 3
             network.beginTransferWriterForTesting()
             network.requestCurrentSettingsForTesting(generation: peer.generation)
-            network.beginAdaptiveMediaForTesting()
+            network.beginAdaptiveMediaForTesting(baselinePresented: true)
             await drain()
             let ping = try XCTUnwrap(frames(6).first { $0.loadLittleEndian(UInt16.self, at: 6) == 0x0200 })
             func receive(_ type: WireMessageType, _ payload: Data, flags: UInt16 = 0) {
@@ -585,7 +985,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
             await drain()
             if flags != 0x0200 || elapsed >= 2 {
                 receive(.pong, Data(ping.suffix(16)), flags: 0x0200)
-                network.beginAdaptiveMediaForTesting()
+                network.beginAdaptiveMediaForTesting(baselinePresented: true)
                 await drain()
                 XCTAssertTrue(frames(93).isEmpty)
                 XCTAssertEqual(frames(6).filter { $0.loadLittleEndian(UInt16.self, at: 6) == 0x0200 }.count, 1)
@@ -607,7 +1007,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
             caps.storeLittleEndian(hello.loadLittleEndian(UInt64.self, at: 16), at: 8)
             caps.storeLittleEndian(owner, at: 16)
             receive(.qualityCapabilities, caps)
-            receive(.qualityState, try remoteQualityState(owner: owner))
+            receive(.qualityState, try manualBaselineState(owner: owner))
             await drain()
             XCTAssertTrue(network.adaptiveQualityAvailable)
             let policy = try XCTUnwrap(frames(95).last)
@@ -632,30 +1032,6 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         var wire = ConnectionControlProtocol.frame(type: type.rawValue, payload: payload, sequence: sequence)
         wire.storeLittleEndian(flags, at: 6)
         return wire
-    }
-
-    private func remoteQualityState(owner: UInt64) throws -> Data {
-        var baseline = bytes(try XCTUnwrap(try fixtures()["96"]))
-        baseline.storeLittleEndian(owner, at: 8)
-        baseline.storeLittleEndian(UInt64(1), at: 24)
-        baseline.storeLittleEndian(UInt32(0), at: 32)
-        baseline.storeLittleEndian(UInt32(1), at: 36)
-        baseline.storeLittleEndian(UInt32(1), at: 40)
-        baseline[45] = 0; baseline[46] = 0; baseline[47] = 0
-        let width = baseline.loadLittleEndian(UInt32.self, at: 48)
-        let height = baseline.loadLittleEndian(UInt32.self, at: 52)
-        baseline.storeLittleEndian(width, at: 56)
-        baseline.storeLittleEndian(height, at: 60)
-        baseline.storeLittleEndian(UInt32(0), at: 64)
-        baseline.storeLittleEndian(UInt32(0), at: 68)
-        baseline.storeLittleEndian(width, at: 72)
-        baseline.storeLittleEndian(height, at: 76)
-        baseline.storeLittleEndian(UInt16(600), at: 80)
-        baseline.storeLittleEndian(UInt16(10000), at: 82)
-        baseline.storeLittleEndian(UInt32(27_000_000), at: 84)
-        baseline.storeLittleEndian(UInt64(0), at: 88)
-        baseline.storeLittleEndian(UInt32(0), at: 96)
-        return baseline
     }
 
     @MainActor func testRemoteTLSManualPreemptsCutoverAndRollbackPresentsOnlyItsReservedIDR() async throws {
@@ -683,7 +1059,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         }
         network.beginTransferWriterForTesting()
         network.requestCurrentSettingsForTesting(generation: peer.generation)
-        network.beginAdaptiveMediaForTesting()
+        network.beginAdaptiveMediaForTesting(baselinePresented: true)
         func drain() async {
             for _ in 0..<4 {
                 let barrier = expectation(description: "remote quality")
@@ -708,7 +1084,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         caps.storeLittleEndian(hello.loadLittleEndian(UInt64.self, at: 16), at: 8)
         caps.storeLittleEndian(owner, at: 16)
         receive(.qualityCapabilities, caps)
-        let baseline = try remoteQualityState(owner: owner)
+        let baseline = try manualBaselineState(owner: owner)
         receive(.qualityState, baseline)
         let get = try XCTUnwrap(frames(WireMessageType.settingsGet.rawValue).last)
         var settings = Data(get.dropFirst(16))
@@ -909,7 +1285,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
             network.beginTransferWriterForTesting()
             network.requestCurrentSettingsForTesting(generation: peer.generation)
             let priorProbeCount = sentProbes().count
-            network.beginAdaptiveMediaForTesting()
+            network.beginAdaptiveMediaForTesting(baselinePresented: true)
             await drain()
             XCTAssertEqual(sentProbes().count, priorProbeCount + 1)
             let probe = try XCTUnwrap(sentProbes().last)
@@ -931,7 +1307,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
             now += 1
             receive(.pong, Data(probe.suffix(16)), flags: 0x0040)
             receive(.pong, Data(probe.suffix(16)), flags: 0x0200)
-            network.beginAdaptiveMediaForTesting()
+            network.beginAdaptiveMediaForTesting(baselinePresented: true)
             reportLegacyAutomaticBitrate()
             await drain()
             let afterPong = network.networkQueueForTesting.sync { Array(writes.dropFirst(beforePong)) }
@@ -954,7 +1330,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         let next = network.simulateCommittedWifiSessionForTesting()
         network.setAdaptiveHostForTesting(host)
         network.beginTransferWriterForTesting()
-        network.beginAdaptiveMediaForTesting()
+        network.beginAdaptiveMediaForTesting(baselinePresented: true)
         await drain()
         XCTAssertEqual(sentProbes().count, 3)
         let probe = try XCTUnwrap(sentProbes().last)
@@ -972,7 +1348,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
             network.realtimeAudioPlaybackForTesting={ _ in XCTFail("No audio in DS2 tests") }
             let peer=network.simulateCommittedWifiSessionForTesting(mode:RealtimeTransportMode.wifiRTP,remote:remote)
             defer { network.stopForTesting() }; network.beginTransferWriterForTesting()
-            network.beginAdaptiveMediaForTesting()
+            network.beginAdaptiveMediaForTesting(baselinePresented: true)
             func drain() async {
                 for _ in 0..<4 {
                     network.networkQueueForTesting.sync {}
@@ -1008,7 +1384,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
             defer { network.stopForTesting() }
             network.beginTransferWriterForTesting()
             network.decoder.onAdaptiveMedia = { _ in true }
-            network.beginAdaptiveMediaForTesting()
+            network.beginAdaptiveMediaForTesting(baselinePresented: true)
             func drain() async {
                 for _ in 0..<4 {
                     network.networkQueueForTesting.sync {}
@@ -1105,7 +1481,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         network.setAdaptiveHostForTesting(hostID)
         defer { network.stopForTesting() }; network.beginTransferWriterForTesting()
         network.decoder.onAdaptiveMedia={ _ in true }
-        network.beginAdaptiveMediaForTesting()
+        network.beginAdaptiveMediaForTesting(baselinePresented: true)
         func drain() async {
             for _ in 0..<4 {
                 network.networkQueueForTesting.sync {}
@@ -1225,7 +1601,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         }
         func negotiate() async throws -> UInt64 {
             network.beginTransferWriterForTesting()
-            network.beginAdaptiveMediaForTesting()
+            network.beginAdaptiveMediaForTesting(baselinePresented: true)
             await drain()
             let probe = try XCTUnwrap(writes.last { $0[5] == 6 && $0.loadLittleEndian(UInt16.self, at: 6) & 0x0200 != 0 })
             receive(.pong, Data(probe.suffix(16)), flags: 0x0200)
@@ -1284,7 +1660,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         XCTAssertTrue(network.admitAdaptiveFrameForTesting(1, isIDR: true), "The retired FirstFrame floor must not survive")
     }
 
-    @MainActor func testSavedCastingAutoReturnsOnlyOnNegotiatedWifiRTPAndReappliesOnce() async throws {
+    @MainActor func testSavedCastingAutoReturnsOnNegotiatedConnectionsAndReappliesOnce() async throws {
         let suite = "CastingQualityConnections." + UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -1324,7 +1700,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
             if !latePairing { network.setAdaptiveHostForTesting(pairedHost, usb: usb) }
             network.beginTransferWriterForTesting()
             network.requestCurrentSettingsForTesting(generation: peer.generation)
-            network.beginAdaptiveMediaForTesting()
+            network.beginAdaptiveMediaForTesting(baselinePresented: mode == RealtimeTransportMode.wifiRTP)
             func drain() async {
                 for _ in 0..<3 {
                     network.networkQueueForTesting.sync {}

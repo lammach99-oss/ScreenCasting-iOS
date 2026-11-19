@@ -126,19 +126,33 @@ enum AdaptiveMediaProtocol {
     }
 }
 
+enum AdaptiveCastingRoute: UInt32 {
+    case wifiRTP = 0, wifiTLS = 1, usbTLS = 2
+
+    var usesOrderedVideo: Bool { self != .wifiRTP }
+}
+
 struct AdaptiveMediaProbe {
     enum Phase { case idle, waiting, enabled, legacy, backoff }
     private(set) var phase: Phase = .idle
-    private var ping = Data(), began: TimeInterval = 0
-    mutating func begin(_ payload: Data, now: TimeInterval) -> Bool {
+    private var ping = Data()
+    private(set) var began: TimeInterval = 0
+    private var castingRoute: AdaptiveCastingRoute?
+    mutating func begin(_ payload: Data, now: TimeInterval, castingRoute: AdaptiveCastingRoute? = nil) -> Bool {
         guard phase == .idle, payload.count == 16 else { return false }
+        self.castingRoute = castingRoute
         phase = .waiting; ping = payload; began = now; return true
     }
+    func matchesRequest(_ payload: Data, sequence: UInt32) -> Bool {
+        phase == .waiting && payload == ping && sequence == (castingRoute?.rawValue ?? 0)
+    }
     mutating func tick(now: TimeInterval) { if phase == .waiting && now-began >= 2 { phase = .legacy; ping = Data() } }
-    mutating func accept(_ payload: Data, flags: UInt16, now: TimeInterval) -> Bool {
+    mutating func accept(_ payload: Data, flags: UInt16, sequence: UInt32 = 0, now: TimeInterval) -> Bool {
         tick(now: now)
         guard phase == .waiting, ping == payload else { return false }
-        switch flags & (AdaptiveMediaProtocol.probeFlag | AdaptiveMediaProtocol.probeBackoffFlag) {
+        let marker = flags & (AdaptiveMediaProtocol.probeFlag | AdaptiveMediaProtocol.probeBackoffFlag)
+        if marker != 0, let castingRoute, castingRoute.usesOrderedVideo, sequence != castingRoute.rawValue { return false }
+        switch marker {
         case AdaptiveMediaProtocol.probeBackoffFlag: phase = .backoff
         case AdaptiveMediaProtocol.probeFlag: phase = .enabled
         case 0: phase = .legacy
@@ -150,14 +164,17 @@ struct AdaptiveMediaProbe {
     mutating func retire() { phase = .legacy; ping = Data() }
 }
 
-/// One instance per authenticated connection. Host values never mutate input
+/// One instance per authenticated route. Host values never mutate input
 /// authority; pending geometry cannot be published as applied quality.
 struct AdaptiveMediaSession {
     let owner: UInt64, nonce: UInt64
     let remote: Bool
-    init(owner: UInt64, nonce: UInt64, remote: Bool = false) {
+    let castingRoute: AdaptiveCastingRoute?
+    init(owner: UInt64, nonce: UInt64, remote: Bool = false, castingRoute: AdaptiveCastingRoute = .wifiRTP) {
         self.owner = owner; self.nonce = nonce; self.remote = remote
+        self.castingRoute = remote ? nil : castingRoute
     }
+    var usesOrderedVideo: Bool { remote || castingRoute?.usesOrderedVideo == true }
     private(set) var capabilities: AdaptiveMediaPacket?
     private(set) var current: AdaptiveMediaEffective?
     private(set) var pending: AdaptiveMediaEffective?
@@ -176,6 +193,7 @@ struct AdaptiveMediaSession {
     var mediaRecoveryActive: Bool { awaitingRollback || pending != nil || awaitingRemoteBaselineIDR || remotePreparing }
     var supportsAuto: Bool {
         guard let caps = capabilities, caps.u32(24) & 7 == 7 else { return false }
+        if castingRoute?.usesOrderedVideo == true { return applied != nil }
         return !remote || (applied != nil && caps.u32(28) <= 20_000_000 && caps.encoded[49] & 4 != 0)
     }
     mutating func acceptCapabilities(_ p: AdaptiveMediaPacket) -> Bool {
@@ -186,6 +204,9 @@ struct AdaptiveMediaSession {
     mutating func receiveState(_ value: AdaptiveMediaEffective) -> Bool {
         guard capabilities != nil, value.identity.owner == owner else { return false }
         if remote { return receiveRemoteState(value) }
+        if castingRoute?.usesOrderedVideo == true, current == nil {
+            guard value.status == 0, value.mode == 0, value.request == 0, fitsCapabilities(value) else { return false }
+        }
         if let old = current {
             if value.identity.source == old.identity.source && value.identity.media != old.identity.media && pending == nil { return false }
             guard value.identity.source >= old.identity.source,
@@ -198,6 +219,9 @@ struct AdaptiveMediaSession {
         if let pending {
             guard value.identity == pending.identity, firstPresented,
                   value.revision >= pending.revision else { return false }
+            if castingRoute?.usesOrderedVideo == true {
+                guard value.status == 0, sameGeometry(value, pending) else { return false }
+            }
             frameFloor = pending.firstFrame; self.pending = nil
         } else if let old = current, value.identity == old.identity,
                   (value.desktopSize != old.desktopSize || value.encodedSize != old.encodedSize || value.fps != old.fps || value.content != old.content) {
@@ -277,9 +301,16 @@ struct AdaptiveMediaSession {
     }
     mutating func configure(_ value: AdaptiveMediaEffective, restoringSource: Bool = false,
                             controlSequence: UInt32 = 0) -> Bool {
+        if usesOrderedVideo {
+            guard value.status == 2, controlSequence < UInt32.max,
+                  value.firstFrame == UInt64(controlSequence + 1) else { return false }
+        }
+        if castingRoute?.usesOrderedVideo == true {
+            guard let current, value.identity.source == current.identity.source,
+                  value.desktopSize == current.desktopSize else { return false }
+        }
         if remote {
-            guard let current, value.status == 2, controlSequence < UInt32.max,
-                  value.firstFrame == UInt64(controlSequence + 1), value.identity.source == current.identity.source,
+            guard let current, value.identity.source == current.identity.source,
                   value.desktopSize == current.desktopSize, value.revision > current.revision,
                   allowsRemoteMode(value, after: current) else { return false }
         }
@@ -305,9 +336,16 @@ struct AdaptiveMediaSession {
         pending = value; frameFloor = value.firstFrame; frameAnchor = value.firstFrame; firstDecoded = false; firstPresented = false
         return true
     }
-    enum RemoteVideoAdmission { case regular, cutover(AdaptiveMediaEffective), discard, missingFirstFrame }
-    var remoteNeedsParameterSets: Bool { awaitingRemoteBaselineIDR || pending != nil && !firstDecoded }
-    mutating func admitRemote(sequence: UInt32, isIDR: Bool, hasParameterSets: Bool) -> RemoteVideoAdmission {
+    enum OrderedVideoAdmission { case regular, cutover(AdaptiveMediaEffective), discard, missingFirstFrame }
+    var orderedVideoNeedsParameterSets: Bool { awaitingRemoteBaselineIDR || pending != nil && !firstDecoded }
+    func admitCastingTLS(sequence: UInt32, isIDR: Bool, hasParameterSets: Bool) -> OrderedVideoAdmission {
+        if awaitingRollback { return .discard }
+        guard let pending else { return .regular }
+        if firstDecoded { return .discard }
+        guard UInt64(sequence) == pending.firstFrame, isIDR, hasParameterSets else { return .missingFirstFrame }
+        return .cutover(pending)
+    }
+    mutating func admitRemote(sequence: UInt32, isIDR: Bool, hasParameterSets: Bool) -> OrderedVideoAdmission {
         if awaitingRollback { return .discard }
         if let pending, !firstDecoded {
             guard let frame = frameIdentity(sequence), frame >= frameFloor else { return .discard }
@@ -332,6 +370,7 @@ struct AdaptiveMediaSession {
     }
     func frameIdentity(_ sequence: UInt32) -> UInt64? {
         guard !awaitingRollback else { return nil }
+        if castingRoute?.usesOrderedVideo == true { return UInt64(sequence) }
         guard let frameAnchor else { return UInt64(sequence) }
         return Self.frameID(sequence,near:frameAnchor)
     }
@@ -345,8 +384,9 @@ struct AdaptiveMediaSession {
         return true
     }
     mutating func presented(sequence: UInt32) -> AdaptiveMediaPacket? {
-        guard let p = pending, firstDecoded, !firstPresented,
-              Self.frameID(sequence,near:p.firstFrame) == p.firstFrame else { return nil }
+        guard let p = pending, firstDecoded, !firstPresented else { return nil }
+        let frame = castingRoute?.usesOrderedVideo == true ? UInt64(sequence) : Self.frameID(sequence, near: p.firstFrame)
+        guard frame == p.firstFrame else { return nil }
         firstPresented = true; return AdaptiveMediaProtocol.ack(p,status:1)
     }
     mutating func failed(reason: UInt8) -> AdaptiveMediaPacket? {
@@ -391,6 +431,8 @@ struct AdaptiveMediaWindow {
         private var slots: [UInt64: UInt64] = [:]
         private(set) var last: UInt64 = 0
 
+        func contains(_ frame: UInt64) -> Bool { slots[frame % Self.capacity] == frame }
+
         mutating func insert(_ frame: UInt64) -> Bool {
             guard last <= frame || last - frame < Self.capacity else { return false }
             let slot = frame % Self.capacity
@@ -415,6 +457,7 @@ struct AdaptiveMediaWindow {
     private var rtt: (UInt32,TimeInterval)?
     init(started: TimeInterval) { self.started = started }
     static func us(_ seconds: TimeInterval) -> UInt32 { UInt32(max(0,min(Double(UInt32.max),(seconds*1_000_000).rounded()))) }
+    func hasReceived(frame: UInt64) -> Bool { receivedFrames.contains(frame) }
     mutating func received(frame: UInt64, bytes: Int, now: TimeInterval, receiveUs: UInt32?) {
         guard receivedFrames.insert(frame) else { return }
         receivedCount &+= 1; self.bytes &+= UInt64(max(0,bytes))

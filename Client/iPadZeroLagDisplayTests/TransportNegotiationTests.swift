@@ -2106,8 +2106,9 @@ final class VideoThroughputV1Tests: XCTestCase {
         XCTAssertEqual(after.realtimeMode, RealtimeTransportMode.legacyTLS)
         XCTAssertEqual(decoder.invalidateCountForTesting, invalidates + 1)
         XCTAssertEqual(decoder.sessionBeganCountForTesting, begins + 1)
+        XCTAssertNotEqual(decoder.currentSessionGeneration, session.generation)
         XCTAssertEqual(Array(decoder.lifecycleEventsForTesting.suffix(3)), [
-            "invalidate-begin", "invalidate-end", "begin-\(session.generation)"])
+            "invalidate-begin", "invalidate-end", "begin-\(decoder.currentSessionGeneration)"])
         XCTAssertFalse(manager.networkQueueForTesting.sync {
             manager.fallbackCommittedWifiToLegacy(generation: session.generation)
         })
