@@ -4,6 +4,175 @@ import UIKit
 @testable import iPadCasting
 
 final class SecureDesktopRecoveryTests: XCTestCase {
+    func testRemoteSecureDesktopOptInAndOldHostFallback() throws {
+        for enabled in [false, true] {
+            var features = RemoteFeatureNegotiation(requestedFeatures: 0x1f)
+            XCTAssertTrue(features.begin(now: 0))
+            let request = try XCTUnwrap(features.pong(flags: 0x4000, now: 1, requestSecureDesktop: enabled))
+            XCTAssertEqual(RemoteFeaturesMessage.decode(request)?.features, enabled ? 0x41f : 0x1f)
+            XCTAssertTrue(features.result(flags: 0, payload: RemoteFeaturesMessage(features: 0x1f).encode()))
+            var secure = RemoteSecureDesktopState()
+            XCTAssertNil(secure.begin(accepted: features.accepted, control: true))
+            XCTAssertFalse(secure.covered)
+            XCTAssertTrue(secure.canSas)
+        }
+    }
+
+    func testRemoteSecureDesktopRevealsAndAcknowledgesOnlyPresentedIDR() {
+        var secure = RemoteSecureDesktopState()
+        XCTAssertEqual(secure.begin(accepted: 0x400, control: true),
+            .request(operation: .controlOn, videoSequence: 0, captureRevision: 0, sourceEpoch: 0))
+        XCTAssertEqual(secure.receive(remoteState(.winlogon, .firstFrame, revision: 3, epoch: 7, sequence: 21),
+            adaptiveOwner: false, timedVideo: false), .fence)
+        XCTAssertTrue(secure.covered)
+        XCTAssertFalse(secure.canSas)
+        XCTAssertEqual(secure.admit(sequence: 21, isIDR: true, decoder: 4), .barrier)
+        XCTAssertTrue(secure.covered)
+        XCTAssertEqual(secure.admit(sequence: 22, isIDR: false, decoder: 4), .drop)
+        XCTAssertNil(secure.presented(sequence: 22, decoder: 4))
+        XCTAssertNil(secure.presented(sequence: 21, decoder: 3))
+        let ack = secure.presented(sequence: 21, decoder: 4)
+        XCTAssertEqual(ack, .request(operation: .presented, videoSequence: 21, captureRevision: 3, sourceEpoch: 7))
+        XCTAssertFalse(secure.covered)
+        XCTAssertFalse(secure.canSas)
+        XCTAssertNotNil(ack)
+        if let ack { XCTAssertTrue(secure.admitRequest(ack)) }
+        XCTAssertTrue(secure.canSas)
+        XCTAssertNil(secure.presented(sequence: 21, decoder: 4))
+        XCTAssertEqual(secure.admit(sequence: 23, isIDR: false, decoder: 4), .drop)
+        XCTAssertEqual(secure.admit(sequence: 24, isIDR: true, decoder: 4), .pass)
+    }
+
+    func testRemoteSecureDesktopRejectsWrongPairAndKeepsCoverOnRevocation() {
+        var secure = RemoteSecureDesktopState()
+        _ = secure.begin(accepted: 0x400, control: true)
+        let first = remoteState(.winlogon, .firstFrame, revision: 3, epoch: 7, sequence: 21)
+        _ = secure.receive(first, adaptiveOwner: false, timedVideo: false)
+        XCTAssertEqual(secure.admit(sequence: 20, isIDR: true, decoder: 4), .invalid)
+        XCTAssertEqual(secure.admit(sequence: 21, isIDR: false, decoder: 4), .invalid)
+        XCTAssertEqual(secure.admit(sequence: 21, isIDR: true, decoder: 4), .barrier)
+        XCTAssertEqual(secure.setControl(false),
+            .request(operation: .controlOff, videoSequence: 0, captureRevision: 0, sourceEpoch: 0))
+        XCTAssertNil(secure.presented(sequence: 21, decoder: 4))
+        _ = secure.setControl(true)
+        XCTAssertEqual(secure.receive(first, adaptiveOwner: false, timedVideo: false), .unchanged)
+        XCTAssertEqual(secure.admit(sequence: 21, isIDR: true, decoder: 4), .drop)
+        XCTAssertTrue(secure.covered)
+        XCTAssertFalse(secure.canSas)
+    }
+
+    func testRemoteSecureDesktopSasStaysDisabledForVideoOnlyGrant() throws {
+        var secure = RemoteSecureDesktopState()
+        _ = secure.begin(accepted: 0x400, control: true)
+        let publication = RemoteSecureDesktopProtocol.Message.state(
+            desktop: .winlogon, phase: .firstFrame, backend: .dxgi, permissions: .video, reason: .none,
+            captureRevision: 3, sourceEpoch: 7, firstVideoSequence: 21)
+        XCTAssertEqual(secure.receive(publication, adaptiveOwner: false, timedVideo: false), .fence)
+        XCTAssertEqual(secure.admit(sequence: 21, isIDR: true, decoder: 4), .barrier)
+        let ack = try XCTUnwrap(secure.presented(sequence: 21, decoder: 4))
+        XCTAssertTrue(secure.admitRequest(ack))
+        XCTAssertFalse(secure.covered)
+        XCTAssertFalse(secure.canSas)
+        XCTAssertFalse(secure.allowsScanAndPointer)
+    }
+
+    func testRemoteSecureDesktopReconnectsAdaptiveOwnerOrTimedVideo() {
+        let hidden = remoteState(.winlogon, .hidden, revision: 2, epoch: 5, sequence: 0)
+        for (adaptive, timed) in [(true, false), (false, true), (false, false)] {
+            var secure = RemoteSecureDesktopState()
+            _ = secure.begin(accepted: 0x400, control: false)
+            XCTAssertEqual(secure.receive(hidden, adaptiveOwner: adaptive, timedVideo: timed),
+                adaptive || timed ? .reconnect : .fence)
+            XCTAssertEqual(secure.admit(sequence: 20, isIDR: true, decoder: 4), .drop)
+        }
+    }
+
+    func testRemoteSecureDesktopUnrequestedGrantIsRejected() {
+        var features = RemoteFeatureNegotiation(requestedFeatures: 0x1f)
+        XCTAssertTrue(features.begin(now: 0))
+        XCTAssertNotNil(features.pong(flags: 0x4000, now: 1))
+        XCTAssertFalse(features.result(flags: 0, payload: RemoteFeaturesMessage(features: 0x41f).encode()))
+    }
+
+    func testRemoteSecureDesktopControlOffDropsWinlogonPairButAllowsDefaultRecovery() {
+        var secure = RemoteSecureDesktopState()
+        _ = secure.begin(accepted: 0x400, control: false)
+        XCTAssertEqual(secure.observeDesktop(.winlogon, adaptiveOwner: false, timedVideo: false), .fence)
+        XCTAssertEqual(secure.admit(sequence: 20, isIDR: true, decoder: 4), .drop)
+        _ = secure.receive(remoteState(.winlogon, .firstFrame, revision: 3, epoch: 7, sequence: 21),
+            adaptiveOwner: false, timedVideo: false)
+        XCTAssertEqual(secure.admit(sequence: 21, isIDR: true, decoder: 4), .drop)
+        XCTAssertNil(secure.presented(sequence: 21, decoder: 4))
+        XCTAssertTrue(secure.covered)
+
+        _ = secure.receive(remoteState(.standard, .firstFrame, revision: 4, epoch: 8, sequence: 22),
+            adaptiveOwner: false, timedVideo: false)
+        XCTAssertEqual(secure.admit(sequence: 22, isIDR: true, decoder: 5), .barrier)
+        XCTAssertEqual(secure.presented(sequence: 22, decoder: 5),
+            .request(operation: .presented, videoSequence: 22, captureRevision: 4, sourceEpoch: 8))
+        XCTAssertFalse(secure.covered)
+        XCTAssertFalse(secure.canSas)
+    }
+
+    func testRemoteSecureDesktopRequiresAnActualHEVCIDR() {
+        XCTAssertTrue(RemoteSecureDesktopState.hasIDR(Data([0, 0, 1, 38, 1, 0x80]), lengthPrefixed: false))
+        XCTAssertTrue(RemoteSecureDesktopState.hasIDR(Data([0, 0, 0, 3, 40, 1, 0x80]), lengthPrefixed: true))
+        XCTAssertFalse(RemoteSecureDesktopState.hasIDR(Data([0, 0, 1, 42, 1, 0x80]), lengthPrefixed: false))
+        XCTAssertFalse(RemoteSecureDesktopState.hasIDR(Data([0, 0, 0, 4, 40, 1, 0x80]), lengthPrefixed: true))
+    }
+
+    func testRemoteSecureDesktopRetiresQueuedAckWhenPublicationChanges() throws {
+        var secure = RemoteSecureDesktopState()
+        _ = secure.begin(accepted: 0x400, control: true)
+        _ = secure.receive(remoteState(.winlogon, .firstFrame, revision: 3, epoch: 7, sequence: 21),
+            adaptiveOwner: false, timedVideo: false)
+        XCTAssertEqual(secure.admit(sequence: 21, isIDR: true, decoder: 4), .barrier)
+        let ack = try XCTUnwrap(secure.presented(sequence: 21, decoder: 4))
+        _ = secure.receive(remoteState(.winlogon, .hidden, revision: 4, epoch: 7, sequence: 0),
+            adaptiveOwner: false, timedVideo: false)
+        XCTAssertFalse(secure.admitRequest(ack))
+        XCTAssertTrue(secure.covered)
+        XCTAssertFalse(secure.canSas)
+    }
+
+    func testRemoteSecureDesktopParserRequiresNegotiatedStateHeader() throws {
+        let payload = try XCTUnwrap(RemoteSecureDesktopProtocol.encode(
+            remoteState(.winlogon, .hidden, revision: 2, epoch: 5, sequence: 0)))
+        let frame = ConnectionControlProtocol.frame(type: 109, payload: payload)
+        let unnegotiated = WireStreamParser(generation: 1)
+        var rejected = false
+        unnegotiated.consume(Data(frame.prefix(WireProtocol.headerSize)), generation: 1) {
+            if case .failure(.invalidHeader) = $0 { rejected = true }
+        }
+        XCTAssertTrue(rejected)
+        XCTAssertEqual(unnegotiated.allocatedPayloadBytes, 0)
+
+        let parser = WireStreamParser(generation: 1, allowsSecureDesktop: { true })
+        var received = 0
+        parser.consume(frame, generation: 1) {
+            guard case let .message(message) = $0 else { return XCTFail("Expected DS7 State") }
+            XCTAssertEqual(message.header.type, .remoteSecureDesktopState)
+            XCTAssertEqual(message.payload, payload)
+            received += 1
+        }
+        XCTAssertEqual(received, 1)
+
+        let malformed = ConnectionControlProtocol.frame(type: 109, payload: Data(count: 31))
+        parser.consume(Data(malformed.prefix(WireProtocol.headerSize)), generation: 1) {
+            if case .failure(.invalidHeader) = $0 { received += 1 }
+        }
+        XCTAssertEqual(received, 2)
+        XCTAssertEqual(parser.allocatedPayloadBytes, 0)
+    }
+
+    private func remoteState(_ desktop: RemoteSecureDesktopProtocol.Desktop, _ phase: RemoteSecureDesktopProtocol.Phase,
+                             revision: UInt64, epoch: UInt64, sequence: UInt32) -> RemoteSecureDesktopProtocol.Message {
+        .state(desktop: desktop, phase: phase, backend: phase == .firstFrame ? .dxgi : .none,
+               permissions: phase == .firstFrame ? (desktop == .winlogon ? .videoAndInputAfterPresented : .video) : .none,
+               reason: phase == .hidden ? .noControl : .none, captureRevision: revision,
+               sourceEpoch: epoch, firstVideoSequence: sequence)
+    }
+
     func testDecoderFenceDropsCompletedOldOutputAndAllowsOnlyPostResumeReceipt() {
         let decoder = DecoderManager(); decoder.beginSession(generation: 7)
         var delivered: [UInt32] = [], fences: [UInt64] = []

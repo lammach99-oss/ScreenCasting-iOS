@@ -130,6 +130,7 @@ struct RemoteFeatureNegotiation {
     }
     private enum Phase { case initial, pong, result, legacy, complete }
     private var phase: Phase = .initial
+    var negotiationSettled: Bool { phase == .complete || phase == .legacy }
     private var deadline: TimeInterval = 0
     private(set) var accepted: UInt64 = 0
     private(set) var context: RemoteInputContextCommand?
@@ -142,10 +143,12 @@ struct RemoteFeatureNegotiation {
     mutating func expire(now: TimeInterval) {
         if phase == .pong && now >= deadline { phase = .legacy }
     }
-    mutating func pong(flags: UInt16, now: TimeInterval, requestRemoteFiles: Bool = false) -> Data? {
+    mutating func pong(flags: UInt16, now: TimeInterval, requestRemoteFiles: Bool = false,
+                       requestSecureDesktop: Bool = false) -> Data? {
         guard phase == .pong else { return nil }
         guard now < deadline, flags & Self.supportedFlag != 0 else { phase = .legacy; return nil }
         if requestRemoteFiles, requestedFeatures & 3 == 3 { requestedFeatures |= Self.remoteFileFeature }
+        if requestSecureDesktop { requestedFeatures |= Self.remoteSecureDesktopFeature }
         phase = .result; return RemoteFeaturesMessage(features: requestedFeatures).encode()
     }
     mutating func result(flags: UInt16, payload: Data) -> Bool {

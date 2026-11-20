@@ -297,6 +297,17 @@ public class NetworkManager: ObservableObject {
     @Published private(set) var remoteFileStatus: String?
     @Published private(set) var remoteFileWaiting = false
     @Published private(set) var remoteFileCanStart = false
+    @Published private(set) var remoteSecureDesktopSupported = false
+    @Published private(set) var remoteSecureDesktopCovered = false
+    @Published private(set) var remoteSecureDesktopControl = false
+    @Published private(set) var remoteSecureDesktopCanSas = true
+    private var remoteSecureDesktop = RemoteSecureDesktopState()
+    private let remoteSecureDesktopPublicationClock = ConnectionGenerationClock()
+    private var remoteSecureControlIntent = false
+    private var remoteTimedVideoLatched = false
+    private var remoteSecureDesktopEnabled: Bool {
+        streamSettingsDefaults.bool(forKey: RemoteSecureDesktopState.preferenceKey)
+    }
     private var remoteFileAccess: RemoteFileAccess?
     private let remoteFileActionClock = ConnectionGenerationClock()
     private var remoteFileIO: DataTransferManager?
@@ -357,7 +368,7 @@ public class NetworkManager: ObservableObject {
     private var remoteMonitorAdmission: (requestId: UInt64, inputRevision: UInt64, controlRevision: UInt64)?
     private let remoteMonitorPublicationClock = ConnectionGenerationClock()
     @Published public private(set) var remoteMonitorState = RemoteMonitorState()
-    private var remoteFeaturesPingNonce: UInt64?
+    private var remoteFeaturesPingChallenge: Data?
     @Published public private(set) var remoteInputFeatures: UInt64 = 0
     @Published public private(set) var remoteInputReady = false
     @Published public private(set) var remoteInputContext: RemoteInputContextCommand?
@@ -537,7 +548,8 @@ public class NetworkManager: ObservableObject {
         })
     private lazy var wireParser = WireParserQueueDomain(
         generation: connectionGeneration,
-        queue: networkQueue, allowsRemoteFiles: { [weak self] in self?.mayReceiveRemoteFiles == true })
+        queue: networkQueue, allowsRemoteFiles: { [weak self] in self?.mayReceiveRemoteFiles == true },
+        allowsSecureDesktop: { [weak self] in self?.remoteSecureDesktop.supported == true })
     private var wireReceiveActiveGeneration: UInt64?
     #if targetEnvironment(simulator)
     private var testingSimulatedWifiSession = false
@@ -919,6 +931,7 @@ public class NetworkManager: ObservableObject {
     public func connect(to endpoint: NWEndpoint) {
         networkQueue.async { [weak self] in
             guard let self else { return }
+            if self.transportState == .idle || self.isDisconnectedOnQueue { self.remoteSecureControlIntent = false }
             if let target = WifiReconnectTargetPolicy.target(from: endpoint) {
                 WifiReconnectTargetStore.save(target)
             }
@@ -1515,10 +1528,11 @@ public class NetworkManager: ObservableObject {
 
     private func beginRemoteFeaturesOnQueue(generation: UInt64) {
         guard remoteInputConnection, remoteFeatures.begin(now: ProcessInfo.processInfo.systemUptime) else { return }
-        remoteFeaturesPingNonce = sendClientPing(force: true, purpose: .telemetry, remoteFeaturesProbe: true)
+        _ = sendClientPing(force: true, purpose: .telemetry, remoteFeaturesProbe: true)
         networkQueue.asyncAfter(deadline: .now() + 2) { [weak self] in
             guard let self, self.connectionGeneration == generation else { return }
             self.remoteFeatures.expire(now: ProcessInfo.processInfo.systemUptime)
+            if self.remoteSecureDesktopEnabled { self.beginAdaptiveProbeOnQueue() }
         }
     }
 
@@ -1535,14 +1549,91 @@ public class NetworkManager: ObservableObject {
         }
     }
     private func resetRemoteInputOnQueue() {
+        remoteSecureDesktop = RemoteSecureDesktopState()
+        remoteTimedVideoLatched = false
+        publishRemoteSecureDesktopOnQueue()
         remoteFileAccess = nil
         retireRemoteFileIOOnQueue()
         remoteFilePacing = RemoteFileMediaPacing()
-        remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: 0x1f); remoteFeaturesPingNonce = nil
+        remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: 0x1f); remoteFeaturesPingChallenge = nil
         remoteMonitors.begin(session: UUID(), acceptedFeatures: 0)
         remoteMonitorControl.update(generation: 0, context: nil, enabled: false)
         remoteMonitorAdmission = nil
         publishRemoteInputOnQueue()
+    }
+
+    func setRemoteSecureControl(_ enabled: Bool) {
+        let generation = connectionGenerationClock.current
+        networkQueue.async { [weak self] in
+            guard let self, self.wireAuthenticatedGeneration == generation,
+                  self.connectionGeneration == generation, !enabled || self.isForegroundActive,
+                  let request = self.remoteSecureDesktop.setControl(enabled) else { return }
+            self.remoteSecureControlIntent = enabled
+            if !enabled && self.remoteSecureDesktop.desktop != .standard {
+                self.fenceRemoteSecureDesktopOnQueue(.fence)
+            } else {
+                self.publishRemoteSecureDesktopOnQueue()
+            }
+            self.sendRemoteSecureDesktopOnQueue(request)
+        }
+    }
+
+    private func publishRemoteSecureDesktopOnQueue() {
+        let secure = remoteSecureDesktop, generation = connectionGeneration
+        let publication = remoteSecureDesktopPublicationClock.advance()
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.connectionGenerationClock.current == generation,
+                  self.remoteSecureDesktopPublicationClock.current == publication else { return }
+            self.remoteSecureDesktopSupported = secure.supported
+            self.remoteSecureDesktopCovered = secure.covered
+            self.remoteSecureDesktopControl = secure.control
+            self.remoteSecureDesktopCanSas = secure.canSas
+        }
+    }
+
+    private func sendRemoteSecureDesktopOnQueue(_ message: RemoteSecureDesktopProtocol.Message) {
+        guard let payload = RemoteSecureDesktopProtocol.encode(message) else { return }
+        sendWireMessage(type: message.type, payload: payload, sequence: 0)
+    }
+
+    private func receiveRemoteSecureDesktopOnQueue(_ header: WireHeader, payload: Data) {
+        guard remoteInputConnection, remoteSecureDesktop.supported,
+              let message = RemoteSecureDesktopProtocol.decode(type: header.type, payload: payload, flags: header.flags) else {
+            handleStreamError("Invalid secure desktop state."); return
+        }
+        let change = remoteSecureDesktop.receive(message, adaptiveOwner: qualitySession?.owner != nil,
+                                                timedVideo: remoteTimedVideoLatched)
+        fenceRemoteSecureDesktopOnQueue(change)
+        if change != .reconnect, case let .state(_, .firstFrame, _, _, _, _, _, sequence) = message {
+            let generation = connectionGeneration
+            networkQueue.asyncAfter(deadline: .now() + 5) { [weak self] in
+                guard let self, self.connectionGeneration == generation,
+                      self.remoteSecureDesktop.awaitsWireIDR(sequence: sequence) else { return }
+                self.handleStreamError("Missing secure desktop first picture.")
+            }
+        }
+    }
+
+    private func fenceRemoteSecureDesktopOnQueue(_ change: RemoteSecureDesktopState.Change) {
+        guard change != .unchanged else { return }
+        decoder.fenceCaptureContinuation()
+        captureTargetVideo.reset()
+        connectionVideo.reset()
+        remoteFeatures.invalidateInput()
+        remoteMonitorAdmission = nil
+        revokeRemoteFilesOnQueue()
+        publishRemoteSecureDesktopOnQueue()
+        publishRemoteInputOnQueue()
+        if change == .reconnect {
+            manualReconnectHealthy = false
+            handleStreamError("Reconnecting after Windows desktop change.")
+            return
+        }
+        guard nextMirrorDecoder != UInt64.max else { handleStreamError("Decoder identity exhausted."); return }
+        nextMirrorDecoder += 1
+        decoder.invalidate(waitForCompletion: false)
+        decoder.clearAdaptiveMedia()
+        decoder.beginSession(generation: nextMirrorDecoder)
     }
 
     private func publishRemoteMonitorsOnQueue() {
@@ -1646,6 +1737,25 @@ public class NetworkManager: ObservableObject {
         guard data.count >= 16, let type = WireMessageType(rawValue: data[5]) else { return true }
         if !remoteInputConnection { return !(61...71).contains(type.rawValue) && type != .remoteDirectTouch }
         let payload = Data(data.dropFirst(16))
+        if type == .remoteSecureDesktopRequest {
+            guard let request = RemoteSecureDesktopProtocol.decode(type: type, payload: payload),
+                  remoteSecureDesktop.admitRequest(request) else { return false }
+            publishRemoteSecureDesktopOnQueue()
+            return true
+        }
+        if type == .remoteCommand, payload.count == 3, payload[1] == RemoteHostCommand.secureAttention.rawValue {
+            return remoteSecureDesktop.canSas
+        }
+        if remoteSecureDesktop.restrictsFeatures {
+            switch type {
+            case .remoteScanKey, .remotePointer:
+                guard remoteSecureDesktop.allowsScanAndPointer else { return false }
+            case .keyboardInput, .pointerInput, .textCommit, .directTouchContact, .remoteCommittedText,
+                 .remoteDirectTouch, .iPadPointerV2, .remoteMonitorSelectRequest:
+                return false
+            default: break
+            }
+        }
         switch type {
         case .remoteMonitorCatalogueRequest:
             return remoteMonitors.enabled && remoteFeatures.accepted & 7 == 7 && RemoteMonitorCatalogueRequest.decode(payload) != nil
@@ -2035,6 +2145,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func stopOnQueue() {
+        remoteSecureControlIntent = false
         resetConnectionControlOnQueue()
         committedConnectionRoute = .unknown
         resetRemoteInputOnQueue()
@@ -3253,7 +3364,8 @@ public class NetworkManager: ObservableObject {
             bytes.storeBytes(of: feedback.0.littleEndian, toByteOffset: 0, as: UInt32.self)
             bytes.storeBytes(of: feedback.1.littleEndian, toByteOffset: 4, as: UInt32.self)
             bytes.storeBytes(of: feedback.2.littleEndian, toByteOffset: 8, as: UInt16.self)
-            bytes.storeBytes(of: feedback.3.littleEndian, toByteOffset: 10, as: UInt16.self)
+            let dropped = remoteSecureDesktop.needsKeyframe && !remoteSecureDesktop.covered ? max(feedback.3, 1) : feedback.3
+            bytes.storeBytes(of: dropped.littleEndian, toByteOffset: 10, as: UInt16.self)
             bytes.storeBytes(of: feedback.4.littleEndian, toByteOffset: 12, as: UInt16.self)
             bytes.storeBytes(of: feedback.5.littleEndian, toByteOffset: 14, as: UInt16.self)
         }
@@ -3351,6 +3463,7 @@ public class NetworkManager: ObservableObject {
             payload: payload,
             sequence: UInt32(truncatingIfNeeded: nonce),
             flags: remoteFeaturesProbe ? RemoteFeatureNegotiation.supportedFlag : 0)
+        if remoteFeaturesProbe { remoteFeaturesPingChallenge = payload }
         return nonce
     }
 
@@ -3700,7 +3813,8 @@ public class NetworkManager: ObservableObject {
 
     private var mayStartRemoteFiles: Bool {
         mayReceiveRemoteFiles && committedTransportGeneration == connectionGeneration &&
-            isForegroundActive && !remoteFileBackgrounded && !captureAvailability.inputBlocked && remoteFeatures.inputReady &&
+            isForegroundActive && !remoteFileBackgrounded && !captureAvailability.inputBlocked &&
+            !remoteSecureDesktop.restrictsFeatures && remoteFeatures.inputReady &&
             remoteFeatures.context?.desktop == 1
     }
 
@@ -4179,6 +4293,9 @@ public class NetworkManager: ObservableObject {
         case .failure(.oversizedPayload):
             handleStreamError("Wire payload exceeds the 8 MiB limit.")
         case .discardedFixedControl(let header):
+            if remoteSecureDesktop.expectsIDR {
+                handleStreamError("Missing secure desktop first picture."); return
+            }
             if activeTransportKind == .wifi,
                [.authResult, .pairingRequired, .trustedDeviceChallenge, .pairingSuccess,
                 .trustedAuthResult, .sessionResumeResult].contains(header.type) {
@@ -4197,6 +4314,9 @@ public class NetworkManager: ObservableObject {
     private func handleWireMessage(_ message: WireMessage, generation: UInt64) {
         let header = message.header
         let payload = message.payload
+        if remoteSecureDesktop.expectsIDR, header.type != .video {
+            handleStreamError("Missing secure desktop first picture."); return
+        }
 
         if (header.type == .captureAvailability || header.type == .captureAvailabilityHello),
            wireAuthenticatedGeneration != generation {
@@ -4273,6 +4393,15 @@ public class NetworkManager: ObservableObject {
         if activeTransportKind == .usb && [.clientHello, .pairingRequired, .trustedDeviceChallenge,
             .trustedDeviceProof, .pairingSuccess, .trustedAuthResult, .sessionResumeResult].contains(header.type) && usbIdentity.optedIn {
             return
+        }
+
+        if header.type == .remoteAudioState,
+           remoteFeatures.accepted & RemoteFeatureNegotiation.remoteAudioFeature != 0,
+           case .state(.streaming, _, _, _, _)? = RemoteAudioProtocol.decode(type: header.type, payload: payload, flags: header.flags) {
+            guard !remoteSecureDesktop.restrictsFeatures else {
+                handleStreamError("Timed video started during a secure desktop transition."); return
+            }
+            remoteTimedVideoLatched = true
         }
 
         switch header.type {
@@ -4559,9 +4688,32 @@ public class NetworkManager: ObservableObject {
                 return
             }
             let isIDR = header.flags & WireProtocol.videoFlagIDR != 0
-            if mayReceiveRemoteFiles { remoteFilePacing.received(bytes: payload.count) }
             let lengthPrefixed = header.flags & WireProtocol.videoFlagLengthPrefixed != 0
             let receivedAt = CACurrentMediaTime()
+            if remoteSecureDesktop.supported {
+                let decoderGeneration = decoder.currentSessionGeneration
+                let verifiedIDR = isIDR && (!remoteSecureDesktop.expectsIDR ||
+                    RemoteSecureDesktopState.hasIDR(payload, lengthPrefixed: lengthPrefixed))
+                switch remoteSecureDesktop.admit(sequence: header.sequence, isIDR: verifiedIDR, decoder: decoderGeneration) {
+                case .invalid:
+                    handleStreamError("Invalid secure desktop first picture."); return
+                case .drop: return
+                case .barrier:
+                    decoder.authorizeCaptureOutput(sequence: header.sequence, generation: decoderGeneration)
+                    decoder.processInputData(payload, sequence: header.sequence, isIDR: true,
+                                             isLengthPrefixed: lengthPrefixed, receivedAt: receivedAt)
+                    let sequence = header.sequence
+                    networkQueue.asyncAfter(deadline: .now() + 5) { [weak self] in
+                        guard let self, self.connectionGeneration == generation,
+                              self.remoteSecureDesktop.awaitsPresentation(sequence: sequence, decoder: decoderGeneration) else { return }
+                        self.handleStreamError("Secure desktop first picture was not presented.")
+                    }
+                    return
+                case .pass:
+                    if qualityProbe.phase == .idle { beginAdaptiveProbeOnQueue() }
+                }
+            }
+            if mayReceiveRemoteFiles { remoteFilePacing.received(bytes: payload.count) }
             let qualityReceivedAt = adaptiveNow()
             if qualitySession?.usesOrderedVideo == true, qualitySession?.current != nil {
                 if castingAdaptiveRoute?.usesOrderedVideo == true, captureAvailability.wireSuspended {
@@ -4665,11 +4817,13 @@ public class NetworkManager: ObservableObject {
             let nonce = payload.withUnsafeBytes {
                 $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self).littleEndian
             }
-            if remoteInputConnection, remoteFeaturesPingNonce == nonce {
-                remoteFeaturesPingNonce = nil
+            if remoteInputConnection, remoteFeaturesPingChallenge == payload {
+                remoteFeaturesPingChallenge = nil
                 if let request = remoteFeatures.pong(flags: header.flags, now: ProcessInfo.processInfo.systemUptime,
-                                                     requestRemoteFiles: true) {
+                                                     requestRemoteFiles: true, requestSecureDesktop: remoteSecureDesktopEnabled) {
                     sendWireMessage(type: .remoteFeaturesRequest, payload: request, sequence: 0)
+                } else if remoteSecureDesktopEnabled {
+                    beginAdaptiveProbeOnQueue()
                 }
             }
             if let pending = pendingClientPings[nonce],
@@ -4711,7 +4865,7 @@ public class NetworkManager: ObservableObject {
             return
 
         case .audio:
-            guard committedTransportGeneration == generation else { return }
+            guard committedTransportGeneration == generation, !remoteSecureDesktop.restrictsFeatures else { return }
             switch ScstAudioPolicy.classify(
                 mode: committedRealtimeMode,
                 flags: header.flags,
@@ -4929,14 +5083,21 @@ public class NetworkManager: ObservableObject {
 
         case .remoteFileState, .remoteFilePacket, .remoteFileWindow:
             receiveRemoteFileOnQueue(header, payload: payload)
+        case .remoteSecureDesktopState:
+            receiveRemoteSecureDesktopOnQueue(header, payload: payload)
         case .remoteFileControl,
              .remoteAudioSet, .remoteAudioState, .remoteAudioPacket, .remoteTimedVideo,
-             .remoteSecureDesktopRequest, .remoteSecureDesktopState:
+             .remoteSecureDesktopRequest:
             handleStreamError("Unnegotiated remote feature message.")
         case .remoteFeaturesResult:
             guard remoteInputConnection, remoteFeatures.result(flags: header.flags, payload: payload) else {
                 handleStreamError("Invalid remote feature result."); return
             }
+            let intent = remoteSecureDesktop.begin(accepted: remoteFeatures.accepted,
+                                                   control: remoteSecureControlIntent && remoteSecureDesktopEnabled)
+            publishRemoteSecureDesktopOnQueue()
+            if let intent { sendRemoteSecureDesktopOnQueue(intent) }
+            if remoteSecureDesktopEnabled { beginAdaptiveProbeOnQueue() }
             remoteMonitors.begin(session: UUID(), acceptedFeatures: remoteFeatures.accepted)
             if mayReceiveRemoteFiles { remoteFileAccess = RemoteFileAccess() }
             remoteMonitorAdmission = nil
@@ -4949,6 +5110,14 @@ public class NetworkManager: ObservableObject {
             if let context = remoteFeatures.context,
                remoteFileAccess?.desktopRequiresRevocation(context) == true {
                 revokeRemoteFilesOnQueue()
+            }
+            if remoteSecureDesktop.supported, let context = remoteFeatures.context,
+               let desktop = RemoteSecureDesktopProtocol.Desktop(rawValue: context.desktop) {
+                let change = remoteSecureDesktop.observeDesktop(desktop, adaptiveOwner: qualitySession?.owner != nil,
+                                                               timedVideo: remoteTimedVideoLatched)
+                if change != .unchanged { fenceRemoteSecureDesktopOnQueue(change); return }
+                if !remoteSecureDesktop.allowsScanAndPointer { remoteFeatures.invalidateInput() }
+                else if remoteSecureDesktop.hasPresentedBarrier { remoteFeatures.keyframeArrived() }
             }
             publishRemoteInputOnQueue()
         case .remoteMonitorCatalogue:
@@ -7408,6 +7577,12 @@ public class NetworkManager: ObservableObject {
     func recordCapturePresentation(sequence: UInt32, generation: UInt64) {
         networkQueue.async { [weak self] in
             guard let self, self.decoder.currentSessionGeneration == generation else { return }
+            if let ack = self.remoteSecureDesktop.presented(sequence: sequence, decoder: generation) {
+                self.decoder.resetCaptureOutputFence()
+                self.publishRemoteSecureDesktopOnQueue()
+                self.sendRemoteSecureDesktopOnQueue(ack)
+                self.beginAdaptiveProbeOnQueue()
+            }
             self.observeCaptureContinuationOnQueue(sequence: sequence, decoder: generation, decoded: false, presented: true)
             if !self.qualityBaselinePresented, self.qualityBaselineDecoder == generation,
                self.qualityBaselineIDRs.contains(sequence), !self.captureAvailability.inputBlocked {
@@ -7449,7 +7624,7 @@ public class NetworkManager: ObservableObject {
         qualitySession?.remote == true && qualitySession?.current != nil
     }
     private func restoreRemoteManualIfReady() {
-        guard remoteInputConnection, remoteSettingsReady, remoteManualRestorePending,
+        guard remoteInputConnection, !remoteSecureDesktop.restrictsFeatures, remoteSettingsReady, remoteManualRestorePending,
               remoteManualRequestID == nil,
               qualityProbe.phase != .waiting,
               qualityProbe.phase != .enabled || remoteQualityNegotiated else { return }
@@ -7582,6 +7757,11 @@ public class NetworkManager: ObservableObject {
         }
     }
     private func beginAdaptiveProbeOnQueue() {
+        if remoteInputConnection && remoteSecureDesktopEnabled {
+            // Learn the desktop lane before creating a DS2 owner on a DS7 reconnect.
+            guard remoteFeatures.negotiationSettled, !remoteSecureDesktop.restrictsFeatures,
+                  !remoteSecureDesktop.supported || remoteSecureDesktop.sawStandardVideo else { return }
+        }
         guard adaptiveQualityTransport, !connectionHandoffInProgress, !captureAvailability.inputBlocked,
               remoteInputConnection || qualityBaselinePresented, wireAuthenticatedGeneration == connectionGeneration,
               committedTransportGeneration == connectionGeneration, let connection = activeControlConnection else { return }
@@ -7636,6 +7816,7 @@ public class NetworkManager: ObservableObject {
         publishAdaptiveStateOnQueue()
     }
     private func receiveAdaptivePongOnQueue(_ payload: Data, flags: UInt16, sequence: UInt32) {
+        guard !remoteSecureDesktop.restrictsFeatures else { return }
         guard adaptiveQualityTransport, let connection=activeControlConnection,
               qualityConnectionID == ObjectIdentifier(connection),
               !connectionHandoffInProgress, wireAuthenticatedGeneration == connectionGeneration,

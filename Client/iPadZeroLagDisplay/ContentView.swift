@@ -288,6 +288,7 @@ struct HostIdentityConfirmationView: View {
     /// The last Wi-Fi PC by name or typed address; Reconnect uses the matching saved target.
     @AppStorage("ScreenCasting.client.lastWifiHostLabel") private var lastWifiHostLabel = ""
     @AppStorage("ScreenCasting.client.remoteControlMode") private var remoteControlMode = false
+    @AppStorage(RemoteSecureDesktopState.preferenceKey) private var remoteSecureDesktopEnabled = false
 
     // UI States
     @AppStorage(ClientPreferenceKeys.showPerformanceHUD)
@@ -434,6 +435,20 @@ struct HostIdentityConfirmationView: View {
     private var backgroundLayer: some View {
         if streamManager.isConnected {
             connectedVideoSurface
+                .overlay {
+                    if networkManager.remoteSecureDesktopCovered {
+                        ZStack {
+                            Color.black.ignoresSafeArea()
+                            Text("Remote picture hidden")
+                                .font(.headline)
+                                .foregroundStyle(Color.white)
+                                .padding(24)
+                        }
+                        .allowsHitTesting(false)
+                        .accessibilityIdentifier("session.secureDesktopCover")
+                        .transition(.identity)
+                    }
+                }
         } else {
             Color.inkCanvas
                 .ignoresSafeArea()
@@ -998,6 +1013,12 @@ struct HostIdentityConfirmationView: View {
                                 .accessibilityHint("Removes this PC's saved trust so you can pair again")
                         }
                         owner.discoveredPCs
+                        Toggle("Allow Windows security screens", isOn: owner.$remoteSecureDesktopEnabled)
+                            .font(.subheadline)
+                            .tint(Color.inkAccent)
+                            .frame(minHeight: 44)
+                            .disabled(owner.isConnectBusy)
+                            .accessibilityHint("Applies to whole-PC connections. The PC must grant permission.")
                         owner.usbCard
                         owner.ipEntry
                     }

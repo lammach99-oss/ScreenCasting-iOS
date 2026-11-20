@@ -827,10 +827,20 @@ private extension Color {
     @MainActor private struct RemoteActionsSection: View {
         let owner: SessionPanelOverlay
         var body: some View {
+            if owner.networkManager.remoteSecureDesktopSupported {
+                Toggle("Control Windows security screens", isOn: Binding(
+                    get: { owner.networkManager.remoteSecureDesktopControl },
+                    set: { owner.networkManager.setRemoteSecureControl($0) }))
+                    .font(.subheadline)
+                    .tint(Color.inkAccent)
+                    .frame(minHeight: 44)
+            }
             SessionActionLayout(accessibility: owner.typeSize.isAccessibilitySize) {
-                owner.actionButton("Ctrl+Alt+Del", icon: "lock.shield", hint: "Opens the Windows security screen") {
-                    owner.lastInteraction = Date()
-                    owner.networkManager.sendRemoteCommand(.secureAttention)
+                if owner.networkManager.remoteSecureDesktopCanSas {
+                    owner.actionButton("Ctrl+Alt+Del", icon: "lock.shield", hint: "Opens the Windows security screen") {
+                        owner.lastInteraction = Date()
+                        owner.networkManager.sendRemoteCommand(.secureAttention)
+                    }
                 }
                 owner.actionButton("Lock PC", icon: "lock") {
                     owner.lastInteraction = Date()
