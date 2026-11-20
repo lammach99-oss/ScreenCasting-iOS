@@ -71,6 +71,35 @@ final class ConnectionControlProtocolTests: XCTestCase {
                 route == .usb ? Self.resumeUSB : Self.resumeWiFi)
         }
     }
+    func testProtectedUSBProbeRequiresExactPingAndReturnsDistinctPong() {
+        let context = ConnectionProofContext(target: .usb, transaction: 3, owner: 1, revision: 2,
+            token: Data(0..<16), challenge: Data(32..<64), secret: Data(64..<96))
+        let ping = Self.bytes("53435354010600042000000000000000" +
+            "35e5f1e2e516f488854955640b907ba315a9066f670e4a0e368f013a414fad49")
+        let pong = Self.bytes("53435354010700042000000000000000" +
+            "ef4c6c5e68877a90a6fb0d9cd7049927b10c5654054824d538e52224632ede8b")
+        XCTAssertEqual(context.usbProbeReply(to: ping), pong)
+        for offset in [0, 4, 5, 6, 7, 8, 12, 16, 47] {
+            var corrupt = ping; corrupt[offset] ^= 1
+            XCTAssertNil(context.usbProbeReply(to: corrupt))
+        }
+        XCTAssertNil(context.usbProbeReply(to: pong))
+        XCTAssertNil(context.usbProbeReply(to: Data(ping.dropLast())))
+        XCTAssertNil(context.usbProbeReply(to: ping + Data([0])))
+    }
+
+    func testProtectedOptInCapabilitiesRequireBothAdvertisementBits() throws {
+        for flags: UInt16 in [0, 0x0100, 0x0200, 0x0300] {
+            var state = ConnectionSwitchState(); state.begin(generation: 1)
+            let payload = state.advertise(flags: flags, authenticated: true, generation: 1)
+            if flags & 0x0200 == 0 { XCTAssertNil(payload); continue }
+            let hello = try XCTUnwrap(payload)
+            XCTAssertEqual(try ConnectionHello.decode(hello).capabilities, flags == 0x0300 ? 3 : 1)
+            XCTAssertEqual(state.refresh()?[4], hello[4])
+        }
+        var invalid = Data(Self.resumeUSB.dropFirst(16)); invalid[4] = 3
+        XCTAssertThrowsError(try ConnectionHello.decode(invalid))
+    }
     func testRemovedCandidateKindsPhaseAndFormerHostProofReject() throws {
         for kind in [UInt8(1), 2, 3] {
             var frame = Self.resumeUSB; frame[17] = kind

@@ -50,6 +50,11 @@ public enum ConnectionControlError: Error { case malformed }
 
 public enum ConnectionControlProtocol {
     public static let advertisementFlag: UInt16 = 0x0200
+    static let protectedHandoffFlag: UInt16 = 0x0100
+    static let usbProbeFlag: UInt16 = 0x0400
+    static let usbProbeLength = 48
+    static let usbProbeWait: TimeInterval = 3
+    static let rollbackWait: TimeInterval = 120
     public static let preflightWait: TimeInterval = 15
     public static let listenerWait: TimeInterval = 5
     public static let outcomeWait: TimeInterval = 75
@@ -63,9 +68,10 @@ public enum ConnectionControlProtocol {
     static func zero(_ bytes: Data) -> Bool { bytes.allSatisfy { $0 == 0 } }
     static func read(_ bytes: [UInt8], _ offset: Int, _ count: Int = 8) -> UInt64 { MirrorControlCodec.read(bytes, offset, count) }
     static func put(_ value: UInt64, _ bytes: inout [UInt8], _ offset: Int, _ count: Int = 8) { MirrorControlCodec.put(value, &bytes, offset, count) }
-    static func frame(type: UInt8, payload: Data, sequence: UInt32 = 0) -> Data {
+    static func frame(type: UInt8, payload: Data, sequence: UInt32 = 0, flags: UInt16 = 0) -> Data {
         var bytes = [UInt8](repeating: 0, count: 16)
         put(0x54534353, &bytes, 0, 4); bytes[4] = 1; bytes[5] = type
+        put(UInt64(flags), &bytes, 6, 2)
         put(UInt64(payload.count), &bytes, 8, 4); put(UInt64(sequence), &bytes, 12, 4)
         return Data(bytes) + payload
     }
@@ -93,12 +99,20 @@ public struct ConnectionHello: Equatable {
     public let kind: ConnectionHelloKind, target: ConnectionRoute
     public let transaction: UInt64, owner: UInt64, revision: UInt64
     public let token: Data, proof: Data
-    public static func optIn(revision: UInt64 = 0) -> Self {
+    public let capabilities: UInt32
+    init(kind: ConnectionHelloKind, target: ConnectionRoute, transaction: UInt64, owner: UInt64,
+         revision: UInt64, token: Data, proof: Data, capabilities: UInt32 = 1) {
+        self.kind = kind; self.target = target; self.transaction = transaction; self.owner = owner
+        self.revision = revision; self.token = token; self.proof = proof; self.capabilities = capabilities
+    }
+    public static func optIn(revision: UInt64 = 0, protectedHandoff: Bool = false) -> Self {
         Self(kind: .optIn, target: .unknown, transaction: 0, owner: 0, revision: revision,
-             token: Data(repeating: 0, count: 16), proof: Data(repeating: 0, count: 32))
+             token: Data(repeating: 0, count: 16), proof: Data(repeating: 0, count: 32),
+             capabilities: protectedHandoff ? 3 : 1)
     }
     public func encode() throws -> Data {
-        var b = [UInt8](repeating: 0, count: 80); b[0] = 1; b[1] = kind.rawValue; b[2] = target.rawValue; b[4] = 1
+        var b = [UInt8](repeating: 0, count: 80); b[0] = 1; b[1] = kind.rawValue; b[2] = target.rawValue
+        ConnectionControlProtocol.put(UInt64(capabilities), &b, 4, 4)
         ConnectionControlProtocol.put(transaction, &b, 8); ConnectionControlProtocol.put(owner, &b, 16)
         ConnectionControlProtocol.put(revision, &b, 24)
         try ConnectionControlProtocol.require(token.count == 16 && proof.count == 32)
@@ -108,16 +122,19 @@ public struct ConnectionHello: Equatable {
     public static func decode(_ data: Data) throws -> Self {
         try ConnectionControlProtocol.require(data.count == 80)
         let b = Array(data)
-        guard b.count == 80, b[0] == 1, b[3] == 0, ConnectionControlProtocol.read(b, 4, 4) == 1,
+        let capabilities = UInt32(ConnectionControlProtocol.read(b, 4, 4))
+        guard b[0] == 1, b[3] == 0,
               let kind = ConnectionHelloKind(rawValue: b[1]), let target = ConnectionRoute(rawValue: b[2]) else { throw ConnectionControlError.malformed }
         let value = Self(kind: kind, target: target, transaction: ConnectionControlProtocol.read(b, 8),
             owner: ConnectionControlProtocol.read(b, 16), revision: ConnectionControlProtocol.read(b, 24),
-            token: Data(b[32..<48]), proof: Data(b[48..<80]))
+            token: Data(b[32..<48]), proof: Data(b[48..<80]), capabilities: capabilities)
         if kind == .optIn {
-            try ConnectionControlProtocol.require(target == .unknown && value.transaction == 0 && value.owner == 0 &&
+            try ConnectionControlProtocol.require((capabilities == 1 || capabilities == 3) &&
+                target == .unknown && value.transaction == 0 && value.owner == 0 &&
                 ConnectionControlProtocol.zero(value.token) && ConnectionControlProtocol.zero(value.proof))
         } else {
-            try ConnectionControlProtocol.require(value.owner != 0 && value.revision != 0 && !ConnectionControlProtocol.zero(value.token) &&
+            try ConnectionControlProtocol.require(capabilities == 1 &&
+                value.owner != 0 && value.revision != 0 && !ConnectionControlProtocol.zero(value.token) &&
                 !ConnectionControlProtocol.zero(value.proof) && target != .unknown && value.transaction != 0)
         }
         return value
@@ -253,7 +270,7 @@ public struct ConnectionSelectResult: Equatable {
 
 /// Ephemeral in-memory context. Never log, stringify or persist this value.
 struct ConnectionProofContext {
-    enum Role: String { case resume = "SCCT1-W" }
+    enum Role: String { case ping = "SCCT1-P", pong = "SCCT1-Q", resume = "SCCT1-W" }
     let target: ConnectionRoute, transaction: UInt64, owner: UInt64, revision: UInt64
     private(set) var token: Data, challenge: Data
     private var secret: Data
@@ -271,6 +288,20 @@ struct ConnectionProofContext {
             using: SymmetricKey(data: secret)))
         return ConnectionHello(kind: .resumeProof, target: target, transaction: transaction, owner: owner,
             revision: revision, token: token, proof: proof)
+    }
+    func usbProbeReply(to frame: Data) -> Data? {
+        guard target == .usb, frame.count == ConnectionControlProtocol.usbProbeLength else { return nil }
+        let b = Array(frame)
+        let flag = ConnectionControlProtocol.usbProbeFlag
+        guard ConnectionControlProtocol.read(b, 0, 4) == 0x54534353, b[4] == 1,
+              b[5] == WireMessageType.ping.rawValue, ConnectionControlProtocol.read(b, 6, 2) == UInt64(flag),
+              ConnectionControlProtocol.read(b, 8, 4) == 32, ConnectionControlProtocol.read(b, 12, 4) == 0 else { return nil }
+        let key = SymmetricKey(data: secret)
+        let authority = context
+        guard HMAC<SHA256>.isValidAuthenticationCode(Data(b[16..<48]),
+            authenticating: Data(Role.ping.rawValue.utf8) + authority, using: key) else { return nil }
+        let pong = Data(HMAC<SHA256>.authenticationCode(for: Data(Role.pong.rawValue.utf8) + authority, using: key))
+        return ConnectionControlProtocol.frame(type: WireMessageType.pong.rawValue, payload: pong, flags: flag)
     }
     mutating func erase() {
         secret.resetBytes(in: 0..<secret.count); secret.removeAll(keepingCapacity: false)

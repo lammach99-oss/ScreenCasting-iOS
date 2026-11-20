@@ -499,11 +499,16 @@ public class NetworkManager: ObservableObject {
     private var pairedControlGeneration: UInt64?
     private var trustedProofGeneration: UInt64?
     private var connectionProof: ConnectionProofContext?
+    private var connectionUSBProbe: NWConnection?
+    private var connectionUSBProbeFrame: Data?
+    private var connectionUSBProbeDeadline: TimeInterval?
+    private var connectionUSBProbeAttempted = false
     private var connectionSelectedEndpoint: NWEndpoint?
     private var connectionSelectedCredential: TrustedHostCredential?
     private var connectionExpectedRetirement = false
     private var connectionHandoffInProgress = false
     private var connectionOperation = UUID()
+    private var connectionRollbackRetry: DispatchWorkItem?
     private var connectionLastInputFence = false
     private var connectionStatusTimer: DispatchSourceTimer?
     private var usbIdentity = USBSessionIdentityProof()
@@ -1004,7 +1009,9 @@ public class NetworkManager: ObservableObject {
 
     private func connectOnQueue(to endpoint: NWEndpoint) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
-        reconnectEnabled = true
+        let rollingBack = connectionSwitch.pending?.rollingBack == true
+        guard !rollingBack || endpoint == connectionSelectedEndpoint else { return }
+        reconnectEnabled = !rollingBack
         guard transportState == .idle || isDisconnectedOnQueue else { return }
         committedConnectionRoute = .wifi
         pairedControlGeneration = nil; trustedProofGeneration = nil; connectionAdvertisement = 0
@@ -1054,8 +1061,13 @@ public class NetworkManager: ObservableObject {
         setState(.connecting)
         if !connectionHandoffInProgress { print("[IPAD][TCP_CONNECT] endpoint=\(endpoint)") }
         connectionTimeoutWorkItem?.cancel()
+        let generation = connectionGeneration
         let timeout = DispatchWorkItem { [weak self] in
-            guard let self, self.transportState == .connecting else { return }
+            guard let self, self.connectionGeneration == generation, self.transportState == .connecting else { return }
+            if self.connectionHandoffInProgress {
+                self.handleStreamError("Connection change transport timeout.")
+                return
+            }
             print("[IPAD][TIMEOUT] stage=TCP/TLS timeout=8s")
             self.connection?.cancel()
             self.setState(.disconnected(reason: "Timed out connecting to Windows host."))
@@ -2907,7 +2919,7 @@ public class NetworkManager: ObservableObject {
                     self.connectionListenerReadyForTesting?()
                     #endif
                 case .failed(let error):
-                    if self.connectionHandoffInProgress { self.failConnectionControlOnQueue(.listenerClosed); return }
+                    if self.connectionHandoffInProgress { self.recoverConnectionControlOnQueue(.listenerClosed); return }
                     if !self.usbListenerExplicitlyStarted {
                         self.rejectConnectionPreflightOnQueue(.listenerClosed); return
                     }
@@ -2916,7 +2928,7 @@ public class NetworkManager: ObservableObject {
                     self.setState(.disconnected(
                         reason: "USB listener failed: \(error.localizedDescription)"))
                 case .cancelled:
-                    if self.connectionHandoffInProgress { self.failConnectionControlOnQueue(.listenerClosed); return }
+                    if self.connectionHandoffInProgress { self.recoverConnectionControlOnQueue(.listenerClosed); return }
                     if !self.usbListenerExplicitlyStarted {
                         self.rejectConnectionPreflightOnQueue(.listenerClosed); return
                     }
@@ -2934,8 +2946,13 @@ public class NetworkManager: ObservableObject {
                     newConnection.cancel()
                     return
                 }
+                if self.connectionSwitch.pending?.protectedUSB == true, self.connectionSwitch.pending?.accepted == false,
+                   self.connectionSwitch.pending?.rollingBack == false {
+                    self.startUSBHandoffProbeOnQueue(newConnection)
+                    return
+                }
                 if self.connectionHandoffInProgress {
-                    guard self.connectionHandoffInProgress, self.connectionSwitch.pending?.accepted == true,
+                    guard self.connectionSwitch.pending?.accepted == true, self.connectionSwitch.pending?.rollingBack == false,
                           self.connectionSwitch.pending?.request.target == .usb else { newConnection.cancel(); return }
                     if self.connectionExpectedRetirement, let old = self.connection {
                         _ = self.handleConnectionRetirementOnQueue(connection: old, generation: self.connectionGeneration)
@@ -3166,6 +3183,11 @@ public class NetworkManager: ObservableObject {
                 let fingerprint = SHA256.hash(data: certificateData)
                     .map { String(format: "%02X", $0) }
                     .joined(separator: ":")
+                if self.connectionSwitch.pending?.rollingBack == true,
+                   fingerprint != self.connectionSelectedCredential?.fingerprint {
+                    completionHandler(false)
+                    return
+                }
                 let decision = WifiHostIdentityPolicy.decide(
                     presentedFingerprint: fingerprint,
                     pinnedFingerprint: self.trustedHostFingerprintStore.load(endpoint: endpoint) ??
@@ -3292,9 +3314,7 @@ public class NetworkManager: ObservableObject {
             case .failed, .cancelled:
                 if self.handleConnectionRetirementOnQueue(connection: connection, generation: generation) { return }
                 if self.connectionSwitch.pending != nil || self.committedConnectionRoute == .usb && self.connectionSwitch.enabled {
-                    self.failConnectionControlOnQueue(.connectionLost)
-                    self.teardownCurrentSession()
-                    self.setState(.disconnected(reason: "Connection lost"))
+                    self.handleStreamError("Connection change transport lost.")
                     return
                 }
             default: break
@@ -3305,7 +3325,7 @@ public class NetworkManager: ObservableObject {
             case .preparing:
                 print("[IPAD][NW_STATE] preparing")
             case .waiting(let error):
-                if self.connectionHandoffInProgress { self.failConnectionControlOnQueue(.connectionLost); return }
+                if self.connectionHandoffInProgress { self.handleStreamError("Connection change transport waiting."); return }
                 print("[IPAD][NW_STATE] waiting error=\(error)")
                 if self.shouldPreserveTransientWifiControlError(
                     error, generation: generation, connection: connection) {
@@ -6054,8 +6074,8 @@ public class NetworkManager: ObservableObject {
             interfaceOrientation: interfaceOrientation,
             requestId: 0)
         guard let request = displayRequestGate.begin(proposed) else { return }
-        if connectionHandoffInProgress, connectionSwitch.pending?.accepted == true {
-            connectionDisplayRequest = request.requestId; connectionDisplayReady = false
+        if connectionHandoffInProgress, connectionSwitch.pending != nil {
+            trackConnectionDisplayRequestOnQueue(request.requestId)
         }
         if captureTargets.pending != nil || captureTargets.applied != nil { abandonCaptureTargetPresentationOnQueue() }
         if activeTransportKind == .usb {
@@ -6083,7 +6103,7 @@ public class NetworkManager: ObservableObject {
         if let nextRequest,
            let latestPreference = latestDisplayPreference {
             if connectionHandoffInProgress {
-                connectionDisplayRequest = nextRequest.requestId; connectionDisplayReady = false
+                trackConnectionDisplayRequestOnQueue(nextRequest.requestId)
             }
             pendingDisplayPreference = latestPreference
             sendWireMessage(
@@ -6126,7 +6146,7 @@ public class NetworkManager: ObservableObject {
         if let nextRequest,
            let latestPreference = latestDisplayPreference {
             if connectionHandoffInProgress {
-                connectionDisplayRequest = nextRequest.requestId; connectionDisplayReady = false
+                trackConnectionDisplayRequestOnQueue(nextRequest.requestId)
             }
             pendingDisplayPreference = latestPreference
             sendWireMessage(
@@ -6202,6 +6222,7 @@ public class NetworkManager: ObservableObject {
         startVideoReceiveLoop(generation: generation)
         requestCurrentSettingsIfNeeded(generation: generation)
         beginAdaptiveProbeOnQueue()
+        if connectionSwitch.pending?.rollingBack == true { advanceConnectionVideoOnQueue() }
         if activeTransportKind == .usb {
             recordUsbLifecycleDiagnostic(
                 "[USB_RECOVERY_CANDIDATE] attempt=\(generation) generation=\(generation) state=committed")
@@ -6448,8 +6469,8 @@ public class NetworkManager: ObservableObject {
     private func handleStreamError(_ reason: String) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         if connectionHandoffInProgress || connectionSwitch.pending != nil || committedConnectionRoute == .usb && connectionSwitch.enabled {
-            failConnectionControlOnQueue(.connectionLost)
-            teardownCurrentSession()
+            if recoverConnectionControlOnQueue(.connectionLost) { return }
+            if connection != nil { teardownCurrentSession() }
             setState(.disconnected(reason: "Connection lost"))
             return
         }
@@ -7434,7 +7455,7 @@ public class NetworkManager: ObservableObject {
         usbIdentityDeadline?.cancel(); usbIdentityDeadline = nil
         if !identified { usbIdentity.abandon() }
         guard identified else {
-            if connectionHandoffInProgress { failConnectionControlOnQueue(.identityUnavailable) }
+            if connectionHandoffInProgress { recoverConnectionControlOnQueue(.identityUnavailable); return }
             teardownCurrentSession()
             setState(.disconnected(reason: "USB host identity could not be verified. Pair over Wi-Fi first or update the PC host."))
             return
@@ -7541,7 +7562,57 @@ public class NetworkManager: ObservableObject {
     private func eraseConnectionProofOnQueue() {
         connectionProof?.erase(); connectionProof = nil
     }
+    private func startUSBHandoffProbeOnQueue(_ probe: NWConnection) {
+        guard let pending = connectionSwitch.pending, pending.sent,
+              pending.originGeneration == connectionGeneration,
+              !connectionUSBProbeAttempted else { probe.cancel(); return }
+        connectionUSBProbeAttempted = true
+        connectionUSBProbe = probe
+        connectionUSBProbeDeadline = connectionControlNow() + ConnectionControlProtocol.usbProbeWait
+        probe.stateUpdateHandler = { [weak self, weak probe] state in
+            guard let self, let probe, self.connectionUSBProbe === probe else { return }
+            switch state {
+            case .failed, .cancelled: self.closeUSBHandoffProbeOnQueue()
+            default: break
+            }
+        }
+        probe.start(queue: networkQueue)
+        let length = ConnectionControlProtocol.usbProbeLength
+        probe.receive(minimumIncompleteLength: length, maximumLength: length + 1) { [weak self, weak probe] data, _, _, error in
+            guard let self, let probe, self.connectionUSBProbe === probe else { return }
+            guard error == nil, let data, data.count == length else { self.closeUSBHandoffProbeOnQueue(); return }
+            // Prepare and the probe arrive on different sockets. Either callback can arrive first.
+            self.connectionUSBProbeFrame = data
+            self.answerUSBHandoffProbeOnQueue()
+        }
+        networkQueue.asyncAfter(deadline: .now() + ConnectionControlProtocol.usbProbeWait) { [weak self, weak probe] in
+            guard let self, let probe, self.connectionUSBProbe === probe else { return }
+            self.closeUSBHandoffProbeOnQueue()
+        }
+    }
+    private func answerUSBHandoffProbeOnQueue() {
+        let now = connectionControlNow()
+        guard let probe = connectionUSBProbe, let frame = connectionUSBProbeFrame,
+              let deadline = connectionUSBProbeDeadline, let proof = connectionProof else { return }
+        guard !expireConnectionControlOnQueue(now: now), now < deadline,
+              let pong = proof.usbProbeReply(to: frame),
+              connectionSwitch.markUSBProbeAnswered(generation: connectionGeneration, now: now) else {
+            closeUSBHandoffProbeOnQueue(); return
+        }
+        connectionUSBProbeFrame = nil
+        recordDiagnosticLine("[CONNECTION_CONTROL] event=usb_probe_verified")
+        probe.send(content: pong, completion: .contentProcessed { [weak self, weak probe] _ in
+            guard let self, let probe, self.connectionUSBProbe === probe else { return }
+            self.closeUSBHandoffProbeOnQueue()
+        })
+    }
+    private func closeUSBHandoffProbeOnQueue() {
+        connectionUSBProbe?.stateUpdateHandler = nil
+        connectionUSBProbe?.cancel(); connectionUSBProbe = nil
+        connectionUSBProbeFrame = nil; connectionUSBProbeDeadline = nil
+    }
     private func closeRoutePreparationOnQueue() {
+        closeUSBHandoffProbeOnQueue(); connectionUSBProbeAttempted = false
         connectionListenerCompletion = nil; connectionListenerPreparationAt = nil
         if !usbListenerExplicitlyStarted && activeTransportKind == .wifi, let listener = usbListener {
             listener.stateUpdateHandler = nil; listener.newConnectionHandler = nil
@@ -7551,16 +7622,14 @@ public class NetworkManager: ObservableObject {
     private func resetConnectionControlOnQueue(preserveFailure: Bool = false) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         connectionOperation = UUID(); connectionStatusTimer?.cancel(); connectionStatusTimer = nil
+        connectionRollbackRetry?.cancel(); connectionRollbackRetry = nil
         closeRoutePreparationOnQueue(); eraseConnectionProofOnQueue()
         connectionHandoffInProgress = false; connectionExpectedRetirement = false
         pairedControlGeneration = nil; trustedProofGeneration = nil; connectionAdvertisement = 0
         connectionSelectedCredential = nil
         usbIdentity = USBSessionIdentityProof(); usbReadinessPongWrittenGeneration = nil
         usbIdentityDeadline?.cancel(); usbIdentityDeadline = nil
-        connectionVideo.reset(); connectionCompleted = nil; connectionVideoStarted = false
-        connectionDisplayRequest = nil; connectionDisplayReady = false
-        connectionReadyDisplay = nil
-        mirrorDecoderLock.lock(); connectionDecoder = nil; mirrorDecoderLock.unlock()
+        resetConnectionPresentationOnQueue()
         if !preserveFailure { connectionSwitch.begin(generation: connectionGeneration) }
         publishConnectionControlOnQueue()
     }
@@ -7576,15 +7645,27 @@ public class NetworkManager: ObservableObject {
         connectionStatusTimer = timer; timer.resume()
     }
     private func expireConnectionControlOnQueue(now: TimeInterval) -> Bool {
+        if connectionSwitch.shouldTryWifiRollbackAfterTimeout(now: now),
+           connectionSwitch.beginWifiRollback(reason: .deadlineExceeded, now: now) {
+            startWifiRollbackAttemptOnQueue()
+            return true
+        }
         let hadPending = connectionSwitch.pending != nil
         connectionSwitch.tick(now: now)
-        guard hadPending && connectionSwitch.pending == nil && connectionSwitch.offersReconnect else { return false }
-        failConnectionControlOnQueue(.deadlineExceeded, retainMessage: true)
-        return true
+        guard hadPending, connectionSwitch.pending == nil else { return false }
+        if connectionSwitch.offersReconnect {
+            failConnectionControlOnQueue(.deadlineExceeded, retainMessage: true)
+            return true
+        }
+        if connectionHandoffInProgress && !connectionSwitch.inputBlocked {
+            finishConnectionControlOnQueue()
+            publishConnectionControlOnQueue()
+        }
+        return false
     }
     private func connectionStatusTickOnQueue() {
         dispatchPrecondition(condition: .onQueue(networkQueue))
-        let now = captureReadinessNow()
+        let now = connectionControlNow()
         if expireConnectionControlOnQueue(now: now) { return }
         if let start = connectionListenerPreparationAt,
            now < start || now - start >= ConnectionControlProtocol.listenerWait {
@@ -7597,22 +7678,39 @@ public class NetworkManager: ObservableObject {
               pairedControlGeneration == connectionGeneration else { return }
         if connectionSwitch.generation != connectionGeneration {
             if connectionHandoffInProgress {
-                guard let proof = connectionProof,
-                      let credential = trustedCredential, let original = connectionSelectedCredential,
+                guard connectionAdvertisement & ConnectionControlProtocol.advertisementFlag != 0 else { return }
+                guard let credential = trustedCredential, let original = connectionSelectedCredential,
+                      credential.fingerprint == original.fingerprint,
                       credential.hostID == original.hostID, credential.deviceID == original.deviceID,
-                      credential.secret == original.secret,
-                      connectionAdvertisement & 0x0200 != 0,
-                      connectionSwitch.bindReplacement(generation: connectionGeneration, route: committedConnectionRoute,
-                          authenticated: true, now: captureReadinessNow()) else {
-                    if connectionAdvertisement & 0x0200 != 0 { failConnectionControlOnQueue(.identityUnavailable) }
-                    return
+                      credential.secret == original.secret else {
+                    recoverConnectionControlOnQueue(.identityUnavailable); return
                 }
-                // ResumeProof opts this independently identified replacement in, in either direction.
-                _ = connectionSwitch.advertise(flags: connectionAdvertisement, authenticated: true, generation: connectionGeneration)
-                guard let payload = try? proof.resumeHello().encode() else { failConnectionControlOnQueue(.proofFailed); return }
-                sendWireMessage(type: .connectionHello, payload: payload, sequence: 0)
-                recordDiagnosticLine("[CONNECTION_CONTROL] event=replacement_bound route=\(proof.target.rawValue)")
-                publishConnectionControlOnQueue(); return
+                if connectionSwitch.pending?.rollingBack == true {
+                    guard committedConnectionRoute == .wifi,
+                          verifiedHostFingerprint == original.fingerprint,
+                          connectionAdvertisement & ConnectionControlProtocol.protectedHandoffFlag != 0,
+                          connectionSwitch.bindWifiRollback(generation: connectionGeneration,
+                              authenticated: true, now: connectionControlNow()) else {
+                        failConnectionControlOnQueue(.identityUnavailable); return
+                    }
+                    // Ordinary paired authentication and OptIn establish restored Wi-Fi.
+                    recordDiagnosticLine("[CONNECTION_CONTROL] event=wifi_rollback_authenticated")
+                } else {
+                    guard let proof = connectionProof,
+                      connectionSwitch.bindReplacement(generation: connectionGeneration, route: committedConnectionRoute,
+                          authenticated: true, now: connectionControlNow()) else {
+                        recoverConnectionControlOnQueue(.identityUnavailable); return
+                    }
+                    let optIn = connectionSwitch.advertise(flags: connectionAdvertisement, authenticated: true, generation: connectionGeneration)
+                    guard let payload = try? proof.resumeHello().encode() else { recoverConnectionControlOnQueue(.proofFailed); return }
+                    sendWireMessage(type: .connectionHello, payload: payload, sequence: 0)
+                    if committedConnectionRoute == .wifi, connectionAdvertisement & ConnectionControlProtocol.protectedHandoffFlag != 0,
+                       let optIn {
+                        sendWireMessage(type: .connectionHello, payload: optIn, sequence: 0)
+                    }
+                    recordDiagnosticLine("[CONNECTION_CONTROL] event=replacement_bound route=\(proof.target.rawValue)")
+                    publishConnectionControlOnQueue(); return
+                }
             } else { connectionSwitch.begin(generation: connectionGeneration) }
         }
         if let payload = connectionSwitch.advertise(flags: connectionAdvertisement, authenticated: true, generation: connectionGeneration) {
@@ -7633,12 +7731,14 @@ public class NetworkManager: ObservableObject {
                 if let payload = self.connectionSwitch.refresh() { self.sendWireMessage(type: .connectionHello, payload: payload, sequence: 0) }
                 return
             }
-            guard let request = self.connectionSwitch.select(route, askPC: askPC, now: self.captureReadinessNow()),
+            guard let request = self.connectionSwitch.select(route, askPC: askPC, now: self.connectionControlNow()),
                   let payload = try? request.encode() else { self.publishConnectionControlOnQueue(); return }
             self.retirePendingAdaptiveOnQueue()
             self.connectionSwitch.deferRequestSend()
             self.connectionSelectedCredential = self.trustedCredential
-            if self.connectionSelectedEndpoint == nil { self.connectionSelectedEndpoint = self.loadWifiReconnectEndpoint() }
+            if route == .wifi && self.connectionSelectedEndpoint == nil {
+                self.connectionSelectedEndpoint = self.loadWifiReconnectEndpoint()
+            }
             self.resetDirectTouchSessionOnQueue()
             self.publishConnectionControlOnQueue()
             self.startConnectionStatusTimerOnQueue()
@@ -7646,8 +7746,7 @@ public class NetworkManager: ObservableObject {
             let send = { [weak self] in
                 guard let self, self.connectionOperation == operation, self.connectionGeneration == generation,
                       self.connectionSwitch.pending?.request == request else { return }
-                self.connectionSwitch.tick(now: self.captureReadinessNow())
-                guard self.connectionSwitch.markRequestSent(transaction: request.transaction, now: self.captureReadinessNow()) else {
+                guard self.connectionSwitch.markRequestSent(transaction: request.transaction, now: self.connectionControlNow()) else {
                     self.rejectConnectionPreflightOnQueue(.staleRevision); return
                 }
                 self.sendWireMessage(type: .connectionSelectRequest, payload: payload, sequence: 0)
@@ -7663,7 +7762,7 @@ public class NetworkManager: ObservableObject {
               generation == connectionGeneration, message.header.flags == 0 else {
             handleStreamError("Unnegotiated connection control message."); return
         }
-        let now = captureReadinessNow()
+        let now = connectionControlNow()
         if expireConnectionControlOnQueue(now: now) { return }
         do {
             if message.header.type == .connectionState {
@@ -7671,6 +7770,7 @@ public class NetworkManager: ObservableObject {
                 if value.phase == .snapshot {
                     if connectionSwitch.receive(value, generation: generation, now: now) {
                         recordDiagnosticLine("[CONNECTION_CONTROL] event=state revision=\(value.revision) route=\(value.current.rawValue)")
+                        if connectionSwitch.pending?.rollingBack == true { advanceConnectionVideoOnQueue() }
                     }
                 } else {
                     guard connectionSwitch.preparing(value, generation: generation, now: now) else { return }
@@ -7678,10 +7778,12 @@ public class NetworkManager: ObservableObject {
                     let target: ConnectionRoute = value.phase == .prepareUSB ? .usb : .wifi
                     connectionProof = ConnectionProofContext(target: target, transaction: value.transaction, owner: value.owner,
                         revision: value.revision, token: value.token, challenge: value.challenge, secret: value.secret)
-                    if target == .wifi && connectionSelectedEndpoint == nil { rejectConnectionPreflightOnQueue(.listenerClosed) }
+                    if target == .usb { answerUSBHandoffProbeOnQueue() }
+                    else if connectionSelectedEndpoint == nil { rejectConnectionPreflightOnQueue(.listenerClosed) }
                 }
             } else {
                 let value = try ConnectionSelectResult.decode(message.payload)
+                let wasRollingBack = connectionSwitch.pending?.rollingBack == true
                 guard connectionSwitch.receive(value, generation: generation, now: now) else { return }
                 recordDiagnosticLine("[CONNECTION_CONTROL] event=result status=\(value.status.rawValue) reason=\(value.reason.rawValue)")
                 switch value.status {
@@ -7690,6 +7792,7 @@ public class NetworkManager: ObservableObject {
                           proof.target == value.target else {
                         failConnectionControlOnQueue(.proofFailed); return
                     }
+                    closeUSBHandoffProbeOnQueue()
                     connectionHandoffInProgress = true; connectionExpectedRetirement = true
                     decoder.fenceCaptureContinuation()
                     resetAdaptiveMediaOnQueue(preserveHostPreference: true)
@@ -7703,7 +7806,13 @@ public class NetworkManager: ObservableObject {
                 case .completed:
                     connectionCompleted = value; advanceConnectionVideoOnQueue()
                 case .failed:
-                    failConnectionControlOnQueue(value.reason, retainMessage: true)
+                    if wasRollingBack && !connectionSwitch.inputBlocked {
+                        finishConnectionControlOnQueue()
+                    } else if connectionSwitch.pending?.rollingBack == true {
+                        if !wasRollingBack { startWifiRollbackAttemptOnQueue() }
+                    } else {
+                        failConnectionControlOnQueue(value.reason, retainMessage: true)
+                    }
                 case .alreadyActive, .denied, .permissionRequired, .unavailable, .busy:
                     closeRoutePreparationOnQueue(); eraseConnectionProofOnQueue()
                     connectionSelectedCredential = nil
@@ -7717,7 +7826,7 @@ public class NetworkManager: ObservableObject {
         if let listener = usbListener, case .ready = listener.state { ready(); return }
         guard connectionListenerCompletion == nil, activeTransportKind == .wifi else { return }
         connectionListenerCompletion = ready
-        connectionListenerPreparationAt = captureReadinessNow()
+        connectionListenerPreparationAt = connectionControlNow()
         if usbListener == nil {
             let port: UInt16
             #if targetEnvironment(simulator)
@@ -7763,10 +7872,10 @@ public class NetworkManager: ObservableObject {
         old.stateUpdateHandler = nil
         teardownCurrentSession()
         pairedControlGeneration = nil; connectionAdvertisement = 0
-        connectionVideo.reset(); connectionVideoStarted = false
+        resetConnectionPresentationOnQueue()
         if pending.request.target == .usb {
             guard let listener = usbListener, case .ready = listener.state else {
-                failConnectionControlOnQueue(.listenerClosed); return true
+                recoverConnectionControlOnQueue(.listenerClosed); return true
             }
             committedConnectionRoute = .usb; reconnectEnabled = false
             connectionSwitch.waitingForPeer()
@@ -7781,16 +7890,66 @@ public class NetworkManager: ObservableObject {
         }
         publishConnectionControlOnQueue(); return true
     }
+    @discardableResult private func recoverConnectionControlOnQueue(_ reason: ConnectionReason) -> Bool {
+        if connectionSwitch.pending?.rollingBack == true && reason == .connectionLost {
+            connectionSwitch.retryWifiRollback()
+        } else if !connectionSwitch.beginWifiRollback(reason: reason, now: connectionControlNow()) {
+            failConnectionControlOnQueue(reason)
+            return false
+        }
+        startWifiRollbackAttemptOnQueue()
+        return true
+    }
+    private func startWifiRollbackAttemptOnQueue() {
+        guard let endpoint = connectionSelectedEndpoint, connectionSelectedCredential != nil else {
+            failConnectionControlOnQueue(.identityUnavailable); return
+        }
+        connectionHandoffInProgress = true; connectionExpectedRetirement = false
+        reconnectEnabled = false
+        reconnectWorkItem?.cancel(); reconnectWorkItem = nil
+        eraseConnectionProofOnQueue(); closeRoutePreparationOnQueue()
+        usbListenerExplicitlyStarted = false
+        usbListener?.stateUpdateHandler = nil; usbListener?.newConnectionHandler = nil
+        usbListener?.cancel(); usbListener = nil; listenerGeneration &+= 1
+        if connection != nil { teardownCurrentSession() }
+        resetConnectionPresentationOnQueue()
+        setState(.disconnected(reason: "Reconnecting over Wi-Fi."))
+        guard !expireConnectionControlOnQueue(now: connectionControlNow()) else { return }
+        publishConnectionControlOnQueue()
+        connectionRollbackRetry?.cancel()
+        let operation = connectionOperation
+        let retry = DispatchWorkItem { [weak self] in
+            guard let self, self.connectionOperation == operation,
+                  self.connectionSwitch.pending?.rollingBack == true, self.connection == nil,
+                  !self.expireConnectionControlOnQueue(now: self.connectionControlNow()) else { return }
+            self.connectionRollbackRetry = nil
+            self.connectOnQueue(to: endpoint)
+        }
+        connectionRollbackRetry = retry
+        networkQueue.asyncAfter(deadline: .now() + 1, execute: retry)
+    }
+    private func resetConnectionPresentationOnQueue() {
+        connectionVideo.reset(); connectionCompleted = nil; connectionVideoStarted = false
+        connectionDisplayRequest = nil; connectionDisplayReady = false; connectionReadyDisplay = nil
+        mirrorDecoderLock.lock(); connectionDecoder = nil; mirrorDecoderLock.unlock()
+    }
+    private func trackConnectionDisplayRequestOnQueue(_ request: UInt32) {
+        if connectionSwitch.pending?.rollingBack == true, connectionDisplayRequest != request {
+            connectionSwitch.invalidateWifiRollbackDisplay()
+            resetConnectionPresentationOnQueue()
+        }
+        connectionDisplayRequest = request; connectionDisplayReady = false
+    }
     private func failConnectionControlOnQueue(_ reason: ConnectionReason, retainMessage: Bool = false) {
         recordDiagnosticLine("[CONNECTION_CONTROL] event=failed reason=\(reason.rawValue)")
         let retireReplacement = connectionHandoffInProgress
         connectionOperation = UUID()
+        connectionRollbackRetry?.cancel(); connectionRollbackRetry = nil
         if !retainMessage { connectionSwitch.cancel(reason: reason) }
         closeRoutePreparationOnQueue(); eraseConnectionProofOnQueue()
         connectionSelectedCredential = nil; connectionHandoffInProgress = false; connectionExpectedRetirement = false
         reconnectWorkItem?.cancel(); reconnectWorkItem = nil; reconnectEnabled = false
-        connectionVideo.reset(); connectionVideoStarted = false; connectionCompleted = nil
-        mirrorDecoderLock.lock(); connectionDecoder = nil; mirrorDecoderLock.unlock()
+        resetConnectionPresentationOnQueue()
         connectionStatusTimer?.cancel(); connectionStatusTimer = nil
         if retireReplacement {
             // No automatic bounce or unproven replacement remains after Accepted.
@@ -7805,6 +7964,7 @@ public class NetworkManager: ObservableObject {
     private func finishConnectionControlOnQueue() {
         eraseConnectionProofOnQueue(); connectionSelectedCredential = nil
         connectionHandoffInProgress = false; connectionExpectedRetirement = false
+        if committedConnectionRoute == .wifi { reconnectEnabled = true }
         connectionVideo.reset(); connectionCompleted = nil
         mirrorControl.setConnectionInputBlocked(false)
         recordDiagnosticLine("[CONNECTION_CONTROL] event=owned_render")
@@ -7812,7 +7972,7 @@ public class NetworkManager: ObservableObject {
     }
     private func consumeConnectionVideoOnQueue(_ data: Data, sequence: UInt32, isIDR: Bool,
         lengthPrefixed: Bool, receivedAt: TimeInterval, domain: ConnectionFrameDomain) -> Bool {
-        guard connectionHandoffInProgress, connectionSwitch.pending?.accepted == true else { return false }
+        guard connectionHandoffInProgress, connectionSwitch.pending != nil else { return false }
         // Before the expected retirement the old picture may remain, but new old-route frames do not acquire ownership.
         guard connectionSwitch.pending?.originGeneration != connectionGeneration else { return true }
         let frame = CaptureTargetVideoBuffer.Frame(data: data, sequence: sequence, isIDR: isIDR,
@@ -7830,21 +7990,33 @@ public class NetworkManager: ObservableObject {
         mirrorDecoderLock.lock(); defer { mirrorDecoderLock.unlock() }; return connectionDecoder
     }
     private func advanceConnectionVideoOnQueue() {
-        guard let completed = connectionCompleted, connectionSwitch.pending?.accepted == true,
+        guard let pending = connectionSwitch.pending, (pending.rollingBack || connectionCompleted != nil),
               connectionSwitch.generation == connectionGeneration, connectionDisplayReady,
               let request = connectionDisplayRequest, !connectionVideoStarted,
-              committedTransportGeneration == connectionGeneration,
-              completed.frameDomain == (committedRealtimeMode == RealtimeTransportMode.wifiRTP ? .rtp : .scst) else { return }
+              committedTransportGeneration == connectionGeneration else { return }
+        let now = connectionControlNow()
+        guard !expireConnectionControlOnQueue(now: now) else { return }
+        let domain: ConnectionFrameDomain = committedRealtimeMode == RealtimeTransportMode.wifiRTP ? .rtp : .scst
         if let state = mirrorControl.currentState, state.mode != .virtualDisplay {
             guard let geometry = state.geometry, state.firstFrame != nil,
                   let ready = connectionReadyDisplay,
                   geometry.frameWidth == Int(ready.width), geometry.frameHeight == Int(ready.height) else { return }
         } else if mirrorControl.currentState == nil && connectionAdvertisement & 0x4000 != 0 { return }
-        let frames = connectionVideo.take(firstFrame: completed.firstFrame)
+        let firstFrame: UInt32
+        if pending.rollingBack {
+            guard connectionSwitch.hasWifiRollbackSnapshot else { return }
+            connectionSwitch.noteWifiRollbackReady(now: now)
+            guard let sequence = connectionVideo.frames.first?.sequence else { return }
+            firstFrame = sequence
+        } else {
+            guard let completed = connectionCompleted, completed.frameDomain == domain else { return }
+            firstFrame = completed.firstFrame
+        }
+        let frames = connectionVideo.take(firstFrame: firstFrame)
         guard let root = frames.first else { return }
         guard nextMirrorDecoder != UInt64.max else { failConnectionControlOnQueue(.startFailed); return }
         nextMirrorDecoder += 1
-        let owner = (network: connectionGeneration, decoder: nextMirrorDecoder, domain: completed.frameDomain)
+        let owner = (network: connectionGeneration, decoder: nextMirrorDecoder, domain: domain)
         mirrorDecoderLock.lock(); connectionDecoder = owner; mirrorDecoderOwner = nil; captureTargetDecoderOwner = nil; mirrorDecoderLock.unlock()
         decoder.invalidate(waitForCompletion: false); decoder.beginSession(generation: owner.decoder)
         if activeVideoCodec == .h264 {
@@ -7852,8 +8024,8 @@ public class NetworkManager: ObservableObject {
                   decoder.configureH264(sps: sets[0], pps: sets[1]) else { failConnectionControlOnQueue(.startFailed); return }
         }
         connectionSwitch.expectDisplay(request: request, decoder: owner.decoder, generation: connectionGeneration)
-        connectionSwitch.displayReady(request: request, generation: connectionGeneration, now: captureReadinessNow())
-        connectionSwitch.observeIDR(sequence: root.sequence, domain: completed.frameDomain, decoder: owner.decoder, generation: connectionGeneration)
+        connectionSwitch.displayReady(request: request, generation: connectionGeneration, now: now)
+        connectionSwitch.observeIDR(sequence: root.sequence, domain: domain, decoder: owner.decoder, generation: connectionGeneration)
         connectionVideoStarted = true
         for frame in frames {
             guard admitCaptureContinuationOnQueue(sequence: frame.sequence, decoder: owner.decoder, isIDR: frame.isIDR) else { continue }
@@ -7908,6 +8080,7 @@ public class NetworkManager: ObservableObject {
         }
     }
     var usbIdentityBoundForTesting: Bool { networkQueue.sync { pairedControlGeneration == connectionGeneration } }
+    var preparedUSBListenerPortForTesting: NWEndpoint.Port? { networkQueue.sync { usbListener?.port } }
     var connectionProofPresentForTesting: Bool { networkQueue.sync { connectionProof != nil } }
     func captureContinuationForTesting(sequence: UInt32, decoder: UInt64, isIDR: Bool) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
@@ -8761,8 +8934,10 @@ public class NetworkManager: ObservableObject {
                 guard let self, self.connectionGeneration == routeDecoder.network,
                       self.currentConnectionDecoder?.decoder == generation else { return }
                 self.transportTelemetry.recordRenderCompletion(sequence: sequence, generation: routeDecoder.network)
+                let now = self.connectionControlNow()
+                if self.expireConnectionControlOnQueue(now: now) { return }
                 self.connectionSwitch.rendered(sequence: sequence, domain: routeDecoder.domain,
-                    decoder: generation, generation: routeDecoder.network, now: self.captureReadinessNow())
+                    decoder: generation, generation: routeDecoder.network, now: now)
                 if self.connectionHandoffInProgress && !self.connectionSwitch.inputBlocked {
                     self.finishConnectionControlOnQueue()
                 }

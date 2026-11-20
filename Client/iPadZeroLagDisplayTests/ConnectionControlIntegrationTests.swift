@@ -97,6 +97,42 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         XCTAssertTrue(writes.snapshot.contains { $0[5] == 78 })
         XCTAssertFalse(writes.snapshot.contains { $0[5] == 76 && (1...3).contains($0[17]) })
     }
+    @MainActor func testProtectedProbeUsesPreparedListenerWithoutRetiringWifi() async throws {
+        let network = NetworkManager(); let writes = Writes()
+        network.controlSendForAudioTesting = { data, done in writes.append(data); done(nil) }
+        network.connectionListenerPortForTesting = 0
+        let wifi = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        defer { network.stopForTesting() }
+        network.beginTransferWriterForTesting(); network.setConnectionIdentityForTesting(verified: true)
+        network.receiveIdentityWireForTesting(type: .displayCapabilities,
+            payload: CaptureTargetIntegrationTests.modes, flags: 0x0300)
+        network.receiveIdentityWireForTesting(type: .connectionState, payload: try ConnectionSwitchStateTests.snapshot().encode())
+        let ready = expectation(description: "prepared USB listener")
+        network.connectionListenerReadyForTesting = { ready.fulfill() }
+        network.requestConnectionRoute(.usb)
+        await fulfillment(of: [ready], timeout: 3); await drain(network)
+        XCTAssertEqual(writes.snapshot.first { $0[5] == 76 }?[20], 3)
+
+        network.receiveIdentityWireForTesting(type: .connectionState, payload: try ConnectionSwitchStateTests.prepare().encode())
+        let port = try XCTUnwrap(network.preparedUSBListenerPortForTesting)
+        let probe = NWConnection(host: .ipv4(.loopback), port: port, using: .tcp)
+        defer { probe.cancel() }
+        let reply = expectation(description: "USB proof Pong")
+        let ping = ConnectionControlProtocolTests.bytes("53435354010600042000000000000000" +
+            "ce83cdcbb78c7b9e432ce98f2d889d4517be4f89e5b949888f30f45f93bfdb5e")
+        let pong = ConnectionControlProtocolTests.bytes("53435354010700042000000000000000" +
+            "41cb339cb7b174f97c05521fb67d601bdda65fdb8b7709ca9c785155132041af")
+        probe.start(queue: DispatchQueue.global())
+        probe.send(content: ping, completion: .contentProcessed { error in XCTAssertNil(error) })
+        probe.receive(minimumIncompleteLength: pong.count, maximumLength: pong.count) { data, _, _, error in
+            XCTAssertNil(error); XCTAssertEqual(data, pong); reply.fulfill()
+        }
+        await fulfillment(of: [reply], timeout: 3); await drain(network)
+        XCTAssertTrue(network.connectionIncumbentIsCurrentForTesting(wifi.connection))
+        XCTAssertEqual(network.connectionSwitchState.actualRoute, .wifi)
+        XCTAssertEqual(network.preparedUSBListenerPortForTesting, port)
+        XCTAssertFalse(writes.snapshot.contains { $0[5] == 7 })
+    }
     @MainActor func testNetworkPreflightRetainsProofAndFenceUntilFifteenSeconds() async throws {
         for accepts in [false, true] {
             let network = NetworkManager(); let writes = Writes(); var now: TimeInterval = 0

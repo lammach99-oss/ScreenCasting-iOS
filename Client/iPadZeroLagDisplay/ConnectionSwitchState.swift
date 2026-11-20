@@ -11,10 +11,15 @@ public struct ConnectionSwitchState: Equatable {
         public fileprivate(set) var started: TimeInterval
         public fileprivate(set) var sent = true
         public fileprivate(set) var accepted = false
+        let protectedUSB: Bool
+        fileprivate(set) var probeAnswered = false
+        fileprivate(set) var rollingBack = false
         fileprivate var token = Data()
         fileprivate var completed: ConnectionSelectResult?
         fileprivate var completedAt: TimeInterval?
         fileprivate var replacement: UInt64?
+        fileprivate var wifiReadyAt: TimeInterval?
+        fileprivate var wifiFailure: ConnectionReason?
     }
     public private(set) var generation: UInt64 = 0
     public private(set) var enabled = false
@@ -39,6 +44,7 @@ public struct ConnectionSwitchState: Equatable {
     private var terminalMessage: String?
     private var lastTarget: ConnectionRoute = .unknown
     private var preparedToken = Data()
+    private var protectedHandoff = false
 
     public init() {}
     public mutating func begin(generation: UInt64) {
@@ -47,10 +53,13 @@ public struct ConnectionSwitchState: Equatable {
     public mutating func advertise(flags: UInt16, authenticated: Bool, generation: UInt64) -> Data? {
         guard generation == self.generation, generation != 0, authenticated, !enabled else { return nil }
         guard flags & ConnectionControlProtocol.advertisementFlag != 0 else { phase = .unsupportedHost; return nil }
+        protectedHandoff = flags & ConnectionControlProtocol.protectedHandoffFlag != 0
         enabled = true; phase = pending == nil ? .checking : .waitingDisplay
-        return try? ConnectionHello.optIn().encode()
+        return refresh()
     }
-    public func refresh() -> Data? { enabled ? try? ConnectionHello.optIn(revision: snapshot?.revision ?? 0).encode() : nil }
+    public func refresh() -> Data? {
+        enabled ? try? ConnectionHello.optIn(revision: snapshot?.revision ?? 0, protectedHandoff: protectedHandoff).encode() : nil
+    }
     @discardableResult public mutating func receive(_ value: ConnectionControlState, generation: UInt64, now: TimeInterval) -> Bool {
         tick(now: now)
         guard enabled, generation == self.generation, value.phase == .snapshot,
@@ -58,6 +67,10 @@ public struct ConnectionSwitchState: Equatable {
               value.revision >= (snapshot?.revision ?? 0) else { return false }
         // Equal revisions refresh a heartbeat, but may not change its contents.
         guard snapshot?.revision != value.revision || snapshot == value else { return false }
+        if let pending, pending.rollingBack {
+            guard pending.replacement == generation, value.current == .wifi,
+                  value.owner != pending.request.owner else { return false }
+        }
         snapshot = value; snapshotAt = now; needsRefresh = false
         resultSnapshots[value.revision] = value
         if resultSnapshots.count > 32, let oldest = resultSnapshots.keys.min() { resultSnapshots.removeValue(forKey: oldest) }
@@ -65,6 +78,7 @@ public struct ConnectionSwitchState: Equatable {
             actualRoute = value.current
             if value.stateReason == .permissionDenied { phase = .declined; issue = .permissionDenied }
             else if phase == .permissionRequired && !value.allowed { }
+            else if phase == .declined && terminalMessage != nil && value.current == .wifi { }
             else { phase = .ready; issue = nil; terminalMessage = nil }
         }
         return true
@@ -83,7 +97,8 @@ public struct ConnectionSwitchState: Equatable {
         }
         nextTransaction += 1
         let request = ConnectionSelectRequest(target: target, transaction: nextTransaction, owner: snapshot.owner, revision: snapshot.revision)
-        pending = Pending(request: request, originGeneration: generation, started: now)
+        pending = Pending(request: request, originGeneration: generation, started: now,
+            protectedUSB: protectedHandoff && snapshot.current == .wifi && target == .usb)
         lastTarget = target
         inputBlocked = true; phase = .checking; issue = nil; terminalMessage = nil
         resetPresentation(); return request
@@ -103,13 +118,21 @@ public struct ConnectionSwitchState: Equatable {
     @discardableResult mutating func preparing(_ value: ConnectionControlState, generation: UInt64, now: TimeInterval) -> Bool {
         tick(now: now)
         guard enabled, generation == self.generation, let pending, !pending.accepted,
-              pending.sent,
+              pending.sent, !pending.rollingBack,
               value.owner == pending.request.owner, value.revision == pending.request.revision,
               value.transaction == pending.request.transaction,
               value.phase == (pending.request.target == .usb ? .prepareUSB : .prepareWiFi),
               preparedToken.isEmpty || preparedToken == value.token else { return false }
         preparedToken = value.token
         phase = value.phase == .prepareUSB ? .preparingUSB : .checking; return true
+    }
+    mutating func markUSBProbeAnswered(generation: UInt64, now: TimeInterval) -> Bool {
+        tick(now: now)
+        guard let pending, pending.protectedUSB, pending.sent, !pending.accepted,
+              !pending.probeAnswered, !pending.rollingBack, pending.originGeneration == generation,
+              self.generation == generation, !preparedToken.isEmpty else { return false }
+        self.pending?.probeAnswered = true
+        return true
     }
     @discardableResult public mutating func receive(_ value: ConnectionSelectResult, generation: UInt64, now: TimeInterval) -> Bool {
         tick(now: now)
@@ -121,12 +144,24 @@ public struct ConnectionSwitchState: Equatable {
               snapshot?.revision == value.revision, authority.current == value.current,
               authority.hostState == value.hostState || value.status == .accepted &&
                 (authority.hostState == .ready || authority.hostState == .preflighting) else { return false }
+        if operation.rollingBack {
+            guard value.status == .failed, operation.replacement == generation, value.current == .wifi,
+                  value.token == operation.token, value.routeOwner != operation.request.owner else { return false }
+            if value.reason == .stoppedOnPC { cancel(reason: value.reason) }
+            else {
+                issue = value.reason
+                pending?.wifiFailure = value.reason
+                completeWifiRollbackIfPresented(now: now)
+            }
+            return true
+        }
         if operation.accepted {
             guard value.token == operation.token, value.status == .completed || value.status == .failed else { return false }
         } else if generation != operation.originGeneration { return false }
         switch value.status {
         case .accepted:
-            guard !preparedToken.isEmpty, value.token == preparedToken else { return false }
+            guard !preparedToken.isEmpty, value.token == preparedToken,
+                  !operation.protectedUSB || operation.probeAnswered else { return false }
             operation.accepted = true; operation.token = value.token; pending = operation
             phase = .switching; inputBlocked = true
         case .completed:
@@ -147,17 +182,61 @@ public struct ConnectionSwitchState: Equatable {
             pending = nil; inputBlocked = false; phase = .declined; issue = value.reason
             needsRefresh = value.reason == .staleRevision
         case .failed:
-            cancel(reason: value.reason)
+            if operation.protectedUSB && !operation.accepted {
+                guard operation.probeAnswered, !preparedToken.isEmpty, value.token == preparedToken else { return false }
+            }
+            if !beginWifiRollback(reason: value.reason, now: now) { cancel(reason: value.reason) }
         }
         return true
     }
     @discardableResult public mutating func bindReplacement(generation: UInt64, route: ConnectionRoute, authenticated: Bool, now: TimeInterval) -> Bool {
         tick(now: now)
-        guard var operation = pending, operation.accepted, operation.replacement == nil, authenticated,
+        guard var operation = pending, operation.accepted, !operation.rollingBack, operation.replacement == nil, authenticated,
               generation != 0, generation != operation.originGeneration, route == operation.request.target else { return false }
         operation.replacement = generation; pending = operation; self.generation = generation
         enabled = false; snapshot = nil; resultSnapshots.removeAll(); nextTransaction = 0
         phase = .waitingDisplay; actualRoute = route; resetPresentation(); return true
+    }
+    mutating func beginWifiRollback(reason: ConnectionReason, now: TimeInterval) -> Bool {
+        guard var operation = pending, operation.protectedUSB, operation.probeAnswered,
+              !operation.rollingBack, reason != .stoppedOnPC,
+              now >= operation.started,
+              now < operation.started + (operation.accepted ? ConnectionControlProtocol.rollbackWait : ConnectionControlProtocol.preflightWait) else { return false }
+        let token = operation.accepted ? operation.token : preparedToken
+        guard !token.isEmpty else { return false }
+        operation.rollingBack = true; operation.token = token
+        operation.completed = nil; operation.completedAt = nil
+        pending = operation
+        issue = reason; retryWifiRollback()
+        return true
+    }
+    mutating func retryWifiRollback() {
+        guard pending?.rollingBack == true else { return }
+        pending?.replacement = nil; pending?.wifiReadyAt = nil; pending?.wifiFailure = nil
+        enabled = false; snapshot = nil; resultSnapshots.removeAll(); nextTransaction = 0
+        phase = .waitingPeer; actualRoute = .unknown; resetPresentation()
+    }
+    mutating func bindWifiRollback(generation: UInt64, authenticated: Bool, now: TimeInterval) -> Bool {
+        tick(now: now)
+        guard let pending, pending.rollingBack, pending.replacement == nil, authenticated,
+              generation != 0, generation != pending.originGeneration else { return false }
+        self.pending?.replacement = generation; self.generation = generation
+        phase = .waitingDisplay
+        return true
+    }
+    var hasWifiRollbackSnapshot: Bool {
+        guard let pending, pending.rollingBack, pending.replacement == generation,
+              !needsRefresh, let snapshot else { return false }
+        return snapshot.current == .wifi && snapshot.hostState != .idle && snapshot.stateReason != .stoppedOnPC
+    }
+    mutating func noteWifiRollbackReady(now: TimeInterval) {
+        guard hasWifiRollbackSnapshot else { return }
+        if pending?.wifiReadyAt == nil { pending?.wifiReadyAt = now }
+        phase = .waitingFrame
+    }
+    mutating func invalidateWifiRollbackDisplay() {
+        guard pending?.rollingBack == true else { return }
+        resetPresentation()
     }
     mutating func waitingForPeer() { if pending?.accepted == true { phase = .waitingPeer; actualRoute = .unknown } }
     public mutating func expectDisplay(request: UInt32, decoder: UInt64, generation: UInt64) {
@@ -169,6 +248,10 @@ public struct ConnectionSwitchState: Equatable {
         let time = now ?? lastTime ?? snapshotAt
         tick(now: time)
         guard generation == self.generation, pending?.replacement == generation, displayRequest == request else { return }
+        if pending?.rollingBack == true {
+            guard hasWifiRollbackSnapshot else { return }
+            noteWifiRollbackReady(now: time)
+        }
         displayIsReady = true; if pending?.completed != nil { phase = .waitingFrame }
         completeIfPresented(now: time)
     }
@@ -187,6 +270,7 @@ public struct ConnectionSwitchState: Equatable {
         renderedFrame = sequence; completeIfPresented(now: now)
     }
     private mutating func completeIfPresented(now: TimeInterval) {
+        if pending?.rollingBack == true { completeWifiRollbackIfPresented(now: now); return }
         guard let operation = pending, let completed = operation.completed, displayIsReady,
               completed.frameDomain == rootDomain, let root, let renderedFrame,
               MirrorControlCodec.sequenceAtOrAfter(renderedFrame, completed.firstFrame),
@@ -194,8 +278,25 @@ public struct ConnectionSwitchState: Equatable {
         actualRoute = completed.current; pending = nil; phase = .completed; inputBlocked = false
         issue = nil; terminalMessage = nil; offersReconnect = false
     }
+    private mutating func completeWifiRollbackIfPresented(now: TimeInterval) {
+        guard let pending, pending.rollingBack, let readyAt = pending.wifiReadyAt,
+              hasWifiRollbackSnapshot, displayIsReady, root != nil, renderedFrame != nil,
+              pending.wifiFailure != nil || now >= readyAt + ConnectionControlProtocol.presentationWait else { return }
+        issue = pending.wifiFailure ?? issue
+        self.pending = nil; actualRoute = .wifi; phase = .declined; inputBlocked = false
+        terminalMessage = "USB switch failed. Reconnected over Wi-Fi."
+    }
+    func shouldTryWifiRollbackAfterTimeout(now: TimeInterval) -> Bool {
+        guard let pending, pending.protectedUSB, pending.accepted, !pending.rollingBack,
+              pending.completed == nil else { return false }
+        return now >= pending.started + ConnectionControlProtocol.outcomeWait
+    }
     private func deadlineExpired(now: TimeInterval) -> Bool {
         guard let operation = pending, operation.sent else { return false }
+        if operation.rollingBack {
+            if let readyAt = operation.wifiReadyAt { return now >= readyAt + ConnectionControlProtocol.presentationWait }
+            return now >= operation.started + ConnectionControlProtocol.rollbackWait
+        }
         if !operation.accepted { return now >= operation.started + ConnectionControlProtocol.preflightWait }
         if let completedAt = operation.completedAt { return now >= min(completedAt + 5, operation.started + 80) }
         return now >= operation.started + 75
@@ -204,6 +305,7 @@ public struct ConnectionSwitchState: Equatable {
         let backwards = lastTime.map { now < $0 } ?? false; lastTime = now
         if backwards { needsRefresh = true; if pending != nil { cancel(reason: .evidenceStale) }; return }
         if snapshot != nil && now - snapshotAt >= ConnectionControlProtocol.lease { needsRefresh = true }
+        if pending?.rollingBack == true { completeWifiRollbackIfPresented(now: now) }
         guard let operation = pending, deadlineExpired(now: now) else { return }
         let text = operation.completedAt == nil ? "Connection change timed out" : "No picture on the new connection"
         cancel(reason: .deadlineExceeded); terminalMessage = text
@@ -253,7 +355,9 @@ public struct ConnectionSwitchState: Equatable {
         case .preparingUSB: return "Preparing USB..."
         case .permissionRequired: return "Allow connection changes on the PC"
         case .switching: return pending?.request.target == .usb ? "Switching to USB..." : "Switching to Wi-Fi..."
-        case .waitingPeer: return pending?.request.target == .usb ? "Connecting over USB..." : "Connecting over Wi-Fi..."
+        case .waitingPeer:
+            return pending?.request.target == .usb && pending?.rollingBack != true
+                ? "Connecting over USB..." : "Connecting over Wi-Fi..."
         case .waitingDisplay: return "Preparing display..."
         case .waitingFrame: return "Waiting for picture..."
         case .failed: return "Connection change failed"
