@@ -872,10 +872,9 @@ public class NetworkManager: ObservableObject {
         decoder.onDecodeLatency = {
             [weak self] sequence, generation, decodeStartedAt, latencyMs in
             guard let self, self.decoder.currentSessionGeneration == generation else { return }
-            let route = self.currentConnectionDecoder
             self.transportTelemetry.recordDecodeCallback(
                 sequence: sequence,
-                generation: route?.decoder == generation ? route?.network ?? generation : generation,
+                generation: self.telemetryGeneration(forDecoder: generation),
                 decodeStartedAt: decodeStartedAt,
                 durationMs: latencyMs)
         }
@@ -907,10 +906,11 @@ public class NetworkManager: ObservableObject {
             }
         }
         decoder.onFrameDropped = { [weak self] sequence, generation in
-            self?.transportTelemetry.recordDropped(
+            guard let self else { return }
+            self.transportTelemetry.recordDropped(
                 sequence: sequence,
-                generation: generation)
-            self?.networkQueue.async { [weak self] in
+                generation: self.telemetryGeneration(forDecoder: generation))
+            self.networkQueue.async { [weak self] in
                 guard let self, !self.captureAvailability.inputBlocked, self.connectionHandoffInProgress,
                       let owner = self.currentConnectionDecoder, owner.decoder == generation,
                       owner.network == self.connectionGeneration else { return }
@@ -5161,7 +5161,17 @@ public class NetworkManager: ObservableObject {
             do {
                 let oldState = mirrorControl.currentState
                 if let transition = try mirrorControl.receiveState(session: generation, data: payload) {
-                    if oldState?.epoch != transition.state.epoch && !captureTargetOwnsPresentation {
+                    let state = transition.state
+                    let resumedVirtualDisplay = oldState?.mode == .unavailable &&
+                        oldState?.source == 0 && state.mode == .virtualDisplay
+                    // A virtual restart can publish several Unavailable epochs before
+                    // confirming VirtualDisplay. The first retirement fences old frames.
+                    let preservesVirtualDecoder = !connectionHandoffInProgress &&
+                        currentMirrorDecoderOwner != nil &&
+                        ((oldState?.mode == .virtualDisplay && state.mode == .virtualDisplay) ||
+                         (oldState?.mode == .unavailable && oldState?.source == 0 &&
+                          (resumedVirtualDisplay || (state.mode == .unavailable && state.source == 0))))
+                    if oldState?.epoch != state.epoch && !captureTargetOwnsPresentation && !preservesVirtualDecoder {
                         if connectionHandoffInProgress && connectionVideoStarted {
                             failConnectionControlOnQueue(.localOperation); return
                         }
@@ -5169,10 +5179,10 @@ public class NetworkManager: ObservableObject {
                         decoder.invalidate(waitForCompletion: false)
                         beginOwnedDecoderSession(networkGeneration: generation)
                     }
-                    // The first anchor is reported after its completed write. That IDR may
-                    // already have been discarded while metadata was pending; request a fresh
-                    // dependency root using the existing recovery owner, not a media retry lane.
-                    if !captureAvailability.inputBlocked, !captureTargetOwnsPresentation, oldState?.firstFrame == nil, transition.state.firstFrame != nil {
+                    // An IDR may arrive before the control state admits video again.
+                    let firstPhysicalAnchor = oldState?.firstFrame == nil && state.firstFrame != nil
+                    if !captureAvailability.inputBlocked, !captureTargetOwnsPresentation,
+                       firstPhysicalAnchor || (resumedVirtualDisplay && !connectionHandoffInProgress) {
                         if committedRealtimeMode == RealtimeTransportMode.wifiRTP {
                             wifiMediaReceiver.requestImmediateRecoveryFeedback(generation: generation)
                         } else if let recovery=mirrorControl.presentationRecoveryRequest() {
@@ -7323,6 +7333,15 @@ public class NetworkManager: ObservableObject {
         mirrorDecoderLock.lock(); defer { mirrorDecoderLock.unlock() }; return mirrorDecoderOwner
     }
 
+    private func telemetryGeneration(forDecoder generation: UInt64) -> UInt64 {
+        mirrorDecoderLock.lock()
+        defer { mirrorDecoderLock.unlock() }
+        if let owner = connectionDecoder, owner.decoder == generation { return owner.network }
+        if let owner = captureTargetDecoderOwner, owner.decoder == generation { return owner.generation }
+        if let owner = mirrorDecoderOwner, owner.decoder == generation { return owner.connection }
+        return generation
+    }
+
     // MARK: - Connection control (casting only, CC-01 through CC-21)
     private func selectedUsbCredentialOnQueue() -> TrustedHostCredential? {
         dispatchPrecondition(condition: .onQueue(networkQueue))
@@ -8797,10 +8816,9 @@ public class NetworkManager: ObservableObject {
         generation: UInt64
     ) {
         guard decoder.currentSessionGeneration == generation else { return }
-        let route = currentConnectionDecoder
         transportTelemetry.recordDrawableCommitted(
             sequence: sequence,
-            generation: route?.decoder == generation ? route?.network ?? generation : generation)
+            generation: telemetryGeneration(forDecoder: generation))
     }
 
     public func recordRenderDrop(sequence: UInt32, generation: UInt64) {
@@ -8814,7 +8832,7 @@ public class NetworkManager: ObservableObject {
         }
         transportTelemetry.recordRenderDrop(
             sequence: sequence,
-            generation: generation)
+            generation: telemetryGeneration(forDecoder: generation))
     }
 
     func recordDiagnosticLine(_ line: String) {

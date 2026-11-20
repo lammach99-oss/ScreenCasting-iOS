@@ -1412,6 +1412,35 @@ final class OptionalUsbAudioBindingTests: XCTestCase {
 }
 
 final class ForegroundPerformanceFeedbackTests: XCTestCase {
+    func testFeedbackCountsScopedVirtualFramesAfterForegroundRecovery() throws {
+        let manager = NetworkManager(); defer { manager.stopForTesting() }
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        manager.beginMirrorControlForTesting(generation: session.generation)
+        let state = MirrorControlState(revision: 1, epoch: 1, source: 0, mode: .virtualDisplay,
+            token: MirrorToken(low: 0, high: 0), geometry: nil, firstFrame: nil, lastSent: nil)
+        manager.receiveMirrorWireForTesting(type: .mirrorState, payload: try MirrorControlCodec.encodeState(state),
+            generation: session.generation, connection: session.connection)
+        let retired = try XCTUnwrap(manager.mirrorDecoderGenerationForTesting)
+        manager.seedPerformanceWindowForTesting(at: 10)
+        manager.applicationWillResignActive()
+        manager.applicationDidBecomeActive()
+        manager.networkQueueForTesting.sync { }
+        let current = try XCTUnwrap(manager.mirrorDecoderGenerationForTesting)
+        XCTAssertNotEqual(current, retired)
+
+        for sequence in UInt32(1)...60 {
+            manager.decoderForTesting.onDecodeLatency?(sequence + 1_000, retired, 10, 1)
+            manager.recordDrawableCommitted(sequence: sequence + 1_000, generation: retired)
+            manager.decoderForTesting.onDecodeLatency?(sequence, current, 10, 1)
+            manager.recordDrawableCommitted(sequence: sequence, generation: current)
+            manager.recordDrawableCommitted(sequence: sequence, generation: current)
+        }
+        let sample = try XCTUnwrap(manager.performanceSampleForTesting(at: 11))
+        XCTAssertEqual(sample.generation, session.generation)
+        XCTAssertEqual(sample.decodedFps, 60)
+        XCTAssertEqual(sample.freshPresentedFps, 60)
+    }
+
     func testActiveCommittedWifiCanEmitPerformanceFeedback() {
         for mode in [PipelineMode.office, .game] {
             let manager = NetworkManager(); defer { manager.stopForTesting() }
@@ -1457,6 +1486,48 @@ final class ForegroundPerformanceFeedbackTests: XCTestCase {
         manager.networkQueueForTesting.sync { }
         XCTAssertNil(manager.performanceSampleForTesting(at: 10))
         XCTAssertEqual(manager.sendPerformanceFeedbackForTesting(), 0)
+    }
+}
+
+final class VirtualDisplayRotationRecoveryTests: XCTestCase {
+    func testVirtualRestartRetiresOnceAndRequestsRecoveryAfterVideoReadmission() throws {
+        let manager = NetworkManager(); defer { manager.stopForTesting() }
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        manager.beginMirrorControlForTesting(generation: session.generation)
+        manager.networkQueueForTesting.sync {
+            manager.wifiMediaReceiverForTesting.simulateActivePacketSequenceForTesting(
+                100, generation: session.generation)
+        }
+        func receive(_ mode: MirrorControlMode, _ epoch: UInt64) throws {
+            let state = MirrorControlState(revision: epoch, epoch: epoch, source: 0, mode: mode,
+                token: MirrorToken(low: 0, high: 0), geometry: nil, firstFrame: nil, lastSent: nil)
+            manager.receiveMirrorWireForTesting(type: .mirrorState,
+                payload: try MirrorControlCodec.encodeState(state),
+                generation: session.generation, connection: session.connection)
+        }
+        try receive(.virtualDisplay, 1)
+        let decoder = manager.decoderForTesting
+        let initial = decoder.currentSessionGeneration
+        let begins = decoder.sessionBeganCountForTesting
+        try receive(.virtualDisplay, 2)
+        XCTAssertEqual(decoder.currentSessionGeneration, initial)
+        try receive(.unavailable, 3)
+        let replacement = decoder.currentSessionGeneration
+        XCTAssertNotEqual(replacement, initial)
+        try receive(.unavailable, 4)
+        try receive(.virtualDisplay, 5)
+        XCTAssertEqual(decoder.currentSessionGeneration, replacement)
+        XCTAssertEqual(decoder.sessionBeganCountForTesting, begins + 1)
+        manager.networkQueueForTesting.sync {
+            XCTAssertTrue(manager.wifiMediaReceiverForTesting.isRecovering(generation: session.generation))
+            manager.wifiMediaReceiverForTesting.simulatePendingRecoveryCandidateForTesting(sequence: 101)
+        }
+        decoder.onDecodeCompleted?(101, replacement, true)
+        try receive(.virtualDisplay, 6)
+        XCTAssertEqual(decoder.currentSessionGeneration, replacement)
+        manager.networkQueueForTesting.sync {
+            XCTAssertFalse(manager.wifiMediaReceiverForTesting.isRecovering(generation: session.generation))
+        }
     }
 }
 
