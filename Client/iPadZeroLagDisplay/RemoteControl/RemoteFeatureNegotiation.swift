@@ -121,7 +121,8 @@ struct RemoteFeatureNegotiation {
     static let remoteFileFeature: UInt64 = 0x100
     static let remoteAudioFeature: UInt64 = 0x200
     static let remoteSecureDesktopFeature: UInt64 = 0x400
-    static let phaseAFeatures = remoteFileFeature | remoteAudioFeature | remoteSecureDesktopFeature
+    static let remoteSasAvailabilityFeature: UInt64 = 0x800
+    static let phaseAFeatures = remoteFileFeature | remoteAudioFeature | remoteSecureDesktopFeature | remoteSasAvailabilityFeature
     static let knownFeatures: UInt64 = 0x1f | phaseAFeatures
     private var requestedFeatures: UInt64
     // Input-only callers retain their mask; remote sessions explicitly request 0x1f.
@@ -148,7 +149,7 @@ struct RemoteFeatureNegotiation {
         guard phase == .pong else { return nil }
         guard now < deadline, flags & Self.supportedFlag != 0 else { phase = .legacy; return nil }
         if requestRemoteFiles, requestedFeatures & 3 == 3 { requestedFeatures |= Self.remoteFileFeature }
-        if requestSecureDesktop { requestedFeatures |= Self.remoteSecureDesktopFeature }
+        if requestSecureDesktop { requestedFeatures |= Self.remoteSecureDesktopFeature | Self.remoteSasAvailabilityFeature }
         if requestRemoteAudio { requestedFeatures |= Self.remoteAudioFeature }
         phase = .result; return RemoteFeaturesMessage(features: requestedFeatures).encode()
     }
@@ -156,6 +157,7 @@ struct RemoteFeatureNegotiation {
         guard phase == .result else { return false }; phase = .legacy
         guard flags == 0, let message = RemoteFeaturesMessage.decode(payload),
               message.features & ~Self.knownFeatures == 0, message.features & ~requestedFeatures == 0,
+              message.features & Self.remoteSasAvailabilityFeature == 0 || message.features & Self.remoteSecureDesktopFeature != 0,
               message.features & (4 | Self.remoteFileFeature) == 0 || message.features & 3 == 3 else { return false }
         accepted = message.features; phase = .complete; return true
     }

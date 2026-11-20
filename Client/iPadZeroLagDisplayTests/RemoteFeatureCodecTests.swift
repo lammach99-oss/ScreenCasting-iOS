@@ -112,6 +112,50 @@ final class RemoteFeatureCodecTests: XCTestCase {
         }
     }
 
+    func testRemoteSasAvailabilityGoldenPayloads() throws {
+        // Tests/Ipc/RemoteContracts/remote-sas-availability-golden.json
+        let vectors: [([UInt8], UInt16, Bool?)] = [
+            ([1, 0], 0, false), ([1, 1], 0, true), ([1], 0, nil),
+            ([1, 1, 0], 0, nil), ([2, 1], 0, nil), ([1, 2], 0, nil), ([1, 1], 1, nil)
+        ]
+        let type = try XCTUnwrap(WireMessageType(rawValue: 110))
+        for (bytes, flags, available) in vectors {
+            let payload = Data(bytes)
+            let decoded = RemoteSecureDesktopProtocol.decode(type: type, payload: payload, flags: flags)
+            XCTAssertEqual(decoded, available.map { .sasAvailability(available: $0) }, "\(bytes), flags \(flags)")
+            if let decoded {
+                XCTAssertEqual(decoded.type, type)
+                XCTAssertEqual(RemoteSecureDesktopProtocol.encode(decoded), payload)
+            }
+        }
+    }
+
+    func testRemoteSasAvailabilityParserRequiresNegotiationAndValidHeader() {
+        let cases: [(Bool, Int, UInt8, Bool)] = [
+            (false, 2, 0, false), (true, 2, 0, true), (true, 2, 1, false),
+            (true, 1, 0, false), (true, 3, 0, false)
+        ]
+        for (negotiated, size, flags, allowed) in cases {
+            var frame = ConnectionControlProtocol.frame(type: 110, payload: Data([1, 1, 0].prefix(size)))
+            frame[6] = flags
+            let parser = WireStreamParser(generation: 1, allowsSecureDesktop: { true },
+                                          allowsSasAvailability: { negotiated })
+            var messages = 0, failures = 0
+            parser.consume(Data(frame.prefix(WireProtocol.headerSize)), generation: 1) {
+                if case .failure(.invalidHeader) = $0 { failures += 1 }
+            }
+            if allowed {
+                parser.consume(Data(frame.dropFirst(WireProtocol.headerSize)), generation: 1) {
+                    if case .message = $0 { messages += 1 }
+                }
+            } else {
+                XCTAssertEqual(parser.allocatedPayloadBytes, 0)
+            }
+            XCTAssertEqual(messages, allowed ? 1 : 0)
+            XCTAssertEqual(failures, allowed ? 0 : 1)
+        }
+    }
+
     func testRemoteAudioRequestsFeatureOnlyWithOptInAndAcceptsViewOnlyGrant() throws {
         for preferred in [false, true] {
             var negotiation = RemoteFeatureNegotiation(requestedFeatures: 0x1f)

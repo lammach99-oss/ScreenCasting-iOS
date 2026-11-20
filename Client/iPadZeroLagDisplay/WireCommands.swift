@@ -69,6 +69,7 @@ enum WireMessageType: UInt8 {
     case remoteFileControl = 100, remoteFileState = 101, remoteFilePacket = 102, remoteFileWindow = 103
     case remoteAudioSet = 104, remoteAudioState = 105, remoteAudioPacket = 106, remoteTimedVideo = 107
     case remoteSecureDesktopRequest = 108, remoteSecureDesktopState = 109
+    case remoteSasAvailability = 110
 }
 
 /// Toolbar actions the remote host runs on the PC. Payload: [version 1, command, flags(bit0 confirm)].

@@ -561,6 +561,7 @@ public class NetworkManager: ObservableObject {
         generation: connectionGeneration,
         queue: networkQueue, allowsRemoteFiles: { [weak self] in self?.mayReceiveRemoteFiles == true },
         allowsSecureDesktop: { [weak self] in self?.remoteSecureDesktop.supported == true },
+        allowsSasAvailability: { [weak self] in self?.remoteSecureDesktop.sasAvailabilitySupported == true },
         allowsRemoteAudio: { [weak self] in self?.mayReceiveRemoteAudio == true })
     private var wireReceiveActiveGeneration: UInt64?
     #if targetEnvironment(simulator)
@@ -1623,6 +1624,11 @@ public class NetworkManager: ObservableObject {
         guard remoteInputConnection, remoteSecureDesktop.supported,
               let message = RemoteSecureDesktopProtocol.decode(type: header.type, payload: payload, flags: header.flags) else {
             handleStreamError("Invalid secure desktop state."); return
+        }
+        if case let .sasAvailability(available) = message {
+            remoteSecureDesktop.updateSasAvailability(available)
+            publishRemoteSecureDesktopOnQueue()
+            return
         }
         let change = remoteSecureDesktop.receive(message, adaptiveOwner: qualitySession?.owner != nil,
                                                 timedVideo: remoteTimedVideoLatched)
@@ -5205,7 +5211,7 @@ public class NetworkManager: ObservableObject {
 
         case .remoteFileState, .remoteFilePacket, .remoteFileWindow:
             receiveRemoteFileOnQueue(header, payload: payload)
-        case .remoteSecureDesktopState:
+        case .remoteSecureDesktopState, .remoteSasAvailability:
             receiveRemoteSecureDesktopOnQueue(header, payload: payload)
         case .remoteAudioState, .remoteAudioPacket, .remoteTimedVideo:
             receiveRemoteAudioOnQueue(message, generation: generation)

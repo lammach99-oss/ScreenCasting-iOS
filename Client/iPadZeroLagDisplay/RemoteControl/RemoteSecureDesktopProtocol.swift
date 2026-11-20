@@ -12,21 +12,24 @@ enum RemoteSecureDesktopProtocol {
         case request(operation: Operation, videoSequence: UInt32, captureRevision: UInt64, sourceEpoch: UInt64)
         case state(desktop: Desktop, phase: Phase, backend: Backend, permissions: Permissions, reason: Reason,
                    captureRevision: UInt64, sourceEpoch: UInt64, firstVideoSequence: UInt32)
+        case sasAvailability(available: Bool)
 
         var type: WireMessageType {
             switch self {
             case .request: return .remoteSecureDesktopRequest
             case .state: return .remoteSecureDesktopState
+            case .sasAvailability: return .remoteSasAvailability
             }
         }
     }
 
-    private static let requestSize = 24, stateSize = 32
+    private static let requestSize = 24, stateSize = 32, sasAvailabilitySize = 2
 
     static func isValidLength(type: WireMessageType, length: Int) -> Bool {
         switch type {
         case .remoteSecureDesktopRequest: return length == requestSize
         case .remoteSecureDesktopState: return length == stateSize
+        case .remoteSasAvailability: return length == sasAvailabilitySize
         default: return false
         }
     }
@@ -50,6 +53,8 @@ enum RemoteSecureDesktopProtocol {
             data.storeLittleEndian(revision, at: 8)
             data.storeLittleEndian(source, at: 16)
             data.storeLittleEndian(videoSequence, at: 24)
+        case let .sasAvailability(available):
+            return Data([1, available ? 1 : 0])
         }
         data[0] = 1
         return decode(type: message.type, payload: data) == nil ? nil : data
@@ -59,6 +64,10 @@ enum RemoteSecureDesktopProtocol {
         guard flags == 0, isValidLength(type: type, length: payload.count) else { return nil }
         let data = Data(payload)
         guard data[0] == 1 else { return nil }
+        if type == .remoteSasAvailability {
+            guard data[1] <= 1 else { return nil }
+            return .sasAvailability(available: data[1] == 1)
+        }
         let revision = data.loadLittleEndian(UInt64.self, at: 8)
         let source = data.loadLittleEndian(UInt64.self, at: 16)
         switch type {
@@ -104,6 +113,8 @@ struct RemoteSecureDesktopState {
     enum VideoAdmission: Equatable { case pass, drop, barrier, invalid }
 
     private(set) var supported = false
+    private(set) var sasAvailabilitySupported = false
+    private var sasAvailable = false
     private(set) var covered = false
     private(set) var control = false
     private(set) var desktop: Desktop = .standard
@@ -124,22 +135,30 @@ struct RemoteSecureDesktopState {
     var restrictsFeatures: Bool { covered || desktop != .standard || pendingAck != nil }
     var canSas: Bool {
         if !supported { return true }
-        guard control, !covered, desktop == .winlogon, ackAdmitted,
+        guard control, !covered else { return false }
+        if desktop == .standard { return sasAvailable }
+        guard desktop == .winlogon, ackAdmitted,
               case .state(_, .firstFrame, _, .videoAndInputAfterPresented, _, _, _, _)? = state else { return false }
         return true
     }
-    var allowsScanAndPointer: Bool { !restrictsFeatures || canSas }
+    var allowsScanAndPointer: Bool { !restrictsFeatures || (desktop == .winlogon && canSas) }
     var hasPresentedBarrier: Bool { ackAdmitted }
 
     mutating func begin(accepted: UInt64, control: Bool) -> ProtocolMessage? {
         self = Self()
         supported = accepted & RemoteFeatureNegotiation.remoteSecureDesktopFeature != 0
+        sasAvailabilitySupported = supported && accepted & RemoteFeatureNegotiation.remoteSasAvailabilityFeature != 0
         return setControl(control)
+    }
+
+    mutating func updateSasAvailability(_ available: Bool) {
+        sasAvailable = sasAvailabilitySupported && control && available
     }
 
     mutating func setControl(_ enabled: Bool) -> ProtocolMessage? {
         guard supported, control != enabled else { return nil }
         control = enabled
+        sasAvailable = false
         if !enabled, desktop != .standard {
             retiredRevision = revision
             fence()

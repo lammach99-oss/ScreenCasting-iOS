@@ -9,13 +9,48 @@ final class SecureDesktopRecoveryTests: XCTestCase {
             var features = RemoteFeatureNegotiation(requestedFeatures: 0x1f)
             XCTAssertTrue(features.begin(now: 0))
             let request = try XCTUnwrap(features.pong(flags: 0x4000, now: 1, requestSecureDesktop: enabled))
-            XCTAssertEqual(RemoteFeaturesMessage.decode(request)?.features, enabled ? 0x41f : 0x1f)
+            XCTAssertEqual(RemoteFeaturesMessage.decode(request)?.features, enabled ? 0xc1f : 0x1f)
             XCTAssertTrue(features.result(flags: 0, payload: RemoteFeaturesMessage(features: 0x1f).encode()))
             var secure = RemoteSecureDesktopState()
             XCTAssertNil(secure.begin(accepted: features.accepted, control: true))
             XCTAssertFalse(secure.covered)
             XCTAssertTrue(secure.canSas)
         }
+    }
+
+    func testRemoteSasAvailabilityGrantRequiresSecureDesktop() throws {
+        for (grant, valid) in [(UInt64(0x400), true), (0xc00, true), (0x800, false)] {
+            var features = RemoteFeatureNegotiation()
+            XCTAssertTrue(features.begin(now: 0))
+            _ = try XCTUnwrap(features.pong(flags: 0x4000, now: 1, requestSecureDesktop: true))
+            XCTAssertEqual(features.result(flags: 0, payload: RemoteFeaturesMessage(features: grant).encode()), valid)
+            XCTAssertEqual(features.accepted, valid ? grant : 0)
+        }
+    }
+
+    func testDefaultSasRequiresCurrentAvailabilityAndControl() {
+        var secure = RemoteSecureDesktopState()
+        _ = secure.begin(accepted: 0xc00, control: false)
+        XCTAssertFalse(secure.canSas)
+        secure.updateSasAvailability(true)
+        XCTAssertFalse(secure.canSas)
+        _ = secure.setControl(true)
+        XCTAssertFalse(secure.canSas)
+        secure.updateSasAvailability(true)
+        XCTAssertTrue(secure.canSas)
+        secure.updateSasAvailability(false)
+        XCTAssertFalse(secure.canSas)
+        secure.updateSasAvailability(true)
+        _ = secure.setControl(false)
+        XCTAssertFalse(secure.canSas)
+        _ = secure.setControl(true)
+        XCTAssertFalse(secure.canSas)
+        secure.updateSasAvailability(true)
+        _ = secure.begin(accepted: 0xc00, control: true)
+        XCTAssertFalse(secure.canSas)
+        _ = secure.begin(accepted: 0x400, control: true)
+        secure.updateSasAvailability(true)
+        XCTAssertFalse(secure.canSas)
     }
 
     func testRemoteSecureDesktopRevealsAndAcknowledgesOnlyPresentedIDR() {
@@ -63,7 +98,7 @@ final class SecureDesktopRecoveryTests: XCTestCase {
 
     func testRemoteSecureDesktopSasStaysDisabledForVideoOnlyGrant() throws {
         var secure = RemoteSecureDesktopState()
-        _ = secure.begin(accepted: 0x400, control: true)
+        _ = secure.begin(accepted: 0xc00, control: true)
         let publication = RemoteSecureDesktopProtocol.Message.state(
             desktop: .winlogon, phase: .firstFrame, backend: .dxgi, permissions: .video, reason: .none,
             captureRevision: 3, sourceEpoch: 7, firstVideoSequence: 21)
@@ -71,6 +106,7 @@ final class SecureDesktopRecoveryTests: XCTestCase {
         XCTAssertEqual(secure.admit(sequence: 21, isIDR: true, decoder: 4), .barrier)
         let ack = try XCTUnwrap(secure.presented(sequence: 21, decoder: 4))
         XCTAssertTrue(secure.admitRequest(ack))
+        secure.updateSasAvailability(true)
         XCTAssertFalse(secure.covered)
         XCTAssertFalse(secure.canSas)
         XCTAssertFalse(secure.allowsScanAndPointer)
