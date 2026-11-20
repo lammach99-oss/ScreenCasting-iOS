@@ -476,10 +476,11 @@ public final class DecoderManager {
 
     // Drop pre-suspension decode tickets without changing VT/session/renderer ownership.
     // The renderer keeps its last image; only a fresh IDR may restart the mailbox chain.
-    func fenceCaptureContinuation() {
+    func fenceCaptureContinuation(requiringAuthorization: Bool = true) {
         captureDeliveryLock.lock()
         defer { captureDeliveryLock.unlock() }
-        captureOutputFenced = true; captureOutputs.removeAll()
+        if requiringAuthorization { captureOutputFenced = true }
+        captureOutputs.removeAll()
         adaptiveFrames.removeAll()
         mailboxStateLock.lock()
         mailbox.beginSession(generation: localSessionGeneration)

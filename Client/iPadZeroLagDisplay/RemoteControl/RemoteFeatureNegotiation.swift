@@ -144,11 +144,12 @@ struct RemoteFeatureNegotiation {
         if phase == .pong && now >= deadline { phase = .legacy }
     }
     mutating func pong(flags: UInt16, now: TimeInterval, requestRemoteFiles: Bool = false,
-                       requestSecureDesktop: Bool = false) -> Data? {
+                       requestSecureDesktop: Bool = false, requestRemoteAudio: Bool = false) -> Data? {
         guard phase == .pong else { return nil }
         guard now < deadline, flags & Self.supportedFlag != 0 else { phase = .legacy; return nil }
         if requestRemoteFiles, requestedFeatures & 3 == 3 { requestedFeatures |= Self.remoteFileFeature }
         if requestSecureDesktop { requestedFeatures |= Self.remoteSecureDesktopFeature }
+        if requestRemoteAudio { requestedFeatures |= Self.remoteAudioFeature }
         phase = .result; return RemoteFeaturesMessage(features: requestedFeatures).encode()
     }
     mutating func result(flags: UInt16, payload: Data) -> Bool {

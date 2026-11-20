@@ -100,6 +100,7 @@ final class WireStreamParser {
     private var generation: UInt64
     private let allowsRemoteFiles: () -> Bool
     private let allowsSecureDesktop: () -> Bool
+    private let allowsRemoteAudio: () -> Bool
     private var state: State = .header
     private var headerBytes = Data(count: WireProtocol.headerSize)
     private var headerOffset = 0
@@ -109,10 +110,12 @@ final class WireStreamParser {
     private(set) var maximumDrainChunkObserved = 0
 
     init(generation: UInt64, allowsRemoteFiles: @escaping () -> Bool = { false },
-         allowsSecureDesktop: @escaping () -> Bool = { false }) {
+         allowsSecureDesktop: @escaping () -> Bool = { false },
+         allowsRemoteAudio: @escaping () -> Bool = { false }) {
         self.generation = generation
         self.allowsRemoteFiles = allowsRemoteFiles
         self.allowsSecureDesktop = allowsSecureDesktop
+        self.allowsRemoteAudio = allowsRemoteAudio
     }
 
     var allocatedPayloadBytes: Int { payload.count }
@@ -272,6 +275,13 @@ final class WireStreamParser {
         if type == .remoteSecureDesktopState {
             guard allowsSecureDesktop(), flags == 0,
                   RemoteSecureDesktopProtocol.isValidLength(type: type, length: payloadLength) else {
+                state = .failed; payload = Data()
+                onEvent(.failure(.invalidHeader))
+                return
+            }
+        } else if (105...107).contains(type.rawValue) {
+            guard allowsRemoteAudio(), flags == 0,
+                  RemoteAudioProtocol.isValidLength(type: type, length: payloadLength) else {
                 state = .failed; payload = Data()
                 onEvent(.failure(.invalidHeader))
                 return
@@ -459,10 +469,11 @@ final class WireParserQueueDomain {
     private let parser: WireStreamParser
 
     init(generation: UInt64, queue: DispatchQueue, allowsRemoteFiles: @escaping () -> Bool = { false },
-         allowsSecureDesktop: @escaping () -> Bool = { false }) {
+         allowsSecureDesktop: @escaping () -> Bool = { false },
+         allowsRemoteAudio: @escaping () -> Bool = { false }) {
         self.queue = queue
         parser = WireStreamParser(generation: generation, allowsRemoteFiles: allowsRemoteFiles,
-                                  allowsSecureDesktop: allowsSecureDesktop)
+                                  allowsSecureDesktop: allowsSecureDesktop, allowsRemoteAudio: allowsRemoteAudio)
     }
 
     var suggestedReceiveLength: Int {

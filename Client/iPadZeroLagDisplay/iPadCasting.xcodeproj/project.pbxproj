@@ -128,6 +128,8 @@
 		AD2300010000000000000001 /* RemoteFileProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2300020000000000000001 /* RemoteFileProtocol.swift */; };
 		AD2500010000000000000001 /* RemoteFileAccess.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2500020000000000000001 /* RemoteFileAccess.swift */; };
 		AD2300010000000000000002 /* RemoteAudioProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2300020000000000000002 /* RemoteAudioProtocol.swift */; };
+		AD2300010000000000000006 /* RemoteAudioSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2300020000000000000006 /* RemoteAudioSession.swift */; };
+		AD2300010000000000000007 /* RemoteAudioPlayback.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2300020000000000000007 /* RemoteAudioPlayback.swift */; };
 		AD2300010000000000000003 /* RemoteSecureDesktopProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2300020000000000000003 /* RemoteSecureDesktopProtocol.swift */; };
 		AD2300010000000000000004 /* RemoteFeatureCodecTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2300020000000000000004 /* RemoteFeatureCodecTests.swift */; };
 		AD2300010000000000000005 /* remote-ds5-ds7-golden.json in Resources */ = {isa = PBXBuildFile; fileRef = AD2300020000000000000005 /* remote-ds5-ds7-golden.json */; };
@@ -268,6 +270,8 @@
 		AD2300020000000000000001 /* RemoteFileProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteFileProtocol.swift; sourceTree = "<group>"; };
 		AD2500020000000000000001 /* RemoteFileAccess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteFileAccess.swift; sourceTree = "<group>"; };
 		AD2300020000000000000002 /* RemoteAudioProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteAudioProtocol.swift; sourceTree = "<group>"; };
+		AD2300020000000000000006 /* RemoteAudioSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteAudioSession.swift; sourceTree = "<group>"; };
+		AD2300020000000000000007 /* RemoteAudioPlayback.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteAudioPlayback.swift; sourceTree = "<group>"; };
 		AD2300020000000000000003 /* RemoteSecureDesktopProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteSecureDesktopProtocol.swift; sourceTree = "<group>"; };
 		AD2300020000000000000004 /* RemoteFeatureCodecTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteFeatureCodecTests.swift; sourceTree = "<group>"; };
 		AD2300020000000000000005 /* remote-ds5-ds7-golden.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = Fixtures/remote-ds5-ds7-golden.json; sourceTree = "<group>"; };
@@ -305,6 +309,8 @@
 				AD2300020000000000000001 /* RemoteFileProtocol.swift */,
 				AD2500020000000000000001 /* RemoteFileAccess.swift */,
 				AD2300020000000000000002 /* RemoteAudioProtocol.swift */,
+				AD2300020000000000000006 /* RemoteAudioSession.swift */,
+				AD2300020000000000000007 /* RemoteAudioPlayback.swift */,
 				AD2300020000000000000003 /* RemoteSecureDesktopProtocol.swift */,
 				1A0700030000000000000003 /* IPadInputSession.swift */,
 				1A0700030000000000000002 /* IPadInputEngine.swift */,
@@ -547,6 +553,8 @@
 				AD2300010000000000000001 /* RemoteFileProtocol.swift in Sources */,
 				AD2500010000000000000001 /* RemoteFileAccess.swift in Sources */,
 				AD2300010000000000000002 /* RemoteAudioProtocol.swift in Sources */,
+				AD2300010000000000000006 /* RemoteAudioSession.swift in Sources */,
+				AD2300010000000000000007 /* RemoteAudioPlayback.swift in Sources */,
 				AD2300010000000000000003 /* RemoteSecureDesktopProtocol.swift in Sources */,
 				1A0700040000000000000003 /* IPadInputSession.swift in Sources */,
 				1A0700040000000000000002 /* IPadInputEngine.swift in Sources */,

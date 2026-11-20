@@ -435,6 +435,14 @@ enum ClientStreamSettingsStore {
         defaults.set(enabled, forKey: hostSettingKey("autoQuality", hostID: hostID, remote: remote))
     }
 
+    static func loadRemoteAudio(hostID: Data, defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: hostSettingKey("remoteAudio", hostID: hostID, remote: true))
+    }
+
+    static func saveRemoteAudio(_ enabled: Bool, hostID: Data, defaults: UserDefaults = .standard) {
+        defaults.set(enabled, forKey: hostSettingKey("remoteAudio", hostID: hostID, remote: true))
+    }
+
     static func migrateCastingBitrate(defaults: UserDefaults) {
         // Existing credentials are looked up individually. Snapshot the old
         // shared value for each existing host that has no override yet.

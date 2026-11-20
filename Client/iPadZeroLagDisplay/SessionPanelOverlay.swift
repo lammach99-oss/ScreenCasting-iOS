@@ -827,12 +827,26 @@ private extension Color {
     @MainActor private struct RemoteActionsSection: View {
         let owner: SessionPanelOverlay
         var body: some View {
+            if let status = owner.networkManager.remoteAudioStatus {
+                Toggle("Play PC audio on iPad", isOn: Binding(
+                    get: { owner.networkManager.remoteAudioPreferred },
+                    set: { owner.networkManager.setRemoteAudioPreferred($0) }))
+                    .font(.subheadline)
+                    .tint(Color(ink: SessionInk.accent))
+                    .frame(minHeight: 44)
+                if !status.isEmpty {
+                    Text(status)
+                        .font(.footnote)
+                        .foregroundStyle(Color(ink: SessionInk.secondary))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
             if owner.networkManager.remoteSecureDesktopSupported {
                 Toggle("Control Windows security screens", isOn: Binding(
                     get: { owner.networkManager.remoteSecureDesktopControl },
                     set: { owner.networkManager.setRemoteSecureControl($0) }))
                     .font(.subheadline)
-                    .tint(Color.inkAccent)
+                    .tint(Color(ink: SessionInk.accent))
                     .frame(minHeight: 44)
             }
             SessionActionLayout(accessibility: owner.typeSize.isAccessibilitySize) {

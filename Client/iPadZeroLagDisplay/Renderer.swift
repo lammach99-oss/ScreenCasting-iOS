@@ -603,6 +603,7 @@ public class Renderer: NSObject, MTKViewDelegate {
     }
 
     var onFramePresented: ((UInt32, UInt64) -> Void)?
+    var remotePresentationDeadline: ((UInt32, UInt64, TimeInterval) -> TimeInterval)?
     public var onFrameRendered: ((UInt32, UInt64) -> Void)?
     public var onDrawableCommitted: ((UInt32, UInt64) -> Void)?
     public var onFrameDropped: ((UInt32, UInt64) -> Void)?
@@ -930,6 +931,14 @@ public class Renderer: NSObject, MTKViewDelegate {
     public func draw(in view: MTKView) {
         recordCadence(.drawCallback)
         lock.lock()
+        let ready = presentationCadenceMode == .game ? gameReadyFrame?.identity : officeReadyFrame?.identity
+        if let ready, let remotePresentationDeadline {
+            let now = CACurrentMediaTime()
+            if remotePresentationDeadline(ready.sequence, ready.generation, now) > now {
+                lock.unlock()
+                return
+            }
+        }
         let drawSelection: (GameFrame, DrawKind)?
         if presentationCadenceMode == .game,
            let generation = freshness.sessionGeneration {

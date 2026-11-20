@@ -305,6 +305,17 @@ public class NetworkManager: ObservableObject {
     private let remoteSecureDesktopPublicationClock = ConnectionGenerationClock()
     private var remoteSecureControlIntent = false
     private var remoteTimedVideoLatched = false
+    private var remoteTimedVideoNeedsIDR = false
+    private var remoteTimedVideo = RemoteTimedVideoAssembler()
+    private let remoteVideoTiming = RemoteVideoPresentationTiming()
+    private let remoteAudioPlayback = RemoteAudioPlayback()
+    private var remoteAudio = RemoteAudioSession()
+    private var remoteAudioRequested = false
+    private var remoteAudioFeaturesReceived = false
+    private var remoteAudioOutputFailed = false
+    @Published private(set) var remoteAudioPreferred = false
+    @Published private(set) var remoteAudioStatus: String?
+    private let remoteAudioPublicationClock = ConnectionGenerationClock()
     private var remoteSecureDesktopEnabled: Bool {
         streamSettingsDefaults.bool(forKey: RemoteSecureDesktopState.preferenceKey)
     }
@@ -549,7 +560,8 @@ public class NetworkManager: ObservableObject {
     private lazy var wireParser = WireParserQueueDomain(
         generation: connectionGeneration,
         queue: networkQueue, allowsRemoteFiles: { [weak self] in self?.mayReceiveRemoteFiles == true },
-        allowsSecureDesktop: { [weak self] in self?.remoteSecureDesktop.supported == true })
+        allowsSecureDesktop: { [weak self] in self?.remoteSecureDesktop.supported == true },
+        allowsRemoteAudio: { [weak self] in self?.mayReceiveRemoteAudio == true })
     private var wireReceiveActiveGeneration: UInt64?
     #if targetEnvironment(simulator)
     private var testingSimulatedWifiSession = false
@@ -1048,6 +1060,7 @@ public class NetworkManager: ObservableObject {
             defer { self.recordAppAudioLifecycleDiagnostic(event: "did_become_active", phase: "applied", foregroundBefore: diagnosticForegroundBefore) }
             let wasForegroundActive = self.isForegroundActive
             self.isForegroundActive = true
+            self.updateRemoteAudioSuspensionOnQueue()
             self.remoteFileBackgrounded = false
             self.publishRemoteFileAccessOnQueue()
             if !wasForegroundActive,
@@ -1156,6 +1169,7 @@ public class NetworkManager: ObservableObject {
             defer { self.recordAppAudioLifecycleDiagnostic(event: "will_resign_active", phase: "applied", foregroundBefore: diagnosticForegroundBefore) }
             self.cancelActiveDirectTouchOnQueue()
             self.isForegroundActive = false
+            self.updateRemoteAudioSuspensionOnQueue()
             self.publishRemoteFileAccessOnQueue()
             self.manualReconnectPresentation = nil
             // Foreground eligibility is closed first; discard its old sample window.
@@ -1184,6 +1198,7 @@ public class NetworkManager: ObservableObject {
             self.recordAppAudioLifecycleDiagnostic(event: "did_enter_background", phase: "received", foregroundBefore: diagnosticForegroundBefore)
             defer { self.recordAppAudioLifecycleDiagnostic(event: "did_enter_background", phase: "applied", foregroundBefore: diagnosticForegroundBefore) }
             self.isForegroundActive = false
+            self.updateRemoteAudioSuspensionOnQueue()
             self.backgroundRemoteFilesOnQueue()
             self.manualReconnectPresentation = nil
             // Foreground eligibility is closed first; discard its old sample window.
@@ -1551,6 +1566,14 @@ public class NetworkManager: ObservableObject {
     private func resetRemoteInputOnQueue() {
         remoteSecureDesktop = RemoteSecureDesktopState()
         remoteTimedVideoLatched = false
+        remoteTimedVideoNeedsIDR = false
+        remoteTimedVideo.reset()
+        remoteVideoTiming.reset()
+        remoteAudio = RemoteAudioSession()
+        remoteAudioRequested = false
+        remoteAudioFeaturesReceived = false
+        remoteAudioOutputFailed = false
+        updateRemoteAudioPlaybackOnQueue()
         publishRemoteSecureDesktopOnQueue()
         remoteFileAccess = nil
         retireRemoteFileIOOnQueue()
@@ -1616,6 +1639,8 @@ public class NetworkManager: ObservableObject {
 
     private func fenceRemoteSecureDesktopOnQueue(_ change: RemoteSecureDesktopState.Change) {
         guard change != .unchanged else { return }
+        resetRemoteTimedVideoOnQueue()
+        updateRemoteAudioSuspensionOnQueue()
         decoder.fenceCaptureContinuation()
         captureTargetVideo.reset()
         connectionVideo.reset()
@@ -1634,6 +1659,181 @@ public class NetworkManager: ObservableObject {
         decoder.invalidate(waitForCompletion: false)
         decoder.clearAdaptiveMedia()
         decoder.beginSession(generation: nextMirrorDecoder)
+    }
+
+    private var remoteAudioHostID: Data? {
+        guard remoteInputConnection, wireAuthenticatedGeneration == connectionGeneration,
+              pairedControlGeneration == connectionGeneration else { return nil }
+        return trustedCredential?.hostID
+    }
+
+    private var mayReceiveRemoteAudio: Bool {
+        remoteAudioHostID != nil && remoteFeatures.accepted & RemoteFeatureNegotiation.remoteAudioFeature != 0
+    }
+
+    func setRemoteAudioPreferred(_ enabled: Bool) {
+        let generation = connectionGenerationClock.current
+        networkQueue.async { [weak self] in
+            guard let self, self.connectionGeneration == generation,
+                  self.remoteAudioFeaturesReceived, let hostID = self.remoteAudioHostID,
+                  self.remoteAudio.preferred != enabled else { return }
+            ClientStreamSettingsStore.saveRemoteAudio(enabled, hostID: hostID, defaults: self.streamSettingsDefaults)
+            if !enabled { self.remoteAudioOutputFailed = false }
+            self.sendRemoteAudioOnQueue(self.remoteAudio.prefer(enabled))
+            self.updateRemoteAudioSuspensionOnQueue()
+            if enabled, !self.remoteAudioRequested, let endpoint = self.connectionSelectedEndpoint {
+                // SCST 61/62 is a one-time negotiation on each TLS connection.
+                self.teardownCurrentSession()
+                self.setState(.disconnected(reason: "Reconnecting to enable remote audio"))
+                self.connectOnQueue(to: endpoint)
+            }
+        }
+    }
+
+    private func publishRemoteAudioOnQueue() {
+        let preferred = remoteAudio.preferred
+        let status: String?
+        if !remoteAudioFeaturesReceived || remoteAudioHostID == nil {
+            status = nil
+        } else if !preferred {
+            status = remoteAudioRequested ? "" : "Turning audio on requires a reconnect."
+        } else if !mayReceiveRemoteAudio {
+            status = "Remote audio is unavailable on this PC."
+        } else if remoteAudioOutputFailed {
+            status = "Audio output is unavailable. Turn remote audio off and on to retry."
+        } else if remoteAudio.suspended {
+            status = "Remote audio paused."
+        } else if remoteAudio.pending != nil || remoteAudio.phase == .pending {
+            status = "Waiting for remote audio…"
+        } else {
+            switch remoteAudio.phase {
+            case .streaming: status = "Remote audio streaming."
+            case .paused, .denied:
+                switch remoteAudio.reason {
+                case .policy, .revoked: status = "Remote audio blocked by PC policy."
+                case .desktop, .session: status = "Remote audio paused on the PC."
+                case .budget: status = "Remote audio paused for connection bandwidth."
+                default: status = "The PC’s audio output is unavailable."
+                }
+            case .off, .pending: status = "Remote audio is off."
+            }
+        }
+        let publication = remoteAudioPublicationClock.advance()
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.remoteAudioPublicationClock.current == publication else { return }
+            if self.remoteAudioPreferred != preferred { self.remoteAudioPreferred = preferred }
+            if self.remoteAudioStatus != status { self.remoteAudioStatus = status }
+        }
+    }
+
+    private func updateRemoteAudioSuspensionOnQueue() {
+        let request = remoteAudio.suspend(!isForegroundActive || remoteSecureDesktop.restrictsFeatures || remoteAudioOutputFailed)
+        sendRemoteAudioOnQueue(request)
+        updateRemoteAudioPlaybackOnQueue()
+    }
+
+    private func updateRemoteAudioPlaybackOnQueue() {
+        let epoch = remoteAudio.activeEpoch, generation = connectionGeneration
+        let timing = remoteAudioPlayback.setEpoch(epoch) { [weak self] in
+            self?.networkQueue.async { [weak self] in
+                guard let self, self.connectionGeneration == generation, self.remoteAudio.activeEpoch == epoch else { return }
+                self.remoteAudioOutputFailed = true
+                self.recordDiagnosticLine("[REMOTE_AUDIO] output=unavailable")
+                self.updateRemoteAudioSuspensionOnQueue()
+            }
+        }
+        if let timing {
+            recordDiagnosticLine("[REMOTE_AUDIO] startupMs=\(timing.startupMs ?? -1) maximumVideoHoldMs=\(timing.maximumVideoHoldMs)")
+        }
+        publishRemoteAudioOnQueue()
+    }
+
+    private func sendRemoteAudioOnQueue(_ request: RemoteAudioSession.Request?) {
+        guard let request, mayReceiveRemoteAudio,
+              let payload = RemoteAudioProtocol.encode(.set(operation: request.operation, requestId: request.id)) else { return }
+        sendWireMessage(type: .remoteAudioSet, payload: payload, sequence: 0)
+    }
+
+    private func admitRemoteAudioOnQueue(_ request: RemoteAudioSession.Request) -> Bool {
+        guard remoteAudio.admit(request, now: ProcessInfo.processInfo.systemUptime) else { return false }
+        let generation = connectionGeneration
+        networkQueue.asyncAfter(deadline: .now() + 2.05) { [weak self] in
+            guard let self, self.connectionGeneration == generation, self.remoteAudio.pending == request else { return }
+            let retry = self.remoteAudio.tick(now: ProcessInfo.processInfo.systemUptime)
+            self.sendRemoteAudioOnQueue(retry)
+            self.publishRemoteAudioOnQueue()
+        }
+        return true
+    }
+
+    private func resetRemoteTimedVideoOnQueue() {
+        remoteTimedVideo.reset()
+        remoteVideoTiming.reset()
+    }
+
+    private func recoverRemoteTimedVideoOnQueue() {
+        resetRemoteTimedVideoOnQueue()
+        remoteTimedVideoNeedsIDR = true
+        decoder.fenceCaptureContinuation(requiringAuthorization: false)
+    }
+
+    func remoteVideoPresentationDeadline(sequence: UInt32, generation: UInt64, now: TimeInterval) -> TimeInterval {
+        remoteVideoTiming.deadline(sequence: sequence, generation: generation, now: now, playback: remoteAudioPlayback)
+    }
+
+    private func receiveRemoteAudioOnQueue(_ message: WireMessage, generation: UInt64) {
+        let header = message.header
+        guard mayReceiveRemoteAudio, let value = RemoteAudioProtocol.decode(type: header.type, payload: message.payload,
+                                                                           flags: header.flags, sequence: header.sequence) else {
+            handleStreamError("Invalid remote audio framing.")
+            return
+        }
+        switch value {
+        case let .state(phase, reason, requestID, epoch, startUs):
+            if phase == .streaming && !remoteTimedVideoLatched {
+                guard !remoteSecureDesktop.restrictsFeatures else {
+                    handleStreamError("Timed video started during a secure desktop transition.")
+                    return
+                }
+                remoteTimedVideoLatched = true
+                recoverRemoteTimedVideoOnQueue()
+            }
+            let previous = (remoteAudio.phase, remoteAudio.reason)
+            let request = remoteAudio.receive(phase, reason: reason, requestID: requestID, epoch: epoch, startUs: startUs)
+            if previous != (remoteAudio.phase, remoteAudio.reason) {
+                recordDiagnosticLine("[REMOTE_AUDIO] phase=\(remoteAudio.phase.rawValue) reason=\(remoteAudio.reason.rawValue)")
+            }
+            sendRemoteAudioOnQueue(request)
+            updateRemoteAudioPlaybackOnQueue()
+        case let .packet(sequence, epoch, captureUs, opus):
+            if remoteAudio.acceptPacket(sequence: sequence, epoch: epoch, captureUs: captureUs) {
+                remoteAudioPlayback.enqueue(epoch: epoch, packet: .init(sequence: sequence, captureUs: captureUs, opus: opus))
+            }
+        case let .timedVideo(flags, frame, total, offset, captureUs, fragment):
+            guard remoteTimedVideoLatched else {
+                handleStreamError("Timed video arrived before remote audio streaming.")
+                return
+            }
+            if offset == 0 && remoteTimedVideo.hasPartial { recoverRemoteTimedVideoOnQueue() }
+            switch remoteTimedVideo.push(flags: flags, frame: frame, total: total, offset: offset,
+                                         captureUs: captureUs, fragment: fragment, receivedAt: message.firstByteAt) {
+            case .partial:
+                break
+            case .recover:
+                recoverRemoteTimedVideoOnQueue()
+            case .complete(let unit):
+                if remoteTimedVideoNeedsIDR {
+                    guard UInt16(unit.flags) & WireProtocol.videoFlagIDR != 0,
+                          RemoteSecureDesktopState.hasIDR(unit.bytes, lengthPrefixed: true) else { return }
+                    remoteTimedVideoNeedsIDR = false
+                }
+                let header = WireHeader(type: .video, flags: UInt16(unit.flags), payloadLength: unit.bytes.count, sequence: unit.frame)
+                receiveWireVideoOnQueue(WireMessage(header: header, payload: unit.bytes, firstByteAt: unit.firstByteAt),
+                                        generation: generation, timedCaptureUs: unit.captureUs)
+            }
+        case .set:
+            handleStreamError("Unexpected client-direction remote audio request.")
+        }
     }
 
     private func publishRemoteMonitorsOnQueue() {
@@ -1735,6 +1935,12 @@ public class NetworkManager: ObservableObject {
 
     private func remoteInputPacketIsCurrent(_ data: Data) -> Bool {
         guard data.count >= 16, let type = WireMessageType(rawValue: data[5]) else { return true }
+        if type == .remoteAudioSet {
+            guard mayReceiveRemoteAudio,
+                  case let .set(operation, id)? = RemoteAudioProtocol.decode(type: type, payload: Data(data.dropFirst(16))),
+                  operation != .enable || !remoteSecureDesktop.restrictsFeatures else { return false }
+            return admitRemoteAudioOnQueue(.init(operation: operation, id: id))
+        }
         if !remoteInputConnection { return !(61...71).contains(type.rawValue) && type != .remoteDirectTouch }
         let payload = Data(data.dropFirst(16))
         if type == .remoteSecureDesktopRequest {
@@ -3364,7 +3570,8 @@ public class NetworkManager: ObservableObject {
             bytes.storeBytes(of: feedback.0.littleEndian, toByteOffset: 0, as: UInt32.self)
             bytes.storeBytes(of: feedback.1.littleEndian, toByteOffset: 4, as: UInt32.self)
             bytes.storeBytes(of: feedback.2.littleEndian, toByteOffset: 8, as: UInt16.self)
-            let dropped = remoteSecureDesktop.needsKeyframe && !remoteSecureDesktop.covered ? max(feedback.3, 1) : feedback.3
+            let needsIDR = remoteTimedVideoNeedsIDR || (remoteSecureDesktop.needsKeyframe && !remoteSecureDesktop.covered)
+            let dropped = needsIDR ? max(feedback.3, 1) : feedback.3
             bytes.storeBytes(of: dropped.littleEndian, toByteOffset: 10, as: UInt16.self)
             bytes.storeBytes(of: feedback.4.littleEndian, toByteOffset: 12, as: UInt16.self)
             bytes.storeBytes(of: feedback.5.littleEndian, toByteOffset: 14, as: UInt16.self)
@@ -4395,15 +4602,6 @@ public class NetworkManager: ObservableObject {
             return
         }
 
-        if header.type == .remoteAudioState,
-           remoteFeatures.accepted & RemoteFeatureNegotiation.remoteAudioFeature != 0,
-           case .state(.streaming, _, _, _, _)? = RemoteAudioProtocol.decode(type: header.type, payload: payload, flags: header.flags) {
-            guard !remoteSecureDesktop.restrictsFeatures else {
-                handleStreamError("Timed video started during a secure desktop transition."); return
-            }
-            remoteTimedVideoLatched = true
-        }
-
         switch header.type {
         case .transferOffer, .transferResponse, .transferChunk, .transferFileEnd, .transferFileAck, .transferCancel, .transferEnd, .transferAck:
             guard !remoteInputConnection, wireAuthenticatedGeneration == generation, committedTransportGeneration == generation,
@@ -4681,94 +4879,11 @@ public class NetworkManager: ObservableObject {
             return
 
         case .video:
-            guard committedTransportGeneration == generation else { return }
-            if committedRealtimeMode == RealtimeTransportMode.wifiRTP {
-                // A legacy payload cannot authorize its own transition. The
-                // exact host commit must arrive first on authenticated TLS.
+            guard !remoteTimedVideoLatched else {
+                handleStreamError("Plain video arrived after timed video started.")
                 return
             }
-            let isIDR = header.flags & WireProtocol.videoFlagIDR != 0
-            let lengthPrefixed = header.flags & WireProtocol.videoFlagLengthPrefixed != 0
-            let receivedAt = CACurrentMediaTime()
-            if remoteSecureDesktop.supported {
-                let decoderGeneration = decoder.currentSessionGeneration
-                let verifiedIDR = isIDR && (!remoteSecureDesktop.expectsIDR ||
-                    RemoteSecureDesktopState.hasIDR(payload, lengthPrefixed: lengthPrefixed))
-                switch remoteSecureDesktop.admit(sequence: header.sequence, isIDR: verifiedIDR, decoder: decoderGeneration) {
-                case .invalid:
-                    handleStreamError("Invalid secure desktop first picture."); return
-                case .drop: return
-                case .barrier:
-                    decoder.authorizeCaptureOutput(sequence: header.sequence, generation: decoderGeneration)
-                    decoder.processInputData(payload, sequence: header.sequence, isIDR: true,
-                                             isLengthPrefixed: lengthPrefixed, receivedAt: receivedAt)
-                    let sequence = header.sequence
-                    networkQueue.asyncAfter(deadline: .now() + 5) { [weak self] in
-                        guard let self, self.connectionGeneration == generation,
-                              self.remoteSecureDesktop.awaitsPresentation(sequence: sequence, decoder: decoderGeneration) else { return }
-                        self.handleStreamError("Secure desktop first picture was not presented.")
-                    }
-                    return
-                case .pass:
-                    if qualityProbe.phase == .idle { beginAdaptiveProbeOnQueue() }
-                }
-            }
-            if mayReceiveRemoteFiles { remoteFilePacing.received(bytes: payload.count) }
-            let qualityReceivedAt = adaptiveNow()
-            if qualitySession?.usesOrderedVideo == true, qualitySession?.current != nil {
-                if castingAdaptiveRoute?.usesOrderedVideo == true, captureAvailability.wireSuspended {
-                    qualityWindow.drop(3)
-                    return
-                }
-                guard admitOrderedAdaptiveVideoOnQueue(payload, sequence: header.sequence, isIDR: isIDR,
-                                                      lengthPrefixed: lengthPrefixed) else { return }
-            }
-            guard adaptiveIncomingOnQueue(payload, sequence: header.sequence, isIDR: isIDR,
-                receivedAt: qualityReceivedAt, receiveUs: AdaptiveMediaWindow.us(receivedAt-message.firstByteAt)) else { return }
-            captureAvailability.noteFrameReceived(sequence: header.sequence)
-            if consumeConnectionVideoOnQueue(payload, sequence: header.sequence,
-                isIDR: header.flags & WireProtocol.videoFlagIDR != 0,
-                lengthPrefixed: header.flags & WireProtocol.videoFlagLengthPrefixed != 0,
-                receivedAt: receivedAt, domain: .scst) { return }
-            if !captureTargetOwnsPresentation {
-                guard mirrorControl.permitsVideoSequence(header.sequence) else { return }
-            }
-            if remoteInputConnection, header.flags & WireProtocol.videoFlagIDR != 0, !remoteFeatures.inputReady {
-                remoteFeatures.keyframeArrived()
-                publishRemoteInputOnQueue(contextChanged: false)
-            }
-            let receiveDurationMs = max(0, (receivedAt - message.firstByteAt) * 1_000.0)
-            recordVideoPayloadReceived(payload.count, sequence: header.sequence)
-            bytesReceived &+= UInt64(payload.count)
-            transportTelemetry.recordPayloadReceived(
-                sequence: header.sequence,
-                receiveDurationMs: receiveDurationMs,
-                receivedAt: receivedAt,
-                payloadBytes: payload.count,
-                isIDR: (header.flags & WireProtocol.videoFlagIDR) != 0,
-                generation: generation,
-                transportKind: activeTransportKind == .usb
-                    ? StreamingTransportKind.usbTypeC.rawValue
-                    : StreamingTransportKind.wifi.rawValue)
-            if consumeCaptureTargetVideoOnQueue(payload, sequence: header.sequence,
-                isIDR: header.flags & WireProtocol.videoFlagIDR != 0,
-                lengthPrefixed: header.flags & WireProtocol.videoFlagLengthPrefixed != 0,
-                receivedAt: receivedAt) { return }
-            guard admitCaptureContinuationOnQueue(sequence: header.sequence, decoder: decoder.currentSessionGeneration,
-                isIDR: header.flags & WireProtocol.videoFlagIDR != 0) else { return }
-            #if targetEnvironment(simulator)
-            if let decode = captureTargetDecodeForTesting, remoteInputConnection || castingAdaptiveRoute?.usesOrderedVideo == true {
-                decode(payload, header.sequence, decoder.currentSessionGeneration)
-                return
-            }
-            #endif
-            decoder.processInputData(
-                payload,
-                sequence: header.sequence,
-                isIDR: (header.flags & WireProtocol.videoFlagIDR) != 0,
-                isLengthPrefixed:
-                    (header.flags & WireProtocol.videoFlagLengthPrefixed) != 0,
-                receivedAt: receivedAt)
+            receiveWireVideoOnQueue(message, generation: generation)
 
         case .videoConfiguration:
             guard committedTransportGeneration == generation,
@@ -4819,8 +4934,15 @@ public class NetworkManager: ObservableObject {
             }
             if remoteInputConnection, remoteFeaturesPingChallenge == payload {
                 remoteFeaturesPingChallenge = nil
+                let audioPreferred = remoteAudioHostID.map {
+                    ClientStreamSettingsStore.loadRemoteAudio(hostID: $0, defaults: streamSettingsDefaults)
+                } ?? false
+                remoteAudio = RemoteAudioSession(preferred: audioPreferred)
+                updateRemoteAudioSuspensionOnQueue()
                 if let request = remoteFeatures.pong(flags: header.flags, now: ProcessInfo.processInfo.systemUptime,
-                                                     requestRemoteFiles: true, requestSecureDesktop: remoteSecureDesktopEnabled) {
+                                                     requestRemoteFiles: true, requestSecureDesktop: remoteSecureDesktopEnabled,
+                                                     requestRemoteAudio: audioPreferred) {
+                    remoteAudioRequested = audioPreferred
                     sendWireMessage(type: .remoteFeaturesRequest, payload: request, sequence: 0)
                 } else if remoteSecureDesktopEnabled {
                     beginAdaptiveProbeOnQueue()
@@ -5085,9 +5207,9 @@ public class NetworkManager: ObservableObject {
             receiveRemoteFileOnQueue(header, payload: payload)
         case .remoteSecureDesktopState:
             receiveRemoteSecureDesktopOnQueue(header, payload: payload)
-        case .remoteFileControl,
-             .remoteAudioSet, .remoteAudioState, .remoteAudioPacket, .remoteTimedVideo,
-             .remoteSecureDesktopRequest:
+        case .remoteAudioState, .remoteAudioPacket, .remoteTimedVideo:
+            receiveRemoteAudioOnQueue(message, generation: generation)
+        case .remoteFileControl, .remoteAudioSet, .remoteSecureDesktopRequest:
             handleStreamError("Unnegotiated remote feature message.")
         case .remoteFeaturesResult:
             guard remoteInputConnection, remoteFeatures.result(flags: header.flags, payload: payload) else {
@@ -5095,6 +5217,10 @@ public class NetworkManager: ObservableObject {
             }
             let intent = remoteSecureDesktop.begin(accepted: remoteFeatures.accepted,
                                                    control: remoteSecureControlIntent && remoteSecureDesktopEnabled)
+            remoteAudioFeaturesReceived = true
+            updateRemoteAudioSuspensionOnQueue()
+            sendRemoteAudioOnQueue(remoteAudio.negotiate(granted: mayReceiveRemoteAudio))
+            publishRemoteAudioOnQueue()
             publishRemoteSecureDesktopOnQueue()
             if let intent { sendRemoteSecureDesktopOnQueue(intent) }
             if remoteSecureDesktopEnabled { beginAdaptiveProbeOnQueue() }
@@ -5104,8 +5230,12 @@ public class NetworkManager: ObservableObject {
             publishRemoteInputOnQueue()
             requestRemoteCatalogueOnQueue()
         case .remoteInputContext:
+            let previousDesktopEpoch = remoteFeatures.context?.desktopEpoch
             guard remoteInputConnection, remoteFeatures.receiveContext(flags: header.flags, payload: payload) else {
                 handleStreamError("Invalid remote input context."); return
+            }
+            if remoteTimedVideoLatched, let previousDesktopEpoch, previousDesktopEpoch != remoteFeatures.context?.desktopEpoch {
+                recoverRemoteTimedVideoOnQueue()
             }
             if let context = remoteFeatures.context,
                remoteFileAccess?.desktopRequiresRevocation(context) == true {
@@ -5133,6 +5263,7 @@ public class NetworkManager: ObservableObject {
                 handleStreamError("Invalid remote monitor selection result."); return
             }
             if remoteMonitors.receiveResult(result, session: remoteMonitors.session) {
+                if remoteTimedVideoLatched, result.status == 0 { recoverRemoteTimedVideoOnQueue() }
                 publishRemoteMonitorsOnQueue()
                 if remoteMonitors.needsCatalogueRefresh { requestRemoteCatalogueOnQueue() }
             }
@@ -5152,6 +5283,103 @@ public class NetworkManager: ObservableObject {
              .forgetDevice:
             handleStreamError("Unexpected client-direction negotiation message.")
         }
+    }
+
+
+    private func receiveWireVideoOnQueue(_ message: WireMessage, generation: UInt64, timedCaptureUs: UInt64? = nil) {
+        let header = message.header, payload = message.payload
+        guard committedTransportGeneration == generation else { return }
+        if committedRealtimeMode == RealtimeTransportMode.wifiRTP {
+            // A legacy payload cannot authorize its own transition. The
+            // exact host commit must arrive first on authenticated TLS.
+            return
+        }
+        let isIDR = header.flags & WireProtocol.videoFlagIDR != 0
+        let lengthPrefixed = header.flags & WireProtocol.videoFlagLengthPrefixed != 0
+        let receivedAt = CACurrentMediaTime()
+        if remoteSecureDesktop.supported {
+            let decoderGeneration = decoder.currentSessionGeneration
+            let verifiedIDR = isIDR && (!remoteSecureDesktop.expectsIDR ||
+                RemoteSecureDesktopState.hasIDR(payload, lengthPrefixed: lengthPrefixed))
+            switch remoteSecureDesktop.admit(sequence: header.sequence, isIDR: verifiedIDR, decoder: decoderGeneration) {
+            case .invalid:
+                handleStreamError("Invalid secure desktop first picture."); return
+            case .drop: return
+            case .barrier:
+                decoder.authorizeCaptureOutput(sequence: header.sequence, generation: decoderGeneration)
+                decoder.processInputData(payload, sequence: header.sequence, isIDR: true,
+                                         isLengthPrefixed: lengthPrefixed, receivedAt: receivedAt)
+                let sequence = header.sequence
+                networkQueue.asyncAfter(deadline: .now() + 5) { [weak self] in
+                    guard let self, self.connectionGeneration == generation,
+                          self.remoteSecureDesktop.awaitsPresentation(sequence: sequence, decoder: decoderGeneration) else { return }
+                    self.handleStreamError("Secure desktop first picture was not presented.")
+                }
+                return
+            case .pass:
+                if qualityProbe.phase == .idle { beginAdaptiveProbeOnQueue() }
+            }
+        }
+        if mayReceiveRemoteFiles { remoteFilePacing.received(bytes: payload.count) }
+        let qualityReceivedAt = adaptiveNow()
+        if qualitySession?.usesOrderedVideo == true, qualitySession?.current != nil {
+            if castingAdaptiveRoute?.usesOrderedVideo == true, captureAvailability.wireSuspended {
+                qualityWindow.drop(3)
+                return
+            }
+            guard admitOrderedAdaptiveVideoOnQueue(payload, sequence: header.sequence, isIDR: isIDR,
+                                                  lengthPrefixed: lengthPrefixed) else { return }
+        }
+        guard adaptiveIncomingOnQueue(payload, sequence: header.sequence, isIDR: isIDR,
+            receivedAt: qualityReceivedAt, receiveUs: AdaptiveMediaWindow.us(receivedAt-message.firstByteAt)) else { return }
+        captureAvailability.noteFrameReceived(sequence: header.sequence)
+        if consumeConnectionVideoOnQueue(payload, sequence: header.sequence,
+            isIDR: header.flags & WireProtocol.videoFlagIDR != 0,
+            lengthPrefixed: header.flags & WireProtocol.videoFlagLengthPrefixed != 0,
+            receivedAt: receivedAt, domain: .scst) { return }
+        if !captureTargetOwnsPresentation {
+            guard mirrorControl.permitsVideoSequence(header.sequence) else { return }
+        }
+        if remoteInputConnection, header.flags & WireProtocol.videoFlagIDR != 0, !remoteFeatures.inputReady {
+            remoteFeatures.keyframeArrived()
+            publishRemoteInputOnQueue(contextChanged: false)
+        }
+        let receiveDurationMs = max(0, (receivedAt - message.firstByteAt) * 1_000.0)
+        recordVideoPayloadReceived(payload.count, sequence: header.sequence)
+        bytesReceived &+= UInt64(payload.count)
+        transportTelemetry.recordPayloadReceived(
+            sequence: header.sequence,
+            receiveDurationMs: receiveDurationMs,
+            receivedAt: receivedAt,
+            payloadBytes: payload.count,
+            isIDR: (header.flags & WireProtocol.videoFlagIDR) != 0,
+            generation: generation,
+            transportKind: activeTransportKind == .usb
+                ? StreamingTransportKind.usbTypeC.rawValue
+                : StreamingTransportKind.wifi.rawValue)
+        if consumeCaptureTargetVideoOnQueue(payload, sequence: header.sequence,
+            isIDR: header.flags & WireProtocol.videoFlagIDR != 0,
+            lengthPrefixed: header.flags & WireProtocol.videoFlagLengthPrefixed != 0,
+            receivedAt: receivedAt) { return }
+        guard admitCaptureContinuationOnQueue(sequence: header.sequence, decoder: decoder.currentSessionGeneration,
+            isIDR: header.flags & WireProtocol.videoFlagIDR != 0) else { return }
+        #if targetEnvironment(simulator)
+        if let decode = captureTargetDecodeForTesting, remoteInputConnection || castingAdaptiveRoute?.usesOrderedVideo == true {
+            decode(payload, header.sequence, decoder.currentSessionGeneration)
+            return
+        }
+        #endif
+        if let timedCaptureUs {
+            remoteVideoTiming.record(sequence: header.sequence, generation: decoder.currentSessionGeneration,
+                                     captureUs: timedCaptureUs, receivedAt: receivedAt)
+        }
+        decoder.processInputData(
+            payload,
+            sequence: header.sequence,
+            isIDR: (header.flags & WireProtocol.videoFlagIDR) != 0,
+            isLengthPrefixed:
+                (header.flags & WireProtocol.videoFlagLengthPrefixed) != 0,
+            receivedAt: receivedAt)
     }
 
     private var activeTransportKind: ActiveTransportKind {
@@ -7579,6 +7807,7 @@ public class NetworkManager: ObservableObject {
             guard let self, self.decoder.currentSessionGeneration == generation else { return }
             if let ack = self.remoteSecureDesktop.presented(sequence: sequence, decoder: generation) {
                 self.decoder.resetCaptureOutputFence()
+                self.updateRemoteAudioSuspensionOnQueue()
                 self.publishRemoteSecureDesktopOnQueue()
                 self.sendRemoteSecureDesktopOnQueue(ack)
                 self.beginAdaptiveProbeOnQueue()
@@ -7880,6 +8109,7 @@ public class NetworkManager: ObservableObject {
             let selection=captureTargets.pending
             guard !connectionHandoffInProgress, !mirrorSwitchPending, selection?.accepted != true,
                   qualitySession?.configure(value, restoringSource: selection != nil, controlSequence: sequence) == true else { return }
+            resetRemoteTimedVideoOnQueue()
             updateAdaptiveFeedbackEpochOnQueue()
             // Fence queued output synchronously and retain the held drawable.
             // Ordered transports install the new geometry at the reserved IDR.

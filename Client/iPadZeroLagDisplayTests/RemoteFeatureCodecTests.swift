@@ -112,6 +112,140 @@ final class RemoteFeatureCodecTests: XCTestCase {
         }
     }
 
+    func testRemoteAudioRequestsFeatureOnlyWithOptInAndAcceptsViewOnlyGrant() throws {
+        for preferred in [false, true] {
+            var negotiation = RemoteFeatureNegotiation(requestedFeatures: 0x1f)
+            XCTAssertTrue(negotiation.begin(now: 0))
+            let request = try XCTUnwrap(negotiation.pong(flags: 0x4000, now: 1, requestRemoteAudio: preferred))
+            XCTAssertEqual(RemoteFeaturesMessage.decode(request)?.features, preferred ? 0x21f : 0x1f)
+            XCTAssertEqual(negotiation.result(flags: 0, payload: RemoteFeaturesMessage(features: 0x200).encode()), preferred)
+        }
+        var legacy = RemoteFeatureNegotiation(requestedFeatures: 0x1f)
+        XCTAssertTrue(legacy.begin(now: 0))
+        XCTAssertNil(legacy.pong(flags: 0, now: 1, requestRemoteAudio: true))
+    }
+
+    func testRemoteAudioParserAdmitsOnlyNegotiatedServerDirections() {
+        let cases: [(UInt8, Int, UInt8, Bool)] = [
+            (104, 16, 0, false), (105, 32, 0, true), (106, 25, 0, true), (107, 25, 0, true),
+            (105, 32, 1, false), (106, 25, 1, false), (107, 25, 1, false),
+            (105, 31, 0, false), (106, 145, 0, false), (107, 16_409, 0, false)
+        ]
+        for (type, size, flags, allowed) in cases {
+            var bytes = ConnectionControlProtocol.frame(type: type, payload: Data(count: size), sequence: 1)
+            bytes[6] = flags
+            let parser = WireStreamParser(generation: 1, allowsRemoteAudio: { true })
+            var messages = 0
+            var failures = 0
+            parser.consume(bytes, generation: 1) {
+                if case .message = $0 { messages += 1 }
+                if case .failure(.invalidHeader) = $0 { failures += 1 }
+            }
+            XCTAssertEqual(messages, allowed ? 1 : 0)
+            XCTAssertEqual(failures, allowed ? 0 : 1)
+        }
+    }
+
+    func testRemoteAudioPreferenceDefaultsOffAndIsScopedToPairedHost() throws {
+        let suiteName = "remote-audio-tests-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let hostA = Data(repeating: 1, count: 16)
+        let hostB = Data(repeating: 2, count: 16)
+        XCTAssertFalse(ClientStreamSettingsStore.loadRemoteAudio(hostID: hostA, defaults: defaults))
+        ClientStreamSettingsStore.saveRemoteAudio(true, hostID: hostA, defaults: defaults)
+        XCTAssertTrue(ClientStreamSettingsStore.loadRemoteAudio(hostID: hostA, defaults: defaults))
+        XCTAssertFalse(ClientStreamSettingsStore.loadRemoteAudio(hostID: hostB, defaults: defaults))
+        ClientStreamSettingsStore.saveRemoteAudio(false, hostID: hostA, defaults: defaults)
+        XCTAssertFalse(ClientStreamSettingsStore.loadRemoteAudio(hostID: hostA, defaults: defaults))
+    }
+
+    func testRemoteAudioDisableWinsAndRevocationFencesPackets() throws {
+        var session = RemoteAudioSession(preferred: true)
+        let get = try XCTUnwrap(session.negotiate(granted: true))
+        XCTAssertEqual(get.operation, .get)
+        XCTAssertTrue(session.admit(get, now: 0))
+        let enable = try XCTUnwrap(session.receive(.off, reason: .none, requestID: get.id, epoch: 0, startUs: 0))
+        XCTAssertEqual(enable.operation, .enable)
+        XCTAssertTrue(session.admit(enable, now: 0))
+        XCTAssertNil(session.receive(.streaming, reason: .none, requestID: enable.id, epoch: 5, startUs: 100))
+        XCTAssertTrue(session.acceptPacket(sequence: 1, epoch: 5, captureUs: 100))
+        XCTAssertFalse(session.acceptPacket(sequence: 1, epoch: 5, captureUs: 101))
+        let disable = try XCTUnwrap(session.prefer(false))
+        XCTAssertEqual(disable.operation, .disable)
+        XCTAssertNil(session.prefer(true))
+        XCTAssertTrue(session.admit(disable, now: 1))
+        XCTAssertNil(session.receive(.streaming, reason: .none, requestID: 0, epoch: 5, startUs: 100))
+        XCTAssertFalse(session.acceptPacket(sequence: 2, epoch: 5, captureUs: 101))
+        let restart = try XCTUnwrap(session.receive(.off, reason: .none, requestID: disable.id, epoch: 0, startUs: 0))
+        XCTAssertEqual(restart.operation, .enable)
+        XCTAssertTrue(session.admit(restart, now: 2))
+        XCTAssertNil(session.receive(.streaming, reason: .none, requestID: restart.id, epoch: 6, startUs: 200))
+        XCTAssertFalse(session.acceptPacket(sequence: 1, epoch: 6, captureUs: 199))
+        XCTAssertNil(session.receive(.paused, reason: .revoked, requestID: 0, epoch: 0, startUs: 0))
+        XCTAssertEqual(session.reason, .revoked)
+        XCTAssertFalse(session.acceptPacket(sequence: 1, epoch: 6, captureUs: 200))
+        XCTAssertNil(session.receive(.streaming, reason: .none, requestID: 0, epoch: 6, startUs: 200))
+        XCTAssertEqual(session.activeEpoch, 0)
+        XCTAssertNil(session.receive(.denied, reason: .endpoint, requestID: 0, epoch: 0, startUs: 0))
+        XCTAssertEqual(session.reason, .endpoint)
+    }
+
+    func testRemoteAudioTimeoutUsesFreshGetAndBackgroundFencesPlayback() throws {
+        var session = RemoteAudioSession(preferred: true)
+        let get = try XCTUnwrap(session.negotiate(granted: true))
+        XCTAssertTrue(session.admit(get, now: 1))
+        XCTAssertNil(session.tick(now: 2))
+        let retry = try XCTUnwrap(session.tick(now: 3))
+        XCTAssertEqual(retry.operation, .get)
+        XCTAssertGreaterThan(retry.id, get.id)
+        XCTAssertTrue(session.admit(retry, now: 3))
+        XCTAssertNil(session.receive(.streaming, reason: .none, requestID: get.id, epoch: 1, startUs: 1))
+        XCTAssertEqual(session.activeEpoch, 0)
+        XCTAssertNil(session.receive(.streaming, reason: .none, requestID: retry.id, epoch: 1, startUs: 1))
+        XCTAssertEqual(session.activeEpoch, 1)
+        XCTAssertEqual(session.suspend(true)?.operation, .disable)
+        XCTAssertEqual(session.activeEpoch, 0)
+    }
+
+    func testRemoteAudioJitterBoundsDepthAndConcealsAtMostTwoMissingPackets() {
+        var jitter = RemoteAudioJitter()
+        for sequence in UInt32(65_535)...65_538 {
+            jitter.insert(.init(sequence: sequence, captureUs: UInt64(sequence) * 10_000, opus: Data([1])))
+        }
+        XCTAssertEqual(jitter.count, 3)
+        for sequence in UInt32(65_536)...65_538 {
+            XCTAssertEqual(jitter.dequeue()?.captureUs, UInt64(sequence) * 10_000)
+        }
+        XCTAssertEqual(jitter.dequeue(), .init(captureUs: 655_390_000, opus: nil))
+        XCTAssertEqual(jitter.dequeue(), .init(captureUs: 655_400_000, opus: nil))
+        XCTAssertNil(jitter.dequeue())
+    }
+
+    func testRemoteTimedVideoOnlyReleasesCompleteAUAndResetsAcrossBarriers() {
+        var assembler = RemoteTimedVideoAssembler()
+        func append(_ offset: UInt32, bytes: [UInt8], frame: UInt32 = 70) -> RemoteTimedVideoAssembler.Result {
+            assembler.push(flags: 3, frame: frame, total: 4, offset: offset, captureUs: 110, fragment: Data(bytes), receivedAt: 2)
+        }
+        XCTAssertEqual(append(0, bytes: [1, 2]), .partial)
+        XCTAssertEqual(append(2, bytes: [3, 4]), .complete(.init(flags: 3, frame: 70, captureUs: 110,
+                                                               bytes: Data([1, 2, 3, 4]), firstByteAt: 2)))
+        XCTAssertEqual(append(0, bytes: [1]), .partial)
+        XCTAssertEqual(append(2, bytes: [3, 4]), .recover)
+        XCTAssertEqual(append(0, bytes: [1, 2]), .partial)
+        XCTAssertEqual(append(2, bytes: [3, 4], frame: 71), .recover)
+        XCTAssertEqual(append(0, bytes: [1, 2]), .partial)
+        assembler.reset()
+        XCTAssertEqual(append(2, bytes: [3, 4]), .recover)
+    }
+
+    func testRemoteAudioVideoDeadlineUsesAnchorAndCapsDelay() {
+        let anchor = RemoteAudioClock(captureUs: 100_000, playoutAt: 10)
+        XCTAssertEqual(anchor.videoDeadline(captureUs: 130_000, receivedAt: 10, now: 10), 10.03, accuracy: 0.000001)
+        XCTAssertEqual(anchor.videoDeadline(captureUs: 200_000, receivedAt: 10, now: 10), 10.05, accuracy: 0.000001)
+        XCTAssertEqual(anchor.videoDeadline(captureUs: 80_000, receivedAt: 10, now: 10), 10, accuracy: 0.000001)
+    }
+
     func testRemoteFilesRequestRequiresMarkedTimelyPongAndMatchingResult() throws {
         var oldHost = RemoteFeatureNegotiation(requestedFeatures: 0x1f)
         XCTAssertTrue(oldHost.begin(now: 0))
