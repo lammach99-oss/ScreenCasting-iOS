@@ -133,6 +133,13 @@
 		AD2300010000000000000003 /* RemoteSecureDesktopProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2300020000000000000003 /* RemoteSecureDesktopProtocol.swift */; };
 		AD2300010000000000000004 /* RemoteFeatureCodecTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2300020000000000000004 /* RemoteFeatureCodecTests.swift */; };
 		AD2300010000000000000005 /* remote-ds5-ds7-golden.json in Resources */ = {isa = PBXBuildFile; fileRef = AD2300020000000000000005 /* remote-ds5-ds7-golden.json */; };
+		C10B00010000000000000001 /* RemoteClipboardProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10B00020000000000000001 /* RemoteClipboardProtocol.swift */; };
+		C10B00010000000000000002 /* RemoteClipboardLease.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10B00020000000000000002 /* RemoteClipboardLease.swift */; };
+		C10B00010000000000000003 /* RemoteClipboardTransfer.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10B00020000000000000003 /* RemoteClipboardTransfer.swift */; };
+		C10B00010000000000000004 /* RemoteClipboardContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10B00020000000000000004 /* RemoteClipboardContent.swift */; };
+		C10B00010000000000000005 /* RemoteClipboardPasteboard.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10B00020000000000000005 /* RemoteClipboardPasteboard.swift */; };
+		C10B00010000000000000006 /* RemoteClipboardTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10B00020000000000000006 /* RemoteClipboardTests.swift */; };
+		C10B00010000000000000007 /* remote-clipboard-v2.json in Resources */ = {isa = PBXBuildFile; fileRef = C10B00020000000000000007 /* remote-clipboard-v2.json */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -275,6 +282,13 @@
 		AD2300020000000000000003 /* RemoteSecureDesktopProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteSecureDesktopProtocol.swift; sourceTree = "<group>"; };
 		AD2300020000000000000004 /* RemoteFeatureCodecTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteFeatureCodecTests.swift; sourceTree = "<group>"; };
 		AD2300020000000000000005 /* remote-ds5-ds7-golden.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = Fixtures/remote-ds5-ds7-golden.json; sourceTree = "<group>"; };
+		C10B00020000000000000001 /* RemoteClipboardProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteClipboardProtocol.swift; sourceTree = "<group>"; };
+		C10B00020000000000000002 /* RemoteClipboardLease.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteClipboardLease.swift; sourceTree = "<group>"; };
+		C10B00020000000000000003 /* RemoteClipboardTransfer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteClipboardTransfer.swift; sourceTree = "<group>"; };
+		C10B00020000000000000004 /* RemoteClipboardContent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteClipboardContent.swift; sourceTree = "<group>"; };
+		C10B00020000000000000005 /* RemoteClipboardPasteboard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteClipboardPasteboard.swift; sourceTree = "<group>"; };
+		C10B00020000000000000006 /* RemoteClipboardTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteClipboardTests.swift; sourceTree = "<group>"; };
+		C10B00020000000000000007 /* remote-clipboard-v2.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = Fixtures/remote-clipboard-v2.json; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -308,6 +322,11 @@
 				AD2200020000000000000001 /* AdaptiveMediaProtocol.swift */,
 				AD2300020000000000000001 /* RemoteFileProtocol.swift */,
 				AD2500020000000000000001 /* RemoteFileAccess.swift */,
+				C10B00020000000000000001 /* RemoteClipboardProtocol.swift */,
+				C10B00020000000000000002 /* RemoteClipboardLease.swift */,
+				C10B00020000000000000003 /* RemoteClipboardTransfer.swift */,
+				C10B00020000000000000004 /* RemoteClipboardContent.swift */,
+				C10B00020000000000000005 /* RemoteClipboardPasteboard.swift */,
 				AD2300020000000000000002 /* RemoteAudioProtocol.swift */,
 				AD2300020000000000000006 /* RemoteAudioSession.swift */,
 				AD2300020000000000000007 /* RemoteAudioPlayback.swift */,
@@ -396,6 +415,8 @@
 				AD2200020000000000000003 /* AdaptiveMediaV1Golden.json */,
 				AD2400020000000000000001 /* ds8-casting-tls-golden.json */,
 				AD2200020000000000000002 /* AdaptiveMediaTests.swift */,
+				C10B00020000000000000006 /* RemoteClipboardTests.swift */,
+				C10B00020000000000000007 /* remote-clipboard-v2.json */,
 				AD2300020000000000000004 /* RemoteFeatureCodecTests.swift */,
 				AD2300020000000000000005 /* remote-ds5-ds7-golden.json */,
 				1A0700030000000000000008 /* InputBarAccessibilityTests.swift */,
@@ -534,6 +555,7 @@
 				1A0700040000000000000009 /* IPadInputV2Golden.json in Resources */,
 				AD2200010000000000000003 /* AdaptiveMediaV1Golden.json in Resources */,
 				AD2400010000000000000001 /* ds8-casting-tls-golden.json in Resources */,
+				C10B00010000000000000007 /* remote-clipboard-v2.json in Resources */,
 				AD2300010000000000000005 /* remote-ds5-ds7-golden.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -552,6 +574,11 @@
 				AD2200010000000000000001 /* AdaptiveMediaProtocol.swift in Sources */,
 				AD2300010000000000000001 /* RemoteFileProtocol.swift in Sources */,
 				AD2500010000000000000001 /* RemoteFileAccess.swift in Sources */,
+				C10B00010000000000000001 /* RemoteClipboardProtocol.swift in Sources */,
+				C10B00010000000000000002 /* RemoteClipboardLease.swift in Sources */,
+				C10B00010000000000000003 /* RemoteClipboardTransfer.swift in Sources */,
+				C10B00010000000000000004 /* RemoteClipboardContent.swift in Sources */,
+				C10B00010000000000000005 /* RemoteClipboardPasteboard.swift in Sources */,
 				AD2300010000000000000002 /* RemoteAudioProtocol.swift in Sources */,
 				AD2300010000000000000006 /* RemoteAudioSession.swift in Sources */,
 				AD2300010000000000000007 /* RemoteAudioPlayback.swift in Sources */,
@@ -632,6 +659,7 @@
 				1A0700040000000000000007 /* IPadInputV2Tests.swift in Sources */,
 				1A0700040000000000000011 /* PencilMouseTests.swift in Sources */,
 				AD2200010000000000000002 /* AdaptiveMediaTests.swift in Sources */,
+				C10B00010000000000000006 /* RemoteClipboardTests.swift in Sources */,
 				AD2300010000000000000004 /* RemoteFeatureCodecTests.swift in Sources */,
 				FA2300000000000000000003 /* PhysicalMirrorControlTests.swift in Sources */,
 				FA2300000000000000000004 /* PencilKeyboardTests.swift in Sources */,

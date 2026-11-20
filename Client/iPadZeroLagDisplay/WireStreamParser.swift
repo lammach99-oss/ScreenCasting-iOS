@@ -102,6 +102,7 @@ final class WireStreamParser {
     private let allowsSecureDesktop: () -> Bool
     private let allowsSasAvailability: () -> Bool
     private let allowsRemoteAudio: () -> Bool
+    private let allowsRemoteClipboard: () -> Bool
     private var state: State = .header
     private var headerBytes = Data(count: WireProtocol.headerSize)
     private var headerOffset = 0
@@ -113,12 +114,14 @@ final class WireStreamParser {
     init(generation: UInt64, allowsRemoteFiles: @escaping () -> Bool = { false },
          allowsSecureDesktop: @escaping () -> Bool = { false },
          allowsSasAvailability: @escaping () -> Bool = { false },
-         allowsRemoteAudio: @escaping () -> Bool = { false }) {
+         allowsRemoteAudio: @escaping () -> Bool = { false },
+         allowsRemoteClipboard: @escaping () -> Bool = { false }) {
         self.generation = generation
         self.allowsRemoteFiles = allowsRemoteFiles
         self.allowsSecureDesktop = allowsSecureDesktop
         self.allowsSasAvailability = allowsSasAvailability
         self.allowsRemoteAudio = allowsRemoteAudio
+        self.allowsRemoteClipboard = allowsRemoteClipboard
     }
 
     var allocatedPayloadBytes: Int { payload.count }
@@ -266,7 +269,7 @@ final class WireStreamParser {
         guard payloadLength <= WireProtocol.maxPayloadSize else {
             state = .failed
             payload = Data()
-            onEvent(.failure(.oversizedPayload(payloadLength)))
+            onEvent(.failure((84...92).contains(type.rawValue) ? .invalidHeader : .oversizedPayload(payloadLength)))
             return
         }
 
@@ -275,7 +278,14 @@ final class WireStreamParser {
             flags: flags,
             payloadLength: payloadLength,
             sequence: sequence)
-        if type == .remoteSecureDesktopState || type == .remoteSasAvailability {
+        if (84...92).contains(type.rawValue) {
+            guard allowsRemoteClipboard(), type != .clipboardHello, type != .clipboardControl,
+                  flags == 0, RemoteClipboardProtocol.validLength(type, payloadLength) else {
+                state = .failed; payload = Data()
+                onEvent(.failure(.invalidHeader))
+                return
+            }
+        } else if type == .remoteSecureDesktopState || type == .remoteSasAvailability {
             let allowed = type == .remoteSecureDesktopState ? allowsSecureDesktop() : allowsSasAvailability()
             guard allowed, flags == 0,
                   RemoteSecureDesktopProtocol.isValidLength(type: type, length: payloadLength) else {
@@ -475,11 +485,12 @@ final class WireParserQueueDomain {
     init(generation: UInt64, queue: DispatchQueue, allowsRemoteFiles: @escaping () -> Bool = { false },
          allowsSecureDesktop: @escaping () -> Bool = { false },
          allowsSasAvailability: @escaping () -> Bool = { false },
-         allowsRemoteAudio: @escaping () -> Bool = { false }) {
+         allowsRemoteAudio: @escaping () -> Bool = { false },
+         allowsRemoteClipboard: @escaping () -> Bool = { false }) {
         self.queue = queue
         parser = WireStreamParser(generation: generation, allowsRemoteFiles: allowsRemoteFiles,
                                   allowsSecureDesktop: allowsSecureDesktop, allowsSasAvailability: allowsSasAvailability,
-                                  allowsRemoteAudio: allowsRemoteAudio)
+                                  allowsRemoteAudio: allowsRemoteAudio, allowsRemoteClipboard: allowsRemoteClipboard)
     }
 
     var suggestedReceiveLength: Int {

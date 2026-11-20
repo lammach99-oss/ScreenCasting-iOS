@@ -123,11 +123,11 @@ struct RemoteFeatureNegotiation {
     static let remoteSecureDesktopFeature: UInt64 = 0x400
     static let remoteSasAvailabilityFeature: UInt64 = 0x800
     static let phaseAFeatures = remoteFileFeature | remoteAudioFeature | remoteSecureDesktopFeature | remoteSasAvailabilityFeature
-    static let knownFeatures: UInt64 = 0x1f | phaseAFeatures
+    static let knownFeatures: UInt64 = 0x1f | phaseAFeatures | RemoteClipboardProtocol.features
     private var requestedFeatures: UInt64
     // Input-only callers retain their mask; remote sessions explicitly request 0x1f.
     init(requestedFeatures: UInt64 = 3) {
-        self.requestedFeatures = Self.phaseAFeaturesEnabled ? requestedFeatures : requestedFeatures & ~Self.phaseAFeatures
+        self.requestedFeatures = Self.phaseAFeaturesEnabled ? requestedFeatures & ~RemoteClipboardProtocol.features : requestedFeatures & ~(Self.phaseAFeatures | RemoteClipboardProtocol.features)
     }
     private enum Phase { case initial, pong, result, legacy, complete }
     private var phase: Phase = .initial
@@ -145,12 +145,15 @@ struct RemoteFeatureNegotiation {
         if phase == .pong && now >= deadline { phase = .legacy }
     }
     mutating func pong(flags: UInt16, now: TimeInterval, requestRemoteFiles: Bool = false,
-                       requestSecureDesktop: Bool = false, requestRemoteAudio: Bool = false) -> Data? {
+                       requestSecureDesktop: Bool = false, requestRemoteAudio: Bool = false, requestClipboard: Bool = false) -> Data? {
         guard phase == .pong else { return nil }
         guard now < deadline, flags & Self.supportedFlag != 0 else { phase = .legacy; return nil }
         if requestRemoteFiles, requestedFeatures & 3 == 3 { requestedFeatures |= Self.remoteFileFeature }
         if requestSecureDesktop { requestedFeatures |= Self.remoteSecureDesktopFeature | Self.remoteSasAvailabilityFeature }
         if requestRemoteAudio { requestedFeatures |= Self.remoteAudioFeature }
+        if requestClipboard, flags & RemoteClipboardProtocol.marker == RemoteClipboardProtocol.marker, requestedFeatures & 3 == 3 {
+            requestedFeatures |= RemoteClipboardProtocol.features
+        }
         phase = .result; return RemoteFeaturesMessage(features: requestedFeatures).encode()
     }
     mutating func result(flags: UInt16, payload: Data) -> Bool {
@@ -159,7 +162,11 @@ struct RemoteFeatureNegotiation {
               message.features & ~Self.knownFeatures == 0, message.features & ~requestedFeatures == 0,
               message.features & Self.remoteSasAvailabilityFeature == 0 || message.features & Self.remoteSecureDesktopFeature != 0,
               message.features & (4 | Self.remoteFileFeature) == 0 || message.features & 3 == 3 else { return false }
-        accepted = message.features; phase = .complete; return true
+        accepted = message.features
+        if accepted & (RemoteClipboardProtocol.features | 3) != (RemoteClipboardProtocol.features | 3) {
+            accepted &= ~RemoteClipboardProtocol.features
+        }
+        phase = .complete; return true
     }
     mutating func receiveContext(flags: UInt16, payload: Data) -> Bool {
         guard phase == .complete, accepted != 0, flags == 0, let value = RemoteInputContextCommand.decode(payload) else { return false }

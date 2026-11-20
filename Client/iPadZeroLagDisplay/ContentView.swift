@@ -358,7 +358,9 @@ struct HostIdentityConfirmationView: View {
             remoteInput.bind(networkManager)
             remoteInput.configure(value)
         }
+        .onAppear { networkManager.setRemoteClipboardSceneActive(scenePhase == .active) }
         .onChange(of: scenePhase) { _, phase in
+            networkManager.setRemoteClipboardSceneActive(phase == .active)
             switch phase {
             case .active:
                 networkManager.applicationDidBecomeActive()
@@ -1019,6 +1021,14 @@ struct HostIdentityConfirmationView: View {
                             .frame(minHeight: 44)
                             .disabled(owner.isConnectBusy)
                             .accessibilityHint("Applies to whole-PC connections. The PC must grant permission.")
+                        Toggle("Allow clipboard sync in Remote sessions", isOn: Binding(
+                            get: { owner.networkManager.remoteClipboardEnabled },
+                            set: { owner.networkManager.setRemoteClipboardEnabled($0) }))
+                            .font(.subheadline)
+                            .tint(Color.inkAccent)
+                            .frame(minHeight: 44)
+                            .disabled(owner.isConnectBusy)
+                            .accessibilityHint("Applies to paired PCs that support clipboard sync.")
                         owner.usbCard
                         owner.ipEntry
                     }

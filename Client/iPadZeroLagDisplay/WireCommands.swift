@@ -66,6 +66,9 @@ enum WireMessageType: UInt8 {
     case remoteDirectTouch = 82, iPadPointerV2 = 83
     case qualityHello = 93, qualityCapabilities = 94, qualityPolicySet = 95
     case qualityState = 96, qualityFeedback = 97, qualityConfiguration = 98, qualityConfigurationAck = 99
+    case clipboardHello = 84, clipboardState = 85, clipboardControl = 86
+    case clipboardOffer = 87, clipboardOfferResponse = 88, clipboardChunk = 89
+    case clipboardEnd = 90, clipboardResult = 91, clipboardCancel = 92
     case remoteFileControl = 100, remoteFileState = 101, remoteFilePacket = 102, remoteFileWindow = 103
     case remoteAudioSet = 104, remoteAudioState = 105, remoteAudioPacket = 106, remoteTimedVideo = 107
     case remoteSecureDesktopRequest = 108, remoteSecureDesktopState = 109

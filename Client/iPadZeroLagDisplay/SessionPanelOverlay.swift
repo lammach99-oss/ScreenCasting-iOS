@@ -824,9 +824,66 @@ private extension Color {
         }
     }
 
+    @MainActor private struct RemoteClipboardSection: View {
+        @ObservedObject var manager: NetworkManager
+        @ObservedObject var pasteboard: RemoteClipboardPasteboard
+        @Environment(\.openURL) private var openURL
+        @State private var confirmAutomatic = false
+
+        var body: some View {
+            if pasteboard.supported {
+                Toggle("Sync clipboard with PC", isOn: Binding(
+                    get: { manager.remoteClipboardEnabled },
+                    set: { manager.setRemoteClipboardEnabled($0) }))
+                    .font(.subheadline)
+                    .tint(Color(ink: SessionInk.accent))
+                    .frame(minHeight: 44)
+                if manager.remoteClipboardEnabled {
+                    if pasteboard.reason == .hostDisallowed {
+                        Text("Clipboard sync is off on the PC.")
+                            .font(.footnote)
+                            .foregroundStyle(Color(ink: SessionInk.secondary))
+                    }
+                    if pasteboard.canSend {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Send clipboard to PC").font(.subheadline)
+                            RemoteClipboardPasteButton(pasteboard: pasteboard)
+                                .frame(height: 44)
+                            Toggle("Send new copies automatically", isOn: Binding(
+                                get: { pasteboard.automatic },
+                                set: { enabled in
+                                    if enabled { confirmAutomatic = true }
+                                    else { pasteboard.setAutomatic(false) }
+                                }))
+                                .font(.subheadline)
+                                .tint(Color(ink: SessionInk.accent))
+                                .frame(minHeight: 44)
+                        }
+                        .alert("Allow automatic sending?", isPresented: $confirmAutomatic) {
+                            Button("Open iPad Settings") {
+                                if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
+                            }
+                            Button("I?ve set Allow") { pasteboard.setAutomatic(true) }
+                            Button("Cancel", role: .cancel) {}
+                        } message: {
+                            Text("In iPad Settings, open this app and set Paste from Other Apps to Allow. New copies can then be sent to the PC while this session is active.")
+                        }
+                    }
+                    if let notice = pasteboard.transferNotice {
+                        Text(notice)
+                            .font(.footnote)
+                            .foregroundStyle(Color(ink: SessionInk.secondary))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+    }
+
     @MainActor private struct RemoteActionsSection: View {
         let owner: SessionPanelOverlay
         var body: some View {
+            RemoteClipboardSection(manager: owner.networkManager, pasteboard: owner.networkManager.remoteClipboardPasteboard)
             if let status = owner.networkManager.remoteAudioStatus {
                 Toggle("Play PC audio on iPad", isOn: Binding(
                     get: { owner.networkManager.remoteAudioPreferred },

@@ -319,6 +319,31 @@ public class NetworkManager: ObservableObject {
     private var remoteSecureDesktopEnabled: Bool {
         streamSettingsDefaults.bool(forKey: RemoteSecureDesktopState.preferenceKey)
     }
+    @Published private(set) var remoteClipboardEnabled = UserDefaults.standard.bool(forKey: RemoteClipboardProtocol.preferenceKey)
+    private let remoteClipboardAuthority = RemoteClipboardAuthority()
+    private let remoteClipboardWorker = RemoteClipboardContentWorker()
+    private var remoteClipboardLease = RemoteClipboardLease()
+    private var remoteClipboardTimer: DispatchSourceTimer?
+    private var remoteClipboardPresentation: ClipboardPresentation?
+    private var remoteClipboardTransfer: RemoteClipboardTransfer?
+    private var remoteClipboardCounter: UInt64 = 0
+    private var remoteClipboardPeerOrigin: UUID?
+    private var remoteClipboardPeerCounter: UInt64 = 0
+    private var remoteClipboardSeenUpdates: [UUID] = []
+    @MainActor lazy var remoteClipboardPasteboard = RemoteClipboardPasteboard(
+        authority: remoteClipboardAuthority, worker: remoteClipboardWorker,
+        send: { [weak self] grant, revision, content in
+            self?.networkQueue.async { [weak self] in
+                self?.offerRemoteClipboard(grant: grant, revision: revision, content: content)
+            }
+        },
+        changed: { [weak self] grant, revision in
+            self?.networkQueue.async { [weak self] in
+                guard let self, self.remoteClipboardGrant == grant,
+                      self.remoteClipboardTransfer?.revision != revision else { return }
+                self.cancelRemoteClipboardTransfer(.superseded)
+            }
+        })
     private var remoteFileAccess: RemoteFileAccess?
     private let remoteFileActionClock = ConnectionGenerationClock()
     private var remoteFileIO: DataTransferManager?
@@ -380,6 +405,7 @@ public class NetworkManager: ObservableObject {
     private let remoteMonitorPublicationClock = ConnectionGenerationClock()
     @Published public private(set) var remoteMonitorState = RemoteMonitorState()
     private var remoteFeaturesPingChallenge: Data?
+    private var remoteClipboardProbeSent = false
     @Published public private(set) var remoteInputFeatures: UInt64 = 0
     @Published public private(set) var remoteInputReady = false
     @Published public private(set) var remoteInputContext: RemoteInputContextCommand?
@@ -505,7 +531,8 @@ public class NetworkManager: ObservableObject {
                 completion(.posix(.ECANCELED))
                 return
             }
-            guard self.remoteFilePacketIsCurrent(data, startingWrite: true) else { completion(.posix(.ECANCELED)); return }
+            guard self.remoteFilePacketIsCurrent(data, startingWrite: true),
+                  self.remoteClipboardPacketIsCurrent(data, startingWrite: true) else { completion(.posix(.ECANCELED)); return }
             if self.captureAvailability.inputBlocked && (CaptureAvailabilityProtocol.isNewInputPacket(data) || self.isNewRemoteV2InputPacket(data)) {
                 completion(nil); return
             }
@@ -562,7 +589,8 @@ public class NetworkManager: ObservableObject {
         queue: networkQueue, allowsRemoteFiles: { [weak self] in self?.mayReceiveRemoteFiles == true },
         allowsSecureDesktop: { [weak self] in self?.remoteSecureDesktop.supported == true },
         allowsSasAvailability: { [weak self] in self?.remoteSecureDesktop.sasAvailabilitySupported == true },
-        allowsRemoteAudio: { [weak self] in self?.mayReceiveRemoteAudio == true })
+        allowsRemoteAudio: { [weak self] in self?.mayReceiveRemoteAudio == true },
+        allowsRemoteClipboard: { [weak self] in self?.remoteClipboardNegotiated == true })
     private var wireReceiveActiveGeneration: UInt64?
     #if targetEnvironment(simulator)
     private var testingSimulatedWifiSession = false
@@ -919,6 +947,7 @@ public class NetworkManager: ObservableObject {
     // MARK: - Public API
 
     deinit {
+        remoteClipboardTimer?.cancel()
         connectionStatusTimer?.cancel()
         qualityFeedbackTimer?.cancel()
         connectionProof?.erase()
@@ -1542,8 +1571,24 @@ public class NetworkManager: ObservableObject {
         }
     }
 
+    private func beginRemoteFeaturesAfterAuthentication(generation: UInt64) {
+        guard remoteInputConnection else { return }
+        let pairingPending = activeTransportKind == .wifi &&
+            (wifiAuthentication.stage == .paired || wifiAuthentication.stage == .trusted)
+        if remoteClipboardPreference && pairingPending {
+            // The host sends AuthResult before PairingSuccess or TrustedAuthResult.
+            // Keep enhanced input available if an older host omits that second message.
+            networkQueue.asyncAfter(deadline: .now() + 2) { [weak self] in
+                self?.beginRemoteFeaturesOnQueue(generation: generation)
+            }
+        } else {
+            beginRemoteFeaturesOnQueue(generation: generation)
+        }
+    }
+
     private func beginRemoteFeaturesOnQueue(generation: UInt64) {
-        guard remoteInputConnection, remoteFeatures.begin(now: ProcessInfo.processInfo.systemUptime) else { return }
+        guard generation == connectionGeneration, wireAuthenticatedGeneration == generation,
+              remoteInputConnection, remoteFeatures.begin(now: ProcessInfo.processInfo.systemUptime) else { return }
         _ = sendClientPing(force: true, purpose: .telemetry, remoteFeaturesProbe: true)
         networkQueue.asyncAfter(deadline: .now() + 2) { [weak self] in
             guard let self, self.connectionGeneration == generation else { return }
@@ -1554,6 +1599,7 @@ public class NetworkManager: ObservableObject {
 
     private func publishRemoteInputOnQueue(contextChanged: Bool = true) {
         publishRemoteFileAccessOnQueue()
+        if remoteClipboardLease.nonce != nil { tickRemoteClipboard() }
         let generation = connectionGeneration, context = remoteFeatures.context, features = remoteFeatures.accepted
         let ready = remoteFeatures.inputReady
         remoteMonitors.receiveContext(context, session: remoteMonitors.session)
@@ -1565,6 +1611,7 @@ public class NetworkManager: ObservableObject {
         }
     }
     private func resetRemoteInputOnQueue() {
+        resetRemoteClipboard()
         remoteSecureDesktop = RemoteSecureDesktopState()
         remoteTimedVideoLatched = false
         remoteTimedVideoNeedsIDR = false
@@ -1580,6 +1627,7 @@ public class NetworkManager: ObservableObject {
         retireRemoteFileIOOnQueue()
         remoteFilePacing = RemoteFileMediaPacing()
         remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: 0x1f); remoteFeaturesPingChallenge = nil
+        remoteClipboardProbeSent = false
         remoteMonitors.begin(session: UUID(), acceptedFeatures: 0)
         remoteMonitorControl.update(generation: 0, context: nil, enabled: false)
         remoteMonitorAdmission = nil
@@ -1850,6 +1898,326 @@ public class NetworkManager: ObservableObject {
             self.remoteMonitorState = snapshot
         }
     }
+    // MARK: - Remote clipboard
+
+    private typealias Clipboard = RemoteClipboardProtocol
+
+    private struct ClipboardPresentation: Equatable {
+        let generation: UInt64
+        let supported: Bool
+        let grant: RemoteClipboardAuthority.Grant?
+        let reason: Clipboard.Reason
+    }
+
+    @MainActor func setRemoteClipboardEnabled(_ enabled: Bool) {
+        remoteClipboardEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Clipboard.preferenceKey)
+        if !enabled {
+            remoteClipboardAuthority.update(nil, deadline: 0, transfer: nil)
+            remoteClipboardPasteboard.setAutomatic(false)
+            remoteClipboardPasteboard.update(supported: remoteClipboardPasteboard.supported, grant: nil, reason: .ok)
+        }
+        networkQueue.async { [weak self] in self?.tickRemoteClipboard(forceDisable: !enabled) }
+    }
+
+    @MainActor func setRemoteClipboardSceneActive(_ active: Bool) {
+        remoteClipboardAuthority.setSceneActive(active)
+        if !active { remoteClipboardPasteboard.sceneDidResign() }
+        networkQueue.async { [weak self] in self?.tickRemoteClipboard(forceDisable: !active) }
+    }
+
+    private var remoteClipboardPreference: Bool {
+        UserDefaults.standard.bool(forKey: Clipboard.preferenceKey)
+    }
+
+    private var wantsRemoteClipboard: Bool { remoteAudioHostID != nil && remoteClipboardPreference }
+
+    private var remoteClipboardNegotiated: Bool {
+        remoteAudioHostID != nil && remoteFeatures.accepted & Clipboard.features == Clipboard.features
+    }
+
+    private var remoteClipboardEligible: Bool {
+        remoteClipboardNegotiated && wantsRemoteClipboard && remoteClipboardAuthority.sceneActive &&
+            isForegroundActive && committedTransportGeneration == connectionGeneration &&
+            remoteFeatures.inputReady && remoteFeatures.context?.desktop == 1 &&
+            !remoteSecureDesktop.restrictsFeatures && !captureAvailability.inputBlocked
+    }
+
+    private var remoteClipboardGrant: RemoteClipboardAuthority.Grant? {
+        guard let state = remoteClipboardLease.grant, remoteClipboardEligible,
+              ProcessInfo.processInfo.systemUptime < remoteClipboardLease.validUntil else { return nil }
+        return RemoteClipboardAuthority.Grant(token: state.token, epoch: state.epoch,
+                                               directions: state.directions, maxBytes: state.maxBytes)
+    }
+
+    private func beginRemoteClipboard() {
+        guard remoteClipboardNegotiated, let hello = remoteClipboardLease.start() else { return }
+        sendWireMessage(type: hello.type, payload: hello.encode(), sequence: 0) { [weak self] error in
+            if error != nil { self?.resetRemoteClipboard() }
+        }
+        let timer = DispatchSource.makeTimerSource(queue: networkQueue)
+        timer.schedule(deadline: .now() + .milliseconds(200), repeating: .milliseconds(200), leeway: .milliseconds(10))
+        timer.setEventHandler { [weak self] in self?.tickRemoteClipboard() }
+        remoteClipboardTimer = timer
+        timer.resume()
+        publishRemoteClipboard(supported: true)
+    }
+
+    private func resetRemoteClipboard() {
+        remoteClipboardTimer?.cancel()
+        remoteClipboardTimer = nil
+        remoteClipboardLease = RemoteClipboardLease()
+        remoteClipboardCounter = 0
+        retireRemoteClipboardGrant()
+        publishRemoteClipboard(supported: false)
+    }
+
+    private func retireRemoteClipboardGrant() {
+        clearRemoteClipboardTransfer()
+        remoteClipboardPeerOrigin = nil
+        remoteClipboardPeerCounter = 0
+        remoteClipboardSeenUpdates.removeAll()
+    }
+
+    private func updateRemoteClipboardFence() {
+        let state = remoteClipboardGrant != nil ? remoteClipboardLease.grant : nil
+        remoteClipboardAuthority.update(state, deadline: remoteClipboardLease.validUntil,
+                                        transfer: remoteClipboardTransfer)
+    }
+
+    private func publishRemoteClipboard(supported: Bool) {
+        updateRemoteClipboardFence()
+        let result = ClipboardPresentation(generation: connectionGeneration, supported: supported,
+                                           grant: remoteClipboardGrant, reason: remoteClipboardLease.reason)
+        guard remoteClipboardPresentation != result else { return }
+        remoteClipboardPresentation = result
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.connectionGenerationClock.current == result.generation else { return }
+            self.remoteClipboardPasteboard.update(supported: result.supported, grant: result.grant, reason: result.reason)
+        }
+    }
+
+    private func tickRemoteClipboard(forceDisable: Bool = false) {
+        guard remoteClipboardLease.nonce != nil else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let previous = remoteClipboardLease.grant
+        let signal = remoteClipboardLease.tick(eligible: !forceDisable && remoteClipboardEligible, now: now)
+        if previous != remoteClipboardLease.grant { retireRemoteClipboardGrant() }
+        if let signal { sendWireMessage(type: signal.type, payload: signal.encode(), sequence: 0) }
+        publishRemoteClipboard(supported: remoteClipboardNegotiated)
+        if remoteClipboardTransfer?.expired(now: now) == true {
+            cancelRemoteClipboardTransfer(.timeout)
+        }
+    }
+
+    private func remoteClipboardPacketIsCurrent(_ data: Data, startingWrite: Bool = false) -> Bool {
+        guard data.count >= WireProtocol.headerSize, (84...92).contains(data[5]),
+              let type = WireMessageType(rawValue: data[5]) else { return true }
+        guard remoteClipboardNegotiated,
+              let message = Clipboard.decode(type: type, payload: data.dropFirst(WireProtocol.headerSize)) else { return false }
+        let now = ProcessInfo.processInfo.systemUptime
+        switch message {
+        case .hello(_, _, _, let nonce):
+            return remoteClipboardLease.nonce == nonce
+        case .control(let action, _, let id, _, let nonce):
+            guard remoteClipboardLease.nonce == nonce, action == .disable || remoteClipboardEligible,
+                  remoteClipboardLease.mayWrite(action, id: id, now: now) else { return false }
+            if startingWrite, action == .renew {
+                guard remoteClipboardLease.admitRenew(id, now: now) else { return false }
+                updateRemoteClipboardFence()
+            }
+            return true
+        default:
+            guard let grant = remoteClipboardGrant, let prefix = message.prefix,
+                  grant.token == prefix.token, grant.epoch == prefix.epoch else { return false }
+            switch message {
+            case .cancel, .result, .response(_, false, _, _): return true
+            default: return remoteClipboardTransfer?.offer.prefix == prefix
+            }
+        }
+    }
+
+    private func sendRemoteClipboard(_ message: Clipboard.Message, completion: @escaping (Bool) -> Void = { _ in }) {
+        sendWireMessage(type: message.type, payload: message.encode(), sequence: 0, bulk: true) { error in
+            completion(error == nil)
+        }
+    }
+
+    private func noticeRemoteClipboard(_ notice: String?, grant: RemoteClipboardAuthority.Grant) {
+        let generation = connectionGeneration
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.connectionGenerationClock.current == generation else { return }
+            self.remoteClipboardPasteboard.setTransferNotice(notice, grant: grant)
+        }
+    }
+
+    private func clearRemoteClipboardTransfer() {
+        let hadTransfer = remoteClipboardTransfer != nil
+        remoteClipboardTransfer = nil
+        updateRemoteClipboardFence()
+        if hadTransfer {
+            controlChannelWriter.discardPending(where: { [weak self] data in
+                guard let self, data.count >= WireProtocol.headerSize, (87...92).contains(data[5]) else { return false }
+                return !self.remoteClipboardPacketIsCurrent(data)
+            }, error: .posix(.ECANCELED))
+        }
+    }
+
+    private func cancelRemoteClipboardTransfer(_ reason: Clipboard.Reason) {
+        guard let transfer = remoteClipboardTransfer else { return }
+        clearRemoteClipboardTransfer()
+        if let grant = remoteClipboardGrant {
+            sendRemoteClipboard(.cancel(transfer.offer.prefix, reason))
+            if reason != .superseded { noticeRemoteClipboard("Clipboard transfer ended.", grant: grant) }
+        }
+    }
+
+    private func offerRemoteClipboard(grant: RemoteClipboardAuthority.Grant, revision: Int, content: RemoteClipboardContent) {
+        guard remoteClipboardGrant == grant, grant.directions & 1 != 0,
+              let state = remoteClipboardLease.grant, state.formats & content.format.rawValue != 0,
+              content.bytes.count <= state.maxBytes, let origin = remoteClipboardLease.nonce else { return }
+        cancelRemoteClipboardTransfer(.superseded)
+        remoteClipboardCounter += 1
+        let prefix = Clipboard.Prefix(token: grant.token, epoch: grant.epoch, update: UUID())
+        let offer = Clipboard.Offer(prefix: prefix, format: content.format, formats: content.formats,
+                                    length: content.bytes.count, origin: origin, counter: remoteClipboardCounter,
+                                    revision: UInt64(truncatingIfNeeded: revision), digest: content.digest)
+        remoteClipboardTransfer = RemoteClipboardTransfer(offer: offer, outgoingBytes: content.bytes,
+                                                          now: ProcessInfo.processInfo.systemUptime)
+        updateRemoteClipboardFence()
+        noticeRemoteClipboard("Sending clipboard?", grant: grant)
+        sendRemoteClipboard(.offer(offer)) { [weak self] sent in self?.remoteClipboardSendCompleted(prefix, sent: sent) }
+    }
+
+    private func remoteClipboardSendCompleted(_ prefix: Clipboard.Prefix, sent: Bool) {
+        if !sent, remoteClipboardTransfer?.offer.prefix == prefix { cancelRemoteClipboardTransfer(.busy) }
+    }
+
+    private func sendNextRemoteClipboardChunk(_ prefix: Clipboard.Prefix) {
+        guard remoteClipboardGrant != nil, let state = remoteClipboardLease.grant,
+              let transfer = remoteClipboardTransfer, transfer.offer.prefix == prefix,
+              let next = transfer.next(maxChunk: state.maxChunk, now: ProcessInfo.processInfo.systemUptime) else { return }
+        sendRemoteClipboard(next) { [weak self] sent in
+            guard let self else { return }
+            if sent { self.sendNextRemoteClipboardChunk(prefix) }
+            else { self.remoteClipboardSendCompleted(prefix, sent: false) }
+        }
+    }
+
+    private func receiveRemoteClipboard(type: WireMessageType, flags: UInt16, payload: Data) {
+        guard remoteClipboardNegotiated, let message = Clipboard.decode(type: type, payload: payload, flags: flags) else {
+            handleStreamError("Invalid remote clipboard frame.")
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        if case .state(let state) = message {
+            let previous = remoteClipboardLease.grant
+            remoteClipboardLease.receive(state, eligible: remoteClipboardEligible, now: now)
+            if previous != remoteClipboardLease.grant { retireRemoteClipboardGrant() }
+            tickRemoteClipboard()
+            return
+        }
+        guard let grant = remoteClipboardGrant, let state = remoteClipboardLease.grant,
+              let prefix = message.prefix, grant.token == prefix.token, grant.epoch == prefix.epoch else { return }
+
+        if case .offer(let offer) = message {
+            acceptRemoteClipboardOffer(offer, grant: grant, state: state, now: now)
+            return
+        }
+        guard let transfer = remoteClipboardTransfer, transfer.offer.prefix == prefix else { return }
+        if transfer.expired(now: now) { cancelRemoteClipboardTransfer(.timeout); return }
+        switch message {
+        case .response(_, let accepted, _, _):
+            guard transfer.outgoing else { return }
+            if !accepted {
+                clearRemoteClipboardTransfer()
+                noticeRemoteClipboard("The PC declined this clipboard item.", grant: grant)
+            } else if transfer.accept(revision: 0, now: now) {
+                sendNextRemoteClipboardChunk(prefix)
+            }
+        case .chunk(_, let index, let offset, let data):
+            guard transfer.append(index: index, offset: offset, data: data, maxChunk: state.maxChunk, now: now) else {
+                cancelRemoteClipboardTransfer(.invalidChunk); return
+            }
+        case .end(_, let length, let digest):
+            guard let revision = transfer.revision, let bytes = transfer.finish(length: length, digest: digest, now: now) else {
+                cancelRemoteClipboardTransfer(.hashMismatch); return
+            }
+            updateRemoteClipboardFence()
+            prepareRemoteClipboardApply(transfer.offer, bytes: bytes, revision: revision, grant: grant)
+        case .result(_, let applied, _, _):
+            guard transfer.awaitingResult else { return }
+            clearRemoteClipboardTransfer()
+            noticeRemoteClipboard(applied ? "Clipboard sent to PC." : "The PC couldn?t apply this clipboard item.", grant: grant)
+        case .cancel:
+            clearRemoteClipboardTransfer()
+            noticeRemoteClipboard(nil, grant: grant)
+        default: break
+        }
+    }
+
+    private func acceptRemoteClipboardOffer(_ offer: Clipboard.Offer, grant: RemoteClipboardAuthority.Grant,
+                                           state: Clipboard.State, now: TimeInterval) {
+        guard grant.directions & 2 != 0, (remoteClipboardPeerOrigin == nil || remoteClipboardPeerOrigin == offer.origin),
+              offer.counter > remoteClipboardPeerCounter, !remoteClipboardSeenUpdates.contains(offer.prefix.update) else { return }
+        remoteClipboardPeerOrigin = offer.origin
+        remoteClipboardPeerCounter = offer.counter
+        remoteClipboardSeenUpdates.append(offer.prefix.update)
+        if remoteClipboardSeenUpdates.count > 128 { remoteClipboardSeenUpdates.removeFirst() }
+        guard state.formats & offer.format.rawValue != 0, offer.length <= state.maxBytes else {
+            sendRemoteClipboard(.response(offer.prefix, false, offer.length > state.maxBytes ? .tooLarge : .unsupportedFormat, 0))
+            return
+        }
+
+        // The host serializes valid Offers across directions. This later Offer supersedes the old one.
+        clearRemoteClipboardTransfer()
+        remoteClipboardTransfer = RemoteClipboardTransfer(offer: offer, now: now)
+        updateRemoteClipboardFence()
+        noticeRemoteClipboard("Receiving clipboard?", grant: grant)
+        let generation = connectionGeneration
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.connectionGenerationClock.current == generation else { return }
+            let revision = self.remoteClipboardPasteboard.revision(grant: grant, prefix: offer.prefix)
+            self.networkQueue.async { [weak self] in
+                guard let self, self.connectionGeneration == generation, self.remoteClipboardGrant == grant,
+                      let transfer = self.remoteClipboardTransfer, transfer.offer.prefix == offer.prefix else { return }
+                guard let revision, transfer.accept(revision: revision, now: ProcessInfo.processInfo.systemUptime) else {
+                    self.cancelRemoteClipboardTransfer(.staleGrant)
+                    return
+                }
+                self.sendRemoteClipboard(.response(offer.prefix, true, .ok, UInt64(truncatingIfNeeded: revision))) {
+                    [weak self] sent in self?.remoteClipboardSendCompleted(offer.prefix, sent: sent)
+                }
+            }
+        }
+    }
+
+    private func prepareRemoteClipboardApply(_ offer: Clipboard.Offer, bytes: Data, revision: Int,
+                                             grant: RemoteClipboardAuthority.Grant) {
+        let generation = connectionGeneration
+        let authority = remoteClipboardAuthority
+        let queued = remoteClipboardWorker.submit { [weak self] in
+            guard authority.allows(grant, direction: 2, prefix: offer.prefix) else { return }
+            let content = RemoteClipboardContent.prepare(bytes, format: offer.format, formats: offer.formats, fromWire: true)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.connectionGenerationClock.current == generation else { return }
+                let finish: (Clipboard.Reason, Int) -> Void = { [weak self] reason, appliedRevision in
+                    self?.networkQueue.async { [weak self] in
+                        guard let self, self.connectionGeneration == generation, self.remoteClipboardGrant == grant,
+                              self.remoteClipboardTransfer?.offer.prefix == offer.prefix else { return }
+                        self.clearRemoteClipboardTransfer()
+                        self.sendRemoteClipboard(.result(offer.prefix, reason == .ok, reason, UInt64(truncatingIfNeeded: appliedRevision)))
+                        self.noticeRemoteClipboard(reason == .ok ? "Clipboard received from PC." : "This clipboard item couldn?t be applied.", grant: grant)
+                    }
+                }
+                if let content {
+                    self.remoteClipboardPasteboard.apply(content, revision: revision, grant: grant, prefix: offer.prefix, completion: finish)
+                } else { finish(.unsupportedFormat, revision) }
+            }
+        }
+        if !queued { cancelRemoteClipboardTransfer(.busy) }
+    }
+
     private func requestRemoteCatalogueOnQueue() {
         guard remoteInputConnection, remoteFeatures.accepted & 7 == 7,
               wireAuthenticatedGeneration == connectionGeneration,
@@ -3671,12 +4039,13 @@ public class NetworkManager: ObservableObject {
                 toByteOffset: 8,
                 as: UInt64.self)
         }
-        sendWireMessage(
-            type: .ping,
-            payload: payload,
-            sequence: UInt32(truncatingIfNeeded: nonce),
-            flags: remoteFeaturesProbe ? RemoteFeatureNegotiation.supportedFlag : 0)
-        if remoteFeaturesProbe { remoteFeaturesPingChallenge = payload }
+        var flags: UInt16 = 0
+        if remoteFeaturesProbe {
+            remoteFeaturesPingChallenge = payload
+            remoteClipboardProbeSent = wantsRemoteClipboard
+            flags = remoteClipboardProbeSent ? Clipboard.marker : RemoteFeatureNegotiation.supportedFlag
+        }
+        sendWireMessage(type: .ping, payload: payload, sequence: UInt32(truncatingIfNeeded: nonce), flags: flags)
         return nonce
     }
 
@@ -4314,7 +4683,12 @@ public class NetworkManager: ObservableObject {
             completion: { [weak self] error in
                 // Queued bulk cancellation is terminal for its transfer owner,
                 // not a transport send failure. Preserve the authenticated session.
-                if bulk || (100...103).contains(type.rawValue), case .posix(.ECANCELED)? = error {
+                if bulk || (84...92).contains(type.rawValue) || (100...103).contains(type.rawValue),
+                   case .posix(.ECANCELED)? = error {
+                    completion(error)
+                    return
+                }
+                if (84...92).contains(type.rawValue), case .posix(.ENOBUFS)? = error {
                     completion(error)
                     return
                 }
@@ -4360,11 +4734,14 @@ public class NetworkManager: ObservableObject {
         let generation = connectionGeneration
         networkQueue.async { [weak self] in
             guard let self, generation == self.connectionGeneration, self.adaptivePacketIsCurrent(data) else { return }
-            guard self.remoteFilePacketIsCurrent(data) else { completion(.posix(.ECANCELED)); return }
+            guard self.remoteFilePacketIsCurrent(data), self.remoteClipboardPacketIsCurrent(data) else {
+                completion(.posix(.ECANCELED)); return
+            }
             if bulk {
                 let remote = data.count >= WireProtocol.headerSize && self.remoteInputConnection
                 let ready: (() -> Bool)? = remote ? { [weak self] in
-                    guard let self, self.remoteFilePacketIsCurrent(data) else { return true }
+                    guard let self, self.remoteFilePacketIsCurrent(data),
+                          self.remoteClipboardPacketIsCurrent(data) else { return true }
                     return self.remoteFilePacing.rate(now: ProcessInfo.processInfo.systemUptime,
                                                      unsettled: self.remoteFileMediaBlocked) > 0
                 } : nil
@@ -4374,6 +4751,10 @@ public class NetworkManager: ObservableObject {
             } else if movement {
                 self.controlChannelWriter.enqueueMovement(data, completion: completion)
             } else if !self.controlChannelWriter.enqueue(data, completion: completion) {
+                if data.count >= WireProtocol.headerSize, (84...92).contains(data[5]) {
+                    completion(.posix(.ECANCELED))
+                    return
+                }
                 self.handleStreamError("Control queue reached its 64-message bound.")
             }
         }
@@ -4581,7 +4962,7 @@ public class NetworkManager: ObservableObject {
                 print("[IPAD][AUTO_RECONNECT_SUCCESS] generation=\(generation)")
                 wireAuthenticatedGeneration = generation
                 committedTransportGeneration = nil
-                beginRemoteFeaturesOnQueue(generation: generation)
+                beginRemoteFeaturesAfterAuthentication(generation: generation)
                 committedTransportAudioAvailable = false
                 committedRealtimeSessionID = nil
                 wifiLegacyFallbackRequestGeneration = nil
@@ -4640,6 +5021,7 @@ public class NetworkManager: ObservableObject {
             guard header.flags == 0 else { handleStreamError("Unexpected pairing flags."); return }
             if connectionHandoffInProgress { failConnectionControlOnQueue(.identityUnavailable); return }
             storePairingCredential(payload)
+            if pairedControlGeneration == generation { beginRemoteFeaturesOnQueue(generation: generation) }
 
         case .trustedAuthResult:
             guard !payload.isEmpty, payload[0] != 0 else {
@@ -4653,6 +5035,7 @@ public class NetworkManager: ObservableObject {
                 pairedControlGeneration = generation
                 refreshAdaptiveQualityPreferenceOnQueue()
                 negotiateConnectionControlOnQueue()
+                beginRemoteFeaturesOnQueue(generation: generation)
             }
 
         case .sessionResumeResult:
@@ -4947,7 +5330,8 @@ public class NetworkManager: ObservableObject {
                 updateRemoteAudioSuspensionOnQueue()
                 if let request = remoteFeatures.pong(flags: header.flags, now: ProcessInfo.processInfo.systemUptime,
                                                      requestRemoteFiles: true, requestSecureDesktop: remoteSecureDesktopEnabled,
-                                                     requestRemoteAudio: audioPreferred) {
+                                                     requestRemoteAudio: audioPreferred,
+                                                     requestClipboard: remoteClipboardProbeSent && wantsRemoteClipboard) {
                     remoteAudioRequested = audioPreferred
                     sendWireMessage(type: .remoteFeaturesRequest, payload: request, sequence: 0)
                 } else if remoteSecureDesktopEnabled {
@@ -5217,10 +5601,16 @@ public class NetworkManager: ObservableObject {
             receiveRemoteAudioOnQueue(message, generation: generation)
         case .remoteFileControl, .remoteAudioSet, .remoteSecureDesktopRequest:
             handleStreamError("Unnegotiated remote feature message.")
+        case .clipboardState, .clipboardOffer, .clipboardOfferResponse, .clipboardChunk,
+             .clipboardEnd, .clipboardResult, .clipboardCancel:
+            receiveRemoteClipboard(type: header.type, flags: header.flags, payload: payload)
+        case .clipboardHello, .clipboardControl:
+            handleStreamError("Invalid remote clipboard direction.")
         case .remoteFeaturesResult:
             guard remoteInputConnection, remoteFeatures.result(flags: header.flags, payload: payload) else {
                 handleStreamError("Invalid remote feature result."); return
             }
+            beginRemoteClipboard()
             let intent = remoteSecureDesktop.begin(accepted: remoteFeatures.accepted,
                                                    control: remoteSecureControlIntent && remoteSecureDesktopEnabled)
             remoteAudioFeaturesReceived = true
@@ -7561,6 +7951,7 @@ public class NetworkManager: ObservableObject {
             }
         case .updated: break
         }
+        if remoteClipboardLease.nonce != nil { tickRemoteClipboard() }
         publishMirrorStateOnQueue()
     }
     private func admitCaptureContinuationOnQueue(sequence: UInt32, decoder: UInt64, isIDR: Bool) -> Bool {
