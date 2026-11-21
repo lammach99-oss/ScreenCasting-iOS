@@ -16,35 +16,17 @@ struct RemoteTouchPresentation {
 
 @MainActor struct RemoteMouseControls: View {
     @EnvironmentObject private var inputSession: IPadInputSession
-    @Environment(\.dynamicTypeSize) private var typeSize
     private var presentation: RemoteTouchPresentation {
         RemoteTouchPresentation(mode: inputSession.touchMode, canPoint: inputSession.canPoint,
                                 canDirect: inputSession.canDirect)
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            SessionActionLayout(accessibility: typeSize.isAccessibilitySize) {
+        SessionSegmentLayout {
+            if presentation.enabled(.direct) {
                 modeButton(.direct, title: "Direct")
-                modeButton(.trackpad, title: "Trackpad")
             }
-            Text(presentation.helper).font(.footnote)
-                .foregroundStyle(Color(uiColor: SessionInk.secondary))
-                .fixedSize(horizontal: false, vertical: true)
-            Text(inputSession.touchMode == .direct
-                 ? "Windows handles touch movement and press-and-hold. Touch-aware apps may pan instead of dragging."
-                 : "Move your finger to move the pointer. Tap to click. Hold still to right click.")
-                .font(.footnote).foregroundStyle(Color(uiColor: SessionInk.secondary))
-                .fixedSize(horizontal: false, vertical: true)
-            if let reason = inputSession.unavailableReason {
-                Text(reason).font(.footnote).foregroundStyle(Color(uiColor: SessionInk.warning))
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if !inputSession.canDirect && inputSession.unavailableReason == nil {
-                Text(RemoteTouchPresentation.directUnavailable).font(.footnote)
-                    .foregroundStyle(Color(uiColor: SessionInk.warning))
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            modeButton(.trackpad, title: "Trackpad")
         }
         .foregroundStyle(Color(uiColor: SessionInk.text))
     }
@@ -56,10 +38,10 @@ struct RemoteTouchPresentation {
             guard enabled else { return }
             inputSession.selectTouchMode(choice)
         } label: {
-            SessionInputControlLabel(title: title, selected: selected)
+            SessionSegmentLabel(title: title, selected: selected, enabled: enabled)
         }
         .buttonStyle(.plain)
-        .disabled(!enabled).opacity(enabled ? 1 : 0.45)
+        .disabled(!enabled)
         .accessibilityLabel(title)
         .accessibilityValue(!enabled ? "Unavailable" : (selected ? "Selected" : "Not selected"))
         .accessibilityHint(choice == .direct && !inputSession.canDirect
