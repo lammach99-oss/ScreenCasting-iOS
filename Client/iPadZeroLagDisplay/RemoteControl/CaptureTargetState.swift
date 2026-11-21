@@ -232,13 +232,21 @@ struct CaptureTargetVideoBuffer {
         return MirrorControlCodec.sequenceAtOrAfter(root.sequence, firstFrame)
     }
     mutating func reset() { frames.removeAll(keepingCapacity: false); byteCount = 0 }
-    mutating func append(_ frame: Frame) {
+    @discardableResult
+    mutating func append(_ frame: Frame, continuesDecodeChain: Bool = false) -> Bool {
         if frame.isIDR { reset() }
-        guard frame.isIDR || !frames.isEmpty else { return }
+        guard frame.isIDR || !frames.isEmpty || continuesDecodeChain else { return false }
         guard frames.count < Self.maximumFrames, frame.data.count <= Self.maximumBytes - byteCount else {
-            reset(); return
+            reset(); return false
         }
         frames.append(frame); byteCount += frame.data.count
+        return true
+    }
+    mutating func popFirst() -> Frame? {
+        guard !frames.isEmpty else { return nil }
+        let frame = frames.removeFirst()
+        byteCount -= frame.data.count
+        return frame
     }
     mutating func take(firstFrame: UInt32) -> [Frame] {
         defer { reset() }

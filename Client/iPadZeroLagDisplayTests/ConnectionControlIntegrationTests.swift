@@ -1,5 +1,6 @@
 import XCTest
 import Network
+import CoreVideo
 @testable import iPadCasting
 
 final class ConnectionControlIntegrationTests: XCTestCase {
@@ -311,6 +312,144 @@ final class ConnectionControlIntegrationTests: XCTestCase {
             }
         }
     }
+    @MainActor func testHandoffDecodesBufferedChainInOrderAfterRootPresentation() async throws {
+        let network = NetworkManager()
+        defer { network.stopForTesting() }
+        let decoder = try stageUsbHandoff(network)
+        let pixel = try makeHandoffPixel()
+        var submitted: [UInt32] = []
+        decoder.submitDecodeForTesting = { sequence in
+            submitted.append(sequence)
+            return pixel
+        }
+        receiveHandoffVideo(network, sequence: 100, isIDR: true)
+        for sequence in UInt32(101)...104 {
+            receiveHandoffVideo(network, sequence: sequence)
+        }
+        network.receiveIdentityWireForTesting(type: .connectionSelectResult,
+            payload: try ConnectionSwitchStateTests.result(.completed).encode())
+        await drain(network)
+        XCTAssertEqual(decoder.sessionQueueForTesting.sync { submitted }, [100])
+        XCTAssertTrue(network.connectionSwitchState.inputBlocked)
+        network.recordRenderCompletion(sequence: 100, generation: decoder.currentSessionGeneration)
+        for _ in 0..<5 {
+            decoder.sessionQueueForTesting.sync {}
+            await drain(network)
+        }
+        XCTAssertEqual(decoder.sessionQueueForTesting.sync { submitted }, [100, 101, 102, 103, 104])
+        XCTAssertEqual(network.connectionSwitchState.phase, .completed)
+    }
+
+    @MainActor func testHandoffDependentDropKeepsRootAndRecoversAtNextIDR() async throws {
+        let network = NetworkManager()
+        defer { network.stopForTesting() }
+        let decoder = try stageUsbHandoff(network)
+        let pixel = try makeHandoffPixel()
+        let entered = expectation(description: "root held inside decoder")
+        let release = DispatchSemaphore(value: 0)
+        var submitted: [UInt32] = []
+        decoder.submitDecodeForTesting = { sequence in
+            submitted.append(sequence)
+            if sequence == 100 {
+                entered.fulfill()
+                _ = release.wait(timeout: .now() + 5)
+            }
+            return pixel
+        }
+        receiveHandoffVideo(network, sequence: 100, isIDR: true)
+        network.receiveIdentityWireForTesting(type: .connectionSelectResult,
+            payload: try ConnectionSwitchStateTests.result(.completed).encode())
+        await fulfillment(of: [entered], timeout: 2)
+        let generation = decoder.currentSessionGeneration
+        let invalidations = decoder.invalidateCountForTesting
+        let feedback = network.networkQueueForTesting.sync { network.videoFeedbackCountForTesting }
+        // Force real mailbox eviction while the root is in flight.
+        let annexB = Data([0, 0, 1, 0x02, 0x01])
+        decoder.processInputData(annexB, sequence: 101, isIDR: false)
+        decoder.processInputData(annexB, sequence: 102, isIDR: false)
+        await drain(network)
+        XCTAssertEqual(decoder.invalidateCountForTesting, invalidations)
+        XCTAssertGreaterThan(network.networkQueueForTesting.sync { network.videoFeedbackCountForTesting }, feedback)
+        release.signal()
+        decoder.sessionQueueForTesting.sync {}
+        await drain(network)
+        receiveHandoffVideo(network, sequence: 103)
+        network.recordRenderCompletion(sequence: 100, generation: generation)
+        await drain(network)
+        XCTAssertEqual(network.connectionSwitchState.phase, .completed)
+        XCTAssertEqual(decoder.sessionQueueForTesting.sync { submitted }, [100])
+        receiveHandoffVideo(network, sequence: 104, isIDR: true)
+        XCTAssertEqual(decoder.sessionQueueForTesting.sync { submitted }, [100, 104])
+        XCTAssertEqual(decoder.currentSessionGeneration, generation)
+    }
+
+    @MainActor func testHandoffFailedRootWaitsForReplacementIDRPresentation() async throws {
+        let network = NetworkManager()
+        defer { network.stopForTesting() }
+        let decoder = try stageUsbHandoff(network)
+        let pixel = try makeHandoffPixel()
+        var submitted: [UInt32] = []
+        decoder.submitDecodeForTesting = { sequence in
+            submitted.append(sequence)
+            return sequence == 100 ? nil : pixel
+        }
+        receiveHandoffVideo(network, sequence: 100, isIDR: true)
+        receiveHandoffVideo(network, sequence: 101)
+        network.receiveIdentityWireForTesting(type: .connectionSelectResult,
+            payload: try ConnectionSwitchStateTests.result(.completed).encode())
+        decoder.sessionQueueForTesting.sync {}
+        await drain(network)
+        let generation = decoder.currentSessionGeneration
+        network.recordRenderCompletion(sequence: 100, generation: generation)
+        receiveHandoffVideo(network, sequence: 102)
+        await drain(network)
+        XCTAssertTrue(network.connectionSwitchState.inputBlocked)
+        XCTAssertEqual(decoder.sessionQueueForTesting.sync { submitted }, [100])
+
+        receiveHandoffVideo(network, sequence: 103, isIDR: true)
+        XCTAssertEqual(decoder.sessionQueueForTesting.sync { submitted }, [100, 103])
+        network.recordRenderCompletion(sequence: 103, generation: generation)
+        await drain(network)
+        XCTAssertEqual(network.connectionSwitchState.phase, .completed)
+        XCTAssertEqual(decoder.currentSessionGeneration, generation)
+    }
+
+    @MainActor private func stageUsbHandoff(_ network: NetworkManager) throws -> DecoderManager {
+        let origin = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        let replacement = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        var state = ConnectionSwitchState()
+        state.begin(generation: origin.generation)
+        _ = state.advertise(flags: 0x0200, authenticated: true, generation: origin.generation)
+        XCTAssertTrue(state.receive(try ConnectionSwitchStateTests.snapshot(), generation: origin.generation, now: 0))
+        _ = try XCTUnwrap(state.select(.usb, now: 0))
+        XCTAssertTrue(state.preparing(try ConnectionSwitchStateTests.prepare(), generation: origin.generation, now: 0))
+        XCTAssertTrue(state.receive(try ConnectionSwitchStateTests.snapshot(revision: 3, hostState: .switching),
+            generation: origin.generation, now: 0))
+        XCTAssertTrue(state.receive(try ConnectionSwitchStateTests.result(.accepted), generation: origin.generation, now: 0))
+        XCTAssertTrue(state.bindReplacement(generation: replacement.generation, route: .usb, authenticated: true, now: 0))
+        _ = state.advertise(flags: 0x0200, authenticated: true, generation: replacement.generation)
+        XCTAssertTrue(state.receive(try ConnectionSwitchStateTests.snapshot(revision: 3, owner: 2, route: .usb),
+            generation: replacement.generation, now: 0))
+        network.connectionControlNowForTesting = { 0 }
+        network.beginTransferWriterForTesting()
+        network.stageConnectionPresentationForTesting(state: state, request: 7, receivedAt: 100)
+        let decoder = network.decoderForTesting
+        decoder.setMailboxClockForTesting(to: 100)
+        return decoder
+    }
+
+    private func makeHandoffPixel() throws -> CVPixelBuffer {
+        var pixel: CVPixelBuffer?
+        XCTAssertEqual(CVPixelBufferCreate(nil, 2, 2, kCVPixelFormatType_32BGRA, nil, &pixel), kCVReturnSuccess)
+        return try XCTUnwrap(pixel)
+    }
+
+    private func receiveHandoffVideo(_ network: NetworkManager, sequence: UInt32, isIDR: Bool = false) {
+        let annexB = Data([0, 0, 1, isIDR ? 0x26 : 0x02, 0x01])
+        network.receiveIdentityWireForTesting(type: .video, payload: annexB,
+            flags: isIDR ? WireProtocol.videoFlagIDR : 0, sequence: sequence)
+    }
+
     @MainActor func testWifiToOrdinaryUsbSendsOnlyResumeAfterIdentityAndAdvertisement() async throws {
         let network = NetworkManager(); let writes = Writes()
         let credential = ConnectionControlProtocolTests.usbCredential

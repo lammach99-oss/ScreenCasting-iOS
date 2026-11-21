@@ -518,6 +518,10 @@ public class NetworkManager: ObservableObject {
     private var connectionListenerPreparationAt: TimeInterval?
     private var connectionVideo = CaptureTargetVideoBuffer()
     private var connectionVideoStarted = false
+    private var connectionVideoInFlight: UInt32?
+    private var connectionVideoPresentationRoot: UInt32?
+    private var connectionVideoHasPresentedRoot = false
+    private var connectionVideoNeedsIDR = false
     private var connectionCompleted: ConnectionSelectResult?
     private var connectionDisplayRequest: UInt32?
     private var connectionDisplayReady = false
@@ -528,6 +532,7 @@ public class NetworkManager: ObservableObject {
     var connectionListenerPortForTesting: UInt16?
     var connectionListenerReadyForTesting: (() -> Void)?
     var usbIdentityCredentialLoadForTesting: (() -> TrustedHostCredential?)?
+    private var connectionVideoReceivedAtForTesting: TimeInterval?
     #endif
     private lazy var controlChannelWriter = ControlChannelWriter(
         queue: networkQueue,
@@ -929,6 +934,11 @@ public class NetworkManager: ObservableObject {
                     generation: networkGeneration,
                     succeeded: succeeded,
                     decoderGeneration: generation)
+                if succeeded, let owner = self.currentConnectionDecoder, owner.decoder == generation,
+                   owner.network == self.connectionGeneration, self.connectionVideoInFlight == sequence {
+                    self.connectionVideoInFlight = nil
+                    self.drainConnectionVideoOnQueue()
+                }
             }
         }
         decoder.onFrameDropped = { [weak self] sequence, generation in
@@ -937,17 +947,7 @@ public class NetworkManager: ObservableObject {
                 sequence: sequence,
                 generation: self.telemetryGeneration(forDecoder: generation))
             self.networkQueue.async { [weak self] in
-                guard let self, !self.captureAvailability.inputBlocked, self.connectionHandoffInProgress,
-                      let owner = self.currentConnectionDecoder, owner.decoder == generation,
-                      owner.network == self.connectionGeneration else { return }
-                self.connectionSwitch.invalidateDecodeRoot(generation: owner.network)
-                self.connectionVideo.reset(); self.connectionVideoStarted = false
-                self.mirrorDecoderLock.lock(); self.connectionDecoder = nil; self.mirrorDecoderLock.unlock()
-                self.decoder.invalidate(waitForCompletion: false)
-                if self.committedRealtimeMode == RealtimeTransportMode.wifiRTP {
-                    self.wifiMediaReceiver.requestImmediateRecoveryFeedback(generation: owner.network)
-                } else { self.sendVideoFeedback() }
-                self.publishConnectionControlOnQueue()
+                self?.connectionVideoDroppedOnQueue(sequence: sequence, decoder: generation)
             }
         }
         decoder.onMailboxAge = { [weak self] sequence, ageMs in
@@ -957,13 +957,13 @@ public class NetworkManager: ObservableObject {
             guard let self else { return }
             self.networkQueue.async {
                 guard self.wireAuthenticatedGeneration == self.connectionGeneration, !self.captureAvailability.inputBlocked else { return }
+                // The sequence-bearing drop callback owns recovery during handoff and its drain.
+                if self.currentConnectionDecoder?.network == self.connectionGeneration,
+                   self.connectionVideoStarted && (self.connectionHandoffInProgress || self.connectionVideoDraining) { return }
                 if self.captureTargets.applied != nil {
                     self.recoverCaptureTargetDecodeRootOnQueue()
-                } else if self.committedRealtimeMode == RealtimeTransportMode.wifiRTP {
-                    self.wifiMediaReceiver.requestImmediateRecoveryFeedback(
-                        generation: self.connectionGeneration)
                 } else {
-                    self.sendVideoFeedback()
+                    self.requestVideoRecoveryOnQueue()
                 }
             }
         }
@@ -3960,7 +3960,7 @@ public class NetworkManager: ObservableObject {
             }
     }
 
-    private func sendVideoFeedback() {
+    private func sendVideoFeedback(reportDecodeLoss: Bool = false) {
         guard wireAuthenticatedGeneration == connectionGeneration else { return }
         publishAudioDiagnosticsIfDue()
         #if targetEnvironment(simulator)
@@ -3989,7 +3989,8 @@ public class NetworkManager: ObservableObject {
             let dropped = needsIDR ? max(feedback.3, 1) : feedback.3
             bytes.storeBytes(of: dropped.littleEndian, toByteOffset: 10, as: UInt16.self)
             bytes.storeBytes(of: feedback.4.littleEndian, toByteOffset: 12, as: UInt16.self)
-            bytes.storeBytes(of: feedback.5.littleEndian, toByteOffset: 14, as: UInt16.self)
+            let droppedAccessUnits = reportDecodeLoss ? max(feedback.5, 1) : feedback.5
+            bytes.storeBytes(of: droppedAccessUnits.littleEndian, toByteOffset: 14, as: UInt16.self)
         }
         let stages = transportTelemetry.frameStageP95Ms()
         let feedbackFlags = transportTelemetry.feedbackValidityFlags()
@@ -5749,7 +5750,11 @@ public class NetworkManager: ObservableObject {
         }
         let isIDR = header.flags & WireProtocol.videoFlagIDR != 0
         let lengthPrefixed = header.flags & WireProtocol.videoFlagLengthPrefixed != 0
+        #if targetEnvironment(simulator)
+        let receivedAt = connectionVideoReceivedAtForTesting ?? CACurrentMediaTime()
+        #else
         let receivedAt = CACurrentMediaTime()
+        #endif
         if remoteSecureDesktop.supported {
             let decoderGeneration = decoder.currentSessionGeneration
             let verifiedIDR = isIDR && (!remoteSecureDesktop.expectsIDR ||
@@ -8008,9 +8013,15 @@ public class NetworkManager: ObservableObject {
         networkQueue.asyncAfter(deadline: .now() + 1, execute: retry)
     }
     private func resetConnectionPresentationOnQueue() {
-        connectionVideo.reset(); connectionCompleted = nil; connectionVideoStarted = false
+        resetConnectionVideoOnQueue()
+        connectionCompleted = nil
         connectionDisplayRequest = nil; connectionDisplayReady = false; connectionReadyDisplay = nil
         mirrorDecoderLock.lock(); connectionDecoder = nil; mirrorDecoderLock.unlock()
+    }
+    private func resetConnectionVideoOnQueue() {
+        connectionVideo.reset(); connectionVideoStarted = false
+        connectionVideoInFlight = nil; connectionVideoPresentationRoot = nil
+        connectionVideoHasPresentedRoot = false; connectionVideoNeedsIDR = false
     }
     private func trackConnectionDisplayRequestOnQueue(_ request: UInt32) {
         if connectionSwitch.pending?.rollingBack == true, connectionDisplayRequest != request {
@@ -8044,7 +8055,7 @@ public class NetworkManager: ObservableObject {
         eraseConnectionProofOnQueue(); connectionSelectedCredential = nil
         connectionHandoffInProgress = false; connectionExpectedRetirement = false
         if committedConnectionRoute == .wifi { reconnectEnabled = true }
-        connectionVideo.reset(); connectionCompleted = nil
+        connectionCompleted = nil
         mirrorControl.setConnectionInputBlocked(false)
         recordDiagnosticLine("[CONNECTION_CONTROL] event=owned_render")
         beginAdaptiveProbeOnQueue()
@@ -8062,20 +8073,89 @@ public class NetworkManager: ObservableObject {
 
     private func consumeConnectionVideoOnQueue(_ data: Data, sequence: UInt32, isIDR: Bool,
         lengthPrefixed: Bool, receivedAt: TimeInterval, domain: ConnectionFrameDomain) -> Bool {
-        guard connectionHandoffInProgress, connectionSwitch.pending != nil else { return false }
-        // Before the expected retirement the old picture may remain, but new old-route frames do not acquire ownership.
-        guard connectionSwitch.pending?.originGeneration != connectionGeneration else { return true }
+        if connectionHandoffInProgress {
+            guard let pending = connectionSwitch.pending else { return false }
+            // Old-route frames cannot acquire replacement ownership.
+            guard pending.originGeneration != connectionGeneration else { return true }
+        } else {
+            guard connectionVideoDraining, let owner = currentConnectionDecoder,
+                  owner.network == connectionGeneration, owner.domain == domain else { return false }
+        }
+        guard !captureAvailability.wireSuspended else { return true }
         let frame = CaptureTargetVideoBuffer.Frame(data: data, sequence: sequence, isIDR: isIDR,
             lengthPrefixed: lengthPrefixed, receivedAt: receivedAt)
         if connectionVideoStarted {
-            if isIDR, let owner = currentConnectionDecoder {
-                connectionSwitch.observeIDR(sequence: sequence, domain: domain, decoder: owner.decoder, generation: connectionGeneration)
+            guard isIDR || !connectionVideoNeedsIDR || !connectionVideo.frames.isEmpty else { return true }
+            if connectionVideo.append(frame, continuesDecodeChain: !connectionVideoNeedsIDR) {
+                drainConnectionVideoOnQueue()
+            } else {
+                recoverConnectionVideoChainOnQueue(after: sequence)
             }
-            guard admitCaptureContinuationOnQueue(sequence: sequence, decoder: decoder.currentSessionGeneration, isIDR: isIDR) else { return true }
-            submitVideoOnQueue(data, sequence: sequence, isIDR: isIDR,
-                               lengthPrefixed: lengthPrefixed, receivedAt: receivedAt)
         } else { connectionVideo.append(frame); advanceConnectionVideoOnQueue() }
         return true
+    }
+
+    private var connectionVideoDraining: Bool {
+        connectionVideoInFlight != nil || connectionVideoNeedsIDR || !connectionVideo.frames.isEmpty
+    }
+
+    private func drainConnectionVideoOnQueue() {
+        // Only the root may enter the renderer before its first presentation.
+        // Afterward, each decode completion admits at most one buffered unit.
+        guard connectionVideoInFlight == nil, connectionVideoPresentationRoot == nil,
+              let owner = currentConnectionDecoder, owner.network == connectionGeneration,
+              let frame = connectionVideo.popFirst() else { return }
+        guard admitCaptureContinuationOnQueue(sequence: frame.sequence, decoder: owner.decoder, isIDR: frame.isIDR) else {
+            recoverConnectionVideoChainOnQueue(after: frame.sequence)
+            return
+        }
+        if frame.isIDR {
+            connectionVideoNeedsIDR = false
+            if !connectionVideoHasPresentedRoot {
+                connectionVideoPresentationRoot = frame.sequence
+                connectionSwitch.observeIDR(sequence: frame.sequence, domain: owner.domain,
+                    decoder: owner.decoder, generation: owner.network)
+            }
+        }
+        connectionVideoInFlight = frame.sequence
+        submitVideoOnQueue(frame.data, sequence: frame.sequence, isIDR: frame.isIDR,
+                           lengthPrefixed: frame.lengthPrefixed, receivedAt: frame.receivedAt)
+    }
+
+    private func connectionVideoDroppedOnQueue(sequence: UInt32, decoder generation: UInt64) {
+        guard connectionVideoStarted, connectionHandoffInProgress || connectionVideoDraining,
+              let owner = currentConnectionDecoder, owner.decoder == generation,
+              owner.network == connectionGeneration else { return }
+        if connectionVideoInFlight == sequence { connectionVideoInFlight = nil }
+        if connectionVideoPresentationRoot == sequence {
+            connectionVideoPresentationRoot = nil
+            connectionSwitch.invalidateDecodeRoot(generation: owner.network)
+            publishConnectionControlOnQueue()
+        }
+        recoverConnectionVideoChainOnQueue(after: sequence)
+    }
+
+    private func recoverConnectionVideoChainOnQueue(after sequence: UInt32) {
+        if let next = connectionVideo.frames.first, next.isIDR, next.sequence != sequence,
+           MirrorControlCodec.sequenceAtOrAfter(next.sequence, sequence) {
+            drainConnectionVideoOnQueue()
+            return
+        }
+        connectionVideo.reset()
+        guard !connectionVideoNeedsIDR else { return }
+        connectionVideoNeedsIDR = true
+        guard !captureAvailability.inputBlocked else { return }
+        requestVideoRecoveryOnQueue()
+    }
+
+    private func requestVideoRecoveryOnQueue() {
+        if committedRealtimeMode == RealtimeTransportMode.wifiRTP {
+            wifiMediaReceiver.requestImmediateRecoveryFeedback(generation: connectionGeneration)
+        } else if let recovery = mirrorControl.presentationRecoveryRequest() {
+            sendWireMessage(type: .mirrorAction, payload: recovery, sequence: 0)
+        } else {
+            sendVideoFeedback(reportDecodeLoss: true)
+        }
     }
     private var currentConnectionDecoder: (network: UInt64, decoder: UInt64, domain: ConnectionFrameDomain)? {
         mirrorDecoderLock.lock(); defer { mirrorDecoderLock.unlock() }; return connectionDecoder
@@ -8103,8 +8183,7 @@ public class NetworkManager: ObservableObject {
             guard let completed = connectionCompleted, completed.frameDomain == domain else { return }
             firstFrame = completed.firstFrame
         }
-        let frames = connectionVideo.take(firstFrame: firstFrame)
-        guard let root = frames.first else { return }
+        guard connectionVideo.hasRoot(firstFrame: firstFrame) else { connectionVideo.reset(); return }
         guard nextMirrorDecoder != UInt64.max else { failConnectionControlOnQueue(.startFailed); return }
         nextMirrorDecoder += 1
         let owner = (network: connectionGeneration, decoder: nextMirrorDecoder, domain: domain)
@@ -8116,16 +8195,22 @@ public class NetworkManager: ObservableObject {
         }
         connectionSwitch.expectDisplay(request: request, decoder: owner.decoder, generation: connectionGeneration)
         connectionSwitch.displayReady(request: request, generation: connectionGeneration, now: now)
-        connectionSwitch.observeIDR(sequence: root.sequence, domain: domain, decoder: owner.decoder, generation: connectionGeneration)
         connectionVideoStarted = true
-        for frame in frames {
-            guard admitCaptureContinuationOnQueue(sequence: frame.sequence, decoder: owner.decoder, isIDR: frame.isIDR) else { continue }
-            submitVideoOnQueue(frame.data, sequence: frame.sequence, isIDR: frame.isIDR,
-                               lengthPrefixed: frame.lengthPrefixed, receivedAt: frame.receivedAt)
-        }
+        drainConnectionVideoOnQueue()
         publishConnectionControlOnQueue()
     }
     #if targetEnvironment(simulator)
+    func stageConnectionPresentationForTesting(state: ConnectionSwitchState, request: UInt32, receivedAt: TimeInterval) {
+        networkQueue.sync {
+            connectionSwitch = state
+            connectionHandoffInProgress = true
+            connectionDisplayRequest = request
+            connectionDisplayReady = true
+            pairedControlGeneration = connectionGeneration
+            connectionVideoReceivedAtForTesting = receivedAt
+        }
+    }
+
     func setConnectionIdentityForTesting(verified: Bool) {
         networkQueue.sync { pairedControlGeneration = verified ? connectionGeneration : nil }
     }
@@ -8182,6 +8267,7 @@ public class NetworkManager: ObservableObject {
     #endif
     private func beginOwnedDecoderSession(networkGeneration generation: UInt64) {
         if !connectionHandoffInProgress {
+            resetConnectionVideoOnQueue()
             mirrorDecoderLock.lock(); connectionDecoder = nil; mirrorDecoderLock.unlock()
         }
         if captureTargetOwnsPresentation { abandonCaptureTargetPresentationOnQueue() }
@@ -8223,6 +8309,15 @@ public class NetworkManager: ObservableObject {
             controlChannelWriter.discardPending(where: CaptureAvailabilityProtocol.isNewInputPacket)
             if !wasWireSuspended || retireInput {
                 captureTargetVideo.reset(); connectionVideo.reset()
+                if connectionVideoStarted {
+                    connectionVideoInFlight = nil
+                    connectionVideoNeedsIDR = true
+                    if connectionVideoPresentationRoot != nil {
+                        connectionVideoPresentationRoot = nil
+                        connectionSwitch.invalidateDecodeRoot(generation: connectionGeneration)
+                        publishConnectionControlOnQueue()
+                    }
+                }
                 qualityBaselineIDRs.removeAll(keepingCapacity: true)
                 decoder.fenceCaptureContinuation()
             }
@@ -9034,11 +9129,19 @@ public class NetworkManager: ObservableObject {
                 self.transportTelemetry.recordRenderCompletion(sequence: sequence, generation: routeDecoder.network)
                 let now = self.connectionControlNow()
                 if self.expireConnectionControlOnQueue(now: now) { return }
-                self.connectionSwitch.rendered(sequence: sequence, domain: routeDecoder.domain,
-                    decoder: generation, generation: routeDecoder.network, now: now)
+                let presentedRoot = self.connectionVideoPresentationRoot == sequence
+                if !self.connectionHandoffInProgress || self.connectionVideoHasPresentedRoot || presentedRoot {
+                    self.connectionSwitch.rendered(sequence: sequence, domain: routeDecoder.domain,
+                        decoder: generation, generation: routeDecoder.network, now: now)
+                }
+                if presentedRoot {
+                    self.connectionVideoPresentationRoot = nil
+                    self.connectionVideoHasPresentedRoot = true
+                }
                 if self.connectionHandoffInProgress && !self.connectionSwitch.inputBlocked {
                     self.finishConnectionControlOnQueue()
                 }
+                if presentedRoot { self.drainConnectionVideoOnQueue() }
                 if let ack = self.mirrorControl.observeRendered(session: routeDecoder.network, sequence: sequence) {
                     self.sendWireMessage(type: .mirrorAction, payload: ack, sequence: 0)
                 }
@@ -9096,8 +9199,11 @@ public class NetworkManager: ObservableObject {
 
     public func recordRenderDrop(sequence: UInt32, generation: UInt64) {
         networkQueue.async { [weak self] in
-            guard let self, self.decoder.currentSessionGeneration == generation,
-                  self.adaptiveFrameOnQueue(sequence) != nil else { return }
+            guard let self, self.decoder.currentSessionGeneration == generation else { return }
+            if self.connectionVideoPresentationRoot == sequence {
+                self.connectionVideoDroppedOnQueue(sequence: sequence, decoder: generation)
+            }
+            guard self.adaptiveFrameOnQueue(sequence) != nil else { return }
             self.qualityWindow.drop(2)
             if self.qualitySession?.pending?.firstFrame == self.adaptiveFrameOnQueue(sequence) {
                 self.failAdaptiveConfigurationOnQueue(reason: 4)

@@ -1,8 +1,53 @@
 import XCTest
 import CoreMedia
+import CoreVideo
 @testable import iPadCasting
 
 final class DecoderParameterSetTests: XCTestCase {
+    #if targetEnvironment(simulator)
+    func testFailedHEVCReplacementRejectsAccessUnitAndRetriesOnIDR() throws {
+        let decoder = DecoderManager()
+        defer { decoder.invalidate() }
+        let generation = decoder.currentSessionGeneration
+        decoder.setMailboxClockForTesting(to: 100)
+        var buffer: CVPixelBuffer?
+        XCTAssertEqual(CVPixelBufferCreate(nil, 2, 2, kCVPixelFormatType_32BGRA, nil, &buffer), kCVReturnSuccess)
+        let pixel = try XCTUnwrap(buffer)
+        var attempts: [UInt8] = []
+        var submitted: [UInt32] = []
+        let recovery = expectation(description: "rejecting a format requests an IDR")
+        decoder.onRecoveryNeeded = { recovery.fulfill() }
+        decoder.replaceHEVCFormatForTesting = { _, _, pps in
+            let value = pps.last ?? 0
+            attempts.append(value)
+            return value == 0x10 || attempts.count == 3
+        }
+        decoder.submitDecodeForTesting = { sequence in
+            submitted.append(sequence)
+            return pixel
+        }
+        func receive(_ sequence: UInt32, pps: UInt8?, idr: Bool = true) {
+            var bytes: [UInt8] = []
+            if let pps {
+                bytes = [0, 0, 1, 0x40, 1, 0x11, 0, 0, 1, 0x42, 1, 0x12,
+                         0, 0, 1, 0x44, 1, pps]
+            }
+            bytes += [0, 0, 1, idr ? 0x26 : 0x02, 1, 0x80]
+            decoder.processInputData(Data(bytes), sequence: sequence, isIDR: idr, receivedAt: 100)
+            decoder.sessionQueueForTesting.sync {}
+        }
+        receive(1, pps: 0x10)
+        receive(2, pps: 0x20)
+        receive(3, pps: nil, idr: false)
+        receive(4, pps: 0x20)
+        receive(5, pps: nil, idr: false)
+        wait(for: [recovery], timeout: 1)
+        XCTAssertEqual(attempts, [0x10, 0x20, 0x20])
+        XCTAssertEqual(submitted, [1, 4, 5])
+        XCTAssertEqual(decoder.currentSessionGeneration, generation)
+    }
+    #endif
+
     func testIdenticalParameterSetsCreateOneDecoderSession() {
         let vps = Data([0x40, 0x01])
         let sps = Data([0x42, 0x01, 0x0a])

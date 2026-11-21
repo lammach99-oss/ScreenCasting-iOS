@@ -421,6 +421,8 @@ public final class DecoderManager {
     #if targetEnvironment(simulator)
     private let testingLifecycleLock = NSLock()
     private var testingMailboxTime: TimeInterval?
+    var replaceHEVCFormatForTesting: ((Data, Data, Data) -> Bool)?
+    var submitDecodeForTesting: ((UInt32) -> CVPixelBuffer?)?
 
     func setMailboxClockForTesting(to time: TimeInterval) {
         testingLifecycleLock.lock()
@@ -695,11 +697,14 @@ public final class DecoderManager {
             let candidate = HevcParameterSetSignature(vps: vps, sps: sps, pps: pps)
             if candidate != activeParameterSetSignature {
                 let decoder = self
-                _ = parameterSetSessionGate.replaceIfChanged(
+                guard parameterSetSessionGate.replaceIfChanged(
                     vps: vps,
                     sps: sps,
-                    pps: pps) {
+                    pps: pps, factory: {
                     decoder.replaceDecompressionSession(vps: vps, sps: sps, pps: pps)
+                }) else {
+                    finish(ticket, lifetime: lifetime, succeeded: false)
+                    return
                 }
             }
         } else if activeCodec == .h264,
@@ -707,16 +712,30 @@ public final class DecoderManager {
             let candidate = H264ParameterSetSignature(sps: sps, pps: pps)
             if candidate != activeH264ParameterSetSignature {
                 let decoder = self
-                _ = h264ParameterSetSessionGate.replaceIfChanged(
+                guard h264ParameterSetSessionGate.replaceIfChanged(
                     sps: sps,
-                    pps: pps) {
+                    pps: pps, factory: {
                     decoder.replaceH264DecompressionSession(sps: sps, pps: pps)
+                }) else {
+                    finish(ticket, lifetime: lifetime, succeeded: false)
+                    return
                 }
             }
         }
 
-        guard !frameRanges.isEmpty,
-              let session = decompressionSession,
+        guard !frameRanges.isEmpty else {
+            finish(ticket, lifetime: lifetime, succeeded: false)
+            return
+        }
+        #if targetEnvironment(simulator)
+        if let submitDecodeForTesting {
+            let started = CACurrentMediaTime()
+            let pixel = submitDecodeForTesting(accessUnit.sequence)
+            finish(ticket, lifetime: lifetime, succeeded: pixel != nil, decodeStartedAt: started, imageBuffer: pixel)
+            return
+        }
+        #endif
+        guard let session = decompressionSession,
               let description = formatDescription else {
             finish(ticket, lifetime: lifetime, succeeded: false)
             return
@@ -823,6 +842,9 @@ public final class DecoderManager {
         sps: Data,
         pps: Data
     ) -> Bool {
+        #if targetEnvironment(simulator)
+        if let replaceHEVCFormatForTesting { return replaceHEVCFormatForTesting(vps, sps, pps) }
+        #endif
         var candidateDescription: CMVideoFormatDescription?
         var candidateSession: VTDecompressionSession?
 
