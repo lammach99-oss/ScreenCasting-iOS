@@ -682,6 +682,7 @@ public class NetworkManager: ObservableObject {
     private var negotiationFallbackToken: UInt64 = 0
     private lazy var wifiMediaReceiver = WifiMediaReceiver(
         networkQueue: networkQueue,
+        currentDecoderGeneration: { [weak self] in self?.decoder.currentSessionGeneration },
         decoder: { [weak self] data, sequence, isIDR, receivedAt in
             guard let self,
                   self.committedTransportGeneration == self.connectionGeneration,
@@ -699,12 +700,8 @@ public class NetworkManager: ObservableObject {
             guard self.mirrorControl.permitsVideoSequence(sequence) else { return }
             self.recordVideoPayloadReceived(data.count, sequence: sequence)
             guard self.admitCaptureContinuationOnQueue(sequence: sequence, decoder: self.decoder.currentSessionGeneration, isIDR: isIDR) else { return }
-            self.decoder.processInputData(
-                data,
-                sequence: sequence,
-                isIDR: isIDR,
-                isLengthPrefixed: true,
-                receivedAt: receivedAt)
+            self.submitVideoOnQueue(data, sequence: sequence, isIDR: isIDR,
+                lengthPrefixed: true, receivedAt: receivedAt)
         },
         audioConsumer: { data, sequence, timestamp, generation in
             AudioManager.shared.playOpusData(
@@ -840,13 +837,27 @@ public class NetworkManager: ObservableObject {
     private var orientationDebounceWorkItem: DispatchWorkItem?
     private struct DisplayRotationDiagnostic {
         let request: DisplayConfigurationRequest
+        let chainID: UInt32
         let transport: ActiveTransportKind
         let startedAt: TimeInterval
         var sentAt: TimeInterval?
         var readyAt: TimeInterval?
         var presentedAt: TimeInterval?
+
+        func matchesPresentation(_ size: CGSize) -> Bool {
+            guard size.width > 0, size.height > 0,
+                  (size.width > size.height) == (request.width > request.height) else { return false }
+            let source = size.width * CGFloat(request.height)
+            let target = size.height * CGFloat(request.width)
+            // Allow pixel alignment when the encoder scales the desktop.
+            return abs(source - target) <= target * 0.02
+        }
     }
     private var displayRotationDiagnostic: DisplayRotationDiagnostic?
+    private var displayRotationChainID: UInt32?
+    #if targetEnvironment(simulator)
+    var displayRotationDiagnosticSinkForTesting: ((String) -> Void)?
+    #endif
     private static let usbTouchMoveDiagnosticInterval: TimeInterval = 0.25
     private var usbTouchDiagnosticSequence: UInt64 = 0
     private var lastUsbTouchMoveDiagnosticAt: TimeInterval = 0
@@ -916,7 +927,8 @@ public class NetworkManager: ObservableObject {
                 self.wifiMediaReceiver.decoderDidComplete(
                     sequence: sequence,
                     generation: networkGeneration,
-                    succeeded: succeeded)
+                    succeeded: succeeded,
+                    decoderGeneration: generation)
             }
         }
         decoder.onFrameDropped = { [weak self] sequence, generation in
@@ -6101,11 +6113,16 @@ public class NetworkManager: ObservableObject {
         sendDisplayConfigurationRequest(request)
     }
 
-    private func sendDisplayConfigurationRequest(_ request: DisplayConfigurationRequest) {
+    private func sendDisplayConfigurationRequest(
+        _ request: DisplayConfigurationRequest, continuingChain: Bool = false
+    ) {
+        let inheritedChain = continuingChain ? displayRotationChainID : displayRotationDiagnostic?.chainID
         finishDisplayRotationDiagnostic(outcome: "superseded")
-        if let effective = displayRequestGate.effective, effective.orientation != request.orientation {
+        let changesOrientation = displayRequestGate.effective.map { $0.orientation != request.orientation } ?? false
+        displayRotationChainID = inheritedChain ?? (changesOrientation ? request.requestId : nil)
+        if let chainID = displayRotationChainID {
             displayRotationDiagnostic = DisplayRotationDiagnostic(
-                request: request, transport: activeTransportKind,
+                request: request, chainID: chainID, transport: activeTransportKind,
                 startedAt: CACurrentMediaTime())
             networkQueue.asyncAfter(deadline: .now() + .seconds(20)) { [weak self] in
                 guard let self, self.displayRotationDiagnostic?.request.requestId == request.requestId else { return }
@@ -6135,11 +6152,15 @@ public class NetworkManager: ObservableObject {
             return String(Int(max(0, time - rotation.startedAt) * 1_000))
         }
         let request = rotation.request
-        recordDiagnosticLine(
-            "[DISPLAY_ROTATION] request=\(request.requestId) transport=\(rotation.transport) " +
+        let line =
+            "[DISPLAY_ROTATION] request=\(request.requestId) chain=\(rotation.chainID) transport=\(rotation.transport) " +
             "size=\(request.width)x\(request.height) sent_ms=\(elapsed(rotation.sentAt)) " +
             "ack_ms=\(elapsed(rotation.readyAt)) first_present_ms=\(elapsed(rotation.presentedAt)) " +
-            "elapsed_ms=\(elapsed(CACurrentMediaTime())) outcome=\(outcome)")
+            "elapsed_ms=\(elapsed(CACurrentMediaTime())) outcome=\(outcome)"
+        recordDiagnosticLine(line)
+        #if targetEnvironment(simulator)
+        displayRotationDiagnosticSinkForTesting?(line)
+        #endif
     }
 
     private func finishPresentedDisplayRotationIfReady() {
@@ -6166,7 +6187,7 @@ public class NetworkManager: ObservableObject {
                 trackConnectionDisplayRequestOnQueue(nextRequest.requestId)
             }
             pendingDisplayPreference = latestPreference
-            sendDisplayConfigurationRequest(nextRequest)
+            sendDisplayConfigurationRequest(nextRequest, continuingChain: true)
             return
         }
         guard let appliedPreference = pendingDisplayPreference else {
@@ -6207,7 +6228,7 @@ public class NetworkManager: ObservableObject {
                 trackConnectionDisplayRequestOnQueue(nextRequest.requestId)
             }
             pendingDisplayPreference = latestPreference
-            sendDisplayConfigurationRequest(nextRequest)
+            sendDisplayConfigurationRequest(nextRequest, continuingChain: true)
             return
         }
         guard displayRequestGate.pending == nil else { return }
@@ -6225,6 +6246,7 @@ public class NetworkManager: ObservableObject {
         committedPipelineMode.reset()
         decoder.configureRefreshRate(remoteInputConnection ? 120 : UInt32(PipelineMode.office.targetFps))
         finishDisplayRotationDiagnostic(outcome: "session_ended")
+        displayRotationChainID = nil
         orientationDebounceWorkItem?.cancel()
         orientationDebounceWorkItem = nil
         activeDisplayCapabilities = nil
@@ -7304,8 +7326,8 @@ public class NetworkManager: ObservableObject {
         #if targetEnvironment(simulator)
         if let decode=captureTargetDecodeForTesting { decode(frame.data, frame.sequence, generation);return }
         #endif
-        decoder.processInputData(frame.data, sequence: frame.sequence, isIDR: frame.isIDR,
-                                 isLengthPrefixed: frame.lengthPrefixed, receivedAt: frame.receivedAt)
+        submitVideoOnQueue(frame.data, sequence: frame.sequence, isIDR: frame.isIDR,
+                           lengthPrefixed: frame.lengthPrefixed, receivedAt: frame.receivedAt)
     }
     /// Both the TLS parser and authenticated RTP access-unit owner pass through this same gate.
     private func consumeCaptureTargetVideoOnQueue(_ data: Data, sequence: UInt32, isIDR: Bool,
@@ -8027,6 +8049,17 @@ public class NetworkManager: ObservableObject {
         recordDiagnosticLine("[CONNECTION_CONTROL] event=owned_render")
         beginAdaptiveProbeOnQueue()
     }
+    private func submitVideoOnQueue(
+        _ data: Data, sequence: UInt32, isIDR: Bool, lengthPrefixed: Bool, receivedAt: TimeInterval
+    ) {
+        if isIDR, committedRealtimeMode == RealtimeTransportMode.wifiRTP {
+            wifiMediaReceiver.decoderDidSubmit(sequence: sequence, generation: connectionGeneration,
+                decoderGeneration: decoder.currentSessionGeneration)
+        }
+        decoder.processInputData(data, sequence: sequence, isIDR: isIDR,
+                                 isLengthPrefixed: lengthPrefixed, receivedAt: receivedAt)
+    }
+
     private func consumeConnectionVideoOnQueue(_ data: Data, sequence: UInt32, isIDR: Bool,
         lengthPrefixed: Bool, receivedAt: TimeInterval, domain: ConnectionFrameDomain) -> Bool {
         guard connectionHandoffInProgress, connectionSwitch.pending != nil else { return false }
@@ -8039,7 +8072,8 @@ public class NetworkManager: ObservableObject {
                 connectionSwitch.observeIDR(sequence: sequence, domain: domain, decoder: owner.decoder, generation: connectionGeneration)
             }
             guard admitCaptureContinuationOnQueue(sequence: sequence, decoder: decoder.currentSessionGeneration, isIDR: isIDR) else { return true }
-            decoder.processInputData(data, sequence: sequence, isIDR: isIDR, isLengthPrefixed: lengthPrefixed, receivedAt: receivedAt)
+            submitVideoOnQueue(data, sequence: sequence, isIDR: isIDR,
+                               lengthPrefixed: lengthPrefixed, receivedAt: receivedAt)
         } else { connectionVideo.append(frame); advanceConnectionVideoOnQueue() }
         return true
     }
@@ -8086,8 +8120,8 @@ public class NetworkManager: ObservableObject {
         connectionVideoStarted = true
         for frame in frames {
             guard admitCaptureContinuationOnQueue(sequence: frame.sequence, decoder: owner.decoder, isIDR: frame.isIDR) else { continue }
-            decoder.processInputData(frame.data, sequence: frame.sequence, isIDR: frame.isIDR,
-                isLengthPrefixed: frame.lengthPrefixed, receivedAt: frame.receivedAt)
+            submitVideoOnQueue(frame.data, sequence: frame.sequence, isIDR: frame.isIDR,
+                               lengthPrefixed: frame.lengthPrefixed, receivedAt: frame.receivedAt)
         }
         publishConnectionControlOnQueue()
     }
@@ -8454,8 +8488,7 @@ public class NetworkManager: ObservableObject {
             guard let self, self.decoder.currentSessionGeneration == generation else { return }
             if let rotation = self.displayRotationDiagnostic, rotation.presentedAt == nil,
                presentedAt >= rotation.startedAt,
-               let sourceSize, sourceSize.width == CGFloat(rotation.request.width),
-               sourceSize.height == CGFloat(rotation.request.height) {
+               let sourceSize, rotation.matchesPresentation(sourceSize) {
                 self.displayRotationDiagnostic?.presentedAt = presentedAt
                 self.finishPresentedDisplayRotationIfReady()
             }

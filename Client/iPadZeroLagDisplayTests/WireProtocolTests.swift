@@ -2,6 +2,7 @@ import XCTest
 import Network
 import UIKit
 import AVFoundation
+import CoreVideo
 import CryptoKit
 @testable import iPadCasting
 
@@ -1200,41 +1201,8 @@ final class UsbSplitCommitGateTests: XCTestCase {
             XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode)
             receiver.feedbackTimerTickForTesting(at: 10.125)
             XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode + 1)
-            receiver.simulatePendingRecoveryCandidateForTesting(sequence: 5, at: 10.250)
-            receiver.feedbackTimerTickForTesting(at: 10.300)
+            receiver.feedbackTimerTickForTesting(at: 10.175)
             XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode + 1)
-            receiver.decoderDidComplete(sequence: 5, generation: 7,
-                                        succeeded: true)
-            XCTAssertNil(receiver.recoveryEpisodeStartedAtForTesting)
-            receiver.feedbackTimerTickForTesting(at: 10.500)
-            XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode + 1)
-        }
-    }
-
-    func testWifiRotationRetriesAnIDRDroppedWhileVideoAdmissionWasClosed() {
-        let queue = DispatchQueue(label: "test.wifi.rotation.recovery")
-        let receiver = WifiMediaReceiver(
-            networkQueue: queue,
-            decoder: { _, _, _, _ in },
-            audioConsumer: { _, _, _, _ in },
-            onProbeAuthenticated: { _, _ in },
-            onCommittedFailure: { _, _ in })
-        queue.sync {
-            receiver.simulateActivePacketSequenceForTesting(100, generation: 7)
-            receiver.beginRecoveryEpisodeForTesting(at: 10)
-            let episode = receiver.recoveryEpisodeForTesting
-            // An authenticated IDR can finish reassembly while mirror admission
-            // is closed. No decode completion follows from that frame.
-            receiver.simulatePendingRecoveryCandidateForTesting(sequence: 101, at: 10.090)
-            receiver.feedbackTimerTickForTesting(at: 10.125)
-            XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode)
-            receiver.feedbackTimerTickForTesting(at: 10.250)
-            XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode + 1)
-            receiver.decoderDidComplete(sequence: 101, generation: 7, succeeded: true)
-            XCTAssertTrue(receiver.isRecovering(generation: 7))
-            receiver.simulatePendingRecoveryCandidateForTesting(sequence: 102, at: 10.260)
-            receiver.decoderDidComplete(sequence: 102, generation: 7, succeeded: true)
-            XCTAssertFalse(receiver.isRecovering(generation: 7))
         }
     }
 
@@ -1517,72 +1485,325 @@ final class ForegroundPerformanceFeedbackTests: XCTestCase {
 }
 
 final class VirtualDisplayRotationRecoveryTests: XCTestCase {
-    func test120HzVirtualRotationAdvancesDecoderGenerationWithoutTearingDownVideoToolbox() throws {
-        let manager = NetworkManager()
-        defer { manager.stopForTesting() }
-        let session = manager.simulateCommittedWifiSessionForTesting()
-        manager.beginMirrorControlForTesting(generation: session.generation)
-        manager.setDesiredPipelineMode(.game)
-        manager.receiveMirrorWireForTesting(type: .pipelineMode, payload: PipelineMode.game.encode(),
-            generation: session.generation, connection: session.connection)
+    private struct Feed {
+        let manager: NetworkManager
+        let generation: UInt64
+        let connection: NWConnection
+        var packetSequence: UInt16 = 100
 
-        func receive(_ mode: MirrorControlMode, _ epoch: UInt64) throws {
+        init(_ manager: NetworkManager) {
+            self.manager = manager
+            let session = manager.simulateCommittedWifiSessionForTesting()
+            generation = session.generation
+            connection = session.connection
+            manager.beginMirrorControlForTesting(generation: generation)
+            manager.networkQueueForTesting.sync {
+                manager.controlSendForAudioTesting = { _, completion in completion(nil) }
+                manager.wifiMediaReceiverForTesting.installMediaProcessorForTesting(
+                    generation: generation, initialSequence: packetSequence)
+            }
+        }
+
+        func mode(_ mode: MirrorControlMode, epoch: UInt64) throws {
             let state = MirrorControlState(revision: epoch, epoch: epoch, source: 0, mode: mode,
                 token: MirrorToken(low: 0, high: 0), geometry: nil, firstFrame: nil, lastSent: nil)
-            manager.receiveMirrorWireForTesting(type: .mirrorState,
-                payload: try MirrorControlCodec.encodeState(state),
-                generation: session.generation, connection: session.connection)
+            control(.mirrorState, try MirrorControlCodec.encodeState(state))
         }
-        try receive(.virtualDisplay, 1)
+
+        func control(_ type: WireMessageType, _ payload: Data) {
+            manager.receiveMirrorWireForTesting(type: type, payload: payload,
+                generation: generation, connection: connection)
+        }
+
+        mutating func idr(_ sequence: UInt32, portrait: Bool = false,
+                          at arrival: TimeInterval, age: TimeInterval = 0.002) throws {
+            // One synthetic blue Main-profile HEVC frame, encoded at 120 fps
+            // with VPS/SPS/PPS and IDR. Portrait changes the SPS geometry.
+            let encoded = portrait
+                ? "AAAAAUABDAH//wFgAAADAJAAAAMAAAMAPJWUCQAAAAFCAQEBYAAAAwCQAAADAAADADygIIGFllZUpMLwFoCAAAADAIAAADwEAAAAAUQBwHPAiQAAASgBrDGALWP/cKYLVWux0rZT"
+                : "AAAAAUABDAH//wFgAAADAJAAAAMAAAMAPJWUCQAAAAFCAQEBYAAAAwCQAAADAAADADygMIEFllZUpMLwFoCAAAADAIAAADwEAAAAAUQBwHPAiQAAASgBrDGALWP/cKYLVWux0rZT"
+            let accessUnit = try XCTUnwrap(Data(base64Encoded: encoded))
+            let ranges = AnnexBNALScanner.ranges(in: accessUnit)
+            XCTAssertEqual(ranges.count, 4)
+            manager.decoderForTesting.setMailboxClockForTesting(to: arrival + age)
+            manager.networkQueueForTesting.sync {
+                let receiver = manager.wifiMediaReceiverForTesting
+                for (index, range) in ranges.enumerated() {
+                    var packet = Data(count: RtpPacketView.headerLength)
+                    packet[0] = 0x90
+                    packet[1] = index == ranges.count - 1 ? 0xE0 : 0x60
+                    packet.storeLittleEndian(packetSequence.bigEndian, at: 2)
+                    packet.storeLittleEndian((sequence &* 750).bigEndian, at: 4)
+                    packet.storeLittleEndian(UInt16(0xBEDE).bigEndian, at: 12)
+                    packet.storeLittleEndian(UInt16(3).bigEndian, at: 14)
+                    packet[16] = 0x17
+                    withUnsafeBytes(of: sequence.bigEndian) {
+                        packet.replaceSubrange(17..<21, with: $0)
+                    }
+                    packet.append(contentsOf: accessUnit[range])
+                    receiver.consumeMediaDatagramForTesting(packet, arrivalTime: arrival)
+                    packetSequence &+= 1
+                }
+            }
+        }
+
+        func beginDisplayConfiguration() {
+            var capabilities = Data(count: DisplayCapabilities.encodedSize)
+            capabilities[0] = 1
+            capabilities[1] = 1
+            capabilities.storeLittleEndian(UInt32(2388), at: 4)
+            capabilities.storeLittleEndian(UInt32(1668), at: 8)
+            capabilities.storeLittleEndian(UInt16(120), at: 12)
+            control(.displayCapabilities, capabilities)
+            request(.landscape)
+            ready(.landscape, id: 1)
+        }
+
+        func request(_ orientation: ClientDisplayOrientation) {
+            manager.applyDisplayPreference(.defaultValue, interfaceOrientation: orientation)
+            manager.networkQueueForTesting.sync { }
+        }
+
+        func ready(_ orientation: ClientDisplayOrientation, id: UInt32) {
+            var payload = DisplayPreference.defaultValue.makeRequest(
+                interfaceOrientation: orientation, requestId: id).encode()
+            payload.append(contentsOf: [1, 0, 0, 0])
+            control(.displayReady, payload)
+        }
+    }
+
+    func testWifiRotationRetriesAnIDRDroppedWhileVideoAdmissionWasClosed() throws {
+        let manager = NetworkManager()
+        defer { manager.stopForTesting() }
+        var feed = Feed(manager)
+        try feed.mode(.virtualDisplay, epoch: 1)
+        try feed.mode(.unavailable, epoch: 2)
+        let receiver = manager.wifiMediaReceiverForTesting
+        let generation = feed.generation
+        let now = ProcessInfo.processInfo.systemUptime
+        let episode = manager.networkQueueForTesting.sync {
+            receiver.requestImmediateRecoveryFeedback(generation: generation)
+            return receiver.recoveryEpisodeForTesting
+        }
         let decoder = manager.decoderForTesting
-        let oldGeneration = decoder.currentSessionGeneration
-        let invalidations = decoder.invalidateCountForTesting
-        try receive(.unavailable, 2)
-        let newGeneration = decoder.currentSessionGeneration
-        XCTAssertNotEqual(newGeneration, oldGeneration)
-        try receive(.unavailable, 3)
-        try receive(.virtualDisplay, 4)
-        XCTAssertEqual(decoder.currentSessionGeneration, newGeneration)
-        XCTAssertEqual(decoder.invalidateCountForTesting, invalidations)
+        let completion = try XCTUnwrap(decoder.onDecodeCompleted)
+        let decoded = expectation(description: "readmitted IDR decodes")
+        decoder.onDecodeCompleted = { sequence, decoderGeneration, succeeded in
+            completion(sequence, decoderGeneration, succeeded)
+            XCTAssertEqual(sequence, 2, "Mirror Unavailable must drop the first IDR before decode")
+            XCTAssertTrue(succeeded)
+            if sequence == 2 { decoded.fulfill() }
+        }
+        try feed.idr(1, at: now)
+        manager.networkQueueForTesting.sync {
+            receiver.feedbackTimerTickForTesting(at: now + 0.250)
+            XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode + 1)
+        }
+        try feed.mode(.virtualDisplay, epoch: 3)
+        try feed.idr(2, at: now + 0.260)
+        wait(for: [decoded], timeout: 5)
+        manager.networkQueueForTesting.sync {
+            XCTAssertFalse(receiver.isRecovering(generation: generation))
+        }
+    }
+
+    func testWifiRotationKeepsSubmittedIDRThroughRetryTick() throws {
+        let manager = NetworkManager()
+        defer { manager.stopForTesting() }
+        var feed = Feed(manager)
+        try feed.mode(.virtualDisplay, epoch: 1)
+        try feed.mode(.unavailable, epoch: 2)
+        try feed.mode(.virtualDisplay, epoch: 3)
+        let receiver = manager.wifiMediaReceiverForTesting
+        let generation = feed.generation
+        let episode = manager.networkQueueForTesting.sync { receiver.recoveryEpisodeForTesting }
+        XCTAssertNotEqual(episode, 0)
+        let decoder = manager.decoderForTesting
+        let decoderQueueBlocked = DispatchSemaphore(value: 0)
+        let resumeDecode = DispatchSemaphore(value: 0)
+        defer { resumeDecode.signal() }
+        decoder.sessionQueueForTesting.async {
+            decoderQueueBlocked.signal()
+            _ = resumeDecode.wait(timeout: .now() + .seconds(10))
+        }
+        XCTAssertEqual(decoderQueueBlocked.wait(timeout: .now() + .seconds(5)), .success)
+
+        let decoded = expectation(description: "queued IDR decodes after the recovery timer fires")
+        decoder.onFrameDecoded = { _, sequence, _ in
+            XCTAssertEqual(sequence, 1)
+            decoded.fulfill()
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        try feed.idr(1, at: now)
+        manager.networkQueueForTesting.sync {
+            receiver.feedbackTimerTickForTesting(at: now + 0.250)
+            XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode)
+            XCTAssertTrue(receiver.isRecovering(generation: generation))
+        }
+        resumeDecode.signal()
+        wait(for: [decoded], timeout: 5)
+        manager.networkQueueForTesting.sync {
+            XCTAssertFalse(receiver.isRecovering(generation: generation))
+        }
+    }
+
+    func test120HzVirtualRotationReplacesVideoToolboxFormatAndDecodes() throws {
+        let manager = NetworkManager()
+        defer { manager.stopForTesting() }
+        var feed = Feed(manager)
+        feed.control(.pipelineMode, PipelineMode.office.encode())
+        manager.setDesiredPipelineMode(.game)
+        feed.control(.pipelineMode, PipelineMode.game.encode())
+        try feed.mode(.virtualDisplay, epoch: 1)
+        let decoder = manager.decoderForTesting
+        let landscapeGeneration = decoder.currentSessionGeneration
+        let now = ProcessInfo.processInfo.systemUptime
+        let landscape = expectation(description: "landscape pixels")
+        decoder.onFrameDecoded = { buffer, sequence, generation in
+            XCTAssertEqual(sequence, 1)
+            XCTAssertEqual(generation, landscapeGeneration)
+            XCTAssertEqual(CVPixelBufferGetWidth(buffer), 96)
+            XCTAssertEqual(CVPixelBufferGetHeight(buffer), 64)
+            landscape.fulfill()
+        }
+        try feed.idr(1, at: now)
+        wait(for: [landscape], timeout: 5)
+        let oldSession = try XCTUnwrap(decoder.videoToolboxSessionIdentityForTesting)
+
+        try feed.mode(.unavailable, epoch: 2)
+        let portraitGeneration = decoder.currentSessionGeneration
+        XCTAssertNotEqual(portraitGeneration, landscapeGeneration)
+        try feed.mode(.unavailable, epoch: 3)
+        try feed.mode(.virtualDisplay, epoch: 4)
+        XCTAssertEqual(decoder.currentSessionGeneration, portraitGeneration)
+        XCTAssertEqual(decoder.videoToolboxSessionIdentityForTesting, oldSession)
+
+        let portrait = expectation(description: "portrait pixels")
+        decoder.onFrameDecoded = { buffer, sequence, generation in
+            XCTAssertEqual(sequence, 2)
+            XCTAssertEqual(generation, portraitGeneration)
+            XCTAssertEqual(CVPixelBufferGetWidth(buffer), 64)
+            XCTAssertEqual(CVPixelBufferGetHeight(buffer), 96)
+            portrait.fulfill()
+        }
+        // 7 ms is fresh at the negotiated 120 fps.
+        try feed.idr(2, portrait: true, at: now + 0.200, age: 0.007)
+        wait(for: [portrait], timeout: 5)
+        XCTAssertNotEqual(try XCTUnwrap(decoder.videoToolboxSessionIdentityForTesting), oldSession)
+        manager.networkQueueForTesting.sync {
+            XCTAssertFalse(manager.wifiMediaReceiverForTesting.isRecovering(generation: feed.generation))
+        }
+
+        let expired = expectation(description: "rotated decoder still enforces the 120 fps budget")
+        decoder.onFrameDecoded = nil
+        decoder.onFrameDropped = { sequence, _ in
+            XCTAssertEqual(sequence, 3)
+            expired.fulfill()
+        }
+        try feed.idr(3, portrait: true, at: now + 0.400, age: 0.012)
+        wait(for: [expired], timeout: 5)
+    }
+
+    func testAcknowledgedMediaRateControlsDecodeBudgetAcrossDisplayReady() throws {
+        let manager = NetworkManager()
+        defer { manager.stopForTesting() }
+        var feed = Feed(manager)
+        feed.beginDisplayConfiguration()
+        try feed.mode(.virtualDisplay, epoch: 1)
+        let decoder = manager.decoderForTesting
+        let now = ProcessInfo.processInfo.systemUptime
+
+        let office = expectation(description: "12 ms IDR decodes at 60 fps despite 120 Hz display")
+        manager.setDesiredPipelineMode(.office)
+        feed.control(.pipelineMode, PipelineMode.office.encode())
+        feed.request(.portrait)
+        feed.ready(.portrait, id: 2)
+        decoder.onDecodeCompleted = { sequence, _, succeeded in
+            XCTAssertEqual(sequence, 1)
+            XCTAssertTrue(succeeded)
+            office.fulfill()
+        }
+        try feed.idr(1, portrait: true, at: now, age: 0.012)
+        wait(for: [office], timeout: 5)
+
+        let expired = expectation(description: "12 ms IDR drops in the 120 fps mailbox")
+        let game = expectation(description: "dropped IDR completes unsuccessfully")
+        manager.setDesiredPipelineMode(.game)
+        feed.control(.pipelineMode, PipelineMode.game.encode())
+        decoder.onFrameDropped = { sequence, _ in
+            XCTAssertEqual(sequence, 2)
+            expired.fulfill()
+        }
+        decoder.onDecodeCompleted = { sequence, _, succeeded in
+            XCTAssertEqual(sequence, 2)
+            XCTAssertFalse(succeeded)
+            game.fulfill()
+        }
+        try feed.idr(2, portrait: true, at: now + 0.200, age: 0.012)
+        wait(for: [expired, game], timeout: 5)
+    }
+
+    func testCoalescedDisplayRotationMatchesScaledPresentationAndSharesChain() {
+        let manager = NetworkManager()
+        defer { manager.stopForTesting() }
+        let feed = Feed(manager)
+        var lines: [String] = []
+        manager.networkQueueForTesting.sync {
+            manager.displayRotationDiagnosticSinkForTesting = { lines.append($0) }
+        }
+        feed.beginDisplayConfiguration()
+        feed.request(.portrait)
+        feed.request(.landscape)
+        feed.ready(.portrait, id: 2)
+        feed.ready(.landscape, id: 3)
+        let generation = manager.decoderForTesting.currentSessionGeneration
+        manager.recordCapturePresentation(sequence: 1, generation: generation,
+            sourceSize: CGSize(width: 834, height: 1194))
+        manager.networkQueueForTesting.sync {
+            XCTAssertEqual(lines.count, 1)
+        }
+        manager.recordCapturePresentation(sequence: 2, generation: generation,
+            sourceSize: CGSize(width: 1194, height: 834))
+        manager.networkQueueForTesting.sync {
+            XCTAssertEqual(lines.count, 2)
+            XCTAssertTrue(lines.contains { $0.contains("request=2 ") && $0.contains("chain=2 ") && $0.contains("outcome=superseded") })
+            XCTAssertTrue(lines.contains { $0.contains("request=3 ") && $0.contains("chain=2 ") && $0.contains("outcome=presented") })
+        }
     }
 
     func testVirtualRestartRetiresOnceAndRequestsRecoveryAfterVideoReadmission() throws {
-        let manager = NetworkManager(); defer { manager.stopForTesting() }
-        let session = manager.simulateCommittedWifiSessionForTesting()
-        manager.beginMirrorControlForTesting(generation: session.generation)
-        manager.networkQueueForTesting.sync {
-            manager.wifiMediaReceiverForTesting.simulateActivePacketSequenceForTesting(
-                100, generation: session.generation)
-        }
-        func receive(_ mode: MirrorControlMode, _ epoch: UInt64) throws {
-            let state = MirrorControlState(revision: epoch, epoch: epoch, source: 0, mode: mode,
-                token: MirrorToken(low: 0, high: 0), geometry: nil, firstFrame: nil, lastSent: nil)
-            manager.receiveMirrorWireForTesting(type: .mirrorState,
-                payload: try MirrorControlCodec.encodeState(state),
-                generation: session.generation, connection: session.connection)
-        }
-        try receive(.virtualDisplay, 1)
+        let manager = NetworkManager()
+        defer { manager.stopForTesting() }
+        var feed = Feed(manager)
+        try feed.mode(.virtualDisplay, epoch: 1)
         let decoder = manager.decoderForTesting
         let initial = decoder.currentSessionGeneration
         let begins = decoder.sessionBeganCountForTesting
-        try receive(.virtualDisplay, 2)
+        try feed.mode(.virtualDisplay, epoch: 2)
         XCTAssertEqual(decoder.currentSessionGeneration, initial)
-        try receive(.unavailable, 3)
+        try feed.mode(.unavailable, epoch: 3)
         let replacement = decoder.currentSessionGeneration
         XCTAssertNotEqual(replacement, initial)
-        try receive(.unavailable, 4)
-        try receive(.virtualDisplay, 5)
+        try feed.mode(.unavailable, epoch: 4)
+        try feed.mode(.virtualDisplay, epoch: 5)
         XCTAssertEqual(decoder.currentSessionGeneration, replacement)
         XCTAssertEqual(decoder.sessionBeganCountForTesting, begins + 1)
+        let receiver = manager.wifiMediaReceiverForTesting
         manager.networkQueueForTesting.sync {
-            XCTAssertTrue(manager.wifiMediaReceiverForTesting.isRecovering(generation: session.generation))
-            manager.wifiMediaReceiverForTesting.simulatePendingRecoveryCandidateForTesting(sequence: 101)
+            XCTAssertTrue(receiver.isRecovering(generation: feed.generation))
         }
-        decoder.onDecodeCompleted?(101, replacement, true)
-        try receive(.virtualDisplay, 6)
+        let decoded = expectation(description: "virtual restart produces decoded pixels")
+        decoder.onFrameDecoded = { _, sequence, generation in
+            XCTAssertEqual(sequence, 1)
+            XCTAssertEqual(generation, replacement)
+            decoded.fulfill()
+        }
+        try feed.idr(1, at: ProcessInfo.processInfo.systemUptime)
+        wait(for: [decoded], timeout: 5)
+        try feed.mode(.virtualDisplay, epoch: 6)
         XCTAssertEqual(decoder.currentSessionGeneration, replacement)
         manager.networkQueueForTesting.sync {
-            XCTAssertFalse(manager.wifiMediaReceiverForTesting.isRecovering(generation: session.generation))
+            XCTAssertFalse(receiver.isRecovering(generation: feed.generation))
         }
     }
 }
@@ -4918,9 +5139,10 @@ final class WifiForegroundDecoderRecoveryTests: XCTestCase {
 
         manager.networkQueueForTesting.sync {
             let receiver = manager.wifiMediaReceiverForTesting
-            receiver.simulatePendingRecoveryCandidateForTesting(sequence: 77)
+            receiver.simulateSubmittedRecoveryIDRForTesting(sequence: 77)
             receiver.decoderDidComplete(
-                sequence: 77, generation: session.generation, succeeded: true)
+                sequence: 77, generation: session.generation, succeeded: true,
+                decoderGeneration: manager.decoderForTesting.currentSessionGeneration)
             XCTAssertFalse(receiver.isPreservedSessionRecoveryPending(
                 generation: session.generation))
         }
@@ -8376,26 +8598,6 @@ final class VisualProductionSourceClosureTests: XCTestCase {
         XCTAssertTrue(renderer.contains("freshness.isCurrent(token.identity)"))
     }
 
-    func testAcknowledgedMediaRateConfiguresDecodeBudgetIndependentlyOfDisplayRefresh() throws {
-        let network = try source("NetworkManager.swift")
-        let method = try XCTUnwrap(network.range(of: "private func receiveDisplayReady"))
-        let end = try XCTUnwrap(network.range(of: "private func receiveDisplayConfigurationFailure",
-            range: method.upperBound..<network.endIndex))
-        let body = String(network[method.lowerBound..<end.lowerBound])
-        XCTAssertFalse(body.contains("decoder.configureRefreshRate"))
-        let acknowledgement = try XCTUnwrap(network.range(of: "committedPipelineMode.acknowledge(mode)"))
-        let endOfCase = try XCTUnwrap(network.range(of: "case .clientPerformanceFeedback:",
-            range: acknowledgement.upperBound..<network.endIndex))
-        XCTAssertTrue(network[acknowledgement.upperBound..<endOfCase.lowerBound]
-            .contains("decoder.configureRefreshRate(UInt32(mode.targetFps))"))
-        let decoder = try source("DecoderManager.swift")
-        let configure = try XCTUnwrap(decoder.range(of: "public func configureRefreshRate"))
-        let configureEnd = try XCTUnwrap(decoder.range(of: "public var currentSessionGeneration",
-            range: configure.upperBound..<decoder.endIndex))
-        let methodBody = String(decoder[configure.lowerBound..<configureEnd.lowerBound])
-        XCTAssertFalse(methodBody.contains("queue.sync"))
-        XCTAssertTrue(methodBody.contains("mailbox.configureRefreshRate"))
-    }
 }
 
 private final class VisualCallbackRuntime {

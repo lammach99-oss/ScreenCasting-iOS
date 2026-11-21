@@ -457,7 +457,7 @@ final class WifiAuthenticatedMediaProcessor {
         }
     }
 
-    fileprivate static func isIDR(_ accessUnit: Data) -> Bool {
+    private static func isIDR(_ accessUnit: Data) -> Bool {
         var offset = 0
         while offset + 6 <= accessUnit.count {
             let count = Int(UInt32(accessUnit[offset]) << 24 |
@@ -939,6 +939,7 @@ final class WifiMediaReceiver {
 
     private let networkQueue: DispatchQueue
     private let decoder: Decoder
+    private let currentDecoderGeneration: () -> UInt64?
     private let audioConsumer: AudioConsumer
     private let onProbeAuthenticated: (UInt64, SessionID) -> Void
     private let onCommittedFailure: (UInt64, Error) -> Void
@@ -983,10 +984,10 @@ final class WifiMediaReceiver {
     func feedbackTimerTickForTesting(at now: TimeInterval) {
         handleFeedbackTimerTick(now: now)
     }
-    func simulatePendingRecoveryCandidateForTesting(
-        sequence: UInt32, at now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    func simulateSubmittedRecoveryIDRForTesting(
+        sequence: UInt32
     ) {
-        pendingRecoveryIdr = (sequence, recoveryEpisode, now)
+        submittedRecoveryIDRs[sequence] = currentDecoderGeneration() ?? 0
     }
     #endif
     private var feedbackLedger = WifiFeedbackSendLedger()
@@ -1003,7 +1004,10 @@ final class WifiMediaReceiver {
         guard captureSuspended != suspended else { return }
         captureSuspended = suspended
         if suspended {
-            dependencyBreakActive = false; pendingRecoveryIdr = nil; recoveryEpisodeStartedAt = nil
+            dependencyBreakActive = false
+            unsubmittedRecoveryIDRAt = nil
+            submittedRecoveryIDRs.removeAll()
+            recoveryEpisodeStartedAt = nil
             mediaProcessor?.prepareForFreshIDRAnchor()
         }
     }
@@ -1012,11 +1016,8 @@ final class WifiMediaReceiver {
     private var preservedSessionRecoveryGeneration: UInt64?
     private var recoveryFloorFrame: UInt32 = 0
     private var recoveryFloorSet = false
-    private var pendingRecoveryIdr: (
-        sequence: UInt32,
-        episode: UInt32,
-        receivedAt: TimeInterval
-    )?
+    private var unsubmittedRecoveryIDRAt: TimeInterval?
+    private var submittedRecoveryIDRs: [UInt32: UInt64] = [:]
     private var rttSamplesMs: [UInt16] = []
     // p95 is read for every packet but only changes when an RTT sample lands.
     private var cachedRttP95Ms: UInt16 = 0
@@ -1058,6 +1059,7 @@ final class WifiMediaReceiver {
 
     init(
         networkQueue: DispatchQueue,
+        currentDecoderGeneration: @escaping () -> UInt64? = { nil },
         decoder: @escaping Decoder,
         audioConsumer: @escaping AudioConsumer,
         onProbeAuthenticated: @escaping (UInt64, SessionID) -> Void,
@@ -1071,6 +1073,7 @@ final class WifiMediaReceiver {
         }
     ) {
         self.networkQueue = networkQueue
+        self.currentDecoderGeneration = currentDecoderGeneration
         self.decoder = decoder
         self.audioConsumer = audioConsumer
         self.onProbeAuthenticated = onProbeAuthenticated
@@ -1171,10 +1174,10 @@ final class WifiMediaReceiver {
             audioSrtp = audio
             inputSrtp = input
             endpointCommitted = false
-            mediaProcessor = WifiAuthenticatedMediaProcessor(
+            mediaProcessor = makeMediaProcessor(
+                generation: generation,
                 mtu: Int(offer.mtu),
-                initialSequence:
-                    WifiMediaContract.initialMediaSequence(offer.sessionID),
+                initialSequence: WifiMediaContract.initialMediaSequence(offer.sessionID),
                 unprotect: { [weak self] packet in
                     guard let self, let media = self.mediaSrtp else {
                         return false
@@ -1189,87 +1192,6 @@ final class WifiMediaReceiver {
                         self.securityDropCounters.recordCryptoFailure(error)
                         return false
                     }
-                },
-                decoder: decoder,
-                 packetObserver: {
-                     [weak self] sequence, timestamp, _, arrival in
-                     guard let self else { return }
-                     self.observeMediaPacketSequence(sequence, generation: generation)
-                    let transit = arrival * 90_000 - Double(timestamp)
-                    if let previous = self.lastTransit90k {
-                        self.jitter90k +=
-                            (abs(transit - previous) - self.jitter90k) / 16
-                    }
-                    self.lastTransit90k = transit
-                    if self.lastFrameTimestamp != timestamp {
-                        if let previous = self.lastFrameTimestamp {
-                            let delta = UInt32(
-                                truncatingIfNeeded: timestamp &- previous)
-                            if delta > 0 && delta < 90_000 {
-                                self.frameIntervalMs =
-                                    Double(delta) / 90.0
-                            }
-                        }
-                        self.lastFrameTimestamp = timestamp
-                    }
-                },
-                outcomeObserver: { [weak self] outcome in
-                    guard let self else { return }
-                    switch outcome {
-                    case .completed(let accessUnit, let frameSequence, _):
-                        if !self.hasCompletedFrame ||
-                            Self.isNewer(frameSequence, self.lastCompletedFrame) {
-                            self.lastCompletedFrame = frameSequence
-                            self.hasCompletedFrame = true
-                        }
-                        if self.dependencyBreakActive &&
-                            WifiAuthenticatedMediaProcessor.isIDR(accessUnit) &&
-                            (!self.recoveryFloorSet ||
-                             Self.isNewer(
-                                 frameSequence,
-                                 self.recoveryFloorFrame)) {
-                            self.pendingRecoveryIdr = (
-                                frameSequence,
-                                self.recoveryEpisode,
-                                ProcessInfo.processInfo.systemUptime)
-                        }
-                    case .expired:
-                        self.feedbackLedger.recordExpiredFrame()
-                        if !self.dependencyBreakActive {
-                            self.sendFeedback(immediate: true)
-                        }
-                    case .sequenceAnchorLost(let expectedSequence):
-                        print(
-                            "[RTP_REASSEMBLY_RECOVERY] " +
-                            "reason=anchor_lost " +
-                            "old_expected_sequence=\(expectedSequence) " +
-                            "action=reanchor_for_idr")
-                        if !self.dependencyBreakActive {
-                            self.beginRecoveryEpisode()
-                        }
-                    default:
-                        break
-                    }
-                },
-                framePacketObserver: {
-                    sequence, marker, isIDR, bytes, arrivalTime in
-                    self.framePacketObserver?(
-                        generation,
-                        sequence,
-                        marker,
-                        isIDR,
-                        bytes,
-                        arrivalTime)
-                },
-                rttP95Provider: { [weak self] in
-                    guard let self else { return 0 }
-                    return Double(self.rttP95Ms())
-                },
-                timedOutcomeObserver: { outcome, observedAt in
-                    self.timedOutcomeObserver?(
-                        generation,
-                        outcome,
-                        observedAt)
                 })
             return true
         } catch {
@@ -1277,6 +1199,109 @@ final class WifiMediaReceiver {
             return false
         }
     }
+
+    private func makeMediaProcessor(
+        generation: UInt64,
+        mtu: Int,
+        initialSequence: UInt16,
+        unprotect: @escaping WifiAuthenticatedMediaProcessor.Unprotect
+    ) -> WifiAuthenticatedMediaProcessor {
+        return WifiAuthenticatedMediaProcessor(
+            mtu: mtu,
+            initialSequence: initialSequence,
+            unprotect: unprotect,
+            decoder: { [weak self] data, sequence, isIDR, arrival in
+                guard let self else { return }
+                if isIDR, self.isRecoveryCandidate(sequence), self.unsubmittedRecoveryIDRAt == nil {
+                    self.unsubmittedRecoveryIDRAt = ProcessInfo.processInfo.systemUptime
+                }
+                self.decoder(data, sequence, isIDR, arrival)
+            },
+            packetObserver: {
+                [weak self] sequence, timestamp, _, arrival in
+                guard let self else { return }
+                self.observeMediaPacketSequence(sequence, generation: generation)
+                let transit = arrival * 90_000 - Double(timestamp)
+                if let previous = self.lastTransit90k {
+                    self.jitter90k +=
+                        (abs(transit - previous) - self.jitter90k) / 16
+                }
+                self.lastTransit90k = transit
+                if self.lastFrameTimestamp != timestamp {
+                    if let previous = self.lastFrameTimestamp {
+                        let delta = UInt32(
+                            truncatingIfNeeded: timestamp &- previous)
+                        if delta > 0 && delta < 90_000 {
+                            self.frameIntervalMs =
+                                Double(delta) / 90.0
+                        }
+                    }
+                    self.lastFrameTimestamp = timestamp
+                }
+            },
+            outcomeObserver: { [weak self] outcome in
+                guard let self else { return }
+                switch outcome {
+                case .completed(_, let frameSequence, _):
+                    if !self.hasCompletedFrame ||
+                        Self.isNewer(frameSequence, self.lastCompletedFrame) {
+                        self.lastCompletedFrame = frameSequence
+                        self.hasCompletedFrame = true
+                    }
+                case .expired:
+                    self.feedbackLedger.recordExpiredFrame()
+                    if !self.dependencyBreakActive {
+                        self.sendFeedback(immediate: true)
+                    }
+                case .sequenceAnchorLost(let expectedSequence):
+                    print(
+                        "[RTP_REASSEMBLY_RECOVERY] " +
+                        "reason=anchor_lost " +
+                        "old_expected_sequence=\(expectedSequence) " +
+                        "action=reanchor_for_idr")
+                    if !self.dependencyBreakActive {
+                        self.beginRecoveryEpisode()
+                    }
+                default:
+                    break
+                }
+            },
+            framePacketObserver: {
+                [weak self] sequence, marker, isIDR, bytes, arrivalTime in
+                self?.framePacketObserver?(
+                    generation,
+                    sequence,
+                    marker,
+                    isIDR,
+                    bytes,
+                    arrivalTime)
+            },
+            rttP95Provider: { [weak self] in
+                guard let self else { return 0 }
+                return Double(self.rttP95Ms())
+            },
+            timedOutcomeObserver: { [weak self] outcome, observedAt in
+                self?.timedOutcomeObserver?(
+                    generation,
+                    outcome,
+                    observedAt)
+            })
+    }
+
+    #if targetEnvironment(simulator)
+    func installMediaProcessorForTesting(generation: UInt64, initialSequence: UInt16) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        activeGeneration = generation
+        mediaProcessor = makeMediaProcessor(
+            generation: generation, mtu: 1_200, initialSequence: initialSequence,
+            unprotect: { _ in true })
+    }
+
+    func consumeMediaDatagramForTesting(_ packet: Data, arrivalTime: TimeInterval) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        consumeMediaDatagram(packet, arrivalTime: arrivalTime)
+    }
+    #endif
 
     func activate(generation: UInt64) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
@@ -1329,7 +1354,7 @@ final class WifiMediaReceiver {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard activeGeneration == generation, !captureSuspended else { return }
         guard !dependencyBreakActive else {
-            if pendingRecoveryIdr != nil {
+            if !hasSubmittedRecoveryIDR(), unsubmittedRecoveryIDRAt != nil {
                 beginRecoveryEpisode()
                 return
             }
@@ -1351,22 +1376,46 @@ final class WifiMediaReceiver {
         beginRecoveryEpisode()
     }
 
+    private func isRecoveryCandidate(_ sequence: UInt32) -> Bool {
+        dependencyBreakActive &&
+            (!recoveryFloorSet || Self.isNewer(sequence, recoveryFloorFrame))
+    }
+
+    func decoderDidSubmit(
+        sequence: UInt32, generation: UInt64, decoderGeneration: UInt64
+    ) {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard activeGeneration == generation, isRecoveryCandidate(sequence) else { return }
+        submittedRecoveryIDRs[sequence] = decoderGeneration
+        unsubmittedRecoveryIDRAt = nil
+    }
+
+    private func hasSubmittedRecoveryIDR() -> Bool {
+        guard !submittedRecoveryIDRs.isEmpty else { return false }
+        if let generation = currentDecoderGeneration() {
+            submittedRecoveryIDRs = submittedRecoveryIDRs.filter { $0.value == generation }
+        }
+        return !submittedRecoveryIDRs.isEmpty
+    }
+
     func decoderDidComplete(
         sequence: UInt32,
         generation: UInt64,
-        succeeded: Bool
+        succeeded: Bool,
+        decoderGeneration: UInt64
     ) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard activeGeneration == generation,
               dependencyBreakActive,
-              let candidate = pendingRecoveryIdr,
-              candidate.sequence == sequence,
-              candidate.episode == recoveryEpisode else { return }
-        pendingRecoveryIdr = nil
+              submittedRecoveryIDRs[sequence] == decoderGeneration else { return }
+        submittedRecoveryIDRs.removeValue(forKey: sequence)
+        if let current = currentDecoderGeneration(), current != decoderGeneration { return }
         guard succeeded else {
-            beginRecoveryEpisode()
+            if !hasSubmittedRecoveryIDR() { beginRecoveryEpisode() }
             return
         }
+        submittedRecoveryIDRs.removeAll()
+        unsubmittedRecoveryIDRAt = nil
         if preservedSessionRecoveryGeneration == generation {
             preservedSessionRecoveryGeneration = nil
         }
@@ -1385,7 +1434,8 @@ final class WifiMediaReceiver {
         if recoveryEpisode == 0 { recoveryEpisode = 1 }
         recoveryFloorFrame = lastCompletedFrame
         recoveryFloorSet = hasCompletedFrame
-        pendingRecoveryIdr = nil
+        unsubmittedRecoveryIDRAt = nil
+        submittedRecoveryIDRs.removeAll()
         dependencyBreakActive = true
         recoveryEpisodeStartedAt = startedAt
         sendFeedback(immediate: true)
@@ -1421,7 +1471,8 @@ final class WifiMediaReceiver {
         recoveryEpisodeStartedAt = nil
         recoveryFloorFrame = 0
         recoveryFloorSet = false
-        pendingRecoveryIdr = nil
+        unsubmittedRecoveryIDRAt = nil
+        submittedRecoveryIDRs.removeAll()
         feedbackLedger.reset()
         rttSamplesMs.removeAll(keepingCapacity: false)
         cachedRttP95Ms = 0
@@ -1643,7 +1694,11 @@ final class WifiMediaReceiver {
             consumeAudio(datagram, generation: generation, sessionID: sessionID)
             return
         }
-        mediaProcessor?.consume(datagram, arrivalTime: CACurrentMediaTime())
+        consumeMediaDatagram(datagram, arrivalTime: CACurrentMediaTime())
+    }
+
+    private func consumeMediaDatagram(_ packet: Data, arrivalTime: TimeInterval) {
+        mediaProcessor?.consume(packet, arrivalTime: arrivalTime)
     }
 
     private func consumeAudio(
@@ -1689,10 +1744,10 @@ final class WifiMediaReceiver {
 
     private func handleFeedbackTimerTick(now: TimeInterval) {
         if captureSuspended { sendFeedback(immediate: false); return }
-        // Reassembly can nominate an IDR before display admission drops it.
-        // Bound the wait for a decode callback as well as the wait for an IDR.
-        if dependencyBreakActive,
-           let startedAt = pendingRecoveryIdr?.receivedAt ?? recoveryEpisodeStartedAt,
+        // Reassembly can finish while display admission is closed. Once an IDR
+        // reaches the current decoder, its completion owns recovery.
+        if dependencyBreakActive, !hasSubmittedRecoveryIDR(),
+           let startedAt = unsubmittedRecoveryIDRAt ?? recoveryEpisodeStartedAt,
            now - startedAt >= Self.recoveryEpisodeRetryInterval {
             beginRecoveryEpisode(startedAt: now)
             return

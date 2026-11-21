@@ -420,6 +420,18 @@ public final class DecoderManager {
 
     #if targetEnvironment(simulator)
     private let testingLifecycleLock = NSLock()
+    private var testingMailboxTime: TimeInterval?
+
+    func setMailboxClockForTesting(to time: TimeInterval) {
+        testingLifecycleLock.lock()
+        testingMailboxTime = time
+        testingLifecycleLock.unlock()
+    }
+
+    var videoToolboxSessionIdentityForTesting: ObjectIdentifier? {
+        queue.sync { decompressionSession.map { ObjectIdentifier($0) } }
+    }
+
     private var testingSessionBeganCount = 0
     private var testingInvalidateCount = 0
     private var testingInvalidateWaitModes: [Bool] = []
@@ -1117,6 +1129,17 @@ public final class DecoderManager {
 
     private func makeMailbox() -> AccessUnitMailbox {
         AccessUnitMailbox(
+            clock: { [weak self] in
+                #if targetEnvironment(simulator)
+                if let self {
+                    self.testingLifecycleLock.lock()
+                    let time = self.testingMailboxTime
+                    self.testingLifecycleLock.unlock()
+                    if let time { return time }
+                }
+                #endif
+                return ProcessInfo.processInfo.systemUptime
+            },
             onRecoveryNeeded: { [weak self] in self?.onRecoveryNeeded?() },
             onDrop: { [weak self] sequence, generation, _ in
                 self?.onFrameDropped?(sequence, generation)
