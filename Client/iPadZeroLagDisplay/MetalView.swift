@@ -76,8 +76,8 @@ public struct MetalView: UIViewRepresentable {
             }
             renderer.beginSession(
                 generation: networkManager.decoder.currentSessionGeneration)
-            renderer.onFramePresented = { [weak networkManager] sequence, generation in
-                networkManager?.recordCapturePresentation(sequence: sequence, generation: generation)
+            renderer.onFramePresented = { [weak networkManager] sequence, generation, size in
+                networkManager?.recordCapturePresentation(sequence: sequence, generation: generation, sourceSize: size)
             }
             renderer.remotePresentationDeadline = { [weak networkManager] sequence, generation, now in
                 networkManager?.remoteVideoPresentationDeadline(sequence: sequence, generation: generation, now: now) ?? now
@@ -1016,8 +1016,8 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             networkManager?.recordDiagnosticLine(line)
         }
         renderer.beginSession(generation: networkManager.decoder.currentSessionGeneration)
-        renderer.onFramePresented = { [weak networkManager] sequence, generation in
-            networkManager?.recordCapturePresentation(sequence: sequence, generation: generation)
+        renderer.onFramePresented = { [weak networkManager] sequence, generation, size in
+            networkManager?.recordCapturePresentation(sequence: sequence, generation: generation, sourceSize: size)
         }
         renderer.remotePresentationDeadline = { [weak networkManager] sequence, generation, now in
             networkManager?.remoteVideoPresentationDeadline(sequence: sequence, generation: generation, now: now) ?? now

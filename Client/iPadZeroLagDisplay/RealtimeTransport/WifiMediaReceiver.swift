@@ -983,8 +983,10 @@ final class WifiMediaReceiver {
     func feedbackTimerTickForTesting(at now: TimeInterval) {
         handleFeedbackTimerTick(now: now)
     }
-    func simulatePendingRecoveryCandidateForTesting(sequence: UInt32) {
-        pendingRecoveryIdr = (sequence, recoveryEpisode)
+    func simulatePendingRecoveryCandidateForTesting(
+        sequence: UInt32, at now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) {
+        pendingRecoveryIdr = (sequence, recoveryEpisode, now)
     }
     #endif
     private var feedbackLedger = WifiFeedbackSendLedger()
@@ -1012,7 +1014,8 @@ final class WifiMediaReceiver {
     private var recoveryFloorSet = false
     private var pendingRecoveryIdr: (
         sequence: UInt32,
-        episode: UInt32
+        episode: UInt32,
+        receivedAt: TimeInterval
     )?
     private var rttSamplesMs: [UInt16] = []
     // p95 is read for every packet but only changes when an RTT sample lands.
@@ -1227,7 +1230,8 @@ final class WifiMediaReceiver {
                                  self.recoveryFloorFrame)) {
                             self.pendingRecoveryIdr = (
                                 frameSequence,
-                                self.recoveryEpisode)
+                                self.recoveryEpisode,
+                                ProcessInfo.processInfo.systemUptime)
                         }
                     case .expired:
                         self.feedbackLedger.recordExpiredFrame()
@@ -1685,9 +1689,10 @@ final class WifiMediaReceiver {
 
     private func handleFeedbackTimerTick(now: TimeInterval) {
         if captureSuspended { sendFeedback(immediate: false); return }
+        // Reassembly can nominate an IDR before display admission drops it.
+        // Bound the wait for a decode callback as well as the wait for an IDR.
         if dependencyBreakActive,
-           pendingRecoveryIdr == nil,
-           let startedAt = recoveryEpisodeStartedAt,
+           let startedAt = pendingRecoveryIdr?.receivedAt ?? recoveryEpisodeStartedAt,
            now - startedAt >= Self.recoveryEpisodeRetryInterval {
             beginRecoveryEpisode(startedAt: now)
             return

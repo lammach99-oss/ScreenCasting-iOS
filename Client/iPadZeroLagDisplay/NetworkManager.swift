@@ -838,6 +838,15 @@ public class NetworkManager: ObservableObject {
     private var latestDisplayPreference: DisplayPreference?
     private var observedInterfaceOrientation: ClientDisplayOrientation?
     private var orientationDebounceWorkItem: DispatchWorkItem?
+    private struct DisplayRotationDiagnostic {
+        let request: DisplayConfigurationRequest
+        let transport: ActiveTransportKind
+        let startedAt: TimeInterval
+        var sentAt: TimeInterval?
+        var readyAt: TimeInterval?
+        var presentedAt: TimeInterval?
+    }
+    private var displayRotationDiagnostic: DisplayRotationDiagnostic?
     private static let usbTouchMoveDiagnosticInterval: TimeInterval = 0.25
     private var usbTouchDiagnosticSequence: UInt64 = 0
     private var lastUsbTouchMoveDiagnosticAt: TimeInterval = 0
@@ -5158,6 +5167,7 @@ public class NetworkManager: ObservableObject {
                   committedTransportGeneration == generation,
                   let mode = PipelineMode.decode(payload),
                   committedPipelineMode.acknowledge(mode) else { return }
+            if !remoteInputConnection { decoder.configureRefreshRate(UInt32(mode.targetFps)) }
             if captureTargetOwnsPresentation { abandonCaptureTargetPresentationOnQueue() }
             transportTelemetry.beginFreshFrameRate(generation: generation)
             return
@@ -5196,7 +5206,12 @@ public class NetworkManager: ObservableObject {
                             failConnectionControlOnQueue(.localOperation); return
                         }
                         currentMirrorCatalogue=nil;mirrorCatalogueSource=nil
-                        decoder.invalidate(waitForCompletion: false)
+                        let isVirtualDisplayRestart = !connectionHandoffInProgress &&
+                            oldState?.mode == .virtualDisplay && state.mode == .unavailable && state.source == 0
+                        // Fence old tickets immediately. The next virtual IDR can
+                        // replace the VT format from its parameter sets without
+                        // waiting behind teardown before the first submission.
+                        if !isVirtualDisplayRestart { decoder.invalidate(waitForCompletion: false) }
                         beginOwnedDecoderSession(networkGeneration: generation)
                     }
                     // An IDR may arrive before the control state admits video again.
@@ -6078,19 +6093,59 @@ public class NetworkManager: ObservableObject {
             trackConnectionDisplayRequestOnQueue(request.requestId)
         }
         if captureTargets.pending != nil || captureTargets.applied != nil { abandonCaptureTargetPresentationOnQueue() }
-        if activeTransportKind == .usb {
-            recordUsbLifecycleDiagnostic(
-                "[USB_RECONNECT_DISPLAY] generation=\(connectionGeneration) desiredOrientation=\(request.orientation)")
-        }
         pendingDisplayPreference = reconciledPreference
         DispatchQueue.main.async { [weak self] in
             self?.isDisplayConfigurationPending = true
             self?.displayConfigurationFailureMessage = nil
         }
-        sendWireMessage(
-            type: .displayConfigurationRequest,
-            payload: request.encode(),
-            sequence: request.requestId)
+        sendDisplayConfigurationRequest(request)
+    }
+
+    private func sendDisplayConfigurationRequest(_ request: DisplayConfigurationRequest) {
+        finishDisplayRotationDiagnostic(outcome: "superseded")
+        if let effective = displayRequestGate.effective, effective.orientation != request.orientation {
+            displayRotationDiagnostic = DisplayRotationDiagnostic(
+                request: request, transport: activeTransportKind,
+                startedAt: CACurrentMediaTime())
+            networkQueue.asyncAfter(deadline: .now() + .seconds(20)) { [weak self] in
+                guard let self, self.displayRotationDiagnostic?.request.requestId == request.requestId else { return }
+                self.finishDisplayRotationDiagnostic(outcome: "timeout")
+            }
+        }
+        if activeTransportKind == .usb {
+            recordUsbLifecycleDiagnostic(
+                "[USB_RECONNECT_DISPLAY] generation=\(connectionGeneration) desiredOrientation=\(request.orientation)")
+        }
+        sendWireMessage(type: .displayConfigurationRequest, payload: request.encode(),
+            sequence: request.requestId) { [weak self] error in
+                guard let self, self.displayRotationDiagnostic?.request.requestId == request.requestId else { return }
+                guard error == nil else {
+                    self.finishDisplayRotationDiagnostic(outcome: "send_failed")
+                    return
+                }
+                self.displayRotationDiagnostic?.sentAt = CACurrentMediaTime()
+            }
+    }
+
+    private func finishDisplayRotationDiagnostic(outcome: String) {
+        guard let rotation = displayRotationDiagnostic else { return }
+        displayRotationDiagnostic = nil
+        func elapsed(_ time: TimeInterval?) -> String {
+            guard let time else { return "-" }
+            return String(Int(max(0, time - rotation.startedAt) * 1_000))
+        }
+        let request = rotation.request
+        recordDiagnosticLine(
+            "[DISPLAY_ROTATION] request=\(request.requestId) transport=\(rotation.transport) " +
+            "size=\(request.width)x\(request.height) sent_ms=\(elapsed(rotation.sentAt)) " +
+            "ack_ms=\(elapsed(rotation.readyAt)) first_present_ms=\(elapsed(rotation.presentedAt)) " +
+            "elapsed_ms=\(elapsed(CACurrentMediaTime())) outcome=\(outcome)")
+    }
+
+    private func finishPresentedDisplayRotationIfReady() {
+        guard let rotation = displayRotationDiagnostic,
+              rotation.readyAt != nil, rotation.presentedAt != nil else { return }
+        finishDisplayRotationDiagnostic(outcome: "presented")
     }
 
     private func receiveDisplayReady(_ ready: DisplayReady) {
@@ -6098,25 +6153,25 @@ public class NetworkManager: ObservableObject {
         guard displayRequestGate.pending?.requestId == ready.requestId else {
             return
         }
-        if captureTargetOwnsPresentation { abandonCaptureTargetPresentationOnQueue() }
         let nextRequest = displayRequestGate.accept(ready)
+        guard displayRequestGate.effective?.requestId == ready.requestId else { return }
+        if captureTargetOwnsPresentation { abandonCaptureTargetPresentationOnQueue() }
+        if displayRotationDiagnostic?.request.requestId == ready.requestId {
+            displayRotationDiagnostic?.readyAt = CACurrentMediaTime()
+            finishPresentedDisplayRotationIfReady()
+        }
         if let nextRequest,
            let latestPreference = latestDisplayPreference {
             if connectionHandoffInProgress {
                 trackConnectionDisplayRequestOnQueue(nextRequest.requestId)
             }
             pendingDisplayPreference = latestPreference
-            sendWireMessage(
-                type: .displayConfigurationRequest,
-                payload: nextRequest.encode(),
-                sequence: nextRequest.requestId)
+            sendDisplayConfigurationRequest(nextRequest)
             return
         }
-        guard displayRequestGate.effective != nil,
-              let appliedPreference = pendingDisplayPreference else {
+        guard let appliedPreference = pendingDisplayPreference else {
             return
         }
-        decoder.configureRefreshRate(ready.refreshHz)
         if connectionHandoffInProgress, connectionDisplayRequest == ready.requestId {
             connectionDisplayReady = true
             connectionReadyDisplay = ready
@@ -6142,6 +6197,9 @@ public class NetworkManager: ObservableObject {
         guard displayRequestGate.pending?.requestId == failure.requestId else {
             return
         }
+        if displayRotationDiagnostic?.request.requestId == failure.requestId {
+            finishDisplayRotationDiagnostic(outcome: "rejected")
+        }
         let nextRequest = displayRequestGate.reject(failure)
         if let nextRequest,
            let latestPreference = latestDisplayPreference {
@@ -6149,10 +6207,7 @@ public class NetworkManager: ObservableObject {
                 trackConnectionDisplayRequestOnQueue(nextRequest.requestId)
             }
             pendingDisplayPreference = latestPreference
-            sendWireMessage(
-                type: .displayConfigurationRequest,
-                payload: nextRequest.encode(),
-                sequence: nextRequest.requestId)
+            sendDisplayConfigurationRequest(nextRequest)
             return
         }
         guard displayRequestGate.pending == nil else { return }
@@ -6168,6 +6223,8 @@ public class NetworkManager: ObservableObject {
     private func resetDisplaySession() {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         committedPipelineMode.reset()
+        decoder.configureRefreshRate(remoteInputConnection ? 120 : UInt32(PipelineMode.office.targetFps))
+        finishDisplayRotationDiagnostic(outcome: "session_ended")
         orientationDebounceWorkItem?.cancel()
         orientationDebounceWorkItem = nil
         activeDisplayCapabilities = nil
@@ -8391,9 +8448,17 @@ public class NetworkManager: ObservableObject {
 
     // Device: positive drawable presentation time. Simulator: successful current
     // present command completion (the Simulator SDK omits presentation handlers).
-    func recordCapturePresentation(sequence: UInt32, generation: UInt64) {
+    func recordCapturePresentation(sequence: UInt32, generation: UInt64, sourceSize: CGSize? = nil) {
+        let presentedAt = CACurrentMediaTime()
         networkQueue.async { [weak self] in
             guard let self, self.decoder.currentSessionGeneration == generation else { return }
+            if let rotation = self.displayRotationDiagnostic, rotation.presentedAt == nil,
+               presentedAt >= rotation.startedAt,
+               let sourceSize, sourceSize.width == CGFloat(rotation.request.width),
+               sourceSize.height == CGFloat(rotation.request.height) {
+                self.displayRotationDiagnostic?.presentedAt = presentedAt
+                self.finishPresentedDisplayRotationIfReady()
+            }
             if let ack = self.remoteSecureDesktop.presented(sequence: sequence, decoder: generation) {
                 self.decoder.resetCaptureOutputFence()
                 self.updateRemoteAudioSuspensionOnQueue()

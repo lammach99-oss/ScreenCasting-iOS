@@ -602,7 +602,7 @@ public class Renderer: NSObject, MTKViewDelegate {
         case gameRepeated
     }
 
-    var onFramePresented: ((UInt32, UInt64) -> Void)?
+    var onFramePresented: ((UInt32, UInt64, CGSize) -> Void)?
     var remotePresentationDeadline: ((UInt32, UInt64, TimeInterval) -> TimeInterval)?
     public var onFrameRendered: ((UInt32, UInt64) -> Void)?
     public var onDrawableCommitted: ((UInt32, UInt64) -> Void)?
@@ -1097,7 +1097,9 @@ public class Renderer: NSObject, MTKViewDelegate {
             if current, self.adaptiveAwaitingPresentation == identity.sequence { self.adaptiveAwaitingPresentation = nil }
             self.lock.unlock()
             guard current else { return }
-            if drawKind != .gameRepeated { self.onFramePresented?(identity.sequence, identity.generation) }
+            if drawKind != .gameRepeated {
+                self.onFramePresented?(identity.sequence, identity.generation, sourceFrameSize)
+            }
         }
         #endif
 
@@ -1156,7 +1158,7 @@ public class Renderer: NSObject, MTKViewDelegate {
             // after present is a proxy, not confirmation of physical display scanout.
             if drawKind != .gameRepeated, CapturePresentationPolicy.simulatorCompleted(
                 succeeded: RenderCommandCompletionPolicy.succeeded(completedBuffer.status), current: isCurrent) {
-                self.onFramePresented?(identity.sequence, identity.generation)
+                self.onFramePresented?(identity.sequence, identity.generation, sourceFrameSize)
             }
             #endif
             self.publishGeometrySnapshot(for: view, identity: identity,

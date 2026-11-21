@@ -1200,7 +1200,7 @@ final class UsbSplitCommitGateTests: XCTestCase {
             XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode)
             receiver.feedbackTimerTickForTesting(at: 10.125)
             XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode + 1)
-            receiver.simulatePendingRecoveryCandidateForTesting(sequence: 5)
+            receiver.simulatePendingRecoveryCandidateForTesting(sequence: 5, at: 10.250)
             receiver.feedbackTimerTickForTesting(at: 10.300)
             XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode + 1)
             receiver.decoderDidComplete(sequence: 5, generation: 7,
@@ -1208,6 +1208,33 @@ final class UsbSplitCommitGateTests: XCTestCase {
             XCTAssertNil(receiver.recoveryEpisodeStartedAtForTesting)
             receiver.feedbackTimerTickForTesting(at: 10.500)
             XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode + 1)
+        }
+    }
+
+    func testWifiRotationRetriesAnIDRDroppedWhileVideoAdmissionWasClosed() {
+        let queue = DispatchQueue(label: "test.wifi.rotation.recovery")
+        let receiver = WifiMediaReceiver(
+            networkQueue: queue,
+            decoder: { _, _, _, _ in },
+            audioConsumer: { _, _, _, _ in },
+            onProbeAuthenticated: { _, _ in },
+            onCommittedFailure: { _, _ in })
+        queue.sync {
+            receiver.simulateActivePacketSequenceForTesting(100, generation: 7)
+            receiver.beginRecoveryEpisodeForTesting(at: 10)
+            let episode = receiver.recoveryEpisodeForTesting
+            // An authenticated IDR can finish reassembly while mirror admission
+            // is closed. No decode completion follows from that frame.
+            receiver.simulatePendingRecoveryCandidateForTesting(sequence: 101, at: 10.090)
+            receiver.feedbackTimerTickForTesting(at: 10.125)
+            XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode)
+            receiver.feedbackTimerTickForTesting(at: 10.250)
+            XCTAssertEqual(receiver.recoveryEpisodeForTesting, episode + 1)
+            receiver.decoderDidComplete(sequence: 101, generation: 7, succeeded: true)
+            XCTAssertTrue(receiver.isRecovering(generation: 7))
+            receiver.simulatePendingRecoveryCandidateForTesting(sequence: 102, at: 10.260)
+            receiver.decoderDidComplete(sequence: 102, generation: 7, succeeded: true)
+            XCTAssertFalse(receiver.isRecovering(generation: 7))
         }
     }
 
@@ -1490,6 +1517,35 @@ final class ForegroundPerformanceFeedbackTests: XCTestCase {
 }
 
 final class VirtualDisplayRotationRecoveryTests: XCTestCase {
+    func test120HzVirtualRotationAdvancesDecoderGenerationWithoutTearingDownVideoToolbox() throws {
+        let manager = NetworkManager()
+        defer { manager.stopForTesting() }
+        let session = manager.simulateCommittedWifiSessionForTesting()
+        manager.beginMirrorControlForTesting(generation: session.generation)
+        manager.setDesiredPipelineMode(.game)
+        manager.receiveMirrorWireForTesting(type: .pipelineMode, payload: PipelineMode.game.encode(),
+            generation: session.generation, connection: session.connection)
+
+        func receive(_ mode: MirrorControlMode, _ epoch: UInt64) throws {
+            let state = MirrorControlState(revision: epoch, epoch: epoch, source: 0, mode: mode,
+                token: MirrorToken(low: 0, high: 0), geometry: nil, firstFrame: nil, lastSent: nil)
+            manager.receiveMirrorWireForTesting(type: .mirrorState,
+                payload: try MirrorControlCodec.encodeState(state),
+                generation: session.generation, connection: session.connection)
+        }
+        try receive(.virtualDisplay, 1)
+        let decoder = manager.decoderForTesting
+        let oldGeneration = decoder.currentSessionGeneration
+        let invalidations = decoder.invalidateCountForTesting
+        try receive(.unavailable, 2)
+        let newGeneration = decoder.currentSessionGeneration
+        XCTAssertNotEqual(newGeneration, oldGeneration)
+        try receive(.unavailable, 3)
+        try receive(.virtualDisplay, 4)
+        XCTAssertEqual(decoder.currentSessionGeneration, newGeneration)
+        XCTAssertEqual(decoder.invalidateCountForTesting, invalidations)
+    }
+
     func testVirtualRestartRetiresOnceAndRequestsRecoveryAfterVideoReadmission() throws {
         let manager = NetworkManager(); defer { manager.stopForTesting() }
         let session = manager.simulateCommittedWifiSessionForTesting()
@@ -8320,15 +8376,18 @@ final class VisualProductionSourceClosureTests: XCTestCase {
         XCTAssertTrue(renderer.contains("freshness.isCurrent(token.identity)"))
     }
 
-    func testAcceptedDisplayReadyConfiguresDecodeBudgetWithoutSynchronizingDecoderQueue() throws {
+    func testAcknowledgedMediaRateConfiguresDecodeBudgetIndependentlyOfDisplayRefresh() throws {
         let network = try source("NetworkManager.swift")
         let method = try XCTUnwrap(network.range(of: "private func receiveDisplayReady"))
         let end = try XCTUnwrap(network.range(of: "private func receiveDisplayConfigurationFailure",
             range: method.upperBound..<network.endIndex))
         let body = String(network[method.lowerBound..<end.lowerBound])
-        let gate = try XCTUnwrap(body.range(of: "guard displayRequestGate.effective != nil"))
-        let budget = try XCTUnwrap(body.range(of: "decoder.configureRefreshRate"))
-        XCTAssertLessThan(gate.lowerBound, budget.lowerBound)
+        XCTAssertFalse(body.contains("decoder.configureRefreshRate"))
+        let acknowledgement = try XCTUnwrap(network.range(of: "committedPipelineMode.acknowledge(mode)"))
+        let endOfCase = try XCTUnwrap(network.range(of: "case .clientPerformanceFeedback:",
+            range: acknowledgement.upperBound..<network.endIndex))
+        XCTAssertTrue(network[acknowledgement.upperBound..<endOfCase.lowerBound]
+            .contains("decoder.configureRefreshRate(UInt32(mode.targetFps))"))
         let decoder = try source("DecoderManager.swift")
         let configure = try XCTUnwrap(decoder.range(of: "public func configureRefreshRate"))
         let configureEnd = try XCTUnwrap(decoder.range(of: "public var currentSessionGeneration",
