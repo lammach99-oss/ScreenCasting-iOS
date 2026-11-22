@@ -520,6 +520,41 @@ final class CaptureTargetIntegrationTests: XCTestCase {
         network.networkQueueForTesting.sync { expire() };await drain(network)
         XCTAssertEqual(network.captureTargetState.pending?.request.transaction, 1)
     }
+
+    @MainActor func testReconnectRequestsFreshTargetsWhenCapabilitiesPrecedeTransportCommit() async throws {
+        let network = NetworkManager()
+        var writes: [Data] = []
+        network.controlSendForAudioTesting = { bytes, done in writes.append(bytes); done(nil) }
+        network.captureTargetScheduleForTesting = { _, _ in }
+        let old = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        network.beginTransferWriterForTesting()
+        network.receiveCaptureTargetWireForTesting(type: .displayCapabilities, payload: Self.modes,
+            flags: CaptureTargetProtocol.advertisementFlag, generation: old.generation, connection: old.connection)
+        network.receiveCaptureTargetWireForTesting(type: .sourceCatalogue, payload: Self.catalogue(revision: 3, current: 1),
+            generation: old.generation, connection: old.connection)
+        await drain(network)
+        XCTAssertEqual(network.captureTargetState.confirmedCurrentId, 1)
+        network.stopForTesting()
+
+        let next = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        defer { network.stopForTesting() }
+        network.configureTransferAuthorizationForTesting(manager: nil, authenticated: true, committed: false)
+        network.beginTransferWriterForTesting()
+        let before = writes.filter { $0[5] == WireMessageType.sourceHello.rawValue }.count
+        network.receiveIdentityWireForTesting(type: .displayCapabilities, payload: Self.modes,
+            flags: CaptureTargetProtocol.advertisementFlag)
+        await drain(network)
+        XCTAssertEqual(writes.filter { $0[5] == WireMessageType.sourceHello.rawValue }.count, before)
+        network.commitAudioTransportForTesting(mode: RealtimeTransportMode.legacyTLS, audioAvailable: true)
+        await drain(network)
+        XCTAssertEqual(writes.filter { $0[5] == WireMessageType.sourceHello.rawValue }.count, before + 1)
+        network.receiveCaptureTargetWireForTesting(type: .sourceCatalogue,
+            payload: Self.catalogue(revision: 1, current: 14, virtualId: 11, physicalId: 14),
+            generation: next.generation, connection: next.connection)
+        await drain(network)
+        XCTAssertEqual(network.captureTargetState.generation, next.generation)
+        XCTAssertEqual(network.captureTargetState.confirmedCurrentId, 14)
+    }
     @MainActor func testActualSurfaceRetiresHeldPointerContactAndKeySynchronouslyBeforeRequest() async throws {
         let network=NetworkManager();var buttons: [PointerInputCommand]=[], contacts: [DirectTouchContactCommand]=[]
         var keys: [KeyboardInputCommand]=[], requests=0

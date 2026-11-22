@@ -28,6 +28,7 @@ public struct ScreenCyclePresentation: Equatable {
     public let nextLabel: String?
     public let pending: Bool
     public let reason: String?
+    let usesCaptureTargets: Bool
     public var enabled: Bool { nextTargetId != nil && reason == nil }
     public var accessibilityValue: String {
         position.map { "\(currentLabel), \($0) of \(count)" } ?? currentLabel
@@ -38,21 +39,25 @@ public struct ScreenCyclePresentation: Equatable {
     public var hint: String { reason ?? nextLabel.map { "Show \($0)" } ?? "Choose a screen" }
 
     public static func make(candidates: [ScreenPickerTile], currentId: UInt64?, pending: Bool,
-                            disabledReason: String? = nil, extendActive: Bool = false) -> Self {
-        let screens = candidates.filter { !$0.isExtend }
+                            disabledReason: String? = nil, extendActive: Bool = false,
+                            usesCaptureTargets: Bool = false) -> Self {
+        let screens = usesCaptureTargets ? candidates : candidates.filter { !$0.isExtend }
         let index = screens.firstIndex { $0.id == currentId }
-        let next = screens.isEmpty ? nil : screens[index.map { ($0 + 1) % screens.count } ?? 0]
+        let next = index.map { screens[($0 + 1) % screens.count] } ??
+            screens.first { !$0.isExtend } ?? screens.first
+        let legacyExtend = extendActive && !usesCaptureTargets
         let reason: String?
         if pending { reason = "Switching screens\u{2026}" }
-        else if extendActive { reason = "Choose Mirror to switch PC screens." }
+        else if legacyExtend { reason = "Choose Mirror to switch PC screens." }
         else if let disabledReason { reason = disabledReason }
         else if screens.isEmpty { reason = "No screens are available." }
         else if screens.count == 1 && index != nil { reason = "Only one screen is available." }
         else if next?.canSelect != true { reason = "Screen selection is not ready. Refresh screens to try again." }
         else { reason = nil }
-        return Self(currentLabel: extendActive ? "Extend iPad" : index.map { screens[$0].label } ?? "Choose a screen",
-                    position: extendActive ? nil : index.map { $0 + 1 }, count: screens.count,
-                    nextTargetId: next?.id, nextLabel: next?.label, pending: pending, reason: reason)
+        return Self(currentLabel: legacyExtend ? "Extend iPad" : index.map { screens[$0].label } ?? "Choose a screen",
+                    position: legacyExtend ? nil : index.map { $0 + 1 }, count: screens.count,
+                    nextTargetId: next?.id, nextLabel: next?.label, pending: pending, reason: reason,
+                    usesCaptureTargets: usesCaptureTargets)
     }
 }
 
@@ -145,13 +150,14 @@ public struct ScreenPickerSnapshot: Equatable {
     /// Name of the screen the iPad is showing now, or nil before the list arrives.
     public let currentLabel: String?
     public var selectionDisabledReason: String? = nil
+    var usesCaptureTargets = false
 
     public func cycle(kind: SessionPanelKind, disabledReason: String? = nil) -> ScreenCyclePresentation {
         let fallback: String? = phase == .loading ? "Loading screens..."
             : phase == .locked ? "Screen switching is off on the PC." : nil
         return .make(candidates: tiles, currentId: tiles.first { $0.status == .showing }?.id,
                      pending: isSwitching, disabledReason: disabledReason ?? selectionDisabledReason ?? fallback,
-                     extendActive: kind == .castingExtend)
+                     extendActive: kind == .castingExtend, usesCaptureTargets: usesCaptureTargets)
     }
 
     private static func castingControl(state: MirrorControlState?, inputBlocked: Bool,
@@ -195,17 +201,20 @@ public struct ScreenPickerSnapshot: Equatable {
         let current=captureTargets.unknownOutcome ? 0 : captureTargets.confirmedCurrentId
         let control = castingControl(state: state, inputBlocked: captureTargets.inputBlocked,
             legacyInputAvailable: legacyInputAvailable)
-        guard let catalogue=captureTargets.catalogue else {
+        let listUnavailableReason = captureTargets.listUnavailable
+            ? "The screen list is unavailable. Refresh screens to try again." : nil
+        guard let pickerCatalogue = captureTargets.pickerCatalogue else {
             return Self(phase: captureTargets.listUnavailable ? .locked : .loading, tiles: [], control: control,
                         canAskPermission: false, isSwitching: captureTargets.isSwitching, currentLabel: nil,
-                        selectionDisabledReason: captureTargets.listUnavailable ? "The screen list is unavailable. Refresh screens to try again." : nil)
+                        selectionDisabledReason: listUnavailableReason)
         }
-        let ready=catalogue.state == 1 && catalogue.allowed
+        let catalogue = captureTargets.catalogue
+        let ready = catalogue?.state == 1 && catalogue?.allowed == true
         let selectable=ready && captureTargets.canSelect && !captureTargets.needsCatalogueRefresh
-        let tiles=catalogue.entries.map { entry -> ScreenPickerTile in
+        let tiles=pickerCatalogue.entries.map { entry -> ScreenPickerTile in
             let status: ScreenPickerTile.Status
             if entry.id == captureTargets.pending?.request.targetId &&
-                catalogue.revision == captureTargets.pending?.request.revision { status = .switching }
+                pickerCatalogue.revision == captureTargets.pending?.request.revision { status = .switching }
             else if entry.id == current { status = .showing }
             else if !selectable { status = .locked }
             else { status = .available }
@@ -213,15 +222,18 @@ public struct ScreenPickerSnapshot: Equatable {
                 isBuiltIn: entry.kind == .physical && isBuiltIn(entry.name), status: status,
                 isExtend: entry.kind == .extend, canSelect: selectable)
         }
-        return Self(phase: catalogue.state == 1 && catalogue.allowed ? .ready : .locked, tiles: tiles,
-                    control: control, canAskPermission: catalogue.state == 1 && !catalogue.allowed &&
+        let phase: Phase = ready ? .ready : catalogue == nil && !captureTargets.listUnavailable ? .loading : .locked
+        return Self(phase: phase, tiles: tiles,
+                    control: control, canAskPermission: catalogue?.state == 1 && catalogue?.allowed == false &&
                         !permissionAsked && !captureTargets.isSwitching,
                     isSwitching: captureTargets.isSwitching,
                     currentLabel: tiles.first(where: { $0.id == current })?.label,
-                    selectionDisabledReason: catalogue.state != 1 ? "Screens are unavailable. Stop and restart the session."
-                        : !catalogue.allowed ? "Screen switching is off on the PC."
+                    selectionDisabledReason: catalogue == nil ? listUnavailableReason ?? "Loading screens..."
+                        : catalogue?.state != 1 ? "Screens are unavailable. Stop and restart the session."
+                        : !ready ? "Screen switching is off on the PC."
                         : captureTargets.needsCatalogueRefresh ? "Refresh screens before choosing a screen."
-                        : !captureTargets.canSelect ? "Wait for the new screen picture." : nil)
+                        : !captureTargets.canSelect ? "Wait for the new screen picture." : nil,
+                    usesCaptureTargets: true)
     }
 
     /// Remote catalogue adapter; admission remains owned by RemoteMonitorState.

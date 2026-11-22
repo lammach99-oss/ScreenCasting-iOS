@@ -588,7 +588,7 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         network.usbIdentityCredentialLoadForTesting = { credential }
         network.controlSendForAudioTesting = { data, done in writes.append(data); done(nil) }
         network.connectionListenerPortForTesting = 0
-        _ = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        let wifi = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
         defer { network.stopForTesting() }
         network.beginTransferWriterForTesting(); network.setConnectionIdentityForTesting(verified: true)
         network.setConnectionCredentialForTesting(credential)
@@ -604,7 +604,11 @@ final class ConnectionControlIntegrationTests: XCTestCase {
             payload: try ConnectionSwitchStateTests.snapshot(revision: 3, hostState: .switching).encode())
         network.receiveIdentityWireForTesting(type: .connectionSelectResult, payload: try ConnectionSwitchStateTests.result(.accepted).encode())
         await drain(network)
-        network.retireConnectionRouteForTesting()
+        network.simulateWifiControlSendErrorForTesting(generation: wifi.generation, connection: wifi.connection)
+        await drain(network)
+        XCTAssertEqual(network.connectionSwitchState.phase, .waitingPeer)
+        XCTAssertTrue(network.connectionSwitchState.pending?.accepted == true)
+        XCTAssertNotNil(network.preparedUSBListenerPortForTesting)
         _ = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
         network.beginTransferWriterForTesting(); network.configureUsbIdentityForTesting()
         network.receiveIdentityWireForTesting(type: .ping, payload: Data(0..<16), flags: 0x0100)

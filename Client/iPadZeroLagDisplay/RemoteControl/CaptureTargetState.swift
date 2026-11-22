@@ -27,6 +27,7 @@ public struct CaptureTargetState: Equatable {
     private var latestRevision: UInt64 = 0
     private var selectionSuppressed = false
     private var revisions: [UInt64: CaptureTargetCatalogue] = [:]
+    private var lastReadyCatalogue: CaptureTargetCatalogue?
 
     public init() {}
     public mutating func begin(generation: UInt64) {
@@ -38,9 +39,11 @@ public struct CaptureTargetState: Equatable {
         let latestRevision = self.latestRevision
         let previous = preserveAppliedSource ? applied : nil
         let catalogue = self.catalogue
+        let lastReadyCatalogue = self.lastReadyCatalogue
         self = Self(); self.generation = generation; self.enabled = enabled
         self.nextTransaction = nextTransaction; self.owner = owner; inputBlocked = enabled
         self.latestRevision = latestRevision
+        self.lastReadyCatalogue = lastReadyCatalogue
         unknownOutcome = enabled; needsCatalogueRefresh = enabled
         if let previous {
             self.catalogue = catalogue
@@ -74,6 +77,7 @@ public struct CaptureTargetState: Equatable {
             return false
         }
         owner = value.owner; catalogue = value; revisions[value.revision] = value; needsCatalogueRefresh = false
+        if value.state == 1 { lastReadyCatalogue = value }
         // Terminal publication precedes the result. Keep recent revisions to resolve it without regressing the UI.
         if pending == nil { revisions = [value.revision: value] }
         if pending == nil { selectionSuppressed = false }
@@ -183,8 +187,11 @@ public struct CaptureTargetState: Equatable {
         guard !selectionSuppressed else { return 0 }
         return catalogue?.currentId ?? 0
     }
-    public var canSelect: Bool { enabled && pending == nil && !(applied != nil && inputBlocked) }
-    public var isSwitching: Bool { pending != nil || applied != nil && inputBlocked }
+    // A non-ready publication can omit screens. Only the live catalogue authorizes a request.
+    var pickerCatalogue: CaptureTargetCatalogue? { catalogue?.state == 1 ? catalogue : lastReadyCatalogue ?? catalogue }
+    public var canSelect: Bool { enabled && !isSwitching }
+    // Failed transactions can still owe a restored frame before input reopens.
+    public var isSwitching: Bool { pending != nil || issue == nil && applied != nil && inputBlocked }
     public mutating func markListUnavailable(session: UUID) {
         guard session == self.session, catalogue == nil else { return }
         listUnavailable = true

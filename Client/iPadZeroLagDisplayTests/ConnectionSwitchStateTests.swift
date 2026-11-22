@@ -68,6 +68,8 @@ final class ConnectionSwitchStateTests: XCTestCase {
         _ = state.advertise(flags: 0x0200, authenticated: true, generation: 2)
         XCTAssertTrue(state.receive(try Self.snapshot(revision: 3, owner: 2, route: .usb), generation: 2, now: 3))
         XCTAssertTrue(state.receive(try Self.result(.completed), generation: 2, now: 4))
+        XCTAssertNil(SessionConnectionPresentation(state: state, streamingRoute: .usb,
+            hasWifiEndpoint: true).activeRoute)
         var lostBeforeRender = state
         XCTAssertTrue(lostBeforeRender.beginRollback(reason: .connectionLost, now: 4))
         XCTAssertTrue(lostBeforeRender.inputBlocked)
@@ -78,6 +80,8 @@ final class ConnectionSwitchStateTests: XCTestCase {
         XCTAssertTrue(state.inputBlocked)
         state.rendered(sequence: 0, domain: .scst, decoder: 11, generation: 2, now: 4)
         XCTAssertEqual(state.phase, .completed); XCTAssertFalse(state.inputBlocked)
+        XCTAssertEqual(SessionConnectionPresentation(state: state, streamingRoute: .usb,
+            hasWifiEndpoint: true).activeRoute, .usb)
     }
     func testProtectedPreflightRejectionKeepsOriginalWifi() throws {
         var state = try preparedProtectedSwitch()
@@ -342,6 +346,26 @@ final class ConnectionSwitchStateTests: XCTestCase {
             XCTAssertNil(state.pending); XCTAssertTrue(state.inputBlocked)
             XCTAssertFalse(state.receive(try Self.result(.completed), generation: 2, now: 3))
         }
+    }
+
+    func testStoppedOnPCRetiresTheAuthenticatedHandoffAndClearsPanelProgress() throws {
+        var state = try accepted()
+        let streaming = SessionConnectionPresentation(state: state, streamingRoute: .usb, hasWifiEndpoint: true)
+        XCTAssertEqual(streaming.action, .waiting(state.message, showsProgress: true))
+        XCTAssertNil(streaming.activeRoute)
+        let authority = try Self.snapshot(revision: 4, owner: 2, route: .usb, hostState: .failed)
+        XCTAssertTrue(state.receive(authority, generation: 2, now: 3))
+        let stopped = ConnectionSelectResult(status: .failed, target: .usb, current: .usb, reason: .stoppedOnPC,
+            hostState: .failed, transaction: 1, originOwner: 1, revision: 4, routeOwner: 2, token: Data(0..<16),
+            firstFrame: 0, frameDomain: .none)
+        XCTAssertFalse(state.receive(stopped, generation: 1, now: 3))
+        XCTAssertTrue(state.receive(stopped, generation: 2, now: 3))
+        XCTAssertNil(state.pending)
+        XCTAssertEqual(state.issue, .stoppedOnPC)
+        let panel = SessionConnectionPresentation(state: state, streamingRoute: nil, hasWifiEndpoint: true)
+        XCTAssertNil(panel.activeRoute)
+        XCTAssertEqual(panel.action, .reconnect)
+        XCTAssertEqual(panel.outcome, "Casting stopped on PC")
     }
     func testBufferOverflowLosesIDRAndDependentDeltas() {
         var buffer = CaptureTargetVideoBuffer()

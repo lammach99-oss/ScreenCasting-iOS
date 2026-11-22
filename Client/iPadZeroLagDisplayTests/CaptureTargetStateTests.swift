@@ -19,14 +19,14 @@ final class CaptureTargetStateTests: XCTestCase {
             kind: status == .accepted ? nil : kind, transaction: transaction, owner: 2, revision: revision,
             currentId: status == .accepted ? 0 : current, epoch: 5, source: 6, firstFrame: 0)
     }
-    func testTypedCycleExcludesExtendAndModeChoiceUsesOnlyConfirmedIdentity() {
+    func testTypedCycleIncludesExtendAndModeChoiceUsesOnlyConfirmedIdentity() {
         var model = negotiated()
         let extended = ScreenPickerSnapshot.make(captureTargets: model, state: nil)
         let extendCycle = extended.cycle(kind: .castingExtend)
-        XCTAssertEqual(extendCycle.count, 1)
+        XCTAssertEqual(extendCycle.count, 2)
         XCTAssertEqual(extendCycle.currentLabel, "Extend iPad")
-        XCTAssertFalse(extendCycle.enabled)
-        XCTAssertEqual(extendCycle.reason, "Choose Mirror to switch PC screens.")
+        XCTAssertTrue(extendCycle.enabled)
+        XCTAssertEqual(extendCycle.nextTargetId, 4)
         let modes = CaptureModePresentation.make(targets: model, kind: .castingExtend, lastPhysicalId: nil)
         XCTAssertTrue(modes.extend.selected); XCTAssertFalse(modes.extend.enabled)
         XCTAssertTrue(modes.mirror.enabled); XCTAssertEqual(modes.mirror.targetId, 4)
@@ -36,18 +36,18 @@ final class CaptureTargetStateTests: XCTestCase {
         XCTAssertFalse(pending.extend.enabled); XCTAssertFalse(pending.mirror.enabled)
     }
 
-    func testTypedPhysicalCycleUsesReceivedOrderAndWrapsAcrossThreeScreens() {
+    func testTypedCycleUsesReceivedOrderAcrossPhysicalAndExtendTargets() {
         var model = negotiated()
         let entries = [CaptureTargetEntry(id: 4, kind: .physical, name: "Screen"),
                        CaptureTargetEntry(id: 1, kind: .extend, name: "Extend iPad"),
                        CaptureTargetEntry(id: 8, kind: .physical, name: "Screen"),
                        CaptureTargetEntry(id: 6, kind: .physical, name: "Screen")]
-        for (revision, current, next) in [(UInt64(4), UInt64(4), UInt64(8)), (5, 8, 6), (6, 6, 4)] {
+        for (revision, current, next) in [(UInt64(4), UInt64(4), UInt64(1)), (5, 1, 8), (6, 8, 6), (7, 6, 4)] {
             let list = CaptureTargetCatalogue(state: 1, allowed: true, owner: 2, revision: revision,
                 currentId: current, epoch: 5, entries: entries)
             _ = model.receiveCatalogue(list, session: model.session)
             let cycle = ScreenPickerSnapshot.make(captureTargets: model, state: nil).cycle(kind: .castingMirror)
-            XCTAssertEqual(cycle.count, 3); XCTAssertEqual(cycle.nextTargetId, next)
+            XCTAssertEqual(cycle.count, 4); XCTAssertEqual(cycle.nextTargetId, next)
             XCTAssertTrue(cycle.enabled)
         }
     }
@@ -77,7 +77,7 @@ final class CaptureTargetStateTests: XCTestCase {
         let picker = ScreenPickerSnapshot.make(captureTargets: model, state: nil)
         XCTAssertNil(picker.currentLabel)
         let cycle = picker.cycle(kind: .castingUnknown)
-        XCTAssertEqual(cycle.count, 1); XCTAssertTrue(cycle.enabled)
+        XCTAssertEqual(cycle.count, 2); XCTAssertTrue(cycle.enabled)
         XCTAssertEqual(cycle.currentLabel, "Choose a screen"); XCTAssertEqual(cycle.nextTargetId, 4)
         XCTAssertNotNil(model.select(4, catalogue: catalogue(revision: 4, current: 4), session: model.session))
     }
@@ -190,9 +190,53 @@ final class CaptureTargetStateTests: XCTestCase {
         var model=negotiated();let session=model.session
         _=model.select(4, catalogue: catalogue(), session: session)
         _=model.receiveResult(result(.accepted, revision: 3), session: session)
-        _=model.receiveResult(result(.failed), session: session)
+        let busy = CaptureTargetCatalogue(state: 2, allowed: false, owner: 2, revision: 4,
+            currentId: 0, epoch: 5, entries: Array(catalogue().entries.prefix(1)))
+        XCTAssertTrue(model.receiveCatalogue(busy, session: session))
+        _=model.receiveResult(result(.failed, revision: 5), session: session)
         XCTAssertEqual(model.confirmedCurrentId, 0)
         XCTAssertTrue(model.inputBlocked);XCTAssertTrue(model.needsCatalogueRefresh)
+        let cycle = ScreenPickerSnapshot.make(captureTargets: model, state: nil).cycle(kind: .castingUnknown)
+        XCTAssertEqual(cycle.count, 2)
+        XCTAssertTrue(SessionScreenPresentation.showsSwitchRow(kind: .castingUnknown, cycle: cycle))
+        XCTAssertFalse(cycle.pending)
+        XCTAssertFalse(cycle.enabled)
+    }
+
+    func testFailedExtendKeepsPickerThroughBusyCatalogueAndReenablesItOnRestoredMirror() throws {
+        var model = negotiated()
+        let session = model.session
+        let mirror = catalogue(revision: 4, current: 4)
+        XCTAssertTrue(model.receiveCatalogue(mirror, session: session))
+
+        func cycle() -> ScreenCyclePresentation {
+            ScreenPickerSnapshot.make(captureTargets: model, state: nil).cycle(kind: .castingMirror)
+        }
+        XCTAssertTrue(SessionScreenPresentation.showsSwitchRow(kind: .castingMirror, cycle: cycle()))
+        XCTAssertEqual(cycle().nextTargetId, 1)
+        XCTAssertNotNil(model.select(1, catalogue: mirror, session: session))
+        XCTAssertTrue(model.receiveResult(result(.accepted, revision: 4), session: session))
+        let busy = CaptureTargetCatalogue(state: 2, allowed: false, owner: 2, revision: 5,
+            currentId: 0, epoch: 5, entries: Array(mirror.entries.prefix(1)))
+        XCTAssertTrue(model.receiveCatalogue(busy, session: session))
+        XCTAssertTrue(SessionScreenPresentation.showsSwitchRow(kind: .castingUnknown, cycle: cycle()))
+        XCTAssertFalse(cycle().enabled)
+
+        let restored = CaptureTargetCatalogue(state: 1, allowed: true, owner: 2, revision: 6,
+            currentId: 14, epoch: 6, entries: [.init(id: 11, kind: .extend, name: "Extend iPad"),
+                .init(id: 14, kind: .physical, name: "Panel")])
+        XCTAssertTrue(model.receiveCatalogue(restored, session: session))
+        let failed = CaptureTargetResult(status: .failed, state: 1, kind: .physical, transaction: 1,
+            owner: 2, revision: 6, currentId: 14, epoch: 6, source: 7, firstFrame: 1)
+        XCTAssertTrue(model.receiveResult(failed, session: session))
+        XCTAssertEqual(model.issue, .failed)
+        XCTAssertTrue(model.inputBlocked, "the restored decoder still owes a rendered frame")
+        XCTAssertFalse(cycle().pending)
+        XCTAssertTrue(cycle().enabled)
+        XCTAssertEqual(cycle().nextTargetId, 11)
+        XCTAssertTrue(CaptureModePresentation.make(targets: model, kind: .castingMirror,
+            lastPhysicalId: nil).extend.enabled)
+        XCTAssertTrue(model.observeRendered(sequence: 1, session: session))
     }
     func testUnknownDeadlineRequiresExplicitReselectionAndRetiredCallbacksCannotSettle() {
         var model = negotiated(); let oldSession = model.session
@@ -200,8 +244,13 @@ final class CaptureTargetStateTests: XCTestCase {
         XCTAssertEqual(CaptureTargetProtocol.terminalWait, 75)
         XCTAssertTrue(model.expire(transaction: 1, session: oldSession))
         XCTAssertTrue(model.inputBlocked); XCTAssertNotNil(model.statusMessage)
+        let timedOut = ScreenPickerSnapshot.make(captureTargets: model, state: nil).cycle(kind: .castingUnknown)
+        XCTAssertFalse(timedOut.pending)
+        XCTAssertTrue(SessionScreenPresentation.showsSwitchRow(kind: .castingUnknown, cycle: timedOut))
+        XCTAssertFalse(timedOut.enabled)
         XCTAssertFalse(model.receiveResult(result(.applied), session: oldSession))
         _ = model.receiveCatalogue(catalogue(revision: 4), session: oldSession)
+        XCTAssertTrue(CaptureModePresentation.make(targets: model, kind: .castingUnknown, lastPhysicalId: nil).mirror.enabled)
         XCTAssertNotNil(model.select(1, catalogue: catalogue(revision: 4), session: oldSession), "current tile is a real fresh-frame transaction")
         XCTAssertEqual(model.pending?.request.transaction, 2)
         model.begin(generation: 8)

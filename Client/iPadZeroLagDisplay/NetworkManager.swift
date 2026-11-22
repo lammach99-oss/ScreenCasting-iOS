@@ -471,6 +471,7 @@ public class NetworkManager: ObservableObject {
     @Published private(set) var screenSwitchPermissionPending = false
     @Published private(set) var screenSwitchPermissionNotice: String?
     private var captureTargets = CaptureTargetState()
+    private var captureTargetAdvertisementGeneration: UInt64?
     private var screenSwitchPermissionRequest: UUID?
     private var screenSwitchPermissionTimedOut = false
     private var captureAvailability = CaptureAvailabilityState()
@@ -663,6 +664,7 @@ public class NetworkManager: ObservableObject {
             decoder.resetCaptureOutputFence()
             wifiMediaReceiver.setCaptureSuspended(false)
             captureTargets.begin(generation: wireAuthenticatedGeneration ?? 0)
+            captureTargetAdvertisementGeneration = nil
             screenSwitchPermissionRequest = nil
             screenSwitchPermissionTimedOut = false
             deferredSourceDisplay = nil
@@ -3726,7 +3728,7 @@ public class NetworkManager: ObservableObject {
             switch state {
             case .failed, .cancelled:
                 if self.handleConnectionRetirementOnQueue(connection: connection, generation: generation) { return }
-                if self.connectionSwitch.pending != nil || self.committedConnectionRoute == .usb && self.connectionSwitch.enabled {
+                if self.connectionSwitch.pending != nil {
                     self.handleStreamError("Connection change transport lost.")
                     return
                 }
@@ -5194,17 +5196,16 @@ public class NetworkManager: ObservableObject {
         transport: ActiveTransportKind
     ) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
-        if transport == .wifi {
-            guard generation == connectionGeneration,
-                  connection === sentConnection else { return }
-            if let sentConnection,
-               shouldPreserveTransientWifiControlError(
-                   error, generation: generation, connection: sentConnection) {
-                recordWifiLifecycleDiagnostic(
-                    "generation=\(generation) event=control_send_error " +
-                    "action=preserve_transient")
-                return
-            }
+        guard generation == connectionGeneration, connection === sentConnection else { return }
+        if let sentConnection, handleConnectionRetirementOnQueue(connection: sentConnection, generation: generation) {
+            return
+        }
+        if transport == .wifi, let sentConnection,
+           shouldPreserveTransientWifiControlError(error, generation: generation, connection: sentConnection) {
+            recordWifiLifecycleDiagnostic(
+                "generation=\(generation) event=control_send_error " +
+                "action=preserve_transient")
+            return
         }
         handleStreamError("Control send error: \(error)")
     }
@@ -5571,13 +5572,8 @@ public class NetworkManager: ObservableObject {
                 mirrorSwitchAdvertised=header.flags & 0x2000 != 0
                 sendWireMessage(type: .mirrorHello, payload: hello, sequence: 0)
             }
-            if !remoteInputConnection, committedTransportGeneration == generation,
-               let hello = captureTargets.advertise(flags: header.flags, generation: generation) {
-                mirrorControl.enableTypedSources(session: generation)
-                sendWireMessage(type: .sourceHello, payload: hello, sequence: 0)
-                scheduleCaptureTargetListWaitOnQueue()
-                publishMirrorStateOnQueue()
-            }
+            captureTargetAdvertisementGeneration = generation
+            negotiateCaptureTargetsOnQueue()
             receiveDisplayCapabilities(capabilities)
 
         case .captureAvailability:
@@ -6774,6 +6770,7 @@ public class NetworkManager: ObservableObject {
             audioEnabled: audioEnabled)
         setState(.streaming)
         startVideoReceiveLoop(generation: generation)
+        negotiateCaptureTargetsOnQueue()
         requestCurrentSettingsIfNeeded(generation: generation)
         beginAdaptiveProbeOnQueue()
         refreshClipboardOnQueue()
@@ -7025,7 +7022,7 @@ public class NetworkManager: ObservableObject {
     private func handleStreamError(_ reason: String) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         if usbControlTLSAwaitingProof { failSecureUsbOnQueue(); return }
-        if connectionHandoffInProgress || connectionSwitch.pending != nil || committedConnectionRoute == .usb && connectionSwitch.enabled {
+        if connectionHandoffInProgress || connectionSwitch.pending != nil {
             if recoverConnectionControlOnQueue(.connectionLost) { return }
             if connection != nil { teardownCurrentSession() }
             setState(.disconnected(reason: "Connection lost"))
@@ -7781,6 +7778,17 @@ public class NetworkManager: ObservableObject {
             self.flushDeferredSourceDisplayOnQueue()
         }
     }
+    private func negotiateCaptureTargetsOnQueue() {
+        let generation = connectionGeneration
+        guard !remoteInputConnection, wireAuthenticatedGeneration == generation,
+              committedTransportGeneration == generation, captureTargetAdvertisementGeneration == generation,
+              let hello = captureTargets.advertise(flags: connectionAdvertisement, generation: generation) else { return }
+        mirrorControl.enableTypedSources(session: generation)
+        sendWireMessage(type: .sourceHello, payload: hello, sequence: 0)
+        scheduleCaptureTargetListWaitOnQueue()
+        publishMirrorStateOnQueue()
+    }
+
     private func refreshCaptureTargetsOnQueue() {
         guard wireAuthenticatedGeneration == connectionGeneration, committedTransportGeneration == connectionGeneration,
               let payload=captureTargets.refresh(session: captureTargets.session) else { return }
@@ -8677,6 +8685,17 @@ public class NetworkManager: ObservableObject {
         publishConnectionControlOnQueue(); return true
     }
     @discardableResult private func recoverConnectionControlOnQueue(_ reason: ConnectionReason) -> Bool {
+        if reason == .connectionLost, connectionSwitch.pending?.rollbackRoute == .usb,
+           committedConnectionRoute == .usb, usbListener != nil, connection != nil {
+            // An interrupted restore dial spends the existing rollback budget.
+            // Retire its authority so the next dial must authenticate afresh.
+            connectionSwitch.resetRollbackAttempt()
+            teardownCurrentSession()
+            resetConnectionPresentationOnQueue()
+            setState(.listening)
+            publishConnectionControlOnQueue()
+            return true
+        }
         if connectionSwitch.pending?.rollbackRoute == .wifi && reason == .connectionLost {
             connectionSwitch.resetRollbackAttempt()
         } else if !connectionSwitch.beginRollback(reason: reason, now: connectionControlNow()) {
@@ -8780,6 +8799,8 @@ public class NetworkManager: ObservableObject {
         if committedConnectionRoute == .wifi {
             usbListenerExplicitlyStarted = false
             reconnectEnabled = true
+        } else if committedConnectionRoute == .usb {
+            usbListenerExplicitlyStarted = true
         }
         closeRoutePreparationOnQueue()
         connectionCompleted = nil

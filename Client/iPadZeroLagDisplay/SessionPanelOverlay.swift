@@ -72,7 +72,8 @@ struct SessionInputPresentation {
 
 enum SessionScreenPresentation {
     static func showsSwitchRow(kind: SessionPanelKind, cycle: ScreenCyclePresentation) -> Bool {
-        (kind == .castingMirror || kind == .wholePCRemote) &&
+        if cycle.usesCaptureTargets { return cycle.count > 1 }
+        return (kind == .castingMirror || kind == .wholePCRemote) &&
             cycle.count > 1 && cycle.position != nil && cycle.enabled
     }
 }
@@ -104,7 +105,7 @@ struct SessionConnectionPresentation {
     var outcome: String? { state.operationOutcome }
 
     var activeRoute: ConnectionRoute? {
-        guard let streamingRoute else { return nil }
+        guard let streamingRoute, state.pending?.replacement == nil else { return nil }
         if state.actualRoute != .unknown { return state.actualRoute }
         return state.pending == nil && !state.offersReconnect ? streamingRoute : nil
     }
@@ -746,6 +747,7 @@ struct SessionConnectionPresentation {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .disabled(!owner.cycle.enabled)
             .accessibilityLabel("Switch screen")
             .accessibilityValue(owner.cycle.accessibilityValue)
             .accessibilityHint(owner.cycle.hint)
