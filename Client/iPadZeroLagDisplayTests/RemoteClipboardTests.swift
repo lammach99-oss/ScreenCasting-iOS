@@ -456,20 +456,28 @@ final class CastingClipboardIntegrationTests: XCTestCase {
     }
 
     @MainActor func testRemoteClipboardProgressesWhileQueuedFileChunkIsPaced() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let received = root.appendingPathComponent("received", isDirectory: true)
+        try FileManager.default.createDirectory(at: received, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let source = root.appendingPathComponent("sample.bin")
         let bytes = Data([0x01, 0x02, 0x03])
         try bytes.write(to: source)
 
-        let host = Host(receivedFilesDirectory: root.appendingPathComponent("received"))
+        let host = Host(receivedFilesDirectory: received)
+        // Inbound frames are driven by Host.send. Keep the simulated socket idle
+        // when the file I/O callbacks ask the production receive loop for more data.
+        host.manager.transferReceiveForTesting = { _, _ in }
         host.start()
         defer { host.stop() }
         host.manager.setAutomaticClipboardSending(false)
         let owner = host.manager.beginRemoteClipboardForTesting(remoteFiles: true)
         let state = try await grantRemoteClipboard(host, owner: owner)
         XCTAssertNotEqual(host.manager.remoteInputFeatures & RemoteFeatureNegotiation.remoteFileFeature, 0)
+        // The upload takes a storage lease before it can send the offer.
+        await waitFor("Remote File storage setup") { host.manager.receivedFilesViewState.loaded }
+        guard host.manager.receivedFilesViewState.loaded else { return }
 
         let control = WireMessageType.remoteFileControl
         host.manager.sendTransferFiles([source], scope: host.manager.transferActionScope)
@@ -480,8 +488,15 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         }
         let grant = UUID()
         try host.sendFile(.state(phase: .granted, requestId: id, reason: .none, directions: .both, grantId: grant), to: owner)
-        await waitFor("Remote File offer") { host.filePackets().contains { $0.kind == .offer } }
-        let offer = try XCTUnwrap(host.filePackets().first { $0.kind == .offer })
+        await waitFor("Remote File offer or upload failure") {
+            host.filePackets().contains { $0.kind == .offer } || host.manager.transferSnapshot.phase == .failed
+        }
+        let snapshot = host.manager.transferSnapshot
+        let offer = try XCTUnwrap(host.filePackets().first { $0.kind == .offer },
+            "Expected an offer after the grant (waiting: \(host.manager.remoteFileWaiting), " +
+            "stage: \(snapshot.stage), failure: \(snapshot.failure?.reason ?? "none"), " +
+            "code: \(snapshot.failure?.code ?? 0))")
+        XCTAssertEqual(offer.files, [TransferFile(name: "sample.bin", length: UInt64(bytes.count))])
 
         // Hold an earlier send so the healthy chunk queues, then pause pacing before it can start writing.
         let pingCount = host.frames(WireMessageType.ping.rawValue).count
