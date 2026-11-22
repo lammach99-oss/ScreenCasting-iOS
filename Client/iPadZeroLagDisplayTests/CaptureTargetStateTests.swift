@@ -197,7 +197,7 @@ final class CaptureTargetStateTests: XCTestCase {
     func testUnknownDeadlineRequiresExplicitReselectionAndRetiredCallbacksCannotSettle() {
         var model = negotiated(); let oldSession = model.session
         _ = model.select(4, catalogue: catalogue(), session: oldSession)
-        XCTAssertEqual(CaptureTargetProtocol.terminalWait, 65)
+        XCTAssertEqual(CaptureTargetProtocol.terminalWait, 75)
         XCTAssertTrue(model.expire(transaction: 1, session: oldSession))
         XCTAssertTrue(model.inputBlocked); XCTAssertNotNil(model.statusMessage)
         XCTAssertFalse(model.receiveResult(result(.applied), session: oldSession))

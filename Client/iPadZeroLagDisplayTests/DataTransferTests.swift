@@ -600,12 +600,16 @@ final class DataTransferTests: XCTestCase {
         let library = try ReceivedFileLibrary(directory: root), id = UUID()
         let first = UX03Receiver(root: root, library: library)
         await ux03Offer([TransferFile(name: "first", length: 1)], id: id, receiver: first)
-        let stages = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).filter { $0.pathExtension == "part" }
+        let files = FileManager.default
+        let stages = try files.contentsOfDirectory(at: files.temporaryDirectory, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix(".scdt-\(id.uuidString)-") && $0.pathExtension == "part" }
         XCTAssertEqual(stages.count, 1)
+        XCTAssertFalse(try files.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).contains { $0.pathExtension == "part" })
         let second = UX03Receiver(root: root, library: library); await ux03Barrier(second.manager)
         XCTAssertTrue(stages.allSatisfy { FileManager.default.fileExists(atPath: $0.path) }, "New initialization cannot unlink another owner's stage")
         XCTAssertThrowsError(try library.confirmClear())
         first.manager.retire(); await ux03Barrier(first.manager)
+        XCTAssertTrue(stages.allSatisfy { !files.fileExists(atPath: $0.path) })
         await ux03Post(TransferPacket(kind: .offer, generation: 8, id: UUID(), files: [TransferFile(name: "next", length: 0)]), to: second.manager)
         XCTAssertEqual(second.snapshot.phase, .awaitingDecision)
         first.manager.retire(); await ux03Barrier(first.manager)

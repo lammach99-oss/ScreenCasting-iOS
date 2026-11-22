@@ -135,9 +135,11 @@ public struct CaptureTargetState: Equatable {
                   acceptance.epoch != 0, acceptance.source != 0,
                   value.epoch != 0, value.epoch != acceptance.epoch, value.source != 0,
                   value.revision > pending.request.revision, matching.state == 1, matching.epoch == value.epoch {
-            // The terminal catalogue resolves the restored ID, which can change with each revision.
-            // Its first-frame anchor is authoritative even when the sequence wraps to zero.
-            applied = value
+            // Keep the failure in issue and record the attested restored publication
+            // as the local Applied anchor for decoding and scoped recovery.
+            applied = CaptureTargetResult(status: .applied, state: value.state, kind: value.kind,
+                transaction: value.transaction, owner: value.owner, revision: value.revision,
+                currentId: value.currentId, epoch: value.epoch, source: value.source, firstFrame: value.firstFrame)
             needsCatalogueRefresh = false
         }
         revisions = catalogue.map { [$0.revision: $0] } ?? [:]

@@ -93,10 +93,14 @@ final class CaptureTargetIntegrationTests: XCTestCase {
             XCTAssertTrue(decoded.isEmpty, "The candidate decoder chain belongs to an unconfirmed source")
             receive(.video, Data([1]), flags: 3, sequence: 12)
             await drain(network)
-            XCTAssertTrue(writes.contains {
+            let recovery = try XCTUnwrap(writes.first {
                 $0[5] == WireMessageType.videoFeedback.rawValue &&
                     $0.loadLittleEndian(UInt16.self, at: 6) == CaptureTargetProtocol.recoveryFlag
             })
+            XCTAssertEqual(recovery.count, 40)
+            XCTAssertEqual(recovery.loadLittleEndian(UInt64.self, at: 16), 2)
+            XCTAssertEqual(recovery.loadLittleEndian(UInt64.self, at: 24), 5)
+            XCTAssertEqual(recovery.loadLittleEndian(UInt64.self, at: 32), source)
             XCTAssertEqual(decoded.map { $0.0 }, [12])
             let restoredDecoder = try XCTUnwrap(decoded.first?.1)
             XCTAssertNotEqual(restoredDecoder, oldDecoder)

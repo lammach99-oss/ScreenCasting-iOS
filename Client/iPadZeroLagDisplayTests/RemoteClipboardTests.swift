@@ -135,20 +135,28 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         let manager: NetworkManager
         private let defaults: UserDefaults
         private var writes: [Data] = [] // Network queue only.
+        private var heldPing: ((NWError?) -> Void)?
+        private var holdNextPing = false
 
-        init() {
+        init(receivedFilesDirectory: URL? = nil) {
             let suite = "ClipboardTests." + UUID().uuidString
             self.suite = suite
             let defaults = UserDefaults(suiteName: suite)!
             self.defaults = defaults
             defaults.set(true, forKey: Wire.preferenceKey)
-            manager = NetworkManager(userDefaults: defaults)
+            manager = NetworkManager(userDefaults: defaults, receivedFilesDirectory: receivedFilesDirectory)
         }
 
         @MainActor func start() {
             manager.controlSendForAudioTesting = { [weak self] bytes, complete in
-                self?.writes.append(bytes)
-                complete(nil)
+                guard let self else { complete(nil); return }
+                self.writes.append(bytes)
+                if self.holdNextPing, bytes.count >= WireProtocol.headerSize, bytes[5] == WireMessageType.ping.rawValue {
+                    self.holdNextPing = false
+                    self.heldPing = complete
+                } else {
+                    complete(nil)
+                }
             }
             manager.setRemoteClipboardSceneActive(true)
         }
@@ -173,14 +181,41 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         func send(_ message: Wire.Message, to owner: Owner) {
             send(message.type.rawValue, message.encode(), to: owner)
         }
+
+        func sendFile(_ message: RemoteFileProtocol.Message, to owner: Owner) throws {
+            send(message.type.rawValue, try XCTUnwrap(RemoteFileProtocol.encode(message)), to: owner)
+        }
+
+        func filePackets() -> [TransferPacket] {
+            frames(WireMessageType.remoteFilePacket.rawValue).compactMap { payload in
+                guard case .packet(_, let packet)? = RemoteFileProtocol.decode(type: .remoteFilePacket, payload: payload, flags: 0)
+                else { return nil }
+                return packet
+            }
+        }
+
+        func holdWriterWithPing() {
+            manager.networkQueueForTesting.sync { holdNextPing = true }
+            manager.enqueueTransferWireForTesting(bulk: false) { _ in }
+        }
+
+        func releasePing() throws {
+            let complete = manager.networkQueueForTesting.sync {
+                let complete = heldPing
+                heldPing = nil
+                return complete
+            }
+            let release = try XCTUnwrap(complete, "Expected a held ping")
+            release(nil)
+        }
     }
 
-    @MainActor private func waitFor(_ condition: () -> Bool) async {
+    @MainActor private func waitFor(_ traffic: String = "clipboard traffic", _ condition: () -> Bool) async {
         for _ in 0..<200 {
             if condition() { return }
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
-        XCTFail("Timed out waiting for clipboard traffic")
+        XCTFail("Timed out waiting for \(traffic)")
     }
 
     @MainActor private func acknowledgeProbe(_ host: Host, owner: Owner) async throws -> UUID {
@@ -211,6 +246,29 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         host.send(.state(state), to: owner)
         await waitFor { host.manager.remoteClipboardPasteboard.canSend }
         return state
+    }
+
+    @MainActor private func grantRemoteClipboard(_ host: Host, owner: Owner) async throws -> Wire.State {
+        await waitFor("Remote ClipboardHello") { !host.frames(84).isEmpty }
+        let hello = try XCTUnwrap(host.frames(84).last)
+        let nonce = try XCTUnwrap(Wire.decode(type: .clipboardHello, payload: hello).flatMap { message -> UUID? in
+            guard case .hello(_, _, _, let nonce) = message else { return nil }
+            return nonce
+        }, "Expected Remote Hello")
+        return try await grant(host, owner: owner, nonce: nonce)
+    }
+
+    @MainActor private func acceptEmptyTextOffer(_ host: Host, owner: Owner, state: Wire.State) async throws {
+        let responseCount = host.frames(88).count
+        let prefix = Wire.Prefix(token: state.token, epoch: state.epoch, update: UUID())
+        host.send(.offer(.init(prefix: prefix, format: .text, formats: 1, length: 0,
+                               origin: UUID(), counter: 1, revision: 1, digest: Data(SHA256.hash(data: Data())))), to: owner)
+        await waitFor("ClipboardOfferResponse") { host.frames(88).count > responseCount }
+        let response = try XCTUnwrap(host.frames(88).dropFirst(responseCount).first)
+        guard case .response(let acceptedPrefix, true, .ok, _)? = Wire.decode(type: .clipboardOfferResponse, payload: response) else {
+            return XCTFail("Expected the clipboard offer to be accepted")
+        }
+        XCTAssertEqual(acceptedPrefix, prefix)
     }
 
     @MainActor func testMissingUnflaggedMismatchedAndRawUSBRepliesLeaveCastingUnchanged() async throws {
@@ -244,7 +302,8 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         defer { host.stop() }
         let wifi = host.manager.commitCastingClipboardRouteForTesting(usb: false, tls: true)
         let wifiNonce = try await acknowledgeProbe(host, owner: wifi)
-        _ = try await grant(host, owner: wifi, nonce: wifiNonce)
+        let wifiState = try await grant(host, owner: wifi, nonce: wifiNonce)
+        try await acceptEmptyTextOffer(host, owner: wifi, state: wifiState)
         let wifiProbe = try XCTUnwrap(host.frames(6, flags: 0x1000).first)
 
         let usb = host.manager.commitCastingClipboardRouteForTesting(usb: true, tls: true)
@@ -255,7 +314,8 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         XCTAssertEqual(host.frames(111).count, 1)
         let usbNonce = try await acknowledgeProbe(host, owner: usb)
         XCTAssertNotEqual(wifiNonce, usbNonce)
-        _ = try await grant(host, owner: usb, nonce: usbNonce)
+        let usbState = try await grant(host, owner: usb, nonce: usbNonce)
+        try await acceptEmptyTextOffer(host, owner: usb, state: usbState)
         let newWiFi = host.manager.commitCastingClipboardRouteForTesting(usb: false, tls: true)
         await waitFor { host.frames(6, flags: 0x1000).count == 3 && !host.manager.remoteClipboardPasteboard.canSend }
         let newProbe = try XCTUnwrap(host.frames(6, flags: 0x1000).last)
@@ -280,8 +340,15 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         provider.file = url
         provider.registerDataRepresentation(forTypeIdentifier: UTType.utf8PlainText.identifier, visibility: .ownProcess) { _ in nil }
         let host = Host()
-        host.manager.clipboardReadSourceForTesting = .init(changeCount: { board.changeCount },
-            itemCount: { board.numberOfItems }, types: { board.types(forItemSet: IndexSet(integer: 0))?.first ?? [] },
+        // Observe real pasteboard changes for PC copies and echo suppression. Drive
+        // local copies through the file-backed provider with a stable test revision.
+        var localRevision: Int?
+        host.manager.clipboardReadSourceForTesting = .init(changeCount: { localRevision ?? board.changeCount },
+            itemCount: { localRevision == nil ? board.numberOfItems : 1 },
+            types: {
+                if localRevision != nil { return [UTType.utf8PlainText.identifier] }
+                return board.types(forItemSet: IndexSet(integer: 0))?.first ?? []
+            },
             providers: { [provider] })
         host.start()
         defer { host.stop() }
@@ -334,16 +401,18 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         host.manager.setAutomaticClipboardSending(false)
         _ = try await copyOnPC("PC copy in manual mode", counter: 2, retired: retired)
         XCTAssertEqual(notices.count, 1)
-        board.string = "iPad copy"
+        localRevision = board.changeCount + 1
         host.manager.remoteClipboardPasteboard.pollForTesting()
         host.manager.remoteClipboardPasteboard.pollForTesting()
         XCTAssertEqual(provider.fileReads, 0)
+        XCTAssertTrue(host.manager.remoteClipboardPasteboard.canPaste([provider]))
         host.manager.remoteClipboardPasteboard.paste([provider])
         await waitFor { !host.frames(87).isEmpty }
         let payload = try XCTUnwrap(host.frames(87).last)
         guard case .offer(let offer)? = Wire.decode(type: .clipboardOffer, payload: payload) else {
             return XCTFail("Expected iPad offer")
         }
+        XCTAssertEqual(provider.fileReads, 1)
         XCTAssertEqual(offer.digest, Data(SHA256.hash(data: seed)))
         host.send(.response(offer.prefix, true, .ok, 1), to: owner)
         await waitFor { !host.frames(90).isEmpty }
@@ -352,10 +421,17 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         host.send(.result(offer.prefix, true, .ok, 2), to: owner)
 
         host.manager.setAutomaticClipboardSending(true)
-        board.string = "Another copy"
+        let nextCopy = Data("Another copy".utf8)
+        try nextCopy.write(to: url)
+        localRevision = (localRevision ?? board.changeCount) + 1
         host.manager.remoteClipboardPasteboard.pollForTesting()
         host.manager.remoteClipboardPasteboard.pollForTesting()
         await waitFor { host.frames(87).count == 2 }
+        let automaticPayload = try XCTUnwrap(host.frames(87).last)
+        guard case .offer(let automaticOffer)? = Wire.decode(type: .clipboardOffer, payload: automaticPayload) else {
+            return XCTFail("Expected automatic iPad offer")
+        }
+        XCTAssertEqual(automaticOffer.digest, Data(SHA256.hash(data: nextCopy)))
     }
 
     @MainActor func testRemoteMissedCopyHasNoTransferAndGrantStillAcceptsOffers() async throws {
@@ -364,12 +440,8 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         defer { host.stop() }
         host.manager.setAutomaticClipboardSending(false)
         let owner = host.manager.beginRemoteClipboardForTesting()
-        await waitFor { !host.frames(84).isEmpty }
-        let hello = try XCTUnwrap(host.frames(84).last)
-        guard case .hello(_, _, _, let nonce)? = Wire.decode(type: .clipboardHello, payload: hello) else {
-            return XCTFail("Expected Remote Hello")
-        }
-        let state = try await grant(host, owner: owner, nonce: nonce)
+        let state = try await grantRemoteClipboard(host, owner: owner)
+        XCTAssertEqual(host.manager.remoteInputFeatures & RemoteFeatureNegotiation.remoteFileFeature, 0)
         XCTAssertFalse(host.manager.remoteClipboardPasteboard.automatic)
         var notices = 0
         let observer = host.manager.$clipboardMissedCopyNotice.compactMap { $0 }.sink { _ in notices += 1 }
@@ -378,16 +450,58 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         host.send(status, to: owner)
         await waitFor { notices == 1 }
         host.send(status, to: owner)
-        let prefix = Wire.Prefix(token: state.token, epoch: state.epoch, update: UUID())
-        host.send(.offer(.init(prefix: prefix, format: .text, formats: 1, length: 0,
-                               origin: UUID(), counter: 1, revision: 1, digest: Data(SHA256.hash(data: Data())))), to: owner)
-        await waitFor { !host.frames(88).isEmpty }
-        let response = try XCTUnwrap(host.frames(88).last)
-        guard case .response(let acceptedPrefix, true, .ok, _)? = Wire.decode(type: .clipboardOfferResponse, payload: response) else {
-            return XCTFail("Expected the next Remote offer to be accepted")
-        }
-        XCTAssertEqual(acceptedPrefix, prefix)
+        XCTAssertTrue((UInt8(87)...92).allSatisfy { host.frames($0).isEmpty })
+        try await acceptEmptyTextOffer(host, owner: owner, state: state)
         XCTAssertEqual(notices, 1)
+    }
+
+    @MainActor func testRemoteClipboardProgressesWhileQueuedFileChunkIsPaced() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("sample.bin")
+        let bytes = Data([0x01, 0x02, 0x03])
+        try bytes.write(to: source)
+
+        let host = Host(receivedFilesDirectory: root.appendingPathComponent("received"))
+        host.start()
+        defer { host.stop() }
+        host.manager.setAutomaticClipboardSending(false)
+        let owner = host.manager.beginRemoteClipboardForTesting(remoteFiles: true)
+        let state = try await grantRemoteClipboard(host, owner: owner)
+        XCTAssertNotEqual(host.manager.remoteInputFeatures & RemoteFeatureNegotiation.remoteFileFeature, 0)
+
+        let control = WireMessageType.remoteFileControl
+        host.manager.sendTransferFiles([source], scope: host.manager.transferActionScope)
+        await waitFor("Remote File grant request") { !host.frames(control.rawValue).isEmpty }
+        let request = try XCTUnwrap(host.frames(control.rawValue).first)
+        guard case .control(.requestGrant, let id, .both, _)? = RemoteFileProtocol.decode(type: control, payload: request, flags: 0) else {
+            return XCTFail("Expected a Remote File grant request")
+        }
+        let grant = UUID()
+        try host.sendFile(.state(phase: .granted, requestId: id, reason: .none, directions: .both, grantId: grant), to: owner)
+        await waitFor("Remote File offer") { host.filePackets().contains { $0.kind == .offer } }
+        let offer = try XCTUnwrap(host.filePackets().first { $0.kind == .offer })
+
+        // Hold an earlier send so the healthy chunk queues, then pause pacing before it can start writing.
+        let pingCount = host.frames(WireMessageType.ping.rawValue).count
+        host.holdWriterWithPing()
+        await waitFor("held ping") { host.frames(WireMessageType.ping.rawValue).count > pingCount }
+        host.manager.setRemoteFilePacingForTesting(healthy: true)
+        let accepted = TransferPacket(kind: .response, generation: offer.generation, id: offer.id, accepted: true)
+        try host.sendFile(.packet(grantId: grant, transfer: accepted), to: owner)
+        try host.sendFile(.window(grantId: grant, offerId: offer.id, fileIndex: 0, consumedOffset: 0,
+                                  maxOffset: UInt64(bytes.count), maxChunkIndexExclusive: 1), to: owner)
+        await waitFor("Remote File chunk pacing reservation") { host.manager.hasReservedRemoteFileWriteForTesting }
+        host.manager.setRemoteFilePacingForTesting(healthy: false)
+        try host.releasePing()
+
+        try await acceptEmptyTextOffer(host, owner: owner, state: state)
+        XCTAssertEqual(host.filePackets().map(\.kind), [.offer])
+
+        host.manager.setRemoteFilePacingForTesting(healthy: true)
+        await waitFor("Remote File chunk after pacing resumes") { host.filePackets().contains { $0.kind == .chunk } }
+        XCTAssertEqual(host.filePackets().first { $0.kind == .chunk }?.bytes, bytes)
     }
 
     @MainActor func testBackgroundDisablesThenRequestsFreshGrantAndControlLossDisables() async throws {

@@ -20,6 +20,9 @@ final class ControlChannelWriter {
         case telemetry
         case movement
         case bulk
+        case pacedBulk
+
+        var isBulk: Bool { self == .bulk || self == .pacedBulk }
     }
 
     private struct Pending {
@@ -76,12 +79,14 @@ final class ControlChannelWriter {
         return true
     }
 
+    /// A readiness predicate places the frame on the independently bounded paced lane.
     @discardableResult
     func enqueueBulk(_ data: Data, ready: (() -> Bool)? = nil, completion: @escaping (NWError?) -> Void) -> Bool {
         dispatchPrecondition(condition: .onQueue(queue))
-        let count = pending.filter { $0.priority == .bulk }.count + (inFlight?.priority == .bulk ? 1 : 0)
+        let priority: Priority = ready == nil ? .bulk : .pacedBulk
+        let count = pending.filter { $0.priority == priority }.count + (inFlight?.priority == priority ? 1 : 0)
         guard count < 2 else { return false }
-        pending.append(Pending(data: data, priority: .bulk, generation: generation, diagnostic: nil, ready: ready, completion: completion))
+        pending.append(Pending(data: data, priority: priority, generation: generation, diagnostic: nil, ready: ready, completion: completion))
         drain()
         return true
     }
@@ -128,8 +133,17 @@ final class ControlChannelWriter {
     func drain() {
         dispatchPrecondition(condition: .onQueue(queue))
         guard !sending, !pending.isEmpty else { return }
-        let index = pending.firstIndex { $0.priority != .bulk } ?? 0
-        if pending[index].ready?() == false { return }
+        let index: Int
+        if let control = pending.firstIndex(where: { !$0.priority.isBulk }) {
+            index = control
+        } else if pending[0].ready?() != false {
+            index = 0
+        } else if let unpaced = pending.firstIndex(where: { $0.priority == .bulk }) {
+            // Paused file sends leave room for clipboard on the same control stream.
+            index = unpaced
+        } else {
+            return
+        }
         let next = pending.remove(at: index)
         sending = true
         inFlight = next
@@ -161,8 +175,8 @@ final class ControlChannelWriter {
     /// Retires queued transfer frames without disturbing reliable input or the active write.
     func cancelBulk() {
         dispatchPrecondition(condition: .onQueue(queue))
-        let removed = pending.filter { $0.priority == .bulk }
-        pending.removeAll { $0.priority == .bulk }
+        let removed = pending.filter { $0.priority.isBulk }
+        pending.removeAll { $0.priority.isBulk }
         // Settle ownership after queue mutation so callbacks may safely enqueue.
         for item in removed { item.completion(.posix(.ECANCELED)) }
     }

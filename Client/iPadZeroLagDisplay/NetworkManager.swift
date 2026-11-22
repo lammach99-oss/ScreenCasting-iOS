@@ -572,6 +572,7 @@ public class NetworkManager: ObservableObject {
     var connectionListenerPortForTesting: UInt16?
     var connectionListenerReadyForTesting: (() -> Void)?
     var usbIdentityCredentialLoadForTesting: (() -> TrustedHostCredential?)?
+    var usbServerTLSIdentityForTesting: USBServerTLSIdentity?
     private var connectionVideoReceivedAtForTesting: TimeInterval?
     #endif
     private lazy var controlChannelWriter = ControlChannelWriter(
@@ -5222,10 +5223,9 @@ public class NetworkManager: ObservableObject {
                 completion(.posix(.ECANCELED)); return
             }
             if bulk {
-                let remote = data.count >= WireProtocol.headerSize && self.remoteInputConnection
-                let ready: (() -> Bool)? = remote ? { [weak self] in
-                    guard let self, self.remoteFilePacketIsCurrent(data),
-                          self.remoteClipboardPacketIsCurrent(data) else { return true }
+                let paced = data.count >= WireProtocol.headerSize && (100...103).contains(data[5])
+                let ready: (() -> Bool)? = paced ? { [weak self] in
+                    guard let self, self.remoteFilePacketIsCurrent(data) else { return true }
                     return self.remoteFilePacing.rate(now: ProcessInfo.processInfo.systemUptime,
                                                      unsettled: self.remoteFileMediaBlocked) > 0
                 } : nil
@@ -7222,7 +7222,7 @@ public class NetworkManager: ObservableObject {
         return owner
     }
 
-    func beginRemoteClipboardForTesting() -> (connection: NWConnection, generation: UInt64) {
+    func beginRemoteClipboardForTesting(remoteFiles: Bool = false) -> (connection: NWConnection, generation: UInt64) {
         let owner = simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS, remote: true)
         networkQueue.sync {
             controlChannelWriter.begin(generation: owner.generation)
@@ -7231,8 +7231,9 @@ public class NetworkManager: ObservableObject {
             trustedCredential = TrustedHostCredential(fingerprint: "", hostID: Data(count: 16), deviceID: Data(),
                                                        secret: Data(), sessionID: Data())
             _ = remoteFeatures.begin(now: 0)
-            _ = remoteFeatures.pong(flags: Clipboard.marker, now: 1, requestClipboard: true)
-            let payload = RemoteFeaturesMessage(features: Clipboard.features | 3).encode()
+            _ = remoteFeatures.pong(flags: Clipboard.marker, now: 1, requestRemoteFiles: remoteFiles, requestClipboard: true)
+            let fileFeatures = remoteFiles ? RemoteFeatureNegotiation.remoteFileFeature : 0
+            let payload = RemoteFeaturesMessage(features: Clipboard.features | 3 | fileFeatures).encode()
             handleWireMessage(WireMessage(header: WireHeader(type: .remoteFeaturesResult, flags: 0,
                 payloadLength: payload.count, sequence: 0), payload: payload, firstByteAt: 0), generation: owner.generation)
         }
@@ -7240,6 +7241,23 @@ public class NetworkManager: ObservableObject {
                                                 left: 0, top: 0, width: 1, height: 1)
         receiveRemoteMonitorContextForTesting(context, keyframe: true)
         return owner
+    }
+
+    var hasReservedRemoteFileWriteForTesting: Bool {
+        networkQueue.sync { remoteFilePacing.nextWrite > 0 }
+    }
+
+    func setRemoteFilePacingForTesting(healthy: Bool) {
+        networkQueue.sync {
+            remoteFilePacing = RemoteFileMediaPacing()
+            if healthy {
+                let now = ProcessInfo.processInfo.systemUptime
+                remoteFilePacing.feedback(now: now - 1.25, presented: 0, queueAge: 0, drops: 0)
+                remoteFilePacing.received(bytes: 1_000_000)
+                remoteFilePacing.feedback(now: now, presented: 1, queueAge: 0, drops: 0)
+            }
+            controlChannelWriter.drain()
+        }
     }
 
     func receiveClipboardWireForTesting(_ bytes: Data, generation: UInt64, connection owner: NWConnection) {
@@ -8020,7 +8038,12 @@ public class NetworkManager: ObservableObject {
               !connectionHandoffInProgress || connectionPairingMatches(credential) else { return }
         let generation = connectionGeneration
         usbControlTLSUpgrade = USBControlTLSUpgrade(listenerPort: port, peer: candidate.endpoint,
-            credential: credential, queue: networkQueue) { [weak self, weak candidate] advertisedAt in
+             credential: credential, queue: networkQueue, loadIdentity: { [weak self] in
+                 #if targetEnvironment(simulator)
+                 if let identity = self?.usbServerTLSIdentityForTesting { return identity }
+                 #endif
+                 return USBServerTLSIdentity()
+             }) { [weak self, weak candidate] advertisedAt in
                 guard let self, let candidate else { return }
                 self.networkQueue.asyncAfter(deadline: advertisedAt + USBControlTLSUpgrade.budget) { [weak self, weak candidate] in
                     guard let self, let candidate, self.connection === candidate,

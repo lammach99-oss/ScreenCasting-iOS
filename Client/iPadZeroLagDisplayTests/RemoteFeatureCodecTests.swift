@@ -735,6 +735,11 @@ final class RemoteFeatureCodecTests: XCTestCase {
               case let .packet(_, chunk) = try goldenFile("file-chunk") else { return XCTFail("Expected fixture packets") }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
+        func stages(for id: UUID) throws -> [URL] {
+            let files = FileManager.default
+            return try files.contentsOfDirectory(at: files.temporaryDirectory, includingPropertiesForKeys: nil)
+                .filter { $0.lastPathComponent.hasPrefix(".scdt-\(id.uuidString)-") && $0.pathExtension == "part" }
+        }
         var manager: DataTransferManager!
         var events: [String] = []
         var published: [URL] = []
@@ -743,8 +748,9 @@ final class RemoteFeatureCodecTests: XCTestCase {
                 consumedOffset: window.consumed, maxOffset: window.limit, maxChunkIndexExclusive: window.chunks)
             XCTAssertNotNil(RemoteFileProtocol.encode(message))
             if window.consumed == 1 {
-                let stage = try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
-                    .first { $0.pathExtension == "part" }
+                let activeStages = try? stages(for: window.offer)
+                XCTAssertEqual(activeStages?.count, 1)
+                let stage = activeStages?.first
                 XCTAssertEqual(stage.flatMap { try? Data(contentsOf: $0) }, chunk.bytes)
             }
             XCTAssertTrue(manager.authorizeRemoteWindow(window, beginWrite: true))
@@ -794,8 +800,10 @@ final class RemoteFeatureCodecTests: XCTestCase {
         manager.drainRemoteIOForTesting()
         manager.decide(true, consent: try XCTUnwrap(manager.consentForTesting()))
         for _ in 0..<3 { manager.drainRemoteIOForTesting() }
+        XCTAssertEqual(try stages(for: interrupted.id).count, 1)
         manager.retire()
         manager.drainRemoteIOForTesting()
+        XCTAssertTrue(try stages(for: interrupted.id).isEmpty)
         XCTAssertFalse(manager.post(chunk))
         let urls = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
         XCTAssertTrue(urls.contains(saved))

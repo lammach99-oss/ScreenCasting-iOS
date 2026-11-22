@@ -184,6 +184,116 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         func delete(fingerprint: String) -> Bool { entries.removeValue(forKey: fingerprint); return true }
     }
 
+    private enum LoopbackIdentities {
+        static let device = Result { try importIdentity(devicePKCS12) }
+        static let peer = Result { try importIdentity(peerPKCS12) }
+
+        private static func importIdentity(_ encoded: String) throws -> SecIdentity {
+            let data = try XCTUnwrap(Data(base64Encoded: encoded, options: .ignoreUnknownCharacters))
+            var options: [String: Any] = [kSecImportExportPassphrase as String: "usb-loopback"]
+            if #available(iOS 18.0, *) { options[kSecImportToMemoryOnly as String] = true }
+            var items: CFArray?
+            let status = SecPKCS12Import(data as CFData, options as CFDictionary, &items)
+            XCTAssertEqual(status, errSecSuccess, "Loopback PKCS#12 import")
+            let entries = items as? [[String: Any]]
+            let value = try XCTUnwrap(entries?.first?[kSecImportItemIdentity as String]) as CFTypeRef
+            let identity = CFGetTypeID(value) == SecIdentityGetTypeID()
+                ? unsafeBitCast(value, to: SecIdentity.self) : nil
+            return try XCTUnwrap(identity)
+        }
+
+        // Public test-only identities generated for these loopback sockets.
+        // The private keys are fixtures. They must never be used outside this suite.
+        private static let devicePKCS12 = """
+        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
+        """
+        private static let peerPKCS12 = """
+        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
+        """
+    }
+
     private final class Session {
         let suite: String
         let defaults: UserDefaults
@@ -196,8 +306,8 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         let leafHash: Data
 
         init(wrongPin: Bool = false, tlsSeen: Bool? = nil) throws {
-            let identity = try XCTUnwrap(USBServerIdentityStore.loadOrCreate())
-            let peer = try XCTUnwrap(USBServerIdentityStore.simulatorPeerIdentity())
+            let identity = try LoopbackIdentities.device.get()
+            let peer = try LoopbackIdentities.peer.get()
             let deviceHash = try Self.hash(identity)
             let peerHash = try Self.hash(peer)
             XCTAssertNotEqual(deviceHash, peerHash)
@@ -215,6 +325,7 @@ final class USBControlTLSIntegrationTests: XCTestCase {
             suite = suiteName
             defaults = settings
             manager = NetworkManager(userDefaults: settings)
+            manager.usbServerTLSIdentityForTesting = try XCTUnwrap(USBServerTLSIdentity(identity: identity))
             try pair()
             manager.installTrustedHostStoresForTesting(credentials: credentials, pins: pins)
         }
@@ -241,7 +352,6 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         func stop() {
             manager.stopForTesting()
             defaults.removePersistentDomain(forName: suite)
-            USBServerIdentityStore.deleteSimulatorPeerIdentity()
         }
     }
 
@@ -576,6 +686,7 @@ final class USBControlTLSIntegrationTests: XCTestCase {
     private final class HostTLSFramer: NWProtocolFramerImplementation {
         static let label = "USB control TLS fake host"
         static let definition = NWProtocolFramer.Definition(implementation: HostTLSFramer.self)
+        private var forwardingTLS = false
         init(framer: NWProtocolFramer.Instance) {}
 
         func start(framer: NWProtocolFramer.Instance) -> NWProtocolFramer.StartResult {
@@ -585,6 +696,9 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         }
 
         func handleInput(framer: NWProtocolFramer.Instance) -> Int {
+            if forwardingTLS {
+                return USBControlTLSFramer.forwardInput(framer: framer)
+            }
             let expected = USBControlTLSIntegrationTests.frame(
                 .pong, USBControlTLSIntegrationTests.readiness, flags: 0x2080)
             var matched = false
@@ -594,8 +708,8 @@ final class USBControlTLSIntegrationTests: XCTestCase {
                 return bytes.count
             }
             guard parsed else { return expected.count }
-            guard matched, let peer = USBServerIdentityStore.simulatorPeerIdentity(),
-                  let local = sec_identity_create(peer), let identity = USBServerIdentityStore.copy() else {
+            guard matched, let peer = try? LoopbackIdentities.peer.get(),
+                  let local = sec_identity_create(peer), let identity = try? LoopbackIdentities.device.get() else {
                 framer.markFailed(error: .posix(.EPROTO)); return 0
             }
             var certificate: SecCertificate?
@@ -613,14 +727,17 @@ final class USBControlTLSIntegrationTests: XCTestCase {
             }, DispatchQueue.global())
             do { try framer.prependApplicationProtocol(options: tls) }
             catch { framer.markFailed(error: .posix(.EPROTO)); return 0 }
-            framer.passThroughInput()
+            forwardingTLS = true
             framer.passThroughOutput()
             framer.markReady()
-            return 0
+            return USBControlTLSFramer.forwardInput(framer: framer)
         }
 
         func handleOutput(framer: NWProtocolFramer.Instance, message: NWProtocolFramer.Message,
-                          messageLength: Int, isComplete: Bool) {}
+                          messageLength: Int, isComplete: Bool) {
+            do { try framer.writeOutputNoCopy(length: messageLength) }
+            catch { framer.markFailed(error: .posix(.EIO)) }
+        }
         func wakeup(framer: NWProtocolFramer.Instance) {}
         func stop(framer: NWProtocolFramer.Instance) -> Bool { true }
         func cleanup(framer: NWProtocolFramer.Instance) {}
