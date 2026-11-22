@@ -20,12 +20,27 @@ final class ConnectionSwitchStateTests: XCTestCase {
         else if status != .accepted { b.replaceSubrange(40..<56, with: repeatElement(UInt8(0), count: 16)); b[6] = status == .permissionRequired ? 3 : 1 }
         return try ConnectionSelectResult.decode(Data(b))
     }
-    static func prepare() throws -> ConnectionControlState {
-        var bytes = Array(try snapshot().encode()); bytes[7] = 1; bytes[24] = 1
+    static func prepare(target: ConnectionRoute = .usb) throws -> ConnectionControlState {
+        var bytes = Array(try snapshot(route: target == .usb ? .wifi : .usb).encode())
+        bytes[7] = target == .usb ? ConnectionStatePhase.prepareUSB.rawValue : ConnectionStatePhase.prepareWiFi.rawValue
+        bytes[24] = 1
         bytes.replaceSubrange(48..<64, with: UInt8(0)..<UInt8(16))
         bytes.replaceSubrange(64..<96, with: UInt8(32)..<UInt8(64))
         bytes.replaceSubrange(96..<128, with: UInt8(64)..<UInt8(96))
         return try ConnectionControlState.decode(Data(bytes))
+    }
+    static func wifiResult(failure: ConnectionReason? = nil) throws -> ConnectionSelectResult {
+        var bytes = Array(ConnectionControlProtocolTests.accepted.dropFirst(16))
+        bytes[2] = ConnectionRoute.wifi.rawValue
+        bytes[3] = ConnectionRoute.usb.rawValue
+        bytes[8] = 1
+        if let failure {
+            bytes[1] = ConnectionResultStatus.failed.rawValue
+            bytes[4] = UInt8(failure.rawValue)
+            bytes[6] = ConnectionHostState.failed.rawValue
+            bytes[24] = 4; bytes[32] = 3
+        }
+        return try ConnectionSelectResult.decode(Data(bytes))
     }
     func ready(allowed: Bool = true) throws -> ConnectionSwitchState {
         var state = ConnectionSwitchState(); state.begin(generation: 1)
@@ -54,7 +69,7 @@ final class ConnectionSwitchStateTests: XCTestCase {
         XCTAssertTrue(state.receive(try Self.snapshot(revision: 3, owner: 2, route: .usb), generation: 2, now: 3))
         XCTAssertTrue(state.receive(try Self.result(.completed), generation: 2, now: 4))
         var lostBeforeRender = state
-        XCTAssertTrue(lostBeforeRender.beginWifiRollback(reason: .connectionLost, now: 4))
+        XCTAssertTrue(lostBeforeRender.beginRollback(reason: .connectionLost, now: 4))
         XCTAssertTrue(lostBeforeRender.inputBlocked)
         state.expectDisplay(request: 7, decoder: 11, generation: 2)
         state.displayReady(request: 7, generation: 2, now: 4)
@@ -70,16 +85,16 @@ final class ConnectionSwitchStateTests: XCTestCase {
         XCTAssertTrue(state.receive(try Self.result(.unavailable, reason: .tunnelUnavailable), generation: 1, now: 2))
         XCTAssertFalse(state.inputBlocked); XCTAssertNil(state.pending)
         XCTAssertEqual(state.generation, 1); XCTAssertEqual(state.actualRoute, .wifi)
-        XCTAssertFalse(state.beginWifiRollback(reason: .connectionLost, now: 2))
+        XCTAssertFalse(state.beginRollback(reason: .connectionLost, now: 2))
     }
     func testRollbackRequiresFreshWifiAndExactFailedAuthority() throws {
         var state = try preparedProtectedSwitch()
         XCTAssertTrue(state.markUSBProbeAnswered(generation: 1, now: 2))
         XCTAssertTrue(state.receive(try Self.snapshot(revision: 3, hostState: .switching), generation: 1, now: 2))
         XCTAssertTrue(state.receive(try Self.result(.accepted), generation: 1, now: 2))
-        XCTAssertTrue(state.beginWifiRollback(reason: .connectionLost, now: 3))
-        XCTAssertFalse(state.bindWifiRollback(generation: 2, authenticated: false, now: 4))
-        XCTAssertTrue(state.bindWifiRollback(generation: 2, authenticated: true, now: 4))
+        XCTAssertTrue(state.beginRollback(reason: .connectionLost, now: 3))
+        XCTAssertFalse(state.bindRollback(generation: 2, route: .wifi, authenticated: false, now: 4))
+        XCTAssertTrue(state.bindRollback(generation: 2, route: .wifi, authenticated: true, now: 4))
         let hello = try XCTUnwrap(state.advertise(flags: 0x0300, authenticated: true, generation: 2))
         XCTAssertEqual(try ConnectionHello.decode(hello).kind, .optIn)
         XCTAssertTrue(state.receive(try Self.snapshot(revision: 3, owner: 2, hostState: .failed), generation: 2, now: 4))
@@ -102,14 +117,64 @@ final class ConnectionSwitchStateTests: XCTestCase {
         XCTAssertTrue(state.receive(failed, generation: 2, now: 4))
         XCTAssertEqual(state.actualRoute, .wifi); XCTAssertFalse(state.inputBlocked)
         XCTAssertEqual(state.issue, .connectionLost); XCTAssertNil(state.pending)
+        let panel = SessionConnectionPresentation(state: state, streamingRoute: .wifi, hasWifiEndpoint: true)
+        XCTAssertEqual(panel.outcome, "USB switch failed. Reconnected over Wi-Fi.")
+        XCTAssertEqual(panel.action, .change(.usb, faster: false))
+        XCTAssertNotNil(state.select(.usb, now: 4), "A rendered rollback restores route admission")
+    }
+    func testUSBRestoreRequiresOriginalFailureAndFreshOwnedRender() throws {
+        var state = ConnectionSwitchState()
+        state.begin(generation: 1)
+        XCTAssertNotNil(state.advertise(flags: 0x0300, authenticated: true, generation: 1))
+        XCTAssertTrue(state.receive(try Self.snapshot(route: .usb), generation: 1, now: 0))
+        XCTAssertNotNil(state.select(.wifi, now: 0))
+        XCTAssertTrue(state.preparing(try Self.prepare(target: .wifi), generation: 1, now: 1))
+        XCTAssertTrue(state.receive(try Self.snapshot(revision: 3, route: .usb, hostState: .switching),
+                                    generation: 1, now: 2))
+        XCTAssertTrue(state.receive(try Self.wifiResult(), generation: 1, now: 2))
+        XCTAssertTrue(state.bindReplacement(generation: 2, route: .wifi, authenticated: true, now: 3))
+        XCTAssertTrue(state.beginRollback(reason: .connectionLost, now: 90))
+        XCTAssertEqual(state.message, "Reconnecting over USB...")
+        XCTAssertFalse(state.bindRollback(generation: 3, route: .usb, authenticated: false, now: 91))
+        XCTAssertFalse(state.bindRollback(generation: 3, route: .wifi, authenticated: true, now: 91))
+        XCTAssertTrue(state.bindRollback(generation: 3, route: .usb, authenticated: true, now: 91))
+        XCTAssertNotNil(state.advertise(flags: 0x0300, authenticated: true, generation: 3))
+        XCTAssertFalse(state.receive(try Self.snapshot(revision: 4, owner: 1, route: .usb), generation: 3, now: 92))
+        XCTAssertTrue(state.receive(try Self.snapshot(revision: 4, owner: 3, route: .usb, hostState: .failed),
+                                    generation: 3, now: 92))
+        let failed = try Self.wifiResult(failure: .firstFrameTimeout)
+        var bytes = Array(try failed.encode())
+        bytes[40] ^= 1
+        XCTAssertFalse(state.receive(try ConnectionSelectResult.decode(Data(bytes)), generation: 3, now: 92))
+        XCTAssertFalse(state.receive(failed, generation: 2, now: 92))
+        state.expectDisplay(request: 7, decoder: 11, generation: 3)
+        state.displayReady(request: 7, generation: 3, now: 92)
+        state.observeIDR(sequence: 0, domain: .scst, decoder: 11, generation: 3)
+        state.rendered(sequence: 0, domain: .scst, decoder: 11, generation: 2, now: 92)
+        XCTAssertTrue(state.inputBlocked)
+        var withoutResult = state
+        withoutResult.rendered(sequence: 0, domain: .scst, decoder: 11, generation: 3, now: 92)
+        withoutResult.tick(now: 98)
+        XCTAssertTrue(withoutResult.inputBlocked)
+        XCTAssertNotNil(withoutResult.pending)
+        withoutResult.tick(now: 165)
+        XCTAssertTrue(withoutResult.offersReconnect)
+        XCTAssertTrue(state.receive(failed, generation: 3, now: 92))
+        XCTAssertTrue(state.inputBlocked)
+        state.rendered(sequence: 0, domain: .scst, decoder: 11, generation: 3, now: 92)
+        XCTAssertFalse(state.inputBlocked)
+        XCTAssertEqual(state.issue, .firstFrameTimeout)
+        let panel = SessionConnectionPresentation(state: state, streamingRoute: .usb, hasWifiEndpoint: true)
+        XCTAssertEqual(panel.activeRoute, .usb)
+        XCTAssertEqual(panel.outcome, "Wi-Fi switch failed. Reconnected over USB.")
     }
     func testLostAcceptedCanRecoverWithinRollbackDeadline() throws {
         var state = try preparedProtectedSwitch()
-        XCTAssertFalse(state.beginWifiRollback(reason: .connectionLost, now: 2))
+        XCTAssertFalse(state.beginRollback(reason: .connectionLost, now: 2))
         XCTAssertTrue(state.markUSBProbeAnswered(generation: 1, now: 2))
-        XCTAssertFalse(state.beginWifiRollback(reason: .stoppedOnPC, now: 3))
-        XCTAssertTrue(state.beginWifiRollback(reason: .connectionLost, now: 3))
-        XCTAssertTrue(state.bindWifiRollback(generation: 2, authenticated: true, now: 119))
+        XCTAssertFalse(state.beginRollback(reason: .stoppedOnPC, now: 3))
+        XCTAssertTrue(state.beginRollback(reason: .connectionLost, now: 3))
+        XCTAssertTrue(state.bindRollback(generation: 2, route: .wifi, authenticated: true, now: 119))
         _ = state.advertise(flags: 0x0300, authenticated: true, generation: 2)
         XCTAssertTrue(state.receive(try Self.snapshot(revision: 3, owner: 2), generation: 2, now: 119))
         state.expectDisplay(request: 7, decoder: 11, generation: 2)
@@ -126,8 +191,8 @@ final class ConnectionSwitchStateTests: XCTestCase {
     func testWifiRollbackRejectsLateAuthenticationAndOldHosts() throws {
         var protected = try preparedProtectedSwitch()
         XCTAssertTrue(protected.markUSBProbeAnswered(generation: 1, now: 2))
-        XCTAssertTrue(protected.beginWifiRollback(reason: .connectionLost, now: 3))
-        XCTAssertFalse(protected.bindWifiRollback(generation: 2, authenticated: true, now: 120))
+        XCTAssertTrue(protected.beginRollback(reason: .connectionLost, now: 3))
+        XCTAssertFalse(protected.bindRollback(generation: 2, route: .wifi, authenticated: true, now: 120))
         XCTAssertTrue(protected.inputBlocked); XCTAssertTrue(protected.offersReconnect)
 
         var legacy = try ready()
@@ -135,7 +200,7 @@ final class ConnectionSwitchStateTests: XCTestCase {
         XCTAssertTrue(legacy.preparing(try Self.prepare(), generation: 1, now: 1))
         XCTAssertTrue(legacy.receive(try Self.snapshot(revision: 3, hostState: .switching), generation: 1, now: 2))
         XCTAssertTrue(legacy.receive(try Self.result(.accepted), generation: 1, now: 2))
-        XCTAssertFalse(legacy.beginWifiRollback(reason: .connectionLost, now: 3))
+        XCTAssertFalse(legacy.beginRollback(reason: .connectionLost, now: 3))
     }
     func testAcceptedFromTenPointOneThroughFourteenPointNineSecondsContinuesToOwnedRender() throws {
         for arrival in [10.1, 12, 14.9] {

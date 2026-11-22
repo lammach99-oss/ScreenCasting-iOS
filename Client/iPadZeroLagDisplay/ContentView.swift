@@ -262,6 +262,22 @@ struct HostIdentityConfirmationView: View {
 
 // MARK: - ContentView
 
+extension View {
+    @MainActor func trustedHostForgetAlert(_ networkManager: NetworkManager, visible: Bool) -> some View {
+        alert("Forget PC", isPresented: Binding(
+            get: { visible && networkManager.trustedHostForgetOutcome != nil },
+            set: { if visible && !$0 { networkManager.dismissTrustedHostForgetOutcome() } }
+        )) {
+            if case .cleanupIncomplete? = networkManager.trustedHostForgetOutcome {
+                Button("Retry cleanup") { networkManager.retryTrustedHostCleanup() }
+            }
+            Button("OK", role: .cancel) { networkManager.dismissTrustedHostForgetOutcome() }
+        } message: {
+            Text(networkManager.trustedHostForgetOutcome?.message ?? "")
+        }
+    }
+}
+
 @MainActor public struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     private static let geometryLogger = Logger(
@@ -349,6 +365,10 @@ struct HostIdentityConfirmationView: View {
             if newState == .streaming { enteredPIN = "" }
             updateWifiBrowsing(for: newState)
         }
+        .onChange(of: discoveryManager.discoveredHosts) { _, hosts in
+            networkManager.updateDiscoveredWifiEndpoints(hosts.map(\.endpoint))
+        }
+        .trustedHostForgetAlert(networkManager, visible: !isSheetPresented)
         .onChange(of: connectStatus.text) { _, text in
             if !streamManager.isConnected { UIAccessibility.post(notification: .announcement, argument: text) }
         }
@@ -420,8 +440,10 @@ struct HostIdentityConfirmationView: View {
     }
 
     private var normalizedManualHost: String? {
-        RemoteHostAddress.parse(hostIP)?.host
+        RemoteHostAddress.parseManual(hostIP, port: manualHostPort)?.host
     }
+
+    private var manualHostPort: UInt16 { remoteControlMode ? NetworkManager.remoteControlPort : 27015 }
 
     private func updateDisplayOrientation(for size: CGSize) {
         rootSurfaceSize = size
@@ -1021,7 +1043,7 @@ struct HostIdentityConfirmationView: View {
                             .frame(minHeight: 44)
                             .disabled(owner.isConnectBusy)
                             .accessibilityHint("Applies to whole-PC connections. The PC must grant permission.")
-                        Toggle("Allow clipboard sync in Remote sessions", isOn: Binding(
+                        Toggle("Allow clipboard sync in casting and Remote sessions", isOn: Binding(
                             get: { owner.networkManager.remoteClipboardEnabled },
                             set: { owner.networkManager.setRemoteClipboardEnabled($0) }))
                             .font(.subheadline)
@@ -1157,7 +1179,7 @@ struct HostIdentityConfirmationView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     RecentHosts(owner: owner)
                     owner.rowLayout {
-                        TextField("192.168.1.20 or pc-name", text: owner.$hostIP)
+                        TextField("IP address or PC name", text: owner.$hostIP)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                             .keyboardType(.URL)
@@ -1176,7 +1198,7 @@ struct HostIdentityConfirmationView: View {
                             owner.recentRemoteHosts = RecentRemoteHostStore.record(host: host, remoteControl: owner.remoteControlMode)
                             owner.networkManager.connect(
                                 to: host,
-                                port: owner.remoteControlMode ? NetworkManager.remoteControlPort : 27015)
+                                port: owner.manualHostPort)
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.large)
@@ -1191,7 +1213,7 @@ struct HostIdentityConfirmationView: View {
                         .frame(minHeight: 44)
                         .accessibilityHint("Connects to the remote control service on port 27020")
                     if !owner.hostIP.isEmpty && owner.normalizedManualHost == nil {
-                        Text("Enter an IP address or a PC name, like 100.64.0.10 or office-pc.")
+                        Text("Enter an IPv4 or IPv6 address, or a PC name. If you include an IPv6 port, use brackets and port \(owner.manualHostPort).")
                             .font(.caption)
                             .foregroundStyle(Color.inkWarning)
                     }

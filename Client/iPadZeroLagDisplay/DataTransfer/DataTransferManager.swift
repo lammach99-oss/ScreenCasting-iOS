@@ -13,6 +13,7 @@ final class DataTransferManager {
         var stage = "idle"
         var transport = "Connected to PC"
         var failure: FailureDetail?
+        var rejectionReason: TransferReason?
         var retainedBytes: UInt64 = 0
         var retainedCount = 0
         var eligibleCount = 0
@@ -82,7 +83,7 @@ final class DataTransferManager {
         var consumedChunks: UInt64 = 0
         var chunkInFlight = false
         var windowInFlight = false
-        var nextWindow: (file: Int, consumed: UInt64, chunks: UInt64)?
+        var nextWindow: (consumed: UInt64, chunks: UInt64)?
         var progressAt = ProcessInfo.processInfo.systemUptime
         var pausedAt: TimeInterval?
         var received: [URL] = []
@@ -100,6 +101,8 @@ final class DataTransferManager {
     private var pending = 0
     private var remoteRetired = false
     private var remoteUploadQueued = false
+    // One manager per DS5 grant. Both host versions advertise the same grant limits.
+    private var remotePeerUsesWideWindows = false
     private var downloadCredit: DownloadCredit?
     private var proposedDownloadCredit: DownloadCredit?
     private var deadlineCheckQueued = false
@@ -243,20 +246,25 @@ final class DataTransferManager {
         active.consumedChunks += UInt64(consumed.count)
         active.sentEnds.removeFirst(consumed.count)
         active.credit = window
+        if window.chunks == active.consumedChunks + UInt64(RemoteFileProtocol.maxPendingChunks) {
+            remotePeerUsesWideWindows = true
+        }
         if active.waiting == nil { pump(active) }
     }
 
     private func grantReceiveCredit(_ active: Owner, consumed: UInt64, chunks: UInt64) {
         guard let remoteWindowSender, current(active), active.index < active.files.count else { return }
         let length = active.files[active.index].length
-        guard consumed < length else { return }
+        guard consumed < length else { active.nextWindow = nil; return }
         if active.windowInFlight {
-            active.nextWindow = (active.index, consumed, chunks)
+            active.nextWindow = (consumed, chunks)
             return
         }
-        let window = FileWindow(offer: active.id, file: UInt16(active.index), consumed: consumed,
-                                limit: min(length, consumed + UInt64(RemoteFileProtocol.maxChunkBytes)),
-                                chunks: chunks + 1)
+        let slots = min(UInt64(remotePeerUsesWideWindows ? RemoteFileProtocol.maxPendingChunks : 1), length - consumed)
+        let file = active.index
+        let window = FileWindow(offer: active.id, file: UInt16(file), consumed: consumed,
+                                limit: min(length, consumed + slots * UInt64(RemoteFileProtocol.maxChunkBytes)),
+                                chunks: chunks + slots)
         admission.lock()
         guard !remoteRetired else { admission.unlock(); return }
         proposedDownloadCredit = DownloadCredit(generation: active.generation, window: window, offset: consumed, chunk: chunks)
@@ -265,12 +273,12 @@ final class DataTransferManager {
         remoteWindowSender(window) { [weak self, weak active] ok in
             guard let self, let active else { return }
             self.queue.async {
-                guard self.current(active) else { return }
+                guard self.current(active), active.index == file else { return }
                 active.windowInFlight = false
                 guard ok else { self.fail(); return }
                 let next = active.nextWindow
                 active.nextWindow = nil
-                if let next, next.file == active.index {
+                if let next {
                     self.grantReceiveCredit(active, consumed: next.consumed, chunks: next.chunks)
                 }
             }
@@ -278,8 +286,13 @@ final class DataTransferManager {
     }
     func authorizeRemoteWindow(_ window: FileWindow, beginWrite: Bool) -> Bool {
         admission.lock(); defer { admission.unlock() }
-        guard !remoteRetired, let credit = proposedDownloadCredit, credit.window == window else { return false }
+        guard !remoteRetired, var credit = proposedDownloadCredit, credit.window == window else { return false }
         if beginWrite {
+            // Earlier credit can admit more chunks while the replacement is queued.
+            if let previous = downloadCredit, previous.window.offer == window.offer, previous.window.file == window.file {
+                credit.offset = max(credit.offset, previous.offset)
+                credit.chunk = max(credit.chunk, previous.chunk)
+            }
             downloadCredit = credit
             proposedDownloadCredit = nil
         }
@@ -450,9 +463,10 @@ final class DataTransferManager {
     }
     private func packet(_ active: Owner,_ kind: TransferKind) -> TransferPacket {TransferPacket(kind:kind,generation:active.generation,id:active.id)}
     private func current(_ active: Owner) -> Bool {!retired && owner === active && remoteIsLive}
-    private func publish(_ phase: Phase) {
+    private func publish(_ phase: Phase, rejectionReason: TransferReason? = nil) {
         snapshot.consent = owner.flatMap { !$0.outgoing && !$0.accepted && phase == .awaitingDecision ? Consent(sessionID: sessionID, transferID: $0.id) : nil }
         snapshot.phase=phase
+        snapshot.rejectionReason = rejectionReason
         snapshot.transport=transport
         snapshot.stage = diagnosticStage
         if let active=owner {snapshot.outgoing=active.outgoing;snapshot.count=active.files.count;snapshot.index=active.index;snapshot.published=active.published;snapshot.bytes=active.bytes;snapshot.total=active.files.reduce(0){$0+$1.length};snapshot.name=active.index<active.files.count ? active.files[active.index].name : snapshot.name}
@@ -465,7 +479,7 @@ final class DataTransferManager {
         guard now-active.lastProgress>=0.1 else{return};active.lastProgress=now
         snapshot.bytes=bytes;snapshot.phase=active.outgoing ? .sending : .receiving;changed?(snapshot)
     }
-    private func finish(_ phase: Phase) {
+    private func finish(_ phase: Phase, rejectionReason: TransferReason? = nil) {
         admission.lock();wireOwner=nil;downloadCredit=nil;proposedDownloadCredit=nil;admission.unlock()
         if let active=owner {
             if remoteWindowSender != nil, active.outgoing, [.failed, .cancelled, .rejected].contains(phase) {
@@ -476,7 +490,7 @@ final class DataTransferManager {
         }
         if phase == .retired || phase == .completed { retrySources = [] }
         snapshot.retryCount = retrySources.count
-        refreshRetainedFiles();publish(phase);owner=nil
+        refreshRetainedFiles();publish(phase, rejectionReason: rejectionReason);owner=nil
     }
     private func fail(phase: Phase = .failed, error: Error? = nil, reason: TransferReason = .cancelled) {
         guard let active=owner else {return}
@@ -521,7 +535,12 @@ final class DataTransferManager {
         if p.kind == .cancel {finish(.cancelled);return}
         if active.outgoing {
             guard active.waiting == p.kind else {throw TransferProtocol.Failure.invalid}
-            if p.kind == .response {guard p.accepted else {finish(.rejected);return};active.waiting=nil;try openNext(active);return}
+            if p.kind == .response {
+                guard p.accepted else { finish(.rejected, rejectionReason: p.reason); return }
+                active.waiting = nil
+                try openNext(active)
+                return
+            }
             if p.kind == .fileAck {
                 guard p.reason == .ok, p.fileIndex==active.index else {throw TransferProtocol.Failure.invalid}
                 active.bytes+=active.files[active.index].length;active.published+=1;active.index+=1;active.waiting=nil
@@ -536,6 +555,9 @@ final class DataTransferManager {
             diagnosticStage = "write"
             guard p.fileIndex==active.index,let store=active.store else {throw TransferProtocol.Failure.invalid}
             try store.append(chunk:p.chunkIndex,offset:p.offset,bytes:p.bytes)
+            if remoteWindowSender != nil, p.bytes.count > RemoteFileProtocol.defaultChunkBytes {
+                remotePeerUsesWideWindows = true
+            }
             active.observedBytes += UInt64(p.bytes.count)
             active.receivedChunks += 1
             if p.chunkIndex == 0 {event("first_chunk", updateStage:false)}
@@ -561,9 +583,11 @@ final class DataTransferManager {
                 refreshRetainedFiles();throw error
             }
             active.received.append(final);active.bytes+=p.offset;active.published+=1;active.index+=1
+            active.windowInFlight = false
+            active.nextWindow = nil
+            admission.lock(); downloadCredit = nil; proposedDownloadCredit = nil; admission.unlock()
             refreshRetainedFiles();event("published")
             if active.index<active.files.count {active.store=try TransferStore(directory:directory,metadata:active.files[active.index],id:active.id)}
-            admission.lock(); downloadCredit = nil; proposedDownloadCredit = nil; admission.unlock()
             var ack=packet(active,.fileAck);ack.fileIndex=p.fileIndex;publish(.receiving)
             let nextIndex = active.index
             write(active,ack) { [weak self, weak active] _ in
@@ -594,7 +618,7 @@ final class DataTransferManager {
                 var size = min(UInt64(TransferProtocol.defaultChunkBytes), length - active.offset)
                 if remoteWindowSender != nil {
                     guard let credit = active.credit, active.offset < credit.limit, active.chunk < credit.chunks else { return }
-                    size = min(4096, credit.limit - active.offset, length - active.offset)
+                    size = min(UInt64(RemoteFileProtocol.maxChunkBytes), credit.limit - active.offset, length - active.offset)
                 }
                 guard let bytes=try active.handle?.read(upToCount:Int(size)),!bytes.isEmpty else {throw TransferProtocol.Failure.invalid}
                 active.hash.update(data:bytes);var p=packet(active,.chunk);p.fileIndex=UInt16(active.index);p.offset=active.offset;p.chunkIndex=active.chunk;p.bytes=bytes

@@ -6,7 +6,8 @@ public struct CaptureTargetState: Equatable {
         public let request: CaptureTargetRequest
         public let entry: CaptureTargetEntry
         let previousCatalogue: CaptureTargetCatalogue
-        public fileprivate(set) var accepted = false
+        fileprivate(set) var acceptance: CaptureTargetResult? = nil
+        public var accepted: Bool { acceptance != nil }
     }
     public private(set) var session = UUID()
     public private(set) var generation: UInt64 = 0
@@ -81,12 +82,13 @@ public struct CaptureTargetState: Equatable {
             if value.currentId != retained.currentId || !value.entries.contains(where: { $0.id == retained.currentId && $0.kind == retained.kind }) {
                 retainedPresentation = nil
             } else if value.state == 1, value.epoch >= retained.epoch {
-                applied = CaptureTargetResult(status: .applied, state: 1, kind: retained.kind,
+                applied = CaptureTargetResult(status: retained.status, state: 1, kind: retained.kind,
                     transaction: retained.transaction, owner: retained.owner, revision: value.revision,
                     currentId: retained.currentId, epoch: value.epoch, source: retained.source,
                     firstFrame: value.epoch == retained.epoch ? retained.firstFrame : 0)
                 retainedPresentation = nil; awaitingReattachIDR = true
-                unknownOutcome = false; inputBlocked = true; issue = nil
+                unknownOutcome = false; inputBlocked = true
+                issue = retained.status == .applied ? nil : retained.status
             }
         }
         return true
@@ -110,7 +112,7 @@ public struct CaptureTargetState: Equatable {
               value.revision >= pending.request.revision else { return false }
         if value.status == .accepted {
             guard value.revision == pending.request.revision else { return false }
-            self.pending?.accepted = true
+            if !pending.accepted { self.pending?.acceptance = value }
             selectionSuppressed = true
             return true
         }
@@ -128,6 +130,15 @@ public struct CaptureTargetState: Equatable {
                 issue = .failed; needsCatalogueRefresh = true; return true
             }
             applied = value
+        } else if let acceptance = pending.acceptance,
+                  value.kind != nil, value.currentId != 0,
+                  acceptance.epoch != 0, acceptance.source != 0,
+                  value.epoch != 0, value.epoch != acceptance.epoch, value.source != 0,
+                  value.revision > pending.request.revision, matching.state == 1, matching.epoch == value.epoch {
+            // The terminal catalogue resolves the restored ID, which can change with each revision.
+            // Its first-frame anchor is authoritative even when the sequence wraps to zero.
+            applied = value
+            needsCatalogueRefresh = false
         }
         revisions = catalogue.map { [$0.revision: $0] } ?? [:]
         return true
@@ -152,6 +163,13 @@ public struct CaptureTargetState: Equatable {
         inputBlocked = true
         return true
     }
+
+    mutating func releasePresentedSourceForDisplayChange() -> Bool {
+        guard pending == nil, applied != nil, !inputBlocked else { return false }
+        applied = nil
+        return true
+    }
+
     /// Called only for the owned decoder after Applied, never for reception/decode/write acknowledgements.
     @discardableResult public mutating func observeRendered(sequence: UInt32, session: UUID) -> Bool {
         guard session == self.session, inputBlocked, !awaitingReattachIDR, let applied,
@@ -191,8 +209,9 @@ public struct CaptureTargetState: Equatable {
         guard session == self.session, applied != nil else { return }
         inputBlocked = true
     }
+    var requiresRestart: Bool { catalogue?.state == 0 || catalogue?.state == 3 }
+
     public var statusMessage: String? {
-        let requiresRestart=catalogue?.state == 0 || catalogue?.state == 3
         let nextStep=requiresRestart ? " Stop and restart the session." : " Choose a source again."
         if pending != nil { return "Switching display source..." }
         if unknownOutcome { return "Switch outcome unknown." + nextStep }

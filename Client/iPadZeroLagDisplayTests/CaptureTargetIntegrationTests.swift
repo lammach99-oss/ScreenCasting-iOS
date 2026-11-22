@@ -20,14 +20,17 @@ final class CaptureTargetIntegrationTests: XCTestCase {
         return Data(bytes)
     }
     static func result(status: UInt8 = 0, kind: UInt8 = 0, transaction: UInt64 = 1,
-                       revision: UInt64 = 4, current: UInt64 = 11) -> Data {
+                       revision: UInt64 = 4, current: UInt64 = 11,
+                       retiringEpoch: UInt64 = 0, retiringSource: UInt64 = 0,
+                       firstFrame: UInt32 = 0, source: UInt64 = 6) -> Data {
         var bytes=[UInt8](repeating: 0, count: 64);bytes[0]=1;bytes[1]=status
         bytes[2]=status == 9 ? 2 : 1;bytes[3]=status == 9 ? 255 : kind
         for (offset, value) in [(8, transaction), (16, UInt64(2)), (24, revision),
                                 (32, status == 9 ? UInt64(0) : current),
-                                (40, status == 9 ? UInt64(0) : 5), (48, status == 9 ? UInt64(0) : 6)] {
+                                 (40, status == 9 ? retiringEpoch : 5), (48, status == 9 ? retiringSource : source)] {
             MirrorControlCodec.put(value, &bytes, offset, 8)
         }
+        MirrorControlCodec.put(UInt64(firstFrame), &bytes, 56, 4)
         return Data(bytes)
     }
     static func mode(revision: UInt64, epoch: UInt64, physical: Bool, active: Bool = false) throws -> Data {
@@ -46,6 +49,260 @@ final class CaptureTargetIntegrationTests: XCTestCase {
             DispatchQueue.main.async { done.fulfill() };await fulfillment(of: [done], timeout: 2)
         }
         network.networkQueueForTesting.sync {}
+    }
+
+    @MainActor func testAcceptedFailureRecoversRestoredSourceWithFreshDecoderAndIDR() async throws {
+        for physical in [false, true] {
+            let network = NetworkManager()
+            var writes: [Data] = [], decoded: [(UInt32, UInt64)] = []
+            network.controlSendForAudioTesting = { bytes, done in writes.append(bytes); done(nil) }
+            network.captureTargetDecodeForTesting = { _, sequence, generation in decoded.append((sequence, generation)) }
+            var terminalTimers: [(TimeInterval, () -> Void)] = []
+            network.captureTargetScheduleForTesting = { seconds, callback in
+                if seconds >= 60 { terminalTimers.append((seconds, callback)) }
+            }
+            let peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+            defer { network.stopForTesting() }
+            network.beginTransferWriterForTesting()
+            func receive(_ type: WireMessageType, _ payload: Data, flags: UInt16 = 0, sequence: UInt32 = 0) {
+                network.receiveCaptureTargetWireForTesting(type: type, payload: payload, flags: flags,
+                    sequence: sequence, generation: peer.generation, connection: peer.connection)
+            }
+            receive(.displayCapabilities, Self.modes, flags: 0x7c00)
+            receive(.mirrorState, try Self.mode(revision: 1, epoch: 4, physical: physical))
+            receive(.sourceCatalogue, Self.catalogue(revision: 3, current: physical ? 4 : 1, epoch: 4))
+            await drain(network)
+            let oldDecoder = network.decoderForTesting.currentSessionGeneration
+            network.requestCaptureTarget(physical ? 1 : 4, catalogue: try XCTUnwrap(network.captureTargetState.catalogue))
+            await drain(network)
+            let source = physical ? UInt64(6) : UInt64.max
+            receive(.sourceSwitchResult, Self.result(status: 9, revision: 3, current: 0, retiringEpoch: 4, retiringSource: source))
+            XCTAssertEqual(terminalTimers.count, 2)
+            XCTAssertGreaterThan(try XCTUnwrap(terminalTimers.last?.0), 70)
+            let admissionDeadline = try XCTUnwrap(terminalTimers.first?.1)
+            network.networkQueueForTesting.sync { admissionDeadline() }
+            await drain(network)
+            XCTAssertTrue(network.captureTargetState.pending?.accepted == true)
+            receive(.video, Data([1]), flags: 3, sequence: 10)
+            receive(.sourceCatalogue, Self.catalogue(revision: 4, current: physical ? 14 : 11, virtualId: 11, physicalId: 14))
+            let terminal = Self.result(status: 4, kind: physical ? 1 : 0, current: physical ? 14 : 11,
+                                       firstFrame: 12, source: source)
+            receive(.sourceSwitchResult, terminal)
+            receive(.mirrorState, try Self.mode(revision: 2, epoch: 5, physical: physical))
+            receive(.video, Data([1]), flags: 2, sequence: 11)
+            XCTAssertTrue(decoded.isEmpty, "The candidate decoder chain belongs to an unconfirmed source")
+            receive(.video, Data([1]), flags: 3, sequence: 12)
+            await drain(network)
+            XCTAssertTrue(writes.contains {
+                $0[5] == WireMessageType.videoFeedback.rawValue &&
+                    $0.loadLittleEndian(UInt16.self, at: 6) == CaptureTargetProtocol.recoveryFlag
+            })
+            XCTAssertEqual(decoded.map { $0.0 }, [12])
+            let restoredDecoder = try XCTUnwrap(decoded.first?.1)
+            XCTAssertNotEqual(restoredDecoder, oldDecoder)
+            network.recordRenderCompletion(sequence: 12, generation: oldDecoder)
+            await drain(network)
+            XCTAssertTrue(network.captureTargetState.inputBlocked)
+            network.recordRenderCompletion(sequence: 12, generation: restoredDecoder)
+            await drain(network)
+            XCTAssertFalse(network.captureTargetState.inputBlocked)
+            XCTAssertEqual(network.captureTargetState.issue, .failed)
+        }
+    }
+
+    @MainActor func testAcceptedFailureWithoutRetiringStampCannotAuthorizeBufferedMedia() async throws {
+        let network = NetworkManager()
+        var decoded: [UInt32] = []
+        network.controlSendForAudioTesting = { _, done in done(nil) }
+        network.captureTargetDecodeForTesting = { _, sequence, _ in decoded.append(sequence) }
+        network.captureTargetScheduleForTesting = { _, _ in }
+        let peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        defer { network.stopForTesting() }
+        network.beginTransferWriterForTesting()
+        func receive(_ type: WireMessageType, _ bytes: Data, flags: UInt16 = 0) {
+            network.receiveCaptureTargetWireForTesting(type: type, payload: bytes, flags: flags,
+                generation: peer.generation, connection: peer.connection)
+        }
+        receive(.displayCapabilities, Self.modes, flags: 0x7c00)
+        receive(.mirrorState, try Self.mode(revision: 1, epoch: 4, physical: false))
+        receive(.sourceCatalogue, Self.catalogue(revision: 3, current: 1, epoch: 4))
+        await drain(network)
+        network.requestCaptureTarget(4, catalogue: try XCTUnwrap(network.captureTargetState.catalogue))
+        await drain(network)
+        receive(.sourceSwitchResult, Self.result(status: 9, revision: 3, current: 0))
+        receive(.sourceCatalogue, Self.catalogue(revision: 4, current: 11, virtualId: 11, physicalId: 14))
+        receive(.sourceSwitchResult, Self.result(status: 4))
+        receive(.mirrorState, try Self.mode(revision: 2, epoch: 5, physical: false))
+        receive(.video, Data([1]), flags: 3)
+        await drain(network)
+        XCTAssertTrue(decoded.isEmpty)
+        XCTAssertNil(network.captureTargetState.applied)
+        XCTAssertTrue(network.captureTargetState.inputBlocked)
+        XCTAssertEqual(network.captureTargetState.issue, .failed)
+    }
+
+    @MainActor func testAcceptedRollbackUsesWrappedHostAnchorAndMatchingPhysicalIdentity() async throws {
+        let network = NetworkManager()
+        var decoded: [(UInt32, UInt64)] = []
+        network.controlSendForAudioTesting = { _, done in done(nil) }
+        network.captureTargetDecodeForTesting = { _, sequence, generation in decoded.append((sequence, generation)) }
+        network.captureTargetScheduleForTesting = { _, _ in }
+        let peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.wifiRTP)
+        defer { network.stopForTesting() }
+        network.beginTransferWriterForTesting()
+        func receive(_ type: WireMessageType, _ payload: Data, flags: UInt16 = 0) {
+            network.receiveCaptureTargetWireForTesting(type: type, payload: payload, flags: flags,
+                generation: peer.generation, connection: peer.connection)
+        }
+        func idr(_ sequence: UInt32) {
+            network.receiveCaptureTargetVideoForTesting(Data([1]), sequence: sequence, isIDR: true,
+                generation: peer.generation, connection: peer.connection)
+        }
+        receive(.displayCapabilities, Self.modes, flags: 0x7c00)
+        receive(.mirrorState, try Self.mode(revision: 1, epoch: 4, physical: true))
+        receive(.sourceCatalogue, Self.catalogue(revision: 3, current: 4, epoch: 4))
+        await drain(network)
+        network.requestCaptureTarget(1, catalogue: try XCTUnwrap(network.captureTargetState.catalogue))
+        await drain(network)
+        receive(.sourceSwitchResult, Self.result(status: 9, revision: 3, current: 0, retiringEpoch: 4, retiringSource: 6))
+        receive(.sourceCatalogue, Self.catalogue(revision: 4, current: 14, virtualId: 11, physicalId: 14))
+        idr(UInt32.max)
+        receive(.sourceSwitchResult, Self.result(status: 7, kind: 1, current: 14))
+        XCTAssertTrue(decoded.isEmpty, "The restore must wait for physical source metadata")
+        receive(.mirrorState, try Self.mode(revision: 2, epoch: 5, physical: true))
+        XCTAssertTrue(decoded.isEmpty, "The buffered frame predates the wrapped restore anchor")
+        idr(0)
+        await drain(network)
+        XCTAssertEqual(decoded.map { $0.0 }, [0])
+        network.recordRenderCompletion(sequence: 0, generation: try XCTUnwrap(decoded.first?.1))
+        await drain(network)
+        XCTAssertFalse(network.captureTargetState.inputBlocked)
+        XCTAssertEqual(network.captureTargetState.issue, .timedOut)
+        XCTAssertEqual(network.captureTargetState.confirmedCurrentId, 14)
+    }
+
+    @MainActor func testDisplayChangeWaitsForSuccessfulSourcePresentation() async throws {
+        let network = NetworkManager()
+        network.useAutomaticOrientationForTesting()
+        var writes: [Data] = []
+        network.controlSendForAudioTesting = { bytes, done in writes.append(bytes); done(nil) }
+        network.captureTargetScheduleForTesting = { _, _ in }
+        network.captureTargetDecodeForTesting = { _, _, _ in }
+        let peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        defer { network.stopForTesting() }
+        network.beginTransferWriterForTesting()
+        func receive(_ type: WireMessageType, _ payload: Data, flags: UInt16 = 0) {
+            network.receiveCaptureTargetWireForTesting(type: type, payload: payload, flags: flags,
+                generation: peer.generation, connection: peer.connection)
+        }
+        receive(.displayCapabilities, Self.modes, flags: 0x7c00)
+        receive(.mirrorState, try Self.mode(revision: 1, epoch: 2, physical: false))
+        receive(.sourceCatalogue, Self.catalogue(revision: 3, current: 1))
+        await drain(network)
+        network.requestCaptureTarget(4, catalogue: try XCTUnwrap(network.captureTargetState.catalogue))
+        await drain(network)
+        receive(.sourceSwitchResult, Self.result(status: 9, revision: 3, current: 0))
+        network.updateInterfaceOrientation(.landscape)
+        network.updateInterfaceOrientation(.portrait)
+        network.runOrientationDebounceForTesting()
+        await drain(network)
+        XCTAssertTrue(network.captureTargetState.pending?.accepted == true)
+        XCTAssertFalse(writes.contains { $0[5] == WireMessageType.displayConfigurationRequest.rawValue })
+        receive(.sourceCatalogue, Self.catalogue(revision: 4, current: 14, virtualId: 11, physicalId: 14))
+        receive(.mirrorState, try Self.mode(revision: 2, epoch: 5, physical: true))
+        receive(.sourceSwitchResult, Self.result(kind: 1, current: 14))
+        receive(.video, Data([1]), flags: 3)
+        let decoder = try XCTUnwrap(network.captureTargetDecoderForTesting)
+        network.recordRenderCompletion(sequence: 0, generation: decoder)
+        await drain(network)
+        XCTAssertFalse(network.captureTargetState.unknownOutcome)
+        XCTAssertEqual(network.captureTargetState.confirmedCurrentId, 14)
+        let displayRequests = writes.filter { $0[5] == WireMessageType.displayConfigurationRequest.rawValue }
+        XCTAssertEqual(displayRequests.count, 1)
+        XCTAssertEqual(displayRequests.first?[17], ClientDisplayOrientation.portrait.rawValue)
+    }
+
+    @MainActor func testScreenPermissionCanBeRequestedAgainAfterNoApproval() async throws {
+        let network = NetworkManager()
+        var writes: [Data] = [], timers: [(TimeInterval, () -> Void)] = []
+        network.controlSendForAudioTesting = { bytes, done in writes.append(bytes); done(nil) }
+        network.captureTargetScheduleForTesting = { seconds, callback in timers.append((seconds, callback)) }
+        let peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        defer { network.stopForTesting() }
+        network.beginTransferWriterForTesting()
+        func receive(_ type: WireMessageType, _ payload: Data, flags: UInt16 = 0) {
+            network.receiveCaptureTargetWireForTesting(type: type, payload: payload, flags: flags,
+                generation: peer.generation, connection: peer.connection)
+        }
+        func actionIsAvailable() -> Bool {
+            ScreenPickerSnapshot.make(captureTargets: network.captureTargetState, state: network.mirrorControlState,
+                permissionAsked: network.screenSwitchPermissionPending).canAskPermission
+        }
+        receive(.displayCapabilities, Self.modes, flags: 0x7c00)
+        receive(.mirrorState, try Self.mode(revision: 1, epoch: 2, physical: false))
+        receive(.sourceCatalogue, Self.catalogue(revision: 3, current: 1, allowed: false))
+        await drain(network)
+        XCTAssertTrue(actionIsAvailable())
+        network.requestMirrorSwitchPermission()
+        await drain(network)
+        XCTAssertFalse(actionIsAvailable())
+        let expire = try XCTUnwrap(timers.last { $0.0 == 30 }?.1)
+        network.networkQueueForTesting.sync { expire() }
+        await drain(network)
+        XCTAssertTrue(actionIsAvailable())
+        XCTAssertEqual(network.screenSwitchPermissionNotice, "No answer from the PC")
+        network.requestMirrorSwitchPermission()
+        await drain(network)
+        network.networkQueueForTesting.sync { expire() }
+        await drain(network)
+        XCTAssertTrue(network.screenSwitchPermissionPending)
+        XCTAssertNil(network.screenSwitchPermissionNotice)
+        let permissions = writes.filter { $0.count > 17 && $0[5] == WireMessageType.mirrorAction.rawValue && $0[17] == 8 }
+        XCTAssertEqual(permissions.count, 2)
+        receive(.sourceCatalogue, Self.catalogue(revision: 4, current: 11, virtualId: 11, physicalId: 14))
+        await drain(network)
+        XCTAssertFalse(network.screenSwitchPermissionPending)
+        XCTAssertNil(network.screenSwitchPermissionNotice)
+        XCTAssertFalse(actionIsAvailable(), "Approval makes the request action unnecessary")
+    }
+
+    @MainActor func testScreenAndRouteRequestsExcludeEachOtherBeforeHostAcknowledges() async throws {
+        for screenFirst in [true, false] {
+            let network = NetworkManager()
+            var writes: [Data] = [], retirements = 0, panelRetirements = 0
+            network.controlSendForAudioTesting = { bytes, done in writes.append(bytes); done(nil) }
+            network.captureTargetRetireInput = { retirements += 1 }
+            network.captureTargetScheduleForTesting = { _, _ in }
+            let peer = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+            defer { network.stopForTesting() }
+            network.beginTransferWriterForTesting()
+            network.setConnectionIdentityForTesting(verified: true)
+            network.seedRouteEndpointForTesting()
+            func receive(_ type: WireMessageType, _ payload: Data, flags: UInt16 = 0) {
+                network.receiveCaptureTargetWireForTesting(type: type, payload: payload, flags: flags,
+                    generation: peer.generation, connection: peer.connection)
+            }
+            receive(.displayCapabilities, Self.modes, flags: 0x7e00)
+            receive(.mirrorState, try Self.mode(revision: 1, epoch: 2, physical: false))
+            receive(.sourceCatalogue, Self.catalogue(revision: 3, current: 1))
+            receive(.connectionState, try ConnectionSwitchStateTests.snapshot(route: .usb).encode())
+            await drain(network)
+            let catalogue = try XCTUnwrap(network.captureTargetState.catalogue)
+            if screenFirst {
+                network.requestCaptureTarget(4, catalogue: catalogue)
+                network.requestConnectionRoute(.wifi) { panelRetirements += 1 }
+            } else {
+                network.requestConnectionRoute(.wifi) { panelRetirements += 1 }
+                network.requestCaptureTarget(4, catalogue: catalogue)
+            }
+            await drain(network)
+            let requests = writes.map { $0[5] }.filter { [WireMessageType.sourceSwitchRequest.rawValue,
+                WireMessageType.connectionSelectRequest.rawValue].contains($0) }
+            XCTAssertEqual(requests, [screenFirst ? WireMessageType.sourceSwitchRequest.rawValue
+                : WireMessageType.connectionSelectRequest.rawValue])
+            XCTAssertEqual(retirements, 1)
+            XCTAssertEqual(panelRetirements, screenFirst ? 0 : 1)
+        }
     }
     @MainActor func testActualDiscoveryOldHostFallbackAndExtendPermissionGoldenBytes() async throws {
         for typed in [false, true] {
@@ -207,7 +464,7 @@ final class CaptureTargetIntegrationTests: XCTestCase {
         receive(.mirrorState, try Self.mode(revision: 1, epoch: 2, physical: false))
         receive(.sourceCatalogue, Self.catalogue(revision: 3, current: 1));await drain(network)
         network.requestCaptureTarget(1, catalogue: try XCTUnwrap(network.captureTargetState.catalogue));await drain(network)
-        XCTAssertTrue(timers.contains { $0.0 == 65 })
+        XCTAssertTrue(timers.contains { $0.0 == CaptureTargetProtocol.terminalWait })
         receive(.sourceSwitchResult, Self.result(status: 9, revision: 3, current: 0))
         receive(.mirrorState, try Self.mode(revision: 2, epoch: 3, physical: false))
         receive(.sourceCatalogue, Self.catalogue(revision: 4, current: 11, virtualId: 11, physicalId: 14))
@@ -238,7 +495,7 @@ final class CaptureTargetIntegrationTests: XCTestCase {
             generation: old.generation, connection: old.connection)
         await drain(network)
         network.requestCaptureTarget(4, catalogue: try XCTUnwrap(network.captureTargetState.catalogue));await drain(network)
-        let expire=try XCTUnwrap(timers.first { $0.0 == 65 }?.1)
+        let expire=try XCTUnwrap(timers.first { $0.0 == CaptureTargetProtocol.terminalWait }?.1)
         network.stopForTesting();await drain(network)
         let next=network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
         defer { network.stopForTesting() }

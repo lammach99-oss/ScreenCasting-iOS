@@ -11,6 +11,8 @@ struct RemoteClipboardLease {
     private var epoch: UInt64 = 0
     private var nextID: UInt64 = 0
     private var pendingID: UInt64?
+    private var disableID: UInt64?
+    private var awaitingConsent = false
     private var deadline: TimeInterval = 0
     private var nextRenew: TimeInterval = 0
     private var requested = false
@@ -26,30 +28,32 @@ struct RemoteClipboardLease {
         return .hello(3, Wire.maxBytes, Wire.maxChunk, nonce)
     }
 
-    mutating func tick(eligible: Bool, now: TimeInterval) -> Wire.Message? {
+    mutating func tick(eligible: Bool, now: TimeInterval, requestTimeout: TimeInterval = 3) -> Wire.Message? {
         guard let nonce, helloAcknowledged else { return nil }
         if !eligible {
             retry = true
             reason = .ok
             grant = nil
+            awaitingConsent = false
             retryAt = 0
             guard requested else { return nil }
             requested = false
             nextID += 1
             pendingID = nextID
+            disableID = nextID
             return .control(.disable, 0, nextID, false, nonce)
         }
         if requested, now >= deadline {
             grant = nil
             pendingID = nil
+            awaitingConsent = false
             requested = false
         }
         if !requested, retry, now >= retryAt {
             requested = true
             nextID += 1
             pendingID = nextID
-            deadline = now + 3
-            nextRenew = now + 1
+            deadline = now + requestTimeout
             return .control(.request, 3, nextID, true, nonce)
         }
         if let grant, now >= nextRenew {
@@ -68,7 +72,7 @@ struct RemoteClipboardLease {
     }
 
     func mayWrite(_ action: Wire.Action, id: UInt64, now: TimeInterval) -> Bool {
-        if action == .disable { return id == pendingID && !requested }
+        if action == .disable { return id == disableID }
         return id == nextID && requested && now < deadline &&
             (action == .renew ? grant != nil : pendingID == id)
     }
@@ -86,20 +90,30 @@ struct RemoteClipboardLease {
         } else {
             guard state.requestID == pendingID, state.epoch >= epoch else { return }
         }
+        if state.kind == .pendingConsent {
+            guard eligible, requested, grant == nil, state.requestID != 0, now < deadline else { return }
+            if !awaitingConsent { deadline = max(deadline, now + 15) }
+            awaitingConsent = true
+            epoch = state.epoch
+            return
+        }
+        awaitingConsent = false
         if state.kind == .enabled {
             guard eligible, requested, now < deadline, state.epoch > epoch,
                   state.requestID != 0 else { return }
             grant = state
+            deadline = now + 3
+            nextRenew = now + 1
         } else {
             grant = nil
             reason = state.reason
             requested = false
-            retry = state.reason == .timeout || state.reason == .desktopBlocked ||
+            retry = state.requestID == disableID || state.reason == .timeout || state.reason == .desktopBlocked ||
                 state.reason == .controlRequired || (state.requestID == 0 && state.reason == .viewerDisabled)
-            if retry, state.reason != .timeout { retryAt = now + 1 }
+            if retry, state.reason != .timeout, state.requestID != disableID { retryAt = now + 1 }
         }
         epoch = state.epoch
-        if state.kind != .pendingConsent { pendingID = nil }
+        pendingID = nil
         if state.kind == .enabled { reason = .ok }
     }
 }

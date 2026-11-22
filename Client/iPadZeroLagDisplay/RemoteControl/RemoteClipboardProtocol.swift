@@ -2,6 +2,8 @@ import Foundation
 
 enum RemoteClipboardProtocol {
     static let preferenceKey = "ScreenCasting.client.remoteClipboardEnabled"
+    static let automaticPreferenceKey = "ScreenCasting.client.automaticClipboardSending"
+    static let castingCapability: UInt16 = 0x1000
     static let marker: UInt16 = 0x4800
     static let clipboardFeature: UInt64 = 0x40
     static let foregroundFeature: UInt64 = 0x1000

@@ -215,7 +215,9 @@ import UniformTypeIdentifiers
                 Text(owner.state.name).font(.title3).fixedSize(horizontal: false, vertical: true)
                 Text("\(min(owner.state.index+1,owner.state.count)) of \(owner.state.count) files · \(TransferPresentation.size(owner.state.total))").foregroundStyle(.secondary)
                 Text(owner.state.phase.rawValue).font(.headline)
-                if owner.state.phase == .failed {
+                if let rejection = TransferPresentation.rejection(owner.state) {
+                    Text(rejection).font(.subheadline)
+                } else if owner.state.phase == .failed {
                     Label(TransferPresentation.failure(owner.state), systemImage: "exclamationmark.triangle.fill").foregroundStyle(Color(uiColor: SessionInk.warning))
                     Text(TransferPresentation.nextAction(owner.state)).font(.subheadline)
                     DisclosureGroup("Diagnostics") {

@@ -66,7 +66,7 @@ final class RemoteInputProtocolTests: XCTestCase {
         var oldHost = RemoteFeatureNegotiation(); XCTAssertTrue(oldHost.begin(now: 0))
         XCTAssertNil(oldHost.pong(flags: 0, now: 1)); XCTAssertNil(oldHost.pong(flags: 0x4000, now: 1.1))
         var late = RemoteFeatureNegotiation(); XCTAssertTrue(late.begin(now: 0))
-        XCTAssertNil(late.pong(flags: 0x4000, now: 2)); XCTAssertEqual(late.accepted, 0)
+        XCTAssertNil(late.pong(flags: 0x4000, now: 4)); XCTAssertEqual(late.accepted, 0)
         var current = RemoteFeatureNegotiation(); XCTAssertTrue(current.begin(now: 0))
         XCTAssertEqual(current.pong(flags: 0x4000, now: 1), bytes("01000000000000000300000000000000"))
         XCTAssertTrue(current.result(flags: 0, payload: bytes("01000000000000000300000000000000")))
@@ -74,6 +74,21 @@ final class RemoteInputProtocolTests: XCTestCase {
         var malformed = RemoteFeatureNegotiation(); _ = malformed.begin(now: 0); _ = malformed.pong(flags: 0x4000, now: 1)
         XCTAssertFalse(malformed.result(flags: 0, payload: bytes("01000000000000000400000000000000")))
         XCTAssertEqual(malformed.accepted, 0)
+    }
+    func testCapabilityProbeRetriesOnceAndFallsBackWithoutPong() {
+        var state = RemoteFeatureNegotiation()
+        XCTAssertTrue(state.begin(now: 0))
+        let probe = Data(repeating: 1, count: 16)
+        state.recordProbe(probe, clipboard: false)
+        XCTAssertFalse(state.expire(now: 1.9))
+        XCTAssertTrue(state.expire(now: 2))
+        XCTAssertFalse(state.negotiationSettled)
+        XCTAssertFalse(state.expire(now: 3))
+        XCTAssertFalse(state.negotiationSettled)
+        XCTAssertFalse(state.expire(now: 4))
+        XCTAssertTrue(state.negotiationSettled)
+        XCTAssertNil(state.consumeProbeReply(probe))
+        XCTAssertNil(state.pong(flags: RemoteFeatureNegotiation.supportedFlag, now: 4.1))
     }
     func testContextRequiresFreshKeyframeAndDropsOldToken() {
         var state = RemoteFeatureNegotiation(); _ = state.begin(now: 0); _ = state.pong(flags: 0x4000, now: 1)

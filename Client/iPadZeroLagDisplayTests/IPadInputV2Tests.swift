@@ -681,6 +681,37 @@ final class IPadInputV2Tests: XCTestCase {
 }
 
 @MainActor final class IPadInputEngineTests: XCTestCase {
+    func testStationaryThreeFingerLiftOpensSettingsWithoutScrolling() {
+        for mode in [IPadTouchMode.direct, .trackpad] {
+            var now: TimeInterval = 0
+            let engine = IPadInputEngine(clock: { now })
+            engine.mode = mode; engine.enabled = true; engine.directAvailable = true
+            var events: [IPadInputEvent] = []
+            var openedSettings = 0
+            engine.emit = { events.append($0) }
+            engine.openSettings = { openedSettings += 1 }
+            let points = [CGPoint(x: 20, y: 20), CGPoint(x: 60, y: 20), CGPoint(x: 40, y: 110)]
+            for (index, point) in points.enumerated() {
+                now += 0.02
+                engine.begin(id: UInt64(index + 1), pencil: false, point: point, normalized: .zero)
+            }
+            events.removeAll()
+            for index in [2, 1, 0] {
+                now += 0.02
+                engine.end(id: UInt64(index + 1), point: points[index], normalized: .zero, cancelled: false)
+            }
+            XCTAssertEqual(openedSettings, 1)
+            XCTAssertTrue(events.isEmpty, "Sequential lift must not emit input in \(mode)")
+
+            engine.begin(id: 4, pencil: false, point: points[0], normalized: .zero)
+            engine.begin(id: 5, pencil: false, point: points[1], normalized: .zero)
+            engine.moveBatch([
+                (4, CGPoint(x: 20, y: 40), .zero), (5, CGPoint(x: 60, y: 40), .zero)
+            ])
+            XCTAssertTrue(events.contains(.pointer(3, 0, 100, 0)), "A new two-finger gesture can scroll")
+        }
+    }
+
     func testLongPressAndLeaseUseInjectedClock() {
         var now: TimeInterval = 0; let e = IPadInputEngine(clock: { now })
         var out: [IPadInputEvent] = []; e.emit = { out.append($0) }; e.enabled = true; e.directAvailable = true

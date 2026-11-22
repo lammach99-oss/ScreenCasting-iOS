@@ -292,7 +292,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
     func testTelemetryUsesFreshWindowCountsP95AndUnknownValidity() throws {
         var window = AdaptiveMediaWindow(started: 0)
         let identity = AdaptiveMediaIdentity(owner: 1, source: 2, media: 3)
-        XCTAssertNil(window.sample(identity: identity, now: 0.5, activity: 3))
+        XCTAssertNil(window.sample(identity: identity, now: 0.125, activity: 3))
         window.received(frame: 1, bytes: 100, now: 0.1, receiveUs: 100)
         window.received(frame: 1, bytes: 100, now: 0.1, receiveUs: 100)
         window.decoded(frame: 1, queueUs: 200, decodeUs: 300)
@@ -310,13 +310,13 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
     func testFeedbackCountsReorderedFramesOnceAcrossWindowBoundaries() throws {
         var window = AdaptiveMediaWindow(started: 0)
         let identity = AdaptiveMediaIdentity(owner: 1, source: 2, media: 3)
-        window.received(frame: 11, bytes: 200, now: 0.25, receiveUs: 300)
-        window.received(frame: 10, bytes: 100, now: 0.50, receiveUs: 200)
+        window.received(frame: 11, bytes: 200, now: 0.125, receiveUs: 300)
+        window.received(frame: 10, bytes: 100, now: 0.25, receiveUs: 200)
         window.decoded(frame: 11, queueUs: 10, decodeUs: 300)
         window.decoded(frame: 10, queueUs: 20, decodeUs: 600)
-        window.presented(frame: 11, now: 0.5)
-        let first = try XCTUnwrap(window.sample(identity: identity, now: 1.125, activity: 3))
-        XCTAssertEqual(first.u32(40), 1_125_000)
+        window.presented(frame: 11, now: 0.375)
+        let first = try XCTUnwrap(window.sample(identity: identity, now: 0.5, activity: 3))
+        XCTAssertEqual(first.u32(40), 500_000)
         XCTAssertEqual(first.u64(48), 300)
         XCTAssertEqual(first.u64(56), 2)
         XCTAssertEqual(first.u64(64), 2)
@@ -325,12 +325,12 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         XCTAssertEqual(first.u32(104), 600)
         XCTAssertEqual(first.u32(108), 250_000)
         for offset in [120, 128, 136] { XCTAssertEqual(first.u64(offset), 11) }
-        XCTAssertNil(window.sample(identity: identity, now: 1.25, activity: 3))
+        XCTAssertNil(window.sample(identity: identity, now: 0.625, activity: 3))
 
-        window.received(frame: 10, bytes: 100, now: 1.5, receiveUs: 200)
+        window.received(frame: 10, bytes: 100, now: 0.75, receiveUs: 200)
         window.decoded(frame: 10, queueUs: 20, decodeUs: 600)
-        window.presented(frame: 11, now: 1.5)
-        let second = try XCTUnwrap(window.sample(identity: identity, now: 2.25, activity: 3))
+        window.presented(frame: 11, now: 0.75)
+        let second = try XCTUnwrap(window.sample(identity: identity, now: 1, activity: 3))
         XCTAssertEqual(second.u64(32), first.u64(32) &+ 1)
         for offset in [48, 56, 64, 72] { XCTAssertEqual(second.u64(offset), 0) }
         XCTAssertEqual(second.u32(44) & 7, 0)
@@ -370,10 +370,10 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         var window = AdaptiveMediaWindow(started: 0)
         let identity = AdaptiveMediaIdentity(owner: 1, source: 2, media: 3)
         window.received(frame: 1, bytes: 500, now: 0.5, receiveUs: 100)
-        XCTAssertNil(window.sample(identity: identity, now: 20, activity: 3))
-        window.received(frame: 2, bytes: 100, now: 20.25, receiveUs: 100)
-        let fresh = try XCTUnwrap(window.sample(identity: identity, now: 21, activity: 3))
-        XCTAssertEqual(fresh.u32(40), 1_000_000)
+        XCTAssertNil(window.sample(identity: identity, now: 1.25, activity: 3))
+        window.received(frame: 2, bytes: 100, now: 1.375, receiveUs: 100)
+        let fresh = try XCTUnwrap(window.sample(identity: identity, now: 1.5, activity: 3))
+        XCTAssertEqual(fresh.u32(40), 250_000)
         XCTAssertEqual(fresh.u64(48), 100)
         XCTAssertEqual(fresh.u64(56), 1)
         XCTAssertEqual(fresh.u32(44) & 1, 1)
@@ -727,7 +727,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         receive(.video, video.payload, flags: video.header.flags, sequence: 43)
         network.decoder.onAdaptiveDecoded?(43, tlsDecoder, 150, 300)
         network.recordCapturePresentation(sequence: 43, generation: tlsDecoder)
-        network.networkQueueForTesting.sync { now += 1.1 }
+        network.networkQueueForTesting.sync { now += 0.5 }
         network.sendAdaptiveFeedbackForTesting()
         await drainCastingQuality(network)
         let feedback = try XCTUnwrap(packets(.qualityFeedback).last)
@@ -754,7 +754,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         await drainCastingQuality(network)
         XCTAssertEqual(packets(.qualityPolicySet).count, 2)
         XCTAssertEqual(packets(.qualityConfigurationAck), acknowledgements)
-        network.networkQueueForTesting.sync { now += 1.1 }
+        network.networkQueueForTesting.sync { now += 0.5 }
         network.sendAdaptiveFeedbackForTesting()
         await drainCastingQuality(network)
         let usbFeedback = try XCTUnwrap(packets(.qualityFeedback).last)
@@ -1166,7 +1166,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         await drain()
         XCTAssertEqual(network.reconnectAttemptForTesting, 0)
         XCTAssertTrue(network.effectiveQualitySummary?.contains("text sharpness reduced") == true)
-        now = 0.9
+        now = 0.25
         network.sendAdaptiveFeedbackForTesting()
         network.sendAdaptiveFeedbackForTesting()
         await drain()
@@ -1174,7 +1174,7 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         XCTAssertEqual(windows.count, 1)
         let feedback = Data(try XCTUnwrap(windows.first).dropFirst(16))
         XCTAssertEqual(feedback.loadLittleEndian(UInt64.self, at: 24), 4)
-        XCTAssertEqual(feedback.loadLittleEndian(UInt32.self, at: 40), 900_000)
+        XCTAssertEqual(feedback.loadLittleEndian(UInt32.self, at: 40), 250_000)
         XCTAssertEqual(feedback[144] & 8, 0)
 
         cutover[44] = 2
@@ -1190,15 +1190,41 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         XCTAssertEqual(geometries.last?.identity.media, 4)
     }
 
-    func testRemoteTLSFeedbackUsesServiceWindowWithoutChangingCastingCadence() throws {
+    func testCastingAndRemoteFeedbackProduceTenDistinct250msWindows() throws {
         let identity = AdaptiveMediaIdentity(owner: 1, source: 1, media: 1)
-        var window = AdaptiveMediaWindow(started: 0)
-        XCTAssertNil(window.sample(identity: identity, now: 0.74, activity: 3, remote: true))
-        let packet = try XCTUnwrap(window.sample(identity: identity, now: 0.9, activity: 3, remote: true))
-        XCTAssertEqual(packet.u32(40), 900_000)
-        XCTAssertEqual(packet.encoded[144], 3)
-        XCTAssertNil(window.sample(identity: identity, now: 2, activity: 3, remote: true))
-        XCTAssertNil(window.sample(identity: identity, now: 2.5, activity: 3))
+        var window = AdaptiveMediaWindow(started: 10)
+        for id in 0..<10 {
+            let started = 10 + Double(id) * 0.25
+            XCTAssertNil(window.sample(identity: identity, now: started + 0.2, activity: 3))
+            let packet = try XCTUnwrap(window.sample(identity: identity, now: started + 0.25, activity: 3))
+            XCTAssertEqual(packet.u64(32), UInt64(id))
+            XCTAssertEqual(packet.u32(40), 250_000)
+            XCTAssertEqual(packet.encoded[144], 3)
+        }
+    }
+
+    func testLossAndDecoderQueueSpikesShareThe200msRateLimit() throws {
+        let identity = AdaptiveMediaIdentity(owner: 1, source: 1, media: 1)
+        var window = AdaptiveMediaWindow(started: 10)
+        window.drop(0)
+        XCTAssertNil(window.sample(identity: identity, now: 10.199, activity: 3))
+        let loss = try XCTUnwrap(window.sample(identity: identity, now: 10.2, activity: 3))
+        XCTAssertEqual(loss.u32(40), 200_000)
+        XCTAssertEqual(loss.u32(80), 1)
+
+        window.decoded(frame: 1, queueUs: 30_000, decodeUs: 1_000)
+        XCTAssertNil(window.sample(identity: identity, now: 10.399, activity: 3))
+        let queue = try XCTUnwrap(window.sample(identity: identity, now: 10.4, activity: 3))
+        XCTAssertEqual(queue.u32(40), 200_000)
+        XCTAssertEqual(queue.u32(80), 0)
+        XCTAssertEqual(queue.u32(100), 30_000)
+
+        // Fast callbacks and ordinary decoder queues cannot trigger extra reports.
+        window.decoded(frame: 2, queueUs: 2_000, decodeUs: 1_000)
+        XCTAssertNil(window.sample(identity: identity, now: 10.6, activity: 3))
+        let next = try XCTUnwrap(window.sample(identity: identity, now: 10.65, activity: 3))
+        XCTAssertEqual(next.u32(40), 250_000)
+        XCTAssertEqual(next.u32(100), 2_000)
     }
 
     @MainActor func testRemoteScaledMediaKeepsTouchPencilAndMouseDragInDesktopCoordinates() throws {
@@ -1520,10 +1546,10 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
         configuration.storeLittleEndian(UInt32(1),at:32)
         receive(.qualityConfiguration,configuration); await drain()
         XCTAssertEqual(writes.filter { $0[5] == 99 }.map { $0[16+44] },[0])
-        now = 1.99
+        now = 1.125
         network.sendAdaptiveFeedbackForTesting(); await drain()
         XCTAssertEqual(writes.filter { $0[5] == 97 }.count, 1)
-        now = 2.125
+        now = 1.25
         network.sendAdaptiveFeedbackForTesting(); await drain()
         let cutoverWindow = Data(try XCTUnwrap(writes.last { $0[5] == 97 }).dropFirst(16))
         XCTAssertEqual(cutoverWindow.loadLittleEndian(UInt64.self,at:24),4)
@@ -1551,10 +1577,10 @@ final class AdaptiveMediaProtocolTests: XCTestCase {
             network.decoder.onAdaptiveDecoded?(frame, network.decoder.currentSessionGeneration, 200, 300)
             network.recordCapturePresentation(sequence: frame, generation: network.decoder.currentSessionGeneration)
         }
-        now=3.25; network.sendAdaptiveFeedbackForTesting(); await drain()
+        now=1.75; network.sendAdaptiveFeedbackForTesting(); await drain()
         let feedback=Data(try XCTUnwrap(writes.last { $0[5] == 97 }).dropFirst(16))
         XCTAssertEqual(feedback[144], 3)
-        XCTAssertEqual(feedback.loadLittleEndian(UInt32.self,at:40),1_125_000)
+        XCTAssertEqual(feedback.loadLittleEndian(UInt32.self,at:40),500_000)
         XCTAssertEqual(feedback.loadLittleEndian(UInt32.self,at:44) & 7,7)
         XCTAssertEqual(feedback.loadLittleEndian(UInt32.self,at:96),120_000)
         XCTAssertEqual(feedback.loadLittleEndian(UInt64.self,at:48),750_000)

@@ -22,6 +22,25 @@ enum TransferPresentation {
     static func nextAction(_ state: DataTransferManager.Snapshot) -> String {
         state.outgoing ? "Choose files to start a new transfer." : "Ask the PC to send again."
     }
+    static func rejection(_ state: DataTransferManager.Snapshot) -> String? {
+        guard state.phase == .rejected, state.outgoing, let reason = state.rejectionReason else { return nil }
+        switch reason {
+        case .ok: return nil
+        case .userRejected: return "The transfer was declined on the PC."
+        case .busy: return "The PC is busy with another transfer. Try again when it finishes."
+        case .invalidMetadata: return "The PC rejected the file names or sizes. Review the files and try again."
+        case .unsupportedVersion: return "The PC does not support this transfer version. Update the PC app and try again."
+        case .insufficientStorage: return "The PC is out of space for this transfer. Free space on the PC and try again."
+        case .destinationUnavailable: return "The PC could not open the destination. Check the receive folder on the PC."
+        case .sessionRetired: return "The PC transfer session ended. Reconnect and try again."
+        case .policyRejected: return "The PC's file-transfer policy blocked this upload. Check the PC's transfer settings."
+        case .lengthMismatch, .hashMismatch, .invalidOffset, .invalidChunk:
+            return "The PC rejected the file data. Choose the files again and retry."
+        case .writeFailed: return "The PC could not write the files. Check the receive folder on the PC."
+        case .cancelled: return "The PC cancelled the transfer."
+        }
+    }
+
     static func active(_ phase: DataTransferManager.Phase) -> Bool {
         [.offering,.awaitingDecision,.sending,.receiving,.verifying,.awaitingAck].contains(phase)
     }

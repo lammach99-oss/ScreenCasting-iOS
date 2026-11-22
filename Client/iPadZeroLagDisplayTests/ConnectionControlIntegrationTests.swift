@@ -98,13 +98,14 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         XCTAssertTrue(writes.snapshot.contains { $0[5] == 78 })
         XCTAssertFalse(writes.snapshot.contains { $0[5] == 76 && (1...3).contains($0[17]) })
     }
-    @MainActor func testProtectedProbeUsesPreparedListenerWithoutRetiringWifi() async throws {
+    @MainActor func testProtectedProbeHoldsEarlyReplacementUntilAccepted() async throws {
         let network = NetworkManager(); let writes = Writes()
         network.controlSendForAudioTesting = { data, done in writes.append(data); done(nil) }
         network.connectionListenerPortForTesting = 0
         let wifi = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
         defer { network.stopForTesting() }
         network.beginTransferWriterForTesting(); network.setConnectionIdentityForTesting(verified: true)
+        network.setConnectionCredentialForTesting(ConnectionControlProtocolTests.usbCredential)
         network.receiveIdentityWireForTesting(type: .displayCapabilities,
             payload: CaptureTargetIntegrationTests.modes, flags: 0x0300)
         network.receiveIdentityWireForTesting(type: .connectionState, payload: try ConnectionSwitchStateTests.snapshot().encode())
@@ -133,6 +134,113 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         XCTAssertEqual(network.connectionSwitchState.actualRoute, .wifi)
         XCTAssertEqual(network.preparedUSBListenerPortForTesting, port)
         XCTAssertFalse(writes.snapshot.contains { $0[5] == 7 })
+
+        let held = expectation(description: "early replacement held")
+        let promoted = expectation(description: "replacement opened for USB identity")
+        network.networkQueueForTesting.sync {
+            network.connectionUSBCandidateHeldForTesting = { held.fulfill() }
+            network.usbCandidateInstalledForTesting = { _ in promoted.fulfill() }
+        }
+        let replacement = NWConnection(host: .ipv4(.loopback), port: port, using: .tcp)
+        defer { replacement.cancel() }
+        replacement.start(queue: DispatchQueue.global())
+        await fulfillment(of: [held], timeout: 3)
+        XCTAssertTrue(network.connectionIncumbentIsCurrentForTesting(wifi.connection))
+        XCTAssertTrue(network.usbIdentityBoundForTesting)
+        network.receiveIdentityWireForTesting(type: .connectionState,
+            payload: try ConnectionSwitchStateTests.snapshot(revision: 3, hostState: .switching).encode())
+        network.receiveIdentityWireForTesting(type: .connectionSelectResult,
+            payload: try ConnectionSwitchStateTests.result(.accepted).encode())
+        await fulfillment(of: [promoted], timeout: 3)
+        XCTAssertFalse(network.usbIdentityBoundForTesting)
+        await drain(network)
+        XCTAssertTrue(network.connectionSwitchState.inputBlocked)
+    }
+    @MainActor func testFailedWifiAttemptKeepsUSBListenerAndReauthenticatesRestoredOwner() async throws {
+        let network = NetworkManager()
+        let writes = Writes()
+        network.usbIdentityCredentialLoadForTesting = { ConnectionControlProtocolTests.usbCredential }
+        network.controlSendForAudioTesting = { data, done in writes.append(data); done(nil) }
+        defer { network.stopForTesting() }
+
+        let usbReady = expectation(description: "incumbent USB listener ready")
+        network.connectionListenerReadyForTesting = { usbReady.fulfill() }
+        network.startListening(port: 0)
+        await fulfillment(of: [usbReady], timeout: 3)
+        let usbListener = try XCTUnwrap(network.usbSessionSnapshot().listener)
+        let usbPort = try XCTUnwrap(usbListener.port)
+        let incumbent = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        network.beginTransferWriterForTesting()
+        network.configureUsbIdentityForTesting()
+        network.receiveIdentityWireForTesting(type: .ping, payload: Data(0..<16), flags: 0x0100)
+        await drain(network)
+        network.receiveIdentityWireForTesting(type: .trustedDeviceChallenge, payload: ConnectionControlProtocolTests.usbChallenge)
+        await drain(network)
+        network.receiveIdentityWireForTesting(type: .trustedAuthResult, payload: Data([1]))
+        network.receiveIdentityWireForTesting(type: .displayCapabilities, payload: CaptureTargetIntegrationTests.modes, flags: 0x0300)
+        network.receiveIdentityWireForTesting(type: .connectionState,
+            payload: try ConnectionSwitchStateTests.snapshot(route: .usb).encode())
+        await drain(network)
+        XCTAssertTrue(network.usbIdentityBoundForTesting)
+
+        let wifiListener = try NWListener(using: .tcp)
+        let wifiReady = expectation(description: "test Wi-Fi endpoint ready")
+        let wifiConnected = expectation(description: "Wi-Fi attempt reached the test endpoint")
+        var wifiPeer: NWConnection?
+        wifiListener.stateUpdateHandler = { if case .ready = $0 { wifiReady.fulfill() } }
+        wifiListener.newConnectionHandler = { peer in
+            wifiPeer = peer
+            peer.start(queue: network.networkQueueForTesting)
+            wifiConnected.fulfill()
+        }
+        wifiListener.start(queue: network.networkQueueForTesting)
+        defer { network.networkQueueForTesting.sync { wifiPeer?.cancel(); wifiListener.cancel() } }
+        await fulfillment(of: [wifiReady], timeout: 3)
+        network.seedRouteEndpointForTesting(port: try XCTUnwrap(wifiListener.port))
+        network.requestConnectionRoute(.wifi)
+        await drain(network)
+        network.receiveIdentityWireForTesting(type: .connectionState,
+            payload: try ConnectionSwitchStateTests.prepare(target: .wifi).encode())
+        network.receiveIdentityWireForTesting(type: .connectionState,
+            payload: try ConnectionSwitchStateTests.snapshot(revision: 3, route: .usb, hostState: .switching).encode())
+        network.receiveIdentityWireForTesting(type: .connectionSelectResult,
+            payload: try ConnectionSwitchStateTests.wifiResult().encode())
+        network.retireConnectionRouteForTesting()
+        await fulfillment(of: [wifiConnected], timeout: 3)
+        XCTAssertTrue(network.usbSessionSnapshot().listener === usbListener)
+        XCTAssertTrue(network.usbSessionSnapshot().listenerIntent)
+
+        let identityHello = expectation(description: "fresh USB identity hello")
+        network.networkQueueForTesting.sync {
+            network.controlSendForAudioTesting = { data, done in
+                writes.append(data); done(nil)
+                if data[5] == WireMessageType.clientHello.rawValue { identityHello.fulfill() }
+            }
+            wifiPeer?.cancel()
+        }
+        let restored = NWConnection(host: .ipv4(.loopback), port: usbPort, using: .tcp)
+        defer { restored.cancel() }
+        restored.start(queue: DispatchQueue.global())
+        let readinessPing = Data([0x53, 0x43, 0x53, 0x54, 1, 6, 0, 1, 16, 0, 0, 0, 0, 0, 0, 0]) + Data(0..<16)
+        restored.send(content: readinessPing, completion: .contentProcessed { XCTAssertNil($0) })
+        await fulfillment(of: [identityHello], timeout: 3)
+        XCTAssertFalse(network.usbIdentityBoundForTesting)
+        XCTAssertNotEqual(network.usbSessionSnapshot().generation, incumbent.generation)
+        network.receiveIdentityWireForTesting(type: .trustedDeviceChallenge, payload: ConnectionControlProtocolTests.usbChallenge)
+        await drain(network)
+        network.receiveIdentityWireForTesting(type: .trustedAuthResult, payload: Data([1]))
+        network.receiveIdentityWireForTesting(type: .displayCapabilities, payload: CaptureTargetIntegrationTests.modes, flags: 0x0300)
+        network.receiveIdentityWireForTesting(type: .connectionState,
+            payload: try ConnectionSwitchStateTests.snapshot(revision: 4, owner: 3, route: .usb, hostState: .failed).encode())
+        network.receiveIdentityWireForTesting(type: .connectionSelectResult,
+            payload: try ConnectionSwitchStateTests.wifiResult(failure: .firstFrameTimeout).encode())
+        await drain(network)
+        XCTAssertTrue(network.usbIdentityBoundForTesting)
+        XCTAssertEqual(network.connectionSwitchState.issue, .firstFrameTimeout)
+        XCTAssertTrue(network.connectionSwitchState.inputBlocked)
+        let hellos = try writes.snapshot.filter { $0[5] == 76 }.map { try ConnectionHello.decode(Data($0.dropFirst(16))) }
+        XCTAssertEqual(hellos.map { $0.kind }, [.optIn, .optIn])
+        XCTAssertTrue(writes.snapshot.contains { $0[5] == WireMessageType.trustedDeviceProof.rawValue })
     }
     @MainActor func testNetworkPreflightRetainsProofAndFenceUntilFifteenSeconds() async throws {
         for accepts in [false, true] {
@@ -338,6 +446,30 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         }
         XCTAssertEqual(decoder.sessionQueueForTesting.sync { submitted }, [100, 101, 102, 103, 104])
         XCTAssertEqual(network.connectionSwitchState.phase, .completed)
+    }
+
+    @MainActor func testBackgroundForegroundPreservesAcceptedHandoffUntilPresentation() async throws {
+        let network = NetworkManager()
+        defer { network.stopForTesting() }
+        let decoder = try stageUsbHandoff(network)
+        let pixel = try makeHandoffPixel()
+        decoder.submitDecodeForTesting = { _ in pixel }
+        network.applicationDidEnterBackground()
+        await drain(network)
+        XCTAssertTrue(network.connectionSwitchState.pending?.accepted == true)
+        XCTAssertTrue(network.connectionSwitchState.inputBlocked)
+        XCTAssertNil(network.connectionSwitchState.issue)
+        network.applicationDidBecomeActive()
+        await drain(network)
+        receiveHandoffVideo(network, sequence: 100, isIDR: true)
+        network.receiveIdentityWireForTesting(type: .connectionSelectResult,
+            payload: try ConnectionSwitchStateTests.result(.completed).encode())
+        decoder.sessionQueueForTesting.sync {}
+        await drain(network)
+        network.recordRenderCompletion(sequence: 100, generation: decoder.currentSessionGeneration)
+        await drain(network)
+        XCTAssertEqual(network.connectionSwitchState.phase, .completed)
+        XCTAssertFalse(network.connectionSwitchState.inputBlocked)
     }
 
     @MainActor func testHandoffDependentDropKeepsRootAndRecoversAtNextIDR() async throws {

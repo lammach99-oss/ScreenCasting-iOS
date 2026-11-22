@@ -24,7 +24,7 @@ enum RemoteFileProtocol {
     }
 
     static let emptyID = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
-    static let maxFiles = 32, maxChunkBytes = 8192, maxPendingChunks = 2
+    static let maxFiles = 32, defaultChunkBytes = 4096, maxChunkBytes = 8192, maxPendingChunks = 2
     static let maxFileBytes: UInt64 = 1 << 30, maxBatchBytes: UInt64 = 2 << 30
     private static let controlSize = 32, stateSize = 56, windowSize = 64
     static let packetPrefix = 20

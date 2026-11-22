@@ -115,6 +115,41 @@ final class SessionPanelTests: XCTestCase {
         XCTAssertNil(presentation(ConnectionSwitchState(), route: .usb).action)
     }
 
+    func testDeclinedRouteOutcomeSurvivesReadyPublicationAndKeepsNextAction() throws {
+        var state = ConnectionSwitchState()
+        state.begin(generation: 1)
+        _ = state.advertise(flags: ConnectionControlProtocol.advertisementFlag, authenticated: true, generation: 1)
+        XCTAssertTrue(state.receive(try ConnectionSwitchStateTests.snapshot(), generation: 1, now: 0))
+        XCTAssertNotNil(state.select(.usb, now: 0))
+        XCTAssertTrue(state.receive(try ConnectionSwitchStateTests.snapshot(revision: 3), generation: 1, now: 1))
+        XCTAssertTrue(state.receive(try ConnectionSwitchStateTests.result(.denied, reason: .permissionDenied), generation: 1, now: 1))
+        XCTAssertTrue(state.receive(try ConnectionSwitchStateTests.snapshot(revision: 4), generation: 1, now: 2))
+        let panel = SessionConnectionPresentation(state: state, streamingRoute: .wifi, hasWifiEndpoint: true)
+        XCTAssertEqual(panel.outcome, ConnectionReason.permissionDenied.text(target: .usb))
+        XCTAssertNotNil(panel.action)
+        let switchingScreen = SessionConnectionPresentation(state: state, streamingRoute: .wifi,
+            hasWifiEndpoint: true, screenSwitchInProgress: true)
+        XCTAssertEqual(switchingScreen.action, .waiting("Wait for the screen switch to finish.", showsProgress: false))
+    }
+
+    @MainActor func testFaultedSourceOffersRestartGuidanceInsteadOfRefresh() throws {
+        var targets = CaptureTargetState()
+        targets.begin(generation: 1)
+        _ = targets.advertise(flags: CaptureTargetProtocol.advertisementFlag, generation: 1)
+        var bytes = Array(CaptureTargetIntegrationTests.catalogue(revision: 3, current: 0, allowed: false))
+        bytes[1] = 3
+        XCTAssertTrue(targets.receiveCatalogue(try CaptureTargetCatalogue.decode(Data(bytes)), session: targets.session))
+        let notice = try XCTUnwrap(SessionPanelOverlay.ScreenNotice.typedCatalogueNotice(for: targets))
+        XCTAssertTrue(notice.message.contains("Stop and restart the session."))
+        XCTAssertNil(notice.action)
+
+        targets.begin(generation: 2)
+        _ = targets.advertise(flags: CaptureTargetProtocol.advertisementFlag, generation: 2)
+        targets.markListUnavailable(session: targets.session)
+        let unavailable = try XCTUnwrap(SessionPanelOverlay.ScreenNotice.typedCatalogueNotice(for: targets))
+        XCTAssertEqual(unavailable.action, .refresh)
+    }
+
     func testFooterLeavesGestureHelpInsideMoreInput() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         let source = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/SessionPanelOverlay.swift"),

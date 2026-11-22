@@ -73,6 +73,7 @@ enum WireMessageType: UInt8 {
     case remoteAudioSet = 104, remoteAudioState = 105, remoteAudioPacket = 106, remoteTimedVideo = 107
     case remoteSecureDesktopRequest = 108, remoteSecureDesktopState = 109
     case remoteSasAvailability = 110
+    case castingClipboardHello = 111
 }
 
 /// Toolbar actions the remote host runs on the PC. Payload: [version 1, command, flags(bit0 confirm)].
@@ -336,6 +337,20 @@ enum TouchWireProtocol {
 }
 
 enum WireProtocol {
+    static func clientHello(deviceID: Data, sessionID: Data, name: String) -> Data? {
+        guard deviceID.count == 16, sessionID.count == 16 else { return nil }
+
+        var bytes = Data()
+        for scalar in name.unicodeScalars {
+            let utf8 = String(scalar).utf8
+            guard bytes.count + utf8.count <= 64 else { break }
+            bytes.append(contentsOf: utf8)
+        }
+        if bytes.isEmpty { bytes = Data("iPad".utf8) }
+
+        return Data([1]) + deviceID + sessionID + Data([UInt8(bytes.count)]) + bytes
+    }
+
     static let magic: UInt32 = 0x54534353
     static let version: UInt8 = 1
     static let headerSize = 16

@@ -549,7 +549,7 @@ final class SecureDesktopRecoveryTests: XCTestCase {
         await drain(network)
         network.requestCaptureTarget(4, catalogue: try XCTUnwrap(network.captureTargetState.catalogue))
         await drain(network)
-        let expire = try XCTUnwrap(timers.first { $0.0 == 65 }?.1)
+        let expire = try XCTUnwrap(timers.first { $0.0 == CaptureTargetProtocol.terminalWait }?.1)
         now = 4
         receive(.captureAvailability, CaptureAvailabilityCommand(state: 1, reason: 1, sequence: 1).encode())
         await drain(network)
@@ -571,10 +571,11 @@ final class SecureDesktopRecoveryTests: XCTestCase {
         network.recordCapturePresentation(sequence: 1, generation: decoder)
         await drain(network)
         XCTAssertFalse(network.captureInputBlocked)
-        now = 960.9
+        let terminalDeadline = 900 + CaptureTargetProtocol.terminalWait - 4
+        now = terminalDeadline - 0.1
         network.networkQueueForTesting.sync { expire() }
         await drain(network); XCTAssertNotNil(network.captureTargetState.pending)
-        now = 961
+        now = terminalDeadline
         network.networkQueueForTesting.sync { expire() }
         await drain(network); XCTAssertNil(network.captureTargetState.pending)
     }

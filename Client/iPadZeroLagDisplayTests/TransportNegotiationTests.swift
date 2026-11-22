@@ -1,7 +1,363 @@
 import XCTest
 import Network
 import Metal
+import Combine
 @testable import iPadCasting
+
+#if targetEnvironment(simulator)
+final class PairingReconnectRegressionTests: XCTestCase {
+    private final class Backing: TrustedHostCredentialBacking {
+        private var records: [String: Data] = [:]
+        var canDelete = true
+        var rejectDelete: (String) -> Bool = { _ in false }
+        var rejectRead: (String) -> Bool = { _ in false }
+        func load(fingerprint: String) -> Data? { records[fingerprint] }
+        func read(fingerprint: String) -> TrustedHostBackingRead {
+            if rejectRead(fingerprint) { return .failed }
+            return records[fingerprint].map { .found($0) } ?? .missing
+        }
+        func save(_ data: Data, fingerprint: String) -> Bool { records[fingerprint] = data; return true }
+        func delete(fingerprint: String) -> Bool {
+            guard canDelete, !rejectDelete(fingerprint) else { return false }
+            records.removeValue(forKey: fingerprint)
+            return true
+        }
+    }
+
+    private struct Fixture {
+        let defaults: UserDefaults
+        let network: NetworkManager
+        let credentials = Backing()
+        let pins = Backing()
+
+        init(defaults: UserDefaults) {
+            self.defaults = defaults
+            network = NetworkManager(userDefaults: defaults)
+            network.installTrustedHostStoresForTesting(credentials: credentials, pins: pins)
+        }
+
+        @discardableResult
+        func pair(_ endpoint: NWEndpoint, identity: UInt8) -> TrustedHostCredential {
+            let credential = TrustedHostCredential(fingerprint: "fixture-pin-\(identity)",
+                hostID: Data(repeating: identity, count: 16), deviceID: Data(repeating: identity, count: 16),
+                secret: Data(repeating: 0, count: 32), sessionID: Data(repeating: 0, count: 16))
+            XCTAssertTrue(TrustedHostCredentialStore(backing: credentials).save(credential))
+            XCTAssertTrue(TrustedHostFingerprintStore(backing: pins).save(
+                credential.fingerprint, endpoint: endpoint, hostID: credential.hostID))
+            return credential
+        }
+
+        func saveTarget(_ endpoint: NWEndpoint) throws {
+            WifiReconnectTargetStore.save(try XCTUnwrap(WifiReconnectTargetPolicy.target(from: endpoint)), defaults: defaults)
+        }
+
+        func connect(_ endpoint: NWEndpoint, credential: TrustedHostCredential) {
+            _ = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+            network.setPairedHostForTesting(endpoint: endpoint, credential: credential)
+            network.beginTransferWriterForTesting()
+        }
+
+        func isPaired(_ credential: TrustedHostCredential) -> Bool {
+            network.networkQueueForTesting.sync {
+                TrustedHostCredentialStore(backing: credentials).load(fingerprint: credential.fingerprint) != nil
+            }
+        }
+    }
+
+    @MainActor func testForgetWaitsForTheAuthenticatedHostResult() async throws {
+        for accepted in [true, false] {
+            let suite = UUID().uuidString
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let fixture = Fixture(defaults: defaults)
+            let endpoint = service("Fixture A")
+            let credential = fixture.pair(endpoint, identity: 1)
+            try fixture.saveTarget(endpoint)
+            let sent = expectation(description: "Fake host receives Forget")
+            fixture.network.controlSendForAudioTesting = { bytes, complete in
+                if bytes[5] == WireMessageType.forgetDevice.rawValue {
+                    XCTAssertEqual(Data(bytes.dropFirst(WireProtocol.headerSize)), Data([1]) + credential.deviceID)
+                    sent.fulfill()
+                }
+                complete(nil)
+            }
+            fixture.connect(endpoint, credential: credential)
+            fixture.network.receiveIdentityWireForTesting(type: .forgetDeviceResult, payload: Data([1, 1]))
+            XCTAssertTrue(fixture.isPaired(credential), "An unsolicited reply cannot remove pairing")
+            fixture.network.forgetTrustedHost()
+            await fulfillment(of: [sent], timeout: 2)
+            XCTAssertTrue(fixture.isPaired(credential))
+            fixture.network.receiveIdentityWireForTesting(type: .forgetDeviceResult, payload: Data([1, 2]))
+            XCTAssertTrue(fixture.isPaired(credential), "A malformed reply cannot settle Forget")
+            fixture.network.receiveIdentityWireForTesting(type: .forgetDeviceResult,
+                payload: Data([1, accepted ? 1 : 0]))
+            await drainMainQueue()
+            XCTAssertFalse(fixture.isPaired(credential))
+            XCTAssertFalse(fixture.network.hasReconnectTarget)
+            XCTAssertEqual(fixture.network.trustedHostForgetOutcome, accepted ? .both : .localOnly)
+        }
+    }
+
+    @MainActor func testForgetTimesOutLocallyWhenHostNeverReplies() async throws {
+        let suite = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let fixture = Fixture(defaults: defaults)
+        let endpoint = service("Fixture A")
+        let credential = fixture.pair(endpoint, identity: 1)
+        try fixture.saveTarget(endpoint)
+        fixture.network.controlSendForAudioTesting = { _, complete in complete(nil) }
+        fixture.connect(endpoint, credential: credential)
+        let done = expectation(description: "Local-only outcome after missing reply")
+        let observation = fixture.network.$trustedHostForgetOutcome.sink { outcome in
+            if outcome == .localOnly { done.fulfill() }
+        }
+        fixture.network.forgetTrustedHost()
+        await fulfillment(of: [done], timeout: 5)
+        observation.cancel()
+        XCTAssertFalse(fixture.isPaired(credential))
+        XCTAssertFalse(fixture.network.hasReconnectTarget)
+    }
+
+    @MainActor func testForgettingAnotherPCPreservesSavedTargetAndIncumbent() async throws {
+        let suite = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let fixture = Fixture(defaults: defaults)
+        let address = NWEndpoint.Host.ipv4(.loopback)
+        let forgotten = NWEndpoint.hostPort(host: address, port: 27015), retained = service("Fixture B")
+        let old = fixture.pair(forgotten, identity: 1)
+        let current = fixture.pair(retained, identity: 2)
+        try fixture.saveTarget(retained)
+        fixture.network.controlSendForAudioTesting = { _, complete in complete(nil) }
+        fixture.connect(retained, credential: current)
+        defer { fixture.network.stopForTesting() }
+        let generation = fixture.network.wifiSessionSnapshotForTesting().committedGeneration
+        fixture.network.forgetTrustedHost(host: String(describing: address), port: 27015)
+        fixture.network.networkQueueForTesting.sync {}
+        await drainMainQueue()
+        XCTAssertFalse(fixture.isPaired(old))
+        XCTAssertTrue(fixture.isPaired(current))
+        XCTAssertEqual(WifiReconnectTargetStore.load(defaults: defaults)?.endpoint, retained)
+        XCTAssertTrue(fixture.network.hasReconnectTarget)
+        XCTAssertEqual(fixture.network.wifiSessionSnapshotForTesting().committedGeneration, generation)
+        XCTAssertEqual(fixture.network.trustedHostForgetOutcome, .localOnly)
+    }
+
+    @MainActor func testForgetReportsLocalStorageFailure() async throws {
+        let suite = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let fixture = Fixture(defaults: defaults)
+        let endpoint = service("Fixture A")
+        let credential = fixture.pair(endpoint, identity: 1)
+        try fixture.saveTarget(endpoint)
+        fixture.credentials.canDelete = false
+        fixture.network.forgetTrustedHost()
+        fixture.network.networkQueueForTesting.sync {}
+        await drainMainQueue()
+        XCTAssertTrue(fixture.isPaired(credential))
+        XCTAssertTrue(fixture.network.hasReconnectTarget)
+        XCTAssertEqual(fixture.network.trustedHostForgetOutcome, .localFailed(pcConfirmed: false))
+    }
+
+    @MainActor func testPartialForgetSurvivesRelaunchAndRetriesKeychainCleanup() async throws {
+        for failedKey in ["identity.", "endpoint.", "index.", "selected-identity", "selected-host"] {
+            let suite = UUID().uuidString
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let fixture = Fixture(defaults: defaults)
+            let endpoint = service("Fixture A")
+            let credential = fixture.pair(endpoint, identity: 1)
+            try fixture.saveTarget(endpoint)
+            fixture.network.networkQueueForTesting.sync {
+                _ = fixture.pins.save(Data(credential.fingerprint.utf8), fingerprint: "selected-host")
+                fixture.pins.rejectDelete = { $0.hasPrefix(failedKey) }
+            }
+
+            fixture.network.forgetTrustedHost()
+            fixture.network.networkQueueForTesting.sync {}
+            await drainMainQueue()
+            XCTAssertFalse(fixture.isPaired(credential))
+            XCTAssertFalse(fixture.network.hasReconnectTarget)
+            XCTAssertEqual(fixture.network.trustedHostForgetOutcome, .cleanupIncomplete(pcConfirmed: false))
+
+            let relaunched = NetworkManager(userDefaults: defaults)
+            relaunched.installTrustedHostStoresForTesting(credentials: fixture.credentials, pins: fixture.pins)
+            XCTAssertEqual(relaunched.trustedHostForgetOutcome, .cleanupIncomplete(pcConfirmed: false))
+            if failedKey == "identity." || failedKey == "endpoint." {
+                try fixture.saveTarget(endpoint)
+                relaunched.reconnectRouteForTesting = { _, _ in XCTFail("Pending cleanup allowed a reconnect") }
+                relaunched.reconnectLastPC()
+                relaunched.networkQueueForTesting.sync {}
+            }
+            relaunched.networkQueueForTesting.sync { fixture.pins.rejectDelete = { _ in false } }
+            relaunched.retryTrustedHostCleanup()
+            relaunched.networkQueueForTesting.sync {}
+            await drainMainQueue()
+            XCTAssertEqual(relaunched.trustedHostForgetOutcome, .localOnly)
+            XCTAssertFalse(relaunched.hasReconnectTarget)
+            relaunched.networkQueueForTesting.sync {
+                let index = "index." + credential.fingerprint
+                XCTAssertNil(fixture.pins.load(fingerprint: index))
+                XCTAssertNil(TrustedHostFingerprintStore(backing: fixture.pins).load(endpoint: endpoint))
+                XCTAssertNil(TrustedHostFingerprintStore(backing: fixture.pins).fingerprintForCleanup(endpoint: endpoint))
+                XCTAssertNil(TrustedHostFingerprintStore(backing: fixture.pins).load())
+            }
+        }
+    }
+
+    func testUnreadableIndexPreventsPinSaveAndPreservesCleanupInventory() throws {
+        let pins = Backing()
+        let store = TrustedHostFingerprintStore(backing: pins)
+        let fingerprint = "fixture-pin"
+        let index = "index." + fingerprint
+        let hostID = Data(repeating: 1, count: 16)
+        let first = service("Fixture A")
+        let second = service("Fixture B")
+        XCTAssertTrue(store.save(fingerprint, endpoint: first, hostID: hostID))
+        let originalIndex = try XCTUnwrap(pins.load(fingerprint: index))
+        pins.rejectRead = { $0 == index }
+        XCTAssertFalse(store.save(fingerprint, endpoint: second, hostID: hostID) {
+            XCTFail("Unreadable index allowed a credential write")
+            return true
+        })
+        XCTAssertFalse(store.delete(fingerprint: fingerprint))
+        XCTAssertEqual(pins.load(fingerprint: index), originalIndex)
+        pins.rejectRead = { _ in false }
+        XCTAssertTrue(store.delete(fingerprint: fingerprint))
+        for key in try JSONDecoder().decode([String].self, from: originalIndex) {
+            XCTAssertNil(pins.load(fingerprint: key))
+        }
+    }
+
+    @MainActor func testForgettingCurrentSessionPreservesAnotherPCsReconnectTarget() async throws {
+        let suite = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let fixture = Fixture(defaults: defaults)
+        let current = service("Fixture A"), saved = service("Fixture B")
+        let active = fixture.pair(current, identity: 1)
+        let retained = fixture.pair(saved, identity: 2)
+        try fixture.saveTarget(saved)
+        let sent = expectation(description: "Current PC receives Forget")
+        fixture.network.controlSendForAudioTesting = { bytes, complete in
+            if bytes[5] == WireMessageType.forgetDevice.rawValue {
+                XCTAssertEqual(Data(bytes.dropFirst(WireProtocol.headerSize)), Data([1]) + active.deviceID)
+                sent.fulfill()
+            }
+            complete(nil)
+        }
+        fixture.connect(current, credential: active)
+        fixture.network.forgetCurrentTrustedHost()
+        await fulfillment(of: [sent], timeout: 2)
+        fixture.network.receiveIdentityWireForTesting(type: .forgetDeviceResult, payload: Data([1, 1]))
+        await drainMainQueue()
+        XCTAssertFalse(fixture.isPaired(active))
+        XCTAssertTrue(fixture.isPaired(retained))
+        XCTAssertEqual(WifiReconnectTargetStore.load(defaults: defaults)?.endpoint, saved)
+        XCTAssertEqual(fixture.network.trustedHostForgetOutcome, .both)
+    }
+
+    @MainActor func testForgettingAnAliasClearsTheSamePCsSavedTarget() async throws {
+        let suite = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let fixture = Fixture(defaults: defaults)
+        let manual = NWEndpoint.hostPort(host: .ipv4(.loopback), port: 27015)
+        let bonjour = service("Fixture A")
+        fixture.pair(manual, identity: 1)
+        fixture.pair(bonjour, identity: 1)
+        try fixture.saveTarget(manual)
+        fixture.network.forgetTrustedHost(endpoint: bonjour)
+        fixture.network.networkQueueForTesting.sync {}
+        await drainMainQueue()
+        XCTAssertFalse(fixture.network.hasReconnectTarget)
+        XCTAssertEqual(fixture.network.trustedHostForgetOutcome, .localOnly)
+    }
+
+    func testReconnectPrefersVerifiedBonjourAndFallsBackToManual() throws {
+        let suite = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let fixture = Fixture(defaults: defaults)
+        let manual = NWEndpoint.hostPort(host: .ipv4(.loopback), port: 27015)
+        let bonjour = service("Fixture A"), other = service("Fixture B")
+        let trusted = fixture.pair(manual, identity: 1)
+        fixture.pair(bonjour, identity: 1)
+        fixture.pair(other, identity: 2)
+        try fixture.saveTarget(manual)
+        fixture.network.updateDiscoveredWifiEndpoints([other, bonjour])
+        var attempted: [NWEndpoint] = []
+        fixture.network.reconnectRouteForTesting = { endpoint, fingerprint in
+            XCTAssertEqual(fingerprint, trusted.fingerprint)
+            attempted.append(endpoint)
+        }
+        fixture.network.reconnectLastPC()
+        fixture.network.reconnectLastPC()
+        fixture.network.networkQueueForTesting.sync {}
+        XCTAssertEqual(attempted, [bonjour, manual])
+        XCTAssertEqual(WifiReconnectTargetStore.load(defaults: defaults)?.endpoint, manual)
+    }
+
+    func testRemoteReconnectPrefersKnownDNSAliasWithoutChangingThePort() throws {
+        let suite = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let fixture = Fixture(defaults: defaults)
+        let port = try XCTUnwrap(NWEndpoint.Port(rawValue: NetworkManager.remoteControlPort))
+        let manual = NWEndpoint.hostPort(host: .ipv4(.loopback), port: port)
+        let dns = NWEndpoint.hostPort(host: RemoteHostAddress.networkHost(UUID().uuidString.lowercased() + ".example"), port: port)
+        let bonjour = service("Fixture A")
+        let trusted = fixture.pair(manual, identity: 1)
+        fixture.pair(dns, identity: 1)
+        fixture.pair(bonjour, identity: 1)
+        try fixture.saveTarget(manual)
+        fixture.network.updateDiscoveredWifiEndpoints([bonjour])
+        var attempted: [NWEndpoint] = []
+        fixture.network.reconnectRouteForTesting = { endpoint, fingerprint in
+            XCTAssertEqual(fingerprint, trusted.fingerprint)
+            attempted.append(endpoint)
+        }
+        fixture.network.reconnectLastPC()
+        fixture.network.reconnectLastPC()
+        fixture.network.networkQueueForTesting.sync {}
+        XCTAssertEqual(attempted, [dns, manual])
+    }
+
+    func testRetryProbesNewBonjourRouteUsingTheSavedIdentity() throws {
+        let suite = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let fixture = Fixture(defaults: defaults)
+        let manual = NWEndpoint.hostPort(host: .ipv4(.loopback), port: 27015)
+        let newRoute = service("Fixture A"), other = service("Fixture B")
+        let trusted = fixture.pair(manual, identity: 1)
+        fixture.pair(other, identity: 2)
+        try fixture.saveTarget(manual)
+        var attempted: [NWEndpoint] = []
+        fixture.network.reconnectRouteForTesting = { endpoint, fingerprint in
+            XCTAssertEqual(fingerprint, trusted.fingerprint)
+            attempted.append(endpoint)
+        }
+        fixture.network.reconnectLastPC()
+        fixture.network.updateDiscoveredWifiEndpoints([other, newRoute])
+        fixture.network.reconnectLastPC()
+        fixture.network.networkQueueForTesting.sync {}
+        XCTAssertEqual(attempted, [manual, newRoute])
+    }
+
+    private func service(_ fixture: String) -> NWEndpoint {
+        .service(name: fixture, type: "_screencasting._tcp", domain: "local.", interface: nil)
+    }
+
+    @MainActor private func drainMainQueue() async {
+        let done = expectation(description: "Pairing outcome published")
+        DispatchQueue.main.async { done.fulfill() }
+        await fulfillment(of: [done], timeout: 2)
+    }
+}
+#endif
 
 final class AuthenticationStageRegressionTests: XCTestCase {
     #if targetEnvironment(simulator)
@@ -99,7 +455,7 @@ final class AuthenticationStageRegressionTests: XCTestCase {
         var values: [String: Data] = [:]
         func load(fingerprint: String) -> Data? { values[fingerprint] }
         func save(_ data: Data, fingerprint: String) -> Bool { values[fingerprint] = data; return true }
-        func delete(fingerprint: String) { values.removeValue(forKey: fingerprint) }
+        func delete(fingerprint: String) -> Bool { values.removeValue(forKey: fingerprint); return true }
     }
     func testEndpointPinsAndLegacyMigrationCannotTrustAnotherHost() throws {
         let memory = MemoryBacking(), store = TrustedHostFingerprintStore(backing: MemoryBacking())

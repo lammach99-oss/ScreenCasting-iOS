@@ -269,7 +269,8 @@ final class WireStreamParser {
         guard payloadLength <= WireProtocol.maxPayloadSize else {
             state = .failed
             payload = Data()
-            onEvent(.failure((84...92).contains(type.rawValue) ? .invalidHeader : .oversizedPayload(payloadLength)))
+            let clipboard = (84...92).contains(type.rawValue) || type == .castingClipboardHello
+            onEvent(.failure(clipboard ? .invalidHeader : .oversizedPayload(payloadLength)))
             return
         }
 
@@ -278,8 +279,8 @@ final class WireStreamParser {
             flags: flags,
             payloadLength: payloadLength,
             sequence: sequence)
-        if (84...92).contains(type.rawValue) {
-            guard allowsRemoteClipboard(), type != .clipboardHello, type != .clipboardControl,
+        if (84...92).contains(type.rawValue) || type == .castingClipboardHello {
+            guard allowsRemoteClipboard(), type != .castingClipboardHello, type != .clipboardHello, type != .clipboardControl,
                   flags == 0, RemoteClipboardProtocol.validLength(type, payloadLength) else {
                 state = .failed; payload = Data()
                 onEvent(.failure(.invalidHeader))

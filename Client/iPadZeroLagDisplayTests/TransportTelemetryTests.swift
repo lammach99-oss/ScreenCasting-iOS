@@ -81,6 +81,78 @@ final class TransportTelemetryTests: XCTestCase {
             .contains("if drawKind != .gameRepeated {\n            onDrawableCommitted?"))
     }
 
+    func testPersistentLoggingCapsEachChannelDuringAnActiveSession() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let telemetry = TransportTelemetry()
+        let started = expectation(description: "logging started")
+        _ = telemetry.startLogging(directoryURL: directory, summaryInterval: 3600) { url in
+            XCTAssertNotNil(url)
+            started.fulfill()
+        }
+        wait(for: [started], timeout: 2)
+        let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        XCTAssertEqual(files.count, 3)
+        let cap = UInt64(8 * 1024 * 1024)
+        for file in files {
+            let handle = try FileHandle(forWritingTo: file)
+            defer { try? handle.close() }
+            try handle.truncate(atOffset: cap)
+        }
+
+        telemetry.recordPayloadReceived(sequence: 1, receiveDurationMs: 3)
+        telemetry.recordDropped(sequence: 1)
+        telemetry.flushIntervalSummary()
+        telemetry.recordDiagnosticLine("fixture")
+        let drained = expectation(description: "file queue drained")
+        telemetry.deleteStoredLogs(directoryURL: directory) { result in
+            XCTAssertEqual(try? result.get(), 0)
+            drained.fulfill()
+        }
+        wait(for: [drained], timeout: 2)
+        for file in files {
+            XCTAssertEqual(try file.resourceValues(forKeys: [.fileSizeKey]).fileSize, Int(cap))
+        }
+        let stopped = expectation(description: "logging stopped")
+        telemetry.stopLogging { stopped.fulfill() }
+        wait(for: [stopped], timeout: 2)
+    }
+
+    func testPersistentLoggingReservesTotalRetentionBeforeStarting() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let oldest = directory.appendingPathComponent("ScreenCasting-Telemetry-20260101-000000-00000000.csv")
+        for index in 0..<9 {
+            let url = directory.appendingPathComponent("ScreenCasting-Telemetry-20260101-00000\(index)-0000000\(index).csv")
+            try Data().write(to: url)
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            try handle.truncate(atOffset: 8 * 1024 * 1024)
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: TimeInterval(index))],
+                ofItemAtPath: url.path)
+        }
+        let userFile = directory.appendingPathComponent("ScreenCasting-Telemetry-fixture.csv")
+        try Data([1]).write(to: userFile)
+        let telemetry = TransportTelemetry()
+        let started = expectation(description: "logging started")
+        _ = telemetry.startLogging(directoryURL: directory) { url in
+            XCTAssertNotNil(url)
+            started.fulfill()
+        }
+        wait(for: [started], timeout: 2)
+        let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey])
+        XCTAssertEqual(files.count, 9) // Five retained, three active, one unrelated.
+        XCTAssertFalse(FileManager.default.fileExists(atPath: oldest.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: userFile.path))
+        let stopped = expectation(description: "logging stopped")
+        telemetry.stopLogging { stopped.fulfill() }
+        wait(for: [stopped], timeout: 2)
+    }
+
     func testDeleteStoredLogsRemovesOnlyManagedFiles() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

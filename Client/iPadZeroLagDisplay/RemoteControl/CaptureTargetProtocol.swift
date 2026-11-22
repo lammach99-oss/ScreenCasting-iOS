@@ -3,7 +3,8 @@ import Foundation
 /// Casting extension only. Legacy monitor messages 55/56 and remote messages 68-71 are independent.
 public enum CaptureTargetProtocol {
     public static let advertisementFlag: UInt16 = 0x0400
-    public static let terminalWait: TimeInterval = 65
+    // Host forward capture readiness (60 s), restore readiness (10 s), and delivery margin.
+    public static let terminalWait: TimeInterval = 75
     public static let recoveryFlag: UInt16 = 0x1000
     public static let presentationWait: TimeInterval = 5
     static func validInbound(type: UInt8, flags: UInt16, length: Int) -> Bool {

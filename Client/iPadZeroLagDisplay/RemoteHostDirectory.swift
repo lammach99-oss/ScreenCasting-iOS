@@ -2,13 +2,18 @@ import Foundation
 import Network
 
 struct RemoteHostAddress: Equatable {
-    enum Kind: Equatable { case ipv4, dnsName }
+    enum Kind: Equatable { case ipv4, ipv6, dnsName }
     let host: String
     let kind: Kind
 
     static func parse(_ raw: String) -> RemoteHostAddress? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        let literal = unbracketIPv6(trimmed)
+        if literal.contains(":"), IPv6Address(literal) != nil {
+            let host = literal.contains("%") ? literal : literal.lowercased()
+            return RemoteHostAddress(host: host, kind: .ipv6)
+        }
         let octets = trimmed.split(separator: ".", omittingEmptySubsequences: false)
         if octets.count == 4 && octets.allSatisfy({ octet in
             guard !octet.isEmpty, octet.count <= 3,
@@ -33,12 +38,47 @@ struct RemoteHostAddress: Equatable {
         return RemoteHostAddress(host: name, kind: .dnsName)
     }
 
+    static func parseManual(_ raw: String, port: UInt16) -> RemoteHostAddress? {
+        if let host = parse(raw) { return host }
+
+        var authority = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let separator = authority.range(of: "://") {
+            let scheme = authority[..<separator.lowerBound].lowercased()
+            guard scheme == "http" || scheme == "https" else { return nil }
+            authority = String(authority[separator.upperBound...])
+            if authority.hasSuffix("/") { authority.removeLast() }
+        }
+        guard authority.hasPrefix("["), let close = authority.firstIndex(of: "]"),
+              let host = parse(String(authority[...close])), host.kind == .ipv6 else { return nil }
+        let suffix = authority[authority.index(after: close)...]
+        if !suffix.isEmpty {
+            let digits = suffix.dropFirst()
+            guard suffix.hasPrefix(":"), !digits.isEmpty,
+                  digits.utf8.allSatisfy({ (48...57).contains($0) }), UInt16(digits) == port else { return nil }
+        }
+        return host
+    }
+
+    static func networkHost(_ host: String) -> NWEndpoint.Host {
+        let literal = unbracketIPv6(host)
+        if literal.contains(":"), let address = IPv6Address(literal) { return .ipv6(address) }
+        return NWEndpoint.Host(host)
+    }
+
+    private static func unbracketIPv6(_ host: String) -> String {
+        guard host.hasPrefix("["), host.hasSuffix("]") else { return host }
+        return String(host.dropFirst().dropLast())
+    }
+
     var isTailnet: Bool {
         switch kind {
         case .ipv4:
             let octets = host.split(separator: ".")
             guard octets.count == 4, Int(octets[0]) == 100, let second = Int(octets[1]) else { return false }
             return (64...127).contains(second)
+        case .ipv6:
+            let tailnetPrefix: [UInt8] = [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0]
+            return IPv6Address(host)?.rawValue.starts(with: tailnetPrefix) == true
         case .dnsName:
             return host.hasSuffix(".ts.net") || (!host.contains(".") && host != "localhost")
         }

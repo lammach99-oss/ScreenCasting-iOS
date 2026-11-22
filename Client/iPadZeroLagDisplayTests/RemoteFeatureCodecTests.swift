@@ -294,9 +294,23 @@ final class RemoteFeatureCodecTests: XCTestCase {
         var oldHost = RemoteFeatureNegotiation(requestedFeatures: 0x1f)
         XCTAssertTrue(oldHost.begin(now: 0))
         XCTAssertNil(oldHost.pong(flags: 0, now: 1, requestRemoteFiles: true))
-        var late = RemoteFeatureNegotiation(requestedFeatures: 0x1f)
-        XCTAssertTrue(late.begin(now: 0))
-        XCTAssertNil(late.pong(flags: 0x4000, now: 2, requestRemoteFiles: true))
+        let initialProbe = Data(repeating: 1, count: 16)
+        let retryProbe = Data(repeating: 2, count: 16)
+        for reply in [initialProbe, retryProbe] {
+            var late = RemoteFeatureNegotiation(requestedFeatures: 0x1f)
+            XCTAssertTrue(late.begin(now: 0))
+            late.recordProbe(initialProbe, clipboard: false)
+            XCTAssertTrue(late.expire(now: 2))
+            late.recordProbe(retryProbe, clipboard: true)
+            XCTAssertNil(late.consumeProbeReply(Data(repeating: 3, count: 16)))
+            XCTAssertEqual(late.consumeProbeReply(reply), reply == retryProbe)
+            XCTAssertNil(late.consumeProbeReply(initialProbe))
+            XCTAssertNil(late.consumeProbeReply(retryProbe))
+            let lateRequest = try XCTUnwrap(late.pong(flags: 0x4000, now: 2.5, requestRemoteFiles: true))
+            XCTAssertEqual(RemoteFeaturesMessage.decode(lateRequest)?.features, 0x11f)
+            XCTAssertTrue(late.result(flags: 0, payload: RemoteFeaturesMessage(features: 0x11f).encode()))
+            XCTAssertEqual(late.accepted, 0x11f)
+        }
         for mask in [UInt64(0x1f), 0x11f] {
             var peer = RemoteFeatureNegotiation(requestedFeatures: 0x1f)
             XCTAssertTrue(peer.begin(now: 0))
@@ -501,9 +515,8 @@ final class RemoteFeatureCodecTests: XCTestCase {
     }
 
     func testRemoteFileFakeHostUploadWaitsForCreditAndResendStartsAtZero() throws {
-        guard case let .packet(grant, fixtureResponse) = try goldenFile("file-response"),
-              case let .window(_, _, _, _, limit, maxChunks) = try goldenFile("file-window") else {
-            return XCTFail("Expected fixture response and window")
+        guard case let .packet(grant, fixtureResponse) = try goldenFile("file-response") else {
+            return XCTFail("Expected fixture response")
         }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -525,10 +538,18 @@ final class RemoteFeatureCodecTests: XCTestCase {
         let first = try XCTUnwrap(sent.first)
         var accepted = TransferPacket(kind: fixtureResponse.kind, generation: first.generation, id: first.id)
         accepted.accepted = fixtureResponse.accepted
-        XCTAssertTrue(manager.post(accepted))
+        XCTAssertTrue(try postFakeFileMessage(.packet(grantId: grant, transfer: accepted), to: manager))
         manager.drainRemoteIOForTesting()
         XCTAssertEqual(sent.map(\.kind), [.offer])
-        XCTAssertTrue(manager.postRemoteFileWindow(.init(offer: first.id, file: 0, consumed: 0, limit: min(limit, 4097), chunks: maxChunks)) {})
+        func credit(_ offer: UUID, consumed: UInt64, limit: UInt64, chunks: UInt64) throws {
+            XCTAssertTrue(try postFakeFileMessage(.window(grantId: grant, offerId: offer, fileIndex: 0,
+                consumedOffset: consumed, maxOffset: limit, maxChunkIndexExclusive: chunks), to: manager))
+        }
+        try credit(first.id, consumed: 0, limit: 4096, chunks: 1)
+        for _ in 0..<4 { manager.drainRemoteIOForTesting() }
+        XCTAssertEqual(sent.map(\.kind), [.offer, .chunk])
+        XCTAssertEqual(sent.last?.bytes.count, 4096)
+        try credit(first.id, consumed: 4096, limit: 4097, chunks: 2)
         for _ in 0..<4 { manager.drainRemoteIOForTesting() }
         XCTAssertEqual(sent.map(\.kind), [.offer, .chunk, .chunk, .fileEnd])
         XCTAssertEqual(sent.filter { $0.kind == .chunk }.map(\.offset), [0, 4096])
@@ -540,11 +561,173 @@ final class RemoteFeatureCodecTests: XCTestCase {
         XCTAssertEqual(second.kind, .offer)
         XCTAssertNotEqual(second.id, first.id)
         accepted = TransferPacket(kind: .response, generation: second.generation, id: second.id, accepted: true)
-        XCTAssertTrue(manager.post(accepted))
-        XCTAssertTrue(manager.postRemoteFileWindow(.init(offer: second.id, file: 0, consumed: 0, limit: 1, chunks: 1)) {})
+        XCTAssertTrue(try postFakeFileMessage(.packet(grantId: grant, transfer: accepted), to: manager))
+        try credit(second.id, consumed: 0, limit: 1, chunks: 1)
         manager.drainRemoteIOForTesting()
         XCTAssertEqual(sent.last?.kind, .chunk)
         XCTAssertEqual(sent.last?.offset, 0)
+    }
+
+    private func fakeFileWire(_ message: RemoteFileProtocol.Message) throws -> RemoteFileProtocol.Message {
+        let bytes = try XCTUnwrap(RemoteFileProtocol.encode(message))
+        return try XCTUnwrap(RemoteFileProtocol.decode(type: message.type, payload: bytes, flags: 0))
+    }
+
+    private func postFakeFileMessage(_ message: RemoteFileProtocol.Message, to manager: DataTransferManager) throws -> Bool {
+        switch try fakeFileWire(message) {
+        case let .packet(_, packet):
+            return manager.post(packet)
+        case let .window(_, offer, file, consumed, limit, chunks):
+            return manager.postRemoteFileWindow(.init(offer: offer, file: file, consumed: consumed, limit: limit, chunks: chunks)) {}
+        default:
+            XCTFail("Expected DS5 transfer data")
+            return false
+        }
+    }
+
+    func testRemoteFileFakeHostUploadFillsTwoSlotsBeforeAcknowledgment() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("sample.bin"), grant = UUID()
+        let payload = Data(repeating: 1, count: 8192) + Data(repeating: 2, count: 8192) + Data([3])
+        try payload.write(to: source)
+        var sent: [TransferPacket] = []
+        var windows: [DataTransferManager.FileWindow] = []
+        var completed: DataTransferManager.Snapshot?
+        var manager: DataTransferManager!
+        manager = DataTransferManager(generation: 4, directory: root.appendingPathComponent("received"),
+            remoteWindowSender: { window, done in
+                windows.append(window)
+                done(manager.authorizeRemoteWindow(window, beginWrite: true))
+            }) { packet, done in
+            if case let .packet(_, decoded)? = try? self.fakeFileWire(.packet(grantId: grant, transfer: packet)) {
+                sent.append(decoded)
+                done(true)
+            } else { XCTFail("Invalid wire packet"); done(false) }
+        }
+        defer { manager.retire(); manager.drainRemoteIOForTesting(); manager = nil }
+        manager.drainRemoteIOForTesting()
+        manager.changed = { if $0.phase == .completed { completed = $0 } }
+        manager.sendFiles([source])
+        manager.drainRemoteIOForTesting()
+        let offer = try XCTUnwrap(sent.first)
+        func reply(_ kind: TransferKind) throws {
+            let packet = TransferPacket(kind: kind, generation: offer.generation, id: offer.id, accepted: kind == .response)
+            XCTAssertTrue(try postFakeFileMessage(.packet(grantId: grant, transfer: packet), to: manager))
+        }
+        func credit(consumed: UInt64, limit: UInt64, chunks: UInt64) throws {
+            XCTAssertTrue(try postFakeFileMessage(.window(grantId: grant, offerId: offer.id, fileIndex: 0,
+                consumedOffset: consumed, maxOffset: limit, maxChunkIndexExclusive: chunks), to: manager))
+            for _ in 0..<4 { manager.drainRemoteIOForTesting() }
+        }
+        try reply(.response)
+        try credit(consumed: 0, limit: 16384, chunks: 2)
+        XCTAssertEqual(sent.map(\.kind), [.offer, .chunk, .chunk])
+        XCTAssertEqual(sent.dropFirst().map(\.offset), [0, 8192])
+        XCTAssertEqual(sent.dropFirst().map { $0.bytes.count }, [8192, 8192])
+        try credit(consumed: 8192, limit: 16385, chunks: 3)
+        XCTAssertEqual(sent.map(\.kind), [.offer, .chunk, .chunk, .chunk, .fileEnd])
+        XCTAssertEqual(sent.filter { $0.kind == .chunk }.reduce(into: Data()) { $0.append($1.bytes) }, payload)
+        XCTAssertEqual(sent.last?.bytes, Data(SHA256.hash(data: payload)))
+        try reply(.fileAck)
+        try reply(.ack)
+        manager.drainRemoteIOForTesting()
+        XCTAssertEqual(sent.last?.kind, .end)
+        XCTAssertEqual(completed?.bytes, UInt64(payload.count))
+
+        var download = TransferPacket(kind: .offer, generation: offer.generation, id: UUID())
+        download.files = [.init(name: "download.bin", length: 32768)]
+        XCTAssertTrue(try postFakeFileMessage(.packet(grantId: grant, transfer: download), to: manager))
+        manager.drainRemoteIOForTesting()
+        manager.decide(true, consent: try XCTUnwrap(manager.consentForTesting()))
+        for _ in 0..<3 { manager.drainRemoteIOForTesting() }
+        XCTAssertEqual(windows.first, .init(offer: download.id, file: 0, consumed: 0, limit: 16384, chunks: 2))
+    }
+
+    func testRemoteFileFakeHostDownloadExpandsAndKeepsAlreadyAdmittedChunk() throws {
+        try checkFakeFileDownload(chunkBytes: 8192)
+    }
+
+    func testRemoteFileFakeHostLegacyDownloadKeepsOneSlot() throws {
+        try checkFakeFileDownload(chunkBytes: 4096)
+    }
+
+    private func checkFakeFileDownload(chunkBytes: Int) throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let grant = UUID(), id = UUID(), generation: UInt64 = 7
+        let payload = Data(repeating: 0xa5, count: 32768)
+        let wide = chunkBytes == 8192
+        let chunks = (0..<(payload.count / chunkBytes)).map { index in
+            let start = index * chunkBytes
+            return TransferPacket(kind: .chunk, generation: generation, id: id, chunkIndex: UInt64(index),
+                                  offset: UInt64(start), bytes: payload.subdata(in: start..<(start + chunkBytes)))
+        }
+        var windows: [DataTransferManager.FileWindow] = []
+        var sent: [TransferPacket] = []
+        var completed: DataTransferManager.Snapshot?
+        var manager: DataTransferManager!
+        func deliver(_ packet: TransferPacket) throws -> Bool {
+            try postFakeFileMessage(.packet(grantId: grant, transfer: packet), to: manager)
+        }
+        manager = DataTransferManager(generation: generation, directory: root, remoteWindowSender: { window, done in
+            do {
+                let message = RemoteFileProtocol.Message.window(grantId: grant, offerId: window.offer, fileIndex: window.file,
+                    consumedOffset: window.consumed, maxOffset: window.limit, maxChunkIndexExclusive: window.chunks)
+                guard case let .window(_, offer, file, consumed, limit, slots) = try self.fakeFileWire(message) else {
+                    XCTFail("Expected DS5 credit"); done(false); return
+                }
+                // Deliver chunk 2 under the preceding window before the replacement starts writing.
+                let burst = wide && consumed == 16384 && slots == 4
+                if burst { XCTAssertTrue(try deliver(chunks[2])) }
+                XCTAssertTrue(manager.authorizeRemoteWindow(window, beginWrite: true))
+                windows.append(.init(offer: offer, file: file, consumed: consumed, limit: limit, chunks: slots))
+                if burst { XCTAssertTrue(try deliver(chunks[3])) }
+                done(true)
+            } catch { XCTFail("Invalid wire window"); done(false) }
+        }) { packet, done in
+            if case let .packet(_, decoded)? = try? self.fakeFileWire(.packet(grantId: grant, transfer: packet)) {
+                sent.append(decoded)
+                done(true)
+            } else { XCTFail("Invalid wire packet"); done(false) }
+        }
+        defer { manager.retire(); manager.drainRemoteIOForTesting(); manager = nil }
+        manager.drainRemoteIOForTesting()
+        manager.changed = { if $0.phase == .completed { completed = $0 } }
+        func drain() { for _ in 0..<4 { manager.drainRemoteIOForTesting() } }
+        var offer = TransferPacket(kind: .offer, generation: generation, id: id)
+        offer.files = [.init(name: "sample.bin", length: UInt64(payload.count))]
+        XCTAssertTrue(try deliver(offer))
+        drain()
+        manager.decide(true, consent: try XCTUnwrap(manager.consentForTesting()))
+        drain()
+        XCTAssertEqual(windows, [.init(offer: id, file: 0, consumed: 0, limit: 8192, chunks: 1)])
+        XCTAssertTrue(try deliver(chunks[0]))
+        drain()
+        if wide {
+            let widened = DataTransferManager.FileWindow(offer: id, file: 0, consumed: 8192, limit: 24576, chunks: 3)
+            XCTAssertEqual(windows.last, widened)
+            guard windows.last == widened else { return }
+            XCTAssertTrue(try deliver(chunks[1]))
+            drain()
+        } else {
+            for chunk in chunks.dropFirst() {
+                XCTAssertEqual(windows.last?.chunks, chunk.chunkIndex + 1)
+                XCTAssertTrue(try deliver(chunk))
+                drain()
+            }
+        }
+        let end = TransferPacket(kind: .fileEnd, generation: generation, id: id, offset: UInt64(payload.count),
+                                 bytes: Data(SHA256.hash(data: payload)))
+        XCTAssertTrue(try deliver(end))
+        drain()
+        XCTAssertEqual(sent.last?.kind, .fileAck)
+        XCTAssertTrue(try deliver(.init(kind: .end, generation: generation, id: id)))
+        drain()
+        XCTAssertEqual(sent.last?.kind, .ack)
+        XCTAssertEqual(completed?.bytes, UInt64(payload.count))
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(completed?.received.first)), payload)
     }
 
     func testRemoteFileFakeHostDownloadsOnlyAfterCurrentConsentAndCleansRevokedStage() throws {

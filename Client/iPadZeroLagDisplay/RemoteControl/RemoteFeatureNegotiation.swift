@@ -117,6 +117,7 @@ public struct RemoteCommittedTextCommand: Equatable {
 /// Connection-scoped, networkQueue owned. No unknown ID is sent until marked Pong.
 struct RemoteFeatureNegotiation {
     static let supportedFlag: UInt16 = 0x4000
+    private static let pongTimeout: TimeInterval = 2
     static let phaseAFeaturesEnabled = false
     static let remoteFileFeature: UInt64 = 0x100
     static let remoteAudioFeature: UInt64 = 0x200
@@ -132,17 +133,50 @@ struct RemoteFeatureNegotiation {
     private enum Phase { case initial, pong, result, legacy, complete }
     private var phase: Phase = .initial
     var negotiationSettled: Bool { phase == .complete || phase == .legacy }
+    private var retryAt: TimeInterval = 0
     private var deadline: TimeInterval = 0
+    private var retried = false
+    private var probeChallenges: [Data: Bool] = [:]
+    var nextPongDeadline: TimeInterval? {
+        guard phase == .pong else { return nil }
+        return retried ? deadline : retryAt
+    }
     private(set) var accepted: UInt64 = 0
     private(set) var context: RemoteInputContextCommand?
     private var freshKeyframe = false
     private(set) var revision: UInt64 = 0
 
     mutating func begin(now: TimeInterval) -> Bool {
-        guard phase == .initial else { return false }; deadline = now + 2; phase = .pong; return true
+        guard phase == .initial else { return false }
+        retryAt = now + Self.pongTimeout
+        deadline = retryAt + Self.pongTimeout
+        phase = .pong
+        return true
     }
-    mutating func expire(now: TimeInterval) {
-        if phase == .pong && now >= deadline { phase = .legacy }
+
+    mutating func recordProbe(_ payload: Data, clipboard: Bool) {
+        guard phase == .pong else { return }
+        probeChallenges[payload] = clipboard
+    }
+
+    /// Returns whether the matched ping requested clipboard support.
+    mutating func consumeProbeReply(_ payload: Data) -> Bool? {
+        guard phase == .pong, let clipboard = probeChallenges[payload] else { return nil }
+        probeChallenges.removeAll()
+        return clipboard
+    }
+
+    // True requests one retry. Either outstanding pong can finish the probe before the deadline.
+    mutating func expire(now: TimeInterval) -> Bool {
+        guard phase == .pong else { return false }
+        if now >= deadline {
+            phase = .legacy
+            probeChallenges.removeAll()
+            return false
+        }
+        guard now >= retryAt, !retried else { return false }
+        retried = true
+        return true
     }
     mutating func pong(flags: UInt16, now: TimeInterval, requestRemoteFiles: Bool = false,
                        requestSecureDesktop: Bool = false, requestRemoteAudio: Bool = false, requestClipboard: Bool = false) -> Data? {

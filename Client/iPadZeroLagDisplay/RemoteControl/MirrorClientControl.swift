@@ -142,6 +142,18 @@ public final class MirrorClientControl {
     /// Once PMR is advertised, absence of a descriptor is not permission to send legacy input.
     public var allowsLegacyVirtualInput:Bool { synchronized{!captureSuspended && !captureDescriptorPending && !connectionInputBlocked && session != 0 && foreground && (!typedSources || !settingsOpen) && !captureTargetInputBlocked && (!advertised || state?.mode == .virtualDisplay)} }
 
+    var ownsClipboardControl: Bool {
+        synchronized {
+            guard session != 0, foreground, !suspended, !captureSuspended, !captureDescriptorPending,
+                  !connectionInputBlocked, !captureTargetInputBlocked, terminalSwitch == nil,
+                  transportFloor == nil else { return false }
+            if !advertised || state?.mode == .virtualDisplay { return true }
+            guard let state, state.mode == .active, !state.token.isEmpty, acknowledgedEpoch == state.epoch,
+                  let first = state.firstFrame, let seen = rendered else { return false }
+            return MirrorControlCodec.sequenceAtOrAfter(seen, first)
+        }
+    }
+
     public var gestureRevision:UInt64 { synchronized{revision} }
 
     public func enableTypedSources(session generation: UInt64) {

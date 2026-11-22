@@ -99,6 +99,9 @@ struct SessionConnectionPresentation {
     let state: ConnectionSwitchState
     let streamingRoute: ConnectionRoute?
     let hasWifiEndpoint: Bool
+    var screenSwitchInProgress = false
+
+    var outcome: String? { state.operationOutcome }
 
     var activeRoute: ConnectionRoute? {
         guard let streamingRoute else { return nil }
@@ -112,11 +115,12 @@ struct SessionConnectionPresentation {
         if state.needsRefresh { return .refresh }
         if state.phase == .permissionRequired { return .waiting(state.message, showsProgress: false) }
         guard state.enabled, let activeRoute, let snapshot = state.snapshot,
-              activeRoute == snapshot.current, snapshot.hostState == .ready else { return nil }
+               activeRoute == snapshot.current, state.routeSelectionReady else { return nil }
         let target: ConnectionRoute = activeRoute == .usb ? .wifi : .usb
         let availability = target == .usb ? snapshot.usb : snapshot.wifi
         guard target != .wifi || hasWifiEndpoint,
               availability == .available || target == .usb && availability == .detectedUnverified else { return nil }
+        if screenSwitchInProgress { return .waiting("Wait for the screen switch to finish.", showsProgress: false) }
         if !snapshot.allowed { return .ask(target) }
         return .change(target, faster: target == .usb && availability == .available && snapshot.recommended == .usb)
     }
@@ -147,7 +151,6 @@ struct SessionConnectionPresentation {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var switchingTo: UInt64?
     @State private var failedSelection = false
-    @State private var permissionAsked = false
     @State private var controlPermissionAsked = false
     @State private var lastInteraction = Date()
     @State private var confirmRestart = false
@@ -180,11 +183,12 @@ struct SessionConnectionPresentation {
         }
         if networkManager.captureTargetState.enabled {
             return .make(captureTargets: networkManager.captureTargetState, state: networkManager.mirrorControlState,
-                         permissionAsked: permissionAsked, legacyInputAvailable: networkManager.permitsLegacyVirtualInput)
+                         permissionAsked: networkManager.screenSwitchPermissionPending,
+                         legacyInputAvailable: networkManager.permitsLegacyVirtualInput)
         }
         return .make(catalogue: networkManager.mirrorMonitorCatalogue, state: networkManager.mirrorControlState,
               switchingTo: switchingTo, switchPending: networkManager.mirrorMonitorSwitchPending,
-              pickerSupported: networkManager.mirrorScreenPickerSupported, permissionAsked: permissionAsked,
+              pickerSupported: networkManager.mirrorScreenPickerSupported, permissionAsked: networkManager.screenSwitchPermissionPending,
               legacyInputAvailable: networkManager.permitsLegacyVirtualInput)
     }
 
@@ -224,13 +228,15 @@ struct SessionConnectionPresentation {
         default: nil
         }
         return SessionConnectionPresentation(state: networkManager.connectionSwitchState,
-            streamingRoute: session.reconnecting ? nil : route, hasWifiEndpoint: networkManager.hasReconnectTarget)
+            streamingRoute: session.reconnecting ? nil : route, hasWifiEndpoint: networkManager.hasReconnectTarget,
+            screenSwitchInProgress: picker.isSwitching)
     }
 
     private var cycle: ScreenCyclePresentation {
         let p = picker
         let reason: String?
-        if p.phase == .loading { reason = "Loading screens..." }
+        if let screenSwitchBlockedReason { reason = screenSwitchBlockedReason }
+        else if p.phase == .loading { reason = "Loading screens..." }
         else if networkManager.isRemoteControlSession && p.control != .on {
             reason = "Turn Control on to choose a screen."
         } else if p.phase == .locked {
@@ -244,7 +250,18 @@ struct SessionConnectionPresentation {
     }
 
     private var modeChoices: CaptureModePresentation {
-        .make(targets: networkManager.captureTargetState, kind: kind, lastPhysicalId: rememberedPhysical.id)
+        .make(targets: networkManager.captureTargetState, kind: kind, lastPhysicalId: rememberedPhysical.id,
+              switchBlockedReason: screenSwitchBlockedReason)
+    }
+
+    private var routeSwitchInProgress: Bool { networkManager.connectionSwitchState.pending != nil }
+
+    private var screenSwitchBlockedReason: String? {
+        if routeSwitchInProgress { return "Wait for the connection switch to finish." }
+        if networkManager.captureTargetState.enabled && networkManager.isDisplayConfigurationPending {
+            return "Wait for the display change to finish."
+        }
+        return nil
     }
 
     var body: some View {
@@ -260,8 +277,7 @@ struct SessionConnectionPresentation {
             disconnectArming.reset()
             if open {
                 failedSelection = false
-                if networkManager.isRemoteControlSession { networkManager.refreshRemoteScreens() }
-                else { networkManager.refreshMirrorScreens() }
+                refreshScreens()
             }
         }
         .onAppear { rememberedPhysical.observe(networkManager.captureTargetState) }
@@ -270,19 +286,15 @@ struct SessionConnectionPresentation {
             if wasSwitching && !switching { finishSwitch() }
         }
         .onChange(of: networkManager.captureTargetState.session) { _, _ in
-            switchingTo=nil;permissionAsked=false;controlPermissionAsked=false
+            switchingTo=nil;controlPermissionAsked=false
             failedSelection=false
             requestedScreen=nil;awaitingSwitchAnnouncement=false
-        }
-        .onChange(of: networkManager.captureTargetState.catalogue?.allowed) { _, allowed in
-            if allowed == true { permissionAsked=false }
         }
         .onChange(of: picker.control) { _, control in
             if control == .on { controlPermissionAsked = false }
         }
         .onChange(of: networkManager.mirrorMonitorCatalogue) { _, catalogue in settle(catalogue) }
         .onChange(of: networkManager.mirrorMonitorSwitchPending) { _, pending in if !pending { settle(networkManager.mirrorMonitorCatalogue) } }
-        .onChange(of: networkManager.mirrorMonitorCatalogue?.allowed) { _, allowed in if allowed == true { permissionAsked = false } }
     }
 
     // MARK: Pill
@@ -372,20 +384,23 @@ struct SessionConnectionPresentation {
         let p = picker
         let targets = networkManager.captureTargetState
         let remote = networkManager.isRemoteControlSession
-        let catalogueUnavailable = remote
-            ? networkManager.remoteMonitorState.catalogue?.state == 0 || networkManager.remoteMonitorState.issue == .unavailable
-            : targets.enabled && (targets.listUnavailable || targets.catalogue?.state == 0 || targets.catalogue?.state == 3)
+        let remoteCatalogueUnavailable = remote &&
+            (networkManager.remoteMonitorState.catalogue?.state == 0 || networkManager.remoteMonitorState.issue == .unavailable)
         let canRefresh = remote ? networkManager.remoteMonitorState.enabled
             : targets.enabled || networkManager.mirrorScreenPickerSupported
         if p.isSwitching { return ScreenNotice("Switching…", showsProgress: true) }
+        if !remote, let notice = ScreenNotice.typedCatalogueNotice(for: targets) { return notice }
+        if let screenSwitchBlockedReason { return ScreenNotice(screenSwitchBlockedReason) }
         if p.canAskPermission {
-            return ScreenNotice("The PC must allow screen changes.", action: .askPermission)
+            let noAnswer = networkManager.screenSwitchPermissionNotice
+            return ScreenNotice(noAnswer ?? "The PC must allow screen changes.", action: .askPermission,
+                                isFailure: noAnswer != nil)
         }
-        if catalogueUnavailable {
+        if remoteCatalogueUnavailable {
             return ScreenNotice(canRefresh ? "Can't read the PC's screens." : "Can't read the PC's screens. Stop and restart the session.",
                 action: canRefresh ? .refresh : nil)
         }
-        if permissionAsked && p.phase == .locked { return ScreenNotice(CastingPermissionCopy.requestSent) }
+        if !remote && networkManager.screenSwitchPermissionPending { return ScreenNotice(CastingPermissionCopy.requestSent) }
         if targets.unknownOutcome && modeChoices.extend.selected && modeChoices.extend.enabled {
             return ScreenNotice("Couldn't switch screens.", action: .recoverExtend, isFailure: true)
         }
@@ -396,7 +411,7 @@ struct SessionConnectionPresentation {
         if screenHasFailure && (canRefresh || failedSelection) {
             return ScreenNotice("Couldn't switch screens.", action: canRefresh ? .retry : nil, isFailure: true)
         }
-        if targets.needsCatalogueRefresh || networkManager.remoteMonitorState.needsCatalogueRefresh {
+        if remote && networkManager.remoteMonitorState.needsCatalogueRefresh {
             return ScreenNotice("Can't read the PC's screens.", action: canRefresh ? .refresh : nil)
         }
         if remote {
@@ -413,7 +428,7 @@ struct SessionConnectionPresentation {
 
     private func refreshScreens() {
         if networkManager.isRemoteControlSession { networkManager.refreshRemoteScreens() }
-        else { networkManager.refreshMirrorScreens() }
+        else if !networkManager.captureTargetState.requiresRestart { networkManager.refreshMirrorScreens() }
     }
 
     private func changeCastingControl(_ action: SessionHeaderPresentation.ControlAction) {
@@ -443,6 +458,7 @@ struct SessionConnectionPresentation {
     }
 
     private func requestScreen(_ targetId: UInt64) {
+        guard screenSwitchBlockedReason == nil else { return }
         let p = picker
         if networkManager.isRemoteControlSession {
             guard p.tiles.contains(where: { $0.id == targetId && $0.canSelect }), monitorControlEnabled,
@@ -465,9 +481,13 @@ struct SessionConnectionPresentation {
     private func finishSwitch() {
         guard awaitingSwitchAnnouncement else { return }
         awaitingSwitchAnnouncement = false
+        // Typed source catalogue IDs are scoped to each revision. The terminal
+        // result already correlated the request and confirmed its presentation.
+        let legacyIDMismatch = !networkManager.captureTargetState.enabled &&
+            picker.tiles.first(where: { $0.status == .showing })?.id != requestedScreen
         let failed = failedSelection || networkManager.remoteMonitorState.issue != nil ||
             networkManager.captureTargetState.issue != nil || networkManager.captureTargetState.unknownOutcome ||
-            picker.tiles.first(where: { $0.status == .showing })?.id != requestedScreen
+            legacyIDMismatch
         let message = failed ? "Couldn't switch screens."
             : "Showing \(cycle.currentLabel)."
         requestedScreen = nil
@@ -566,7 +586,7 @@ struct SessionConnectionPresentation {
                                                                     idleFor: context.date.timeIntervalSince(owner.lastInteraction),
                                                                     reconnecting: owner.session.reconnecting)
                             ZStack(alignment: .top) {
-                                if mode == .full {
+                                if mode == .full || owner.networkManager.clipboardMissedCopyNotice != nil {
                                     owner.pill(maxX: proxy.size.width).transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .top)))
                                 } else {
                                     owner.handle(maxX: proxy.size.width).transition(.opacity)
@@ -647,6 +667,12 @@ struct SessionConnectionPresentation {
         let owner: SessionPanelOverlay
         var body: some View {
             VStack(alignment: .leading, spacing: 20) {
+                if let notice = owner.networkManager.clipboardMissedCopyNotice {
+                    Text(notice)
+                        .font(.footnote)
+                        .foregroundStyle(Color(ink: SessionInk.secondary))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if ScreenPickerSnapshot.shouldShowPicker(remote: owner.networkManager.isRemoteControlSession,
                     mirror: !owner.networkManager.isRemoteControlSession, acceptedFeatures: owner.networkManager.remoteMonitorState.enabled ? 7 : 0,
                     typedSources: owner.networkManager.captureTargetState.enabled) { owner.screens }
@@ -778,7 +804,7 @@ struct SessionConnectionPresentation {
         }
     }
 
-    private struct ScreenNotice {
+    struct ScreenNotice {
         enum Action: Equatable {
             case askPermission, refresh, retry, recover, recoverExtend
 
@@ -795,6 +821,16 @@ struct SessionConnectionPresentation {
         let action: Action?
         let showsProgress: Bool
         let isFailure: Bool
+
+        static func typedCatalogueNotice(for targets: CaptureTargetState) -> Self? {
+            if targets.requiresRestart {
+                return Self("Screens are unavailable. Stop and restart the session.", isFailure: true)
+            }
+            if targets.listUnavailable {
+                return Self("Can't read the PC's screens.", action: .refresh, isFailure: true)
+            }
+            return nil
+        }
 
         init(_ message: String, action: Action? = nil, showsProgress: Bool = false, isFailure: Bool = false) {
             self.message = message
@@ -821,7 +857,6 @@ struct SessionConnectionPresentation {
                     Button {
                         switch action {
                         case .askPermission:
-                            owner.permissionAsked = true
                             owner.lastInteraction = Date()
                             owner.networkManager.requestMirrorSwitchPermission()
                         case .refresh, .retry:
@@ -944,10 +979,14 @@ struct SessionConnectionPresentation {
 
         var body: some View {
             let presentation = owner.connectionPresentation
-            if presentation.activeRoute != nil || presentation.action != nil {
+            if presentation.activeRoute != nil || presentation.outcome != nil || presentation.action != nil {
                 VStack(alignment: .leading, spacing: 8) {
                     owner.sectionTitle("Connection")
                     if let route = presentation.activeRoute { activeRow(route) }
+                    if let outcome = presentation.outcome {
+                        Text(outcome).font(.footnote).fixedSize(horizontal: false, vertical: true)
+                            .foregroundStyle(Color(ink: SessionInk.secondary))
+                    }
                     if let action = presentation.action {
                         if presentation.activeRoute != nil { owner.separator() }
                         nextAction(action)
@@ -985,8 +1024,7 @@ struct SessionConnectionPresentation {
                     switch action {
                     case let .change(route, _):
                         owner.lastInteraction = Date()
-                        owner.remoteInput.suspend(reason: 1)
-                        owner.networkManager.requestConnectionRoute(route)
+                        owner.networkManager.requestConnectionRoute(route) { owner.remoteInput.suspend(reason: 1) }
                     case let .ask(route):
                         owner.networkManager.requestConnectionRoute(route, askPC: true)
                     case .reconnect:
@@ -1015,8 +1053,6 @@ struct SessionConnectionPresentation {
     @MainActor private struct RemoteClipboardSection: View {
         @ObservedObject var manager: NetworkManager
         @ObservedObject var pasteboard: RemoteClipboardPasteboard
-        @Environment(\.openURL) private var openURL
-        @State private var confirmAutomatic = false
 
         var body: some View {
             if pasteboard.supported {
@@ -1037,24 +1073,6 @@ struct SessionConnectionPresentation {
                             Text("Send clipboard to PC").font(.subheadline)
                             RemoteClipboardPasteButton(pasteboard: pasteboard)
                                 .frame(height: 44)
-                            Toggle("Send new copies automatically", isOn: Binding(
-                                get: { pasteboard.automatic },
-                                set: { enabled in
-                                    if enabled { confirmAutomatic = true }
-                                    else { pasteboard.setAutomatic(false) }
-                                }))
-                                .font(.subheadline)
-                                .tint(Color(ink: SessionInk.accent))
-                                .frame(minHeight: 44)
-                        }
-                        .alert("Allow automatic sending?", isPresented: $confirmAutomatic) {
-                            Button("Open iPad Settings") {
-                                if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
-                            }
-                            Button("I?ve set Allow") { pasteboard.setAutomatic(true) }
-                            Button("Cancel", role: .cancel) {}
-                        } message: {
-                            Text("In iPad Settings, open this app and set Paste from Other Apps to Allow. New copies can then be sent to the PC while this session is active.")
                         }
                     }
                     if let notice = pasteboard.transferNotice {
@@ -1242,11 +1260,13 @@ struct SessionConnectionPresentation {
         let maxX: CGFloat
         var body: some View {
             let s = owner.session
+            let missedCopy = owner.networkManager.clipboardMissedCopyNotice
             return Button {
                 owner.isOpen ? owner.close() : owner.open()
             } label: {
                 Group {
-                    if let status = owner.headerPresentation.pillStatus(isOpen: owner.isOpen) {
+                    if let status = owner.headerPresentation.pillStatus(isOpen: owner.isOpen)
+                        .map({ missedCopy ?? $0 }) {
                         if s.reconnecting {
                             HStack(spacing: 8) {
                                 Image(systemName: "arrow.triangle.2.circlepath").accessibilityHidden(true)
@@ -1277,7 +1297,7 @@ struct SessionConnectionPresentation {
             .buttonStyle(.plain)
             .gesture(owner.moveAlongTop(maxX: maxX))
             .accessibilityLabel(owner.pillLabel(s))
-            .accessibilityValue(owner.isOpen ? "Expanded" : "Collapsed")
+            .accessibilityValue(owner.isOpen ? "Expanded" : (missedCopy ?? "Collapsed"))
             .accessibilityHint("Opens screens, keyboard, files, settings and disconnect")
         }
 

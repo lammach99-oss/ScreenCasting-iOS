@@ -229,6 +229,24 @@ import UIKit
 
 // Adapted from the AU8 audit proposals; real shared engine, no UIKit event mocks.
 @MainActor final class AU8ExternalMouseRegressionTests: XCTestCase {
+    func testStationaryDoubleClickWithoutNeutralHoverBetweenClicks() {
+        for mode in [IPadTouchMode.direct, .trackpad] {
+            let session = IPadInputSession(clock: { 0 }, automaticallyTicks: false)
+            session.engine.mode = mode; session.engine.enabled = true; session.engine.directAvailable = true
+            var events: [IPadInputEvent] = []
+            session.engine.emit = { events.append($0) }
+            let view = PencilUIKitView(frame: .zero)
+            for _ in 0..<2 {
+                view.routeV2IndirectPointer(point: .zero, normalized: .zero, buttons: 1,
+                                            flags: 1, cancelled: false, session: session)
+                view.routeV2IndirectPointer(point: .zero, normalized: .zero, buttons: 0,
+                                            flags: 4, cancelled: false, session: session)
+            }
+            XCTAssertEqual(events.filter { if case .button = $0 { return true }; return false },
+                           [.button(1, 0, 1), .button(1, 1, 1), .button(1, 0, 2), .button(1, 1, 2)])
+        }
+    }
+
     private func engine(_ clock: @escaping () -> TimeInterval = { 0 }) -> IPadInputEngine {
         let e = IPadInputEngine(clock: clock)
         e.enabled = true; e.typeEnabled = true

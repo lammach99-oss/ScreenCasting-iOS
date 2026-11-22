@@ -69,7 +69,7 @@ public struct CaptureModePresentation: Equatable {
     public let explanation: String?
 
     public static func make(targets: CaptureTargetState, kind: SessionPanelKind,
-                            lastPhysicalId: UInt64?) -> Self {
+                            lastPhysicalId: UInt64?, switchBlockedReason: String? = nil) -> Self {
         guard targets.enabled else {
             return Self(extend: CaptureModeChoice(targetId: nil, selected: kind == .castingExtend, enabled: false),
                         mirror: CaptureModeChoice(targetId: nil, selected: kind == .castingMirror, enabled: false),
@@ -80,7 +80,7 @@ public struct CaptureModePresentation: Equatable {
         let physical = entries.filter { $0.kind == .physical }
         let extended = entries.first { $0.kind == .extend }
         let current = entries.first { $0.id == targets.confirmedCurrentId }
-        let ready = targets.canSelect && !targets.needsCatalogueRefresh && !targets.isSwitching &&
+        let ready = switchBlockedReason == nil && targets.canSelect && !targets.needsCatalogueRefresh && !targets.isSwitching &&
             catalogue?.state == 1 && catalogue?.allowed == true
         let mirror = physical.first { $0.id == lastPhysicalId } ?? physical.first
         let recoveringExtend = targets.unknownOutcome && current?.kind == .extend
@@ -88,7 +88,7 @@ public struct CaptureModePresentation: Equatable {
                         enabled: ready && extended != nil && (current?.kind != .extend || recoveringExtend)),
                     mirror: CaptureModeChoice(targetId: mirror?.id, selected: current?.kind == .physical,
                         enabled: ready && mirror != nil && current?.kind != .physical),
-                    explanation: recoveringExtend ? "Choose Extend again to restore the picture." : nil)
+                     explanation: switchBlockedReason ?? (recoveringExtend ? "Choose Extend again to restore the picture." : nil))
     }
 }
 

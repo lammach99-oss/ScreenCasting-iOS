@@ -18,17 +18,28 @@ struct RemoteClipboardContent {
         return Self(format: format, formats: formats, bytes: canonical, digest: Data(SHA256.hash(data: canonical)))
     }
 
-    static func read(_ url: URL, limit: Int) -> Data? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+    enum FileReadResult {
+        case bytes(Data)
+        case tooLarge
+        case unavailable
+    }
+
+    static func read(_ url: URL, limit: Int) -> FileReadResult {
+        guard url.isFileURL,
+              let properties = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+              properties.isRegularFile == true, let size = properties.fileSize else { return .unavailable }
+        guard size <= limit else { return .tooLarge }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return .unavailable }
         defer { try? handle.close() }
         var bytes = Data()
         do {
-            while let chunk = try handle.read(upToCount: min(64 * 1024, limit + 1 - bytes.count)), !chunk.isEmpty {
+            // Also bound files whose size changes after the metadata check.
+            while let chunk = try handle.read(upToCount: min(64 * 1024 - 1, limit - bytes.count) + 1), !chunk.isEmpty {
+                guard chunk.count <= limit - bytes.count else { return .tooLarge }
                 bytes.append(chunk)
-                if bytes.count > limit { return nil }
             }
-            return bytes
-        } catch { return nil }
+            return .bytes(bytes)
+        } catch { return .unavailable }
     }
 
     private static func allowedSize(width: Int, height: Int) -> Bool {

@@ -120,6 +120,21 @@ final class ConnectionControlProtocolTests: XCTestCase {
     static let usbCredential = TrustedHostCredential(fingerprint: "synthetic", hostID: Data(32..<48),
         deviceID: Data(16..<32), secret: Data(112..<144), sessionID: Data(144..<160))
     static let usbChallenge = Data(0..<112)
+    func testClientHelloNameStaysWithinWholeUTF8ScalarsAndHasFallback() throws {
+        let prefix = String(repeating: "a", count: 63)
+        let cases = [(prefix + "ế", prefix), (prefix + "x", prefix + "x"),
+                     (String(repeating: "a", count: 60) + "\u{1F4F1}x", String(repeating: "a", count: 60) + "\u{1F4F1}"),
+                     (String(repeating: "a", count: 62) + "e\u{0301}", String(repeating: "a", count: 62) + "e"),
+                     ("", "iPad")]
+        for (name, expected) in cases {
+            var state = USBSessionIdentityProof()
+            _ = state.offer(flags: 0x0100, credential: Self.usbCredential, now: 0)
+            let hello = try XCTUnwrap(state.clientHello(name: name, now: 0))
+            XCTAssertEqual(Int(hello[33]), expected.utf8.count)
+            XCTAssertEqual(String(data: hello.dropFirst(34), encoding: .utf8), expected)
+        }
+    }
+
     func testUsbIdentitySuccessExactExistingCredentialBytes() throws {
         var state = USBSessionIdentityProof()
         XCTAssertEqual(state.offer(flags: 0x0100, credential: Self.usbCredential, now: 0), 0x0080)

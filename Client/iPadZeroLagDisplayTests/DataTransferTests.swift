@@ -634,6 +634,31 @@ final class DataTransferTests: XCTestCase {
         receiver.manager.retire(); await ux03Barrier(receiver.manager)
     }
 
+    func testOutgoingStorageRejectionReachesSenderAndClearsOnNextOffer() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = root.appendingPathComponent("retained"), source = root.appendingPathComponent("source.bin")
+        let library = try ReceivedFileLibrary(directory: directory)
+        try Data([4]).write(to: source)
+        let receiver = UX03Receiver(root: directory, library: library)
+        receiver.manager.sendFiles([source]); await ux03Barrier(receiver.manager)
+        let offer = try XCTUnwrap(receiver.packets.first { $0.kind == .offer })
+        var rejected = TransferPacket(kind: .response, generation: offer.generation, id: offer.id)
+        rejected.reason = .insufficientStorage
+        let payload = try TransferProtocol.encode(rejected)
+        let decoded = try TransferProtocol.decode(.response, payload)
+        await ux03Post(decoded, to: receiver.manager)
+        let snapshot = receiver.snapshot
+        XCTAssertEqual(snapshot.phase, .rejected)
+        XCTAssertEqual(snapshot.rejectionReason, .insufficientStorage)
+        XCTAssertEqual(TransferPresentation.rejection(snapshot), "The PC is out of space for this transfer. Free space on the PC and try again.")
+
+        receiver.manager.sendFiles([source]); await ux03Barrier(receiver.manager)
+        XCTAssertEqual(receiver.snapshot.phase, .offering)
+        XCTAssertNil(receiver.snapshot.rejectionReason)
+        receiver.manager.retire(); await ux03Barrier(receiver.manager)
+    }
+
     func testUX03OutgoingTransferDoesNotCreateInboundReceipt() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1063,7 +1088,8 @@ final class DataTransferTests: XCTestCase {
         defer {try? FileManager.default.removeItem(at:directory)}
         let store=try TransferStore(directory:directory,metadata:TransferFile(name:"x",length:1),id:UUID())
         try store.append(chunk:0,offset:0,bytes:Data([1]))
-        XCTAssertFalse(FileManager.default.fileExists(atPath:directory.appendingPathComponent("x").path))
+        // Inspect while the stage is live, before cleanup could hide bytes left by process death.
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath:directory.path).isEmpty)
         XCTAssertThrowsError(try store.publish(length:1,digest:Data(count:32)))
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath:directory.path).isEmpty)
     }

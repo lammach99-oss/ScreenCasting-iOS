@@ -440,8 +440,12 @@ enum IPadInputEvent: Equatable {
             else if drag == .armed || tapCount >= 2 { button(1, true); if tapCount >= 2 { suppressedTap = true } }
         } else {
             cancelNative(); button(1, false); if drag != .idle { drag = .idle }
-            let (center, span) = geometry(); twoOrigin = center; twoPrevious = center
-            pinchDistance = span; pinchPrevious = span
+            if maximumFingers == 2 {
+                let (center, span) = geometry(); twoOrigin = center; twoPrevious = center
+                pinchDistance = span; pinchPrevious = span
+            } else {
+                pinching = false; scrolling = false
+            }
             if contacts.count == 3 { settingsCandidate = clock() - gestureBegan <= 0.150 }
         }
     }
@@ -465,7 +469,7 @@ enum IPadInputEvent: Equatable {
         let previous = c.point; c.point = point; c.normalized = p; contacts[id] = c
         if distance(c.start,point) > 8 { moved = true }
         if maximumFingers >= 2 {
-            guard contacts.count == 2 else { return }
+            guard maximumFingers == 2, contacts.count == 2 else { return }
             let (center, span) = geometry()
             let before = twoPrevious ?? center; twoPrevious = center
             if let baseline = pinchDistance, baseline > 0, !scrolling,

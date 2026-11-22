@@ -20,9 +20,16 @@ final class TransferStore {
         let values = try directory.resourceValues(forKeys: [.isSymbolicLinkKey,.volumeAvailableCapacityForImportantUsageKey])
         guard values.isSymbolicLink != true else { throw TransferProtocol.Failure.invalid }
         if let capacity = values.volumeAvailableCapacityForImportantUsage, capacity < 0 || UInt64(capacity) < metadata.length + 64 * 1024 * 1024 { throw CocoaError(.fileWriteOutOfSpace) }
-        temporary = directory.appendingPathComponent(".scdt-\(id.uuidString)-\(UUID().uuidString).part")
+        // The sandbox temp directory is on the app data volume and outside the received library.
+        temporary = FileManager.default.temporaryDirectory
+            .appendingPathComponent(".scdt-\(id.uuidString)-\(UUID().uuidString).part")
         guard FileManager.default.createFile(atPath: temporary.path, contents: nil) else { throw CocoaError(.fileWriteUnknown) }
-        handle = try FileHandle(forWritingTo: temporary)
+        do {
+            handle = try FileHandle(forWritingTo: temporary)
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            throw error
+        }
     }
     func append(chunk: UInt64, offset: UInt64, bytes: Data) throws {
         guard !terminal, let handle, chunk == nextChunk, offset == written, !bytes.isEmpty,

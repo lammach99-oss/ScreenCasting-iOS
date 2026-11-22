@@ -1363,10 +1363,9 @@ public class PencilUIKitView: UIView, UIPencilInteractionDelegate {
             let point = touch.location(in: self)
             let mapped = contentViewport?.normalizedPoint(for: point, in: bounds)
             if touch.type == .indirectPointer {
-                if cancelled || flags == 4 { session.engine.hoverExited(); continue }
-                guard let mapped else { session.engine.hoverExited(); continue }
-                session.clearTextHistory?()
-                session.engine.external(point: point, normalized: mapped, buttons: UInt(truncatingIfNeeded: event?.buttonMask.rawValue ?? 0))
+                routeV2IndirectPointer(point: point, normalized: mapped,
+                                       buttons: UInt(truncatingIfNeeded: event?.buttonMask.rawValue ?? 0),
+                                       flags: flags, cancelled: cancelled, session: session)
                 continue
             }
             guard touch.type == .direct || touch.type == .pencil else { continue }
@@ -1384,6 +1383,13 @@ public class PencilUIKitView: UIView, UIPencilInteractionDelegate {
                 else { session.engine.end(id: id,point: point,normalized: .zero,cancelled: true); v2IDs.removeValue(forKey: key) }
             }
         }
+    }
+
+    func routeV2IndirectPointer(point: CGPoint, normalized: CGPoint?, buttons: UInt,
+                                flags: UInt8, cancelled: Bool, session: IPadInputSession) {
+        guard !cancelled, let normalized else { session.engine.hoverExited(); return }
+        if flags != 4 { session.clearTextHistory?() }
+        session.engine.external(point: point, normalized: normalized, buttons: buttons)
     }
 
     func updateRemoteVideoRect() {

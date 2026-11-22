@@ -12,12 +12,27 @@ struct TrustedHostCredential: Codable, Equatable {
     let deviceID: Data
     let secret: Data
     var sessionID: Data
+    // Older Keychain records omit this field.
+    var usbControlTLSSeen: Bool? = nil
+}
+
+enum TrustedHostBackingRead {
+    case found(Data)
+    case missing
+    case failed
 }
 
 protocol TrustedHostCredentialBacking {
     func load(fingerprint: String) -> Data?
+    func read(fingerprint: String) -> TrustedHostBackingRead
     func save(_ data: Data, fingerprint: String) -> Bool
-    func delete(fingerprint: String)
+    @discardableResult func delete(fingerprint: String) -> Bool
+}
+
+extension TrustedHostCredentialBacking {
+    func read(fingerprint: String) -> TrustedHostBackingRead {
+        load(fingerprint: fingerprint).map { .found($0) } ?? .missing
+    }
 }
 
 struct SecurityTrustedHostCredentialBacking: TrustedHostCredentialBacking {
@@ -25,6 +40,11 @@ struct SecurityTrustedHostCredentialBacking: TrustedHostCredentialBacking {
     init(service: String = "com.screencasting.trusted-host.v1") { self.service = service }
 
     func load(fingerprint: String) -> Data? {
+        if case .found(let data) = read(fingerprint: fingerprint) { return data }
+        return nil
+    }
+
+    func read(fingerprint: String) -> TrustedHostBackingRead {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -33,9 +53,10 @@ struct SecurityTrustedHostCredentialBacking: TrustedHostCredentialBacking {
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
         var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data else { return nil }
-        return data
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound { return .missing }
+        guard status == errSecSuccess, let data = result as? Data else { return .failed }
+        return .found(data)
     }
 
     func save(_ data: Data, fingerprint: String) -> Bool {
@@ -56,12 +77,13 @@ struct SecurityTrustedHostCredentialBacking: TrustedHostCredentialBacking {
         return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
     }
 
-    func delete(fingerprint: String) {
-        SecItemDelete([
+    func delete(fingerprint: String) -> Bool {
+        let status = SecItemDelete([
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: fingerprint,
         ] as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 }
 
@@ -96,7 +118,8 @@ struct TrustedHostCredentialStore {
         return backing.save(data, fingerprint: credential.fingerprint)
     }
 
-    func delete(fingerprint: String) {
+    @discardableResult
+    func delete(fingerprint: String) -> Bool {
         backing.delete(fingerprint: fingerprint)
     }
 }
@@ -107,7 +130,11 @@ struct TrustedHostFingerprintStore {
     init(backing: any TrustedHostCredentialBacking = SecurityTrustedHostCredentialBacking(service: "com.screencasting.trusted-host-identity.v1")) {
         self.backing = backing
     }
-    private struct Record: Codable { let fingerprint: String; let hostID: Data }
+    private struct Record: Codable {
+        let fingerprint: String
+        let hostID: Data
+        let target: WifiReconnectTarget?
+    }
     private func key(_ endpoint: NWEndpoint) -> String? {
         guard let target = WifiReconnectTargetPolicy.target(from: endpoint) else { return nil }
         // Encode deterministically: JSON object key ordering is otherwise unspecified.
@@ -116,28 +143,50 @@ struct TrustedHostFingerprintStore {
         return "endpoint." + SHA256.hash(data: stable).map { String(format: "%02x", $0) }.joined()
     }
     func load(endpoint: NWEndpoint) -> String? {
-        guard let key = key(endpoint), let bytes = backing.load(fingerprint: key),
-              let record = try? JSONDecoder().decode(Record.self, from: bytes),
-              record.hostID.count == 16,
+        key(endpoint).flatMap { record(for: $0)?.fingerprint }
+    }
+
+    private func record(for key: String) -> Record? {
+        guard let record = storedRecord(for: key),
               backing.load(fingerprint: "identity." + record.fingerprint) == record.hostID else { return nil }
-        return record.fingerprint
+        return record
+    }
+
+    private func storedRecord(for key: String) -> Record? {
+        guard let bytes = backing.load(fingerprint: key),
+              let record = try? JSONDecoder().decode(Record.self, from: bytes),
+              record.hostID.count == 16 else { return nil }
+        return record
+    }
+
+    // Includes invalidated endpoint records so callers can suppress retries during cleanup.
+    func fingerprintForCleanup(endpoint: NWEndpoint) -> String? {
+        key(endpoint).flatMap { storedRecord(for: $0)?.fingerprint }
+    }
+
+    func targets(for fingerprint: String) -> [WifiReconnectTarget] {
+        (endpointKeys(fingerprint) ?? []).reversed().compactMap { key in
+            guard let record = record(for: key), record.fingerprint == fingerprint else { return nil }
+            return record.target
+        }
     }
     // Selected identity is only for USB's existing proof protocol, never a Wi-Fi endpoint pin.
     func load() -> String? {
         guard let bytes = backing.load(fingerprint: "selected-identity") ?? backing.load(fingerprint: "selected-host") else { return nil }
         return String(data: bytes, encoding: .utf8)
     }
-    func save(_ fingerprint: String, endpoint: NWEndpoint, hostID: Data) -> Bool {
+    func save(_ fingerprint: String, endpoint: NWEndpoint, hostID: Data, select: Bool = true,
+              saveCredential: () -> Bool = { true }) -> Bool {
         guard !fingerprint.isEmpty, hostID.count == 16, let key = key(endpoint),
-              let bytes = try? JSONEncoder().encode(Record(fingerprint: fingerprint, hostID: hostID)) else { return false }
-        var keys = endpointKeys(fingerprint)
+              var keys = endpointKeys(fingerprint),
+              let target = WifiReconnectTargetPolicy.target(from: endpoint),
+              let bytes = try? JSONEncoder().encode(Record(fingerprint: fingerprint, hostID: hostID, target: target)) else { return false }
         if !keys.contains(key) { keys.append(key) }
-        guard let index = try? JSONEncoder().encode(keys),
+        guard let index = try? JSONEncoder().encode(keys), saveCredential(),
               backing.save(hostID, fingerprint: "identity." + fingerprint),
               backing.save(index, fingerprint: "index." + fingerprint),
-              backing.save(bytes, fingerprint: key),
-              backing.save(Data(fingerprint.utf8), fingerprint: "selected-identity") else { return false }
-        return true
+              backing.save(bytes, fingerprint: key) else { return false }
+        return !select || backing.save(Data(fingerprint.utf8), fingerprint: "selected-identity")
     }
     func migrateLegacy(endpoint: NWEndpoint, presented: String, credential: TrustedHostCredential?) -> String? {
         guard let legacy = backing.load(fingerprint: "selected-host"), String(data: legacy, encoding: .utf8) == presented,
@@ -147,23 +196,38 @@ struct TrustedHostFingerprintStore {
         backing.delete(fingerprint: "selected-host")
         return presented
     }
-    private func endpointKeys(_ fingerprint: String) -> [String] {
-        guard let data = backing.load(fingerprint: "index." + fingerprint) else { return [] }
-        return (try? JSONDecoder().decode([String].self, from: data)) ?? []
+    private func endpointKeys(_ fingerprint: String) -> [String]? {
+        switch backing.read(fingerprint: "index." + fingerprint) {
+        case .found(let data): return try? JSONDecoder().decode([String].self, from: data)
+        case .missing: return []
+        case .failed: return nil
+        }
     }
-    func delete(fingerprint: String) {
-        for key in endpointKeys(fingerprint) {
+    @discardableResult
+    func delete(fingerprint: String) -> Bool {
+        // Removing the identity invalidates every endpoint pin before cleaning up its index.
+        guard let keys = endpointKeys(fingerprint),
+              backing.delete(fingerprint: "identity." + fingerprint) else { return false }
+        for key in keys {
             // A reused endpoint might now belong to a different, explicitly confirmed host.
-            if let data = backing.load(fingerprint: key),
-               let record = try? JSONDecoder().decode(Record.self, from: data), record.fingerprint == fingerprint {
-                backing.delete(fingerprint: key)
+            switch backing.read(fingerprint: key) {
+            case .missing: continue
+            case .failed: return false
+            case .found(let data):
+                guard let record = try? JSONDecoder().decode(Record.self, from: data) else { return false }
+                if record.fingerprint == fingerprint, !backing.delete(fingerprint: key) { return false }
             }
         }
-        backing.delete(fingerprint: "index." + fingerprint)
-        backing.delete(fingerprint: "identity." + fingerprint)
         for key in ["selected-identity", "selected-host"] {
-            if backing.load(fingerprint: key) == Data(fingerprint.utf8) { backing.delete(fingerprint: key) }
+            switch backing.read(fingerprint: key) {
+            case .missing: continue
+            case .failed: return false
+            case .found(let data):
+                if data == Data(fingerprint.utf8), !backing.delete(fingerprint: key) { return false }
+            }
         }
+        // Keep the inventory until every dependent deletion has succeeded or the item is absent.
+        return backing.delete(fingerprint: "index." + fingerprint)
     }
 }
 
@@ -266,7 +330,34 @@ enum RecentWifiResumeStore {
     }
 }
 
-struct WifiReconnectTarget: Codable, Equatable {
+enum TrustedHostForgetOutcome: Equatable {
+    case both
+    case localOnly
+    case savedTargetRemoved
+    case noSavedPairing
+    case localFailed(pcConfirmed: Bool)
+    case cleanupIncomplete(pcConfirmed: Bool)
+
+    var message: String {
+        switch self {
+        case .both: return "Pairing was removed from this iPad and the PC."
+        case .localOnly:
+            return "Pairing was removed from this iPad only. The PC may still list this iPad as paired. Remove it from the PC’s paired devices."
+        case .savedTargetRemoved: return "The saved reconnect target was removed from this iPad."
+        case .noSavedPairing: return "This iPad has no saved pairing for this PC."
+        case .localFailed(let pcConfirmed):
+            return pcConfirmed
+                ? "The PC removed this iPad from its paired devices. This iPad couldn’t remove its saved pairing."
+                : "This iPad couldn’t remove its saved pairing. The PC may still list this iPad as paired."
+        case .cleanupIncomplete(let pcConfirmed):
+            return pcConfirmed
+                ? "The PC removed this iPad from its paired devices. This iPad blocked the saved pairing and still has records to remove. Retry cleanup."
+                : "This iPad blocked the saved pairing and still has records to remove. The PC may still list this iPad as paired. Retry cleanup."
+        }
+    }
+}
+
+struct WifiReconnectTarget: Codable, Hashable {
     enum Kind: String, Codable {
         case hostPort
         case service
@@ -305,7 +396,7 @@ struct WifiReconnectTarget: Codable, Equatable {
             guard let host, !host.isEmpty,
                   let port,
                   let nwPort = NWEndpoint.Port(rawValue: port) else { return nil }
-            return .hostPort(host: NWEndpoint.Host(host), port: nwPort)
+            return .hostPort(host: RemoteHostAddress.networkHost(host), port: nwPort)
         case .service:
             guard let serviceName, !serviceName.isEmpty,
                   let serviceType, !serviceType.isEmpty,

@@ -424,6 +424,13 @@ struct AdaptiveMediaSession {
 /// Counts unique stage progress within a one-second window. Unknown stages keep
 /// their validity bit clear; local presentation age is receive-to-fresh-present.
 struct AdaptiveMediaWindow {
+    static let feedbackPollInterval: TimeInterval = 0.05
+    // Leave headroom above the host's 200 ms observation floor for routine
+    // reports. A loss or queue spike can close the current window earlier.
+    private static let routineFeedbackWindowUs: UInt32 = 250_000
+    private static let minimumFeedbackWindowUs: UInt32 = 200_000
+    private static let decoderQueueSpikeUs: UInt32 = 20_000
+
     // Bound reordering and duplicate detection across window boundaries. An
     // older callback outside this sequence range is stale.
     private struct RecentFrames {
@@ -455,6 +462,8 @@ struct AdaptiveMediaWindow {
     private var validity: UInt32 = 0
     private var drops: [UInt32] = [0,0,0,0]
     private var rtt: (UInt32,TimeInterval)?
+    var hasPressureSpike: Bool { drops[0] > 0 || queueUs >= Self.decoderQueueSpikeUs }
+
     init(started: TimeInterval) { self.started = started }
     static func us(_ seconds: TimeInterval) -> UInt32 { UInt32(max(0,min(Double(UInt32.max),(seconds*1_000_000).rounded()))) }
     func hasReceived(frame: UInt64) -> Bool { receivedFrames.contains(frame) }
@@ -499,20 +508,21 @@ struct AdaptiveMediaWindow {
         drops = [0,0,0,0]; validity = 0; receiveUs = 0; queueUs = 0
         receiveTimingComplete = true
     }
-    mutating func sample(identity: AdaptiveMediaIdentity, now: TimeInterval, activity: UInt8,
-                         remote: Bool = false) -> AdaptiveMediaPacket? {
-        let elapsed = now - started
-        guard identity.valid, elapsed >= (remote ? 0.75 : 1) else { return nil }
-        // The service rejects windows over one second. Discard an overdue
-        // window instead of assigning its counters a shorter duration.
-        guard elapsed <= (remote ? 1 : 10) else {
+    mutating func sample(identity: AdaptiveMediaIdentity, now: TimeInterval, activity: UInt8) -> AdaptiveMediaPacket? {
+        guard identity.valid else { return nil }
+        let durationUs = Self.us(now - started)
+        // The controllers use windows of at most one second. Discard an
+        // overdue window instead of assigning its counters a shorter duration.
+        guard durationUs <= 1_000_000 else {
             resetMeasurements(started: now)
             receiveTimes.removeAll(keepingCapacity: true)
             return nil
         }
+        let minimumUs = hasPressureSpike ? Self.minimumFeedbackWindowUs : Self.routineFeedbackWindowUs
+        guard durationUs >= minimumUs else { return nil }
         func p95(_ values: [UInt32]) -> UInt32 { let s=values.sorted(); return s.isEmpty ? 0 : s[max(0,Int(ceil(Double(s.count)*0.95))-1)] }
         var d=AdaptiveMediaProtocol.empty(97); AdaptiveMediaProtocol.putIdentity(identity,&d)
-        d.storeLittleEndian(window,at:32); d.storeLittleEndian(Self.us(elapsed),at:40)
+        d.storeLittleEndian(window,at:32); d.storeLittleEndian(durationUs,at:40)
         let validReceive = receiveTimingComplete && receiveUs > 0
         var valid = validity
         if validReceive { valid |= 1 }

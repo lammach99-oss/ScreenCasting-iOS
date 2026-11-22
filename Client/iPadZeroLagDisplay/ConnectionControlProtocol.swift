@@ -55,6 +55,9 @@ public enum ConnectionControlProtocol {
     static let usbProbeLength = 48
     static let usbProbeWait: TimeInterval = 3
     static let rollbackWait: TimeInterval = 120
+    // Allow for host preflight, teardown, Wi-Fi startup/first frame, cleanup and USB restore.
+    static let wifiOutcomeWait: TimeInterval = 110
+    static let usbRollbackWait: TimeInterval = 165
     public static let preflightWait: TimeInterval = 15
     public static let listenerWait: TimeInterval = 5
     public static let outcomeWait: TimeInterval = 75
@@ -319,17 +322,20 @@ struct USBSessionIdentityProof {
     private(set) var phase: Phase = .initial
     private(set) var optedIn = false
     private var credential: TrustedHostCredential?
+    private var tlsLeafHash: Data?
     private var started: TimeInterval = 0
     private var lastTime: TimeInterval = 0
     var identified: Bool { phase == .identified }
     var pending: Bool { phase == .offered || phase == .waitingChallenge || phase == .waitingResult }
-    mutating func offer(flags: UInt16, credential: TrustedHostCredential?, now: TimeInterval) -> UInt16 {
+    mutating func offer(flags: UInt16, credential: TrustedHostCredential?, now: TimeInterval,
+                        tlsLeafHash: Data? = nil) -> UInt16 {
         guard phase == .initial else { return 0 }
         guard flags & Self.offerFlag != 0, let credential, credential.deviceID.count == 16,
               credential.hostID.count == 16, credential.secret.count == 32, credential.sessionID.count == 16 else {
             phase = .unidentified; return 0
         }
-        self.credential = credential; started = now; lastTime = now; phase = .offered; optedIn = true
+        self.credential = credential; self.tlsLeafHash = tlsLeafHash
+        started = now; lastTime = now; phase = .offered; optedIn = true
         return Self.optInFlag
     }
     mutating func tick(now: TimeInterval) {
@@ -344,10 +350,11 @@ struct USBSessionIdentityProof {
     mutating func clientHello(name: String, now: TimeInterval) -> Data? {
         tick(now: now)
         guard phase == .offered, let credential else { return nil }
-        let bytes = Data(name.utf8.prefix(64))
-        guard !bytes.isEmpty, String(data: bytes, encoding: .utf8) != nil else { abandon(); return nil }
+        guard let hello = WireProtocol.clientHello(deviceID: credential.deviceID, sessionID: credential.sessionID, name: name) else {
+            abandon(); return nil
+        }
         phase = .waitingChallenge
-        return Data([1]) + credential.deviceID + credential.sessionID + Data([UInt8(bytes.count)]) + bytes
+        return hello
     }
     mutating func answer(_ challenge: Data, flags: UInt16, now: TimeInterval) -> Data? {
         tick(now: now)
@@ -356,7 +363,12 @@ struct USBSessionIdentityProof {
             if pending { abandon() }; return nil
         }
         let context = Data(challenge[48..<112]) + Data(challenge[0..<48]) + Data([1])
-        let proof = Data(HMAC<SHA256>.authenticationCode(for: context, using: SymmetricKey(data: credential.secret)))
+        var key = SymmetricKey(data: credential.secret)
+        if let tlsLeafHash {
+            let binding = Data("SCUSB-TLS1".utf8) + tlsLeafHash
+            key = SymmetricKey(data: HMAC<SHA256>.authenticationCode(for: binding, using: key))
+        }
+        let proof = Data(HMAC<SHA256>.authenticationCode(for: context, using: key))
         phase = .waitingResult
         return Data(challenge[0..<16]) + proof
     }
@@ -365,8 +377,8 @@ struct USBSessionIdentityProof {
         guard phase == .waitingResult, flags == 0, payload.count >= 1, payload[0] == 1,
               String(data: payload.dropFirst(), encoding: .utf8) != nil, let credential,
               currentCredential == credential else { if pending { abandon() }; return false }
-        phase = .identified; self.credential = nil
+        phase = .identified; self.credential = nil; tlsLeafHash = nil
         return true
     }
-    mutating func abandon() { credential = nil; phase = .unidentified }
+    mutating func abandon() { credential = nil; tlsLeafHash = nil; phase = .unidentified }
 }

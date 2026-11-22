@@ -31,12 +31,40 @@ final class RemoteHostDirectoryTests: XCTestCase {
         let cases = [
             "192.168.1", "256.1.1.1", "1.2.3.4.5", "0000.1.1.1",
             "pc_name", "http://pc", "pc:27020", "-pc", "pc-", "", " \t\n",
-            String(repeating: "a", count: 64), name254, "2001:db8::1", "[::1]",
+            String(repeating: "a", count: 64), name254, "2001:db8:::1", "[::1", "[pc.example]",
             "office pc", "office\tpc", "pc..example", ".pc", "pc..", ".",
             "1.2.3.4.", "+1.2.3.4", "123", "caf\u{00e9}"
         ]
         for raw in cases {
             XCTAssertNil(RemoteHostAddress.parse(raw), raw)
+        }
+    }
+
+    func testIPv6LiteralsBecomeNetworkEndpoints() throws {
+        let literal = try XCTUnwrap(IPv6Address("2001:db8::1"))
+        for raw in ["2001:db8::1", " [2001:DB8::1] "] {
+            let address = try XCTUnwrap(RemoteHostAddress.parse(raw))
+            XCTAssertEqual(address.host, "2001:db8::1")
+            XCTAssertEqual(RemoteHostAddress.networkHost(raw.trimmingCharacters(in: .whitespaces)), .ipv6(literal))
+            XCTAssertFalse(address.isTailnet)
+            let target = WifiReconnectTarget.hostPort(host: address.host, port: 27020)
+            XCTAssertEqual(target.endpoint, .hostPort(host: .ipv6(literal), port: 27020))
+        }
+        XCTAssertEqual(RemoteHostAddress.parse("fd7a:115c:a1e0::1")?.isTailnet, true)
+        XCTAssertEqual(RemoteHostAddress.parse("fd7a:115c:a1e1::1")?.isTailnet, false)
+    }
+
+    func testManualIPv6AuthorityUsesTheSelectedServicePort() {
+        let expected = RemoteHostAddress.parse("2001:db8::1")
+        XCTAssertNotNil(expected)
+        for raw in ["[2001:db8::1]:27020", "https://[2001:db8::1]:27020/", "https://[2001:db8::1]/"] {
+            XCTAssertEqual(RemoteHostAddress.parseManual(raw, port: 27020), expected)
+        }
+        for raw in ["[2001:db8::1]:27015", "[2001:db8::1]:", "[2001:db8::1]:65536", "https://[2001:db8::1]/files", "pc.example:27020"] {
+            XCTAssertNil(RemoteHostAddress.parseManual(raw, port: 27020))
+        }
+        for raw in ["192.0.2.1", "pc.example"] {
+            XCTAssertEqual(RemoteHostAddress.parseManual(raw, port: 27020), RemoteHostAddress.parse(raw))
         }
     }
 

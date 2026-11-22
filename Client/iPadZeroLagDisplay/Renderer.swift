@@ -22,6 +22,7 @@ public enum PresentationCadenceMode: String, Equatable {
 struct PresentationCadencePolicy {
     static let officeFPS = 60
     static let gameFPS = 120
+    private var configuredFPS: Int?
 
     func targetFPS(
         maximumPanelFPS: Int,
@@ -29,6 +30,16 @@ struct PresentationCadencePolicy {
     ) -> Int {
         let desiredFPS = mode == .game ? Self.gameFPS : Self.officeFPS
         return min(desiredFPS, max(1, maximumPanelFPS))
+    }
+
+    mutating func refresh(
+        maximumPanelFPS: Int,
+        mode: PresentationCadenceMode
+    ) -> (targetFPS: Int, changed: Bool) {
+        let targetFPS = self.targetFPS(maximumPanelFPS: maximumPanelFPS, mode: mode)
+        let changed = targetFPS != configuredFPS
+        configuredFPS = targetFPS
+        return (targetFPS, changed)
     }
 }
 
@@ -628,10 +639,8 @@ public class Renderer: NSObject, MTKViewDelegate {
     private var publishedGeometrySnapshot: RendererGeometrySnapshot?
     private var geometryPublishGate = RendererGeometryPublishGate()
     private weak var metalView: MTKView?
-    private let maximumPanelFPS: Int
     private var presentationCadencePolicy = PresentationCadencePolicy()
     private var presentationCadenceMode: PresentationCadenceMode
-    private var configuredPresentationFPS: Int
 
     static func contentViewport(
         forDrawableSize drawableSize: CGSize,
@@ -671,29 +680,21 @@ public class Renderer: NSObject, MTKViewDelegate {
               let queue = defaultDevice.makeCommandQueue() else {
             return nil
         }
-        let maximumPanelFPS = UIScreen.main.maximumFramesPerSecond
-        let initialPresentationCadencePolicy = PresentationCadencePolicy()
-        let configuredPresentationFPS =
-            initialPresentationCadencePolicy.targetFPS(
-                maximumPanelFPS: maximumPanelFPS,
-                mode: presentationMode)
         device = defaultDevice
         commandQueue = queue
         self.metalView = metalView
-        self.maximumPanelFPS = maximumPanelFPS
-        presentationCadencePolicy = initialPresentationCadencePolicy
         presentationCadenceMode = presentationMode
-        self.configuredPresentationFPS = configuredPresentationFPS
         metalView.device = defaultDevice
         super.init()
         metalView.delegate = self
-        metalView.preferredFramesPerSecond = configuredPresentationFPS
-        print(
-            "[IPAD][PRESENTATION_RATE] " +
-            "maximum_panel_fps=\(maximumPanelFPS) " +
-            "configured_present_fps=\(configuredPresentationFPS) " +
-            "mode=\(presentationMode.rawValue) " +
-            "reason=init")
+        applyPresentationCadence(reason: "init", forceLog: true)
+        // Start thermal monitoring before registering for its notifications.
+        _ = ProcessInfo.processInfo.thermalState
+        for name in [UIScreen.modeDidChangeNotification, UIScene.didActivateNotification,
+                     .NSProcessInfoPowerStateDidChange, ProcessInfo.thermalStateDidChangeNotification] {
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(presentationEnvironmentDidChange(_:)), name: name, object: nil)
+        }
         metalView.framebufferOnly = true
         metalView.clearColor = MTLClearColor(red: 0.05, green: 0.09, blue: 0.16, alpha: 1)
         setupTextureCache()
@@ -826,17 +827,18 @@ public class Renderer: NSObject, MTKViewDelegate {
         forceLog: Bool = false
     ) {
         dispatchPrecondition(condition: .onQueue(.main))
+        guard let metalView else { return }
+        let screen = metalView.window?.windowScene?.screen ?? UIScreen.main
+        let maximumPanelFPS = screen.maximumFramesPerSecond
         lock.lock()
         let mode = presentationCadenceMode
         lock.unlock()
-        let targetFPS = presentationCadencePolicy.targetFPS(
+        let (targetFPS, fpsChanged) = presentationCadencePolicy.refresh(
             maximumPanelFPS: maximumPanelFPS,
             mode: mode)
-        let fpsChanged = targetFPS != configuredPresentationFPS
 
         if fpsChanged {
-            metalView?.preferredFramesPerSecond = targetFPS
-            configuredPresentationFPS = targetFPS
+            metalView.preferredFramesPerSecond = targetFPS
         }
         guard fpsChanged || forceLog else { return }
 
@@ -848,6 +850,12 @@ public class Renderer: NSObject, MTKViewDelegate {
             "reason=\(reason)"
         print(line)
         diagnosticSink?(line)
+    }
+
+    @objc private func presentationEnvironmentDidChange(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            self?.applyPresentationCadence(reason: "display_environment_changed")
+        }
     }
 
     public func updateFrame(
@@ -929,6 +937,8 @@ public class Renderer: NSObject, MTKViewDelegate {
     }
 
     public func draw(in view: MTKView) {
+        // An existing window can move to a different scene screen while active.
+        applyPresentationCadence(reason: "screen_refresh")
         recordCadence(.drawCallback)
         lock.lock()
         let ready = presentationCadenceMode == .game ? gameReadyFrame?.identity : officeReadyFrame?.identity

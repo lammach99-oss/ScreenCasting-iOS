@@ -1,4 +1,6 @@
 import Foundation
+import CryptoKit
+import Network
 import Security
 
 /// Testable decoder for externally supplied identity resource data.
@@ -68,13 +70,34 @@ enum USBServerIdentityStore {
         backend.deleteIdentityRecords()
     }
 
+    #if targetEnvironment(simulator)
+    private static var simulatorPeerBackend: SystemKeychainBackend {
+        SystemKeychainBackend(label: "ScreenCasting USB TLS Test Peer",
+            applicationTag: Data("com.screencasting.usb-tls-test-peer".utf8),
+            certificateName: "ScreenCasting USB TLS Test Peer")
+    }
+
+    static func simulatorPeerIdentity() -> SecIdentity? {
+        var backend = simulatorPeerBackend
+        return loadOrCreate(using: &backend)
+    }
+
+    static func deleteSimulatorPeerIdentity() {
+        var backend = simulatorPeerBackend
+        delete(using: &backend)
+    }
+    #endif
+
     private struct SystemKeychainBackend: USBServerIdentityKeychainBackend {
         typealias Identity = SecIdentity
+        var label = USBServerIdentityStore.keychainLabel
+        var applicationTag = USBServerIdentityStore.applicationTag
+        var certificateName = "ScreenCasting USB"
 
         mutating func loadIdentity() -> SecIdentity? {
             let query: [String: Any] = [
                 kSecClass as String: kSecClassIdentity,
-                kSecAttrLabel as String: USBServerIdentityStore.keychainLabel,
+                kSecAttrLabel as String: label,
                 kSecReturnRef as String: true,
                 kSecMatchLimit as String: kSecMatchLimitOne,
             ]
@@ -86,15 +109,15 @@ enum USBServerIdentityStore {
         }
 
         mutating func createIdentity() -> SecIdentity? {
-            guard let key = USBServerIdentityStore.createKey(),
-                  let certificate = USBServerIdentityStore.createCertificate(for: key) else {
+            guard let key = USBServerIdentityStore.createKey(label: label, applicationTag: applicationTag),
+                  let certificate = USBServerIdentityStore.createCertificate(for: key, name: certificateName) else {
                 deleteIdentityRecords()
                 return nil
             }
 
             let certificateAttributes: [String: Any] = [
                 kSecClass as String: kSecClassCertificate,
-                kSecAttrLabel as String: USBServerIdentityStore.keychainLabel,
+                kSecAttrLabel as String: label,
                 kSecValueRef as String: certificate,
             ]
             guard SecItemAdd(certificateAttributes as CFDictionary, nil) == errSecSuccess,
@@ -109,22 +132,22 @@ enum USBServerIdentityStore {
             for type in [kSecClassIdentity, kSecClassCertificate, kSecClassKey] {
                 let query: [String: Any] = [
                     kSecClass as String: type,
-                    kSecAttrLabel as String: USBServerIdentityStore.keychainLabel,
+                    kSecAttrLabel as String: label,
                 ]
                 SecItemDelete(query as CFDictionary)
             }
         }
     }
 
-    private static func createKey() -> SecKey? {
+    private static func createKey(label: String, applicationTag: Data) -> SecKey? {
         let attributes: [String: Any] = [
             kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
             kSecAttrKeySizeInBits as String: 2048,
-            kSecAttrLabel as String: keychainLabel,
+            kSecAttrLabel as String: label,
             kSecAttrApplicationTag as String: applicationTag,
             kSecPrivateKeyAttrs as String: [
                 kSecAttrIsPermanent as String: true,
-                kSecAttrLabel as String: keychainLabel,
+                kSecAttrLabel as String: label,
                 kSecAttrApplicationTag as String: applicationTag,
             ],
         ]
@@ -132,12 +155,12 @@ enum USBServerIdentityStore {
         return SecKeyCreateRandomKey(attributes as CFDictionary, &error)
     }
 
-    private static func createCertificate(for key: SecKey) -> SecCertificate? {
+    private static func createCertificate(for key: SecKey, name commonName: String) -> SecCertificate? {
         guard let publicKey = SecKeyCopyPublicKey(key),
               let publicKeyData = SecKeyCopyExternalRepresentation(publicKey, nil) as Data? else { return nil }
         let algorithm = derSequence(derOID("1.2.840.113549.1.1.1"), derNull())
         let subjectPublicKeyInfo = derSequence(algorithm, derBitString(publicKeyData))
-        let name = derSequence(derSet(derSequence(derOID("2.5.4.3"), derUTF8("ScreenCasting USB"))))
+        let name = derSequence(derSet(derSequence(derOID("2.5.4.3"), derUTF8(commonName))))
         let validity = derSequence(derGeneralizedTime(Date().addingTimeInterval(-60)),
                                    derGeneralizedTime(Date().addingTimeInterval(31536000)))
         let tbs = derSequence(
@@ -178,4 +201,175 @@ enum USBServerIdentityStore {
         for number in parts.dropFirst(2) { var n = number; var encoded = [UInt8(n & 0x7F)]; n >>= 7; while n > 0 { encoded.insert(UInt8(n & 0x7F) | 0x80, at: 0); n >>= 7 }; bytes.append(contentsOf: encoded) }
         return tlv(0x06, bytes)
     }
+}
+
+struct USBServerTLSIdentity {
+    private let identity: sec_identity_t
+    let leafHash: Data
+
+    init?() {
+        guard let identity = USBServerIdentityStore.loadOrCreate(),
+              let protocolIdentity = sec_identity_create(identity) else { return nil }
+        var leaf: SecCertificate?
+        guard SecIdentityCopyCertificate(identity, &leaf) == errSecSuccess, let leaf else { return nil }
+        self.identity = protocolIdentity
+        leafHash = Data(SHA256.hash(data: SecCertificateCopyData(leaf) as Data))
+    }
+
+    func makeOptions() -> NWProtocolTLS.Options {
+        let options = NWProtocolTLS.Options()
+        sec_protocol_options_set_min_tls_protocol_version(options.securityProtocolOptions, .TLSv12)
+        sec_protocol_options_set_local_identity(options.securityProtocolOptions, identity)
+        return options
+    }
+}
+
+/// NetworkManager registers only the ordinary USB owner immediately before start.
+/// The framer consumes that registration on its own Network.framework queue.
+final class USBControlTLSUpgrade {
+    private struct Key: Hashable {
+        let listener: NWEndpoint.Port
+        let peer: NWEndpoint.Port
+    }
+
+    private static let lock = NSLock()
+    private static var registrations: [Key: USBControlTLSUpgrade] = [:]
+    static let flag: UInt16 = 0x2000
+    static let budget: DispatchTimeInterval = .seconds(5)
+
+    private let key: Key
+    private let identity: USBServerTLSIdentity
+    private let expectedPin: String
+    private let verificationQueue: DispatchQueue
+    private let onAdvertise: (DispatchTime) -> Void
+    private let advertisementLock = NSLock()
+    private var advertisement: DispatchTime?
+    private(set) var peerVerified = false // Accessed on verificationQueue.
+    let credential: TrustedHostCredential
+    var leafHash: Data { identity.leafHash }
+
+    var advertisedAt: DispatchTime? {
+        advertisementLock.lock(); defer { advertisementLock.unlock() }
+        return advertisement
+    }
+
+    init?(listenerPort: NWEndpoint.Port, peer: NWEndpoint, credential: TrustedHostCredential,
+          queue: DispatchQueue, onAdvertise: @escaping (DispatchTime) -> Void) {
+        let components = credential.fingerprint.split(separator: ":", omittingEmptySubsequences: false)
+        guard case let .hostPort(_, peerPort) = peer,
+              components.count == 32, components.allSatisfy({ $0.count == 2 && UInt8($0, radix: 16) != nil }),
+              let identity = USBServerTLSIdentity() else { return nil }
+        key = Key(listener: listenerPort, peer: peerPort)
+        self.identity = identity
+        expectedPin = credential.fingerprint
+        verificationQueue = queue
+        self.credential = credential
+        self.onAdvertise = onAdvertise
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        Self.registrations[key] = self
+    }
+
+    func removeRegistration() {
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        if Self.registrations[key] === self { Self.registrations.removeValue(forKey: key) }
+    }
+
+    fileprivate static func take(local: NWEndpoint?, remote: NWEndpoint?) -> USBControlTLSUpgrade? {
+        guard case let .hostPort(_, localPort)? = local, case let .hostPort(_, remotePort)? = remote else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        return registrations.removeValue(forKey: Key(listener: localPort, peer: remotePort))
+    }
+
+    fileprivate func makeOptions() -> NWProtocolTLS.Options {
+        let options = identity.makeOptions()
+        let security = options.securityProtocolOptions
+        sec_protocol_options_set_max_tls_protocol_version(security, .TLSv13)
+        sec_protocol_options_set_peer_authentication_required(security, true)
+        sec_protocol_options_set_tls_resumption_enabled(security, false)
+        sec_protocol_options_set_tls_tickets_enabled(security, false)
+        sec_protocol_options_set_tls_renegotiation_enabled(security, false)
+        sec_protocol_options_set_verify_block(security, { [weak self] _, trust, finish in
+            let peerTrust = sec_trust_copy_ref(trust).takeRetainedValue()
+            guard let self, let leaf = SecTrustGetCertificateAtIndex(peerTrust, 0) else { finish(false); return }
+            let fingerprint = SHA256.hash(data: SecCertificateCopyData(leaf) as Data)
+                .map { String(format: "%02X", $0) }.joined(separator: ":")
+            self.peerVerified = fingerprint == self.expectedPin
+            finish(self.peerVerified)
+        }, verificationQueue)
+        return options
+    }
+
+    fileprivate func markAdvertised() {
+        let now = DispatchTime.now()
+        advertisementLock.lock()
+        advertisement = now
+        advertisementLock.unlock()
+        verificationQueue.async { [onAdvertise] in onAdvertise(now) }
+    }
+}
+
+/// Intercepts just the TLS readiness exchange. The rest of this socket stays a
+/// byte stream, with Network.framework TLS added above the framer on opt-in.
+final class USBControlTLSFramer: NWProtocolFramerImplementation {
+    static let label = "USB control TLS readiness"
+    static let definition = NWProtocolFramer.Definition(implementation: USBControlTLSFramer.self)
+    private static let offerHeader = Data(ConnectionControlProtocol.frame(
+        type: WireMessageType.ping.rawValue, payload: Data(count: 16),
+        flags: USBSessionIdentityProof.offerFlag | USBControlTLSUpgrade.flag).prefix(WireProtocol.headerSize))
+    private var upgrade: USBControlTLSUpgrade?
+
+    init(framer: NWProtocolFramer.Instance) {}
+
+    func start(framer: NWProtocolFramer.Instance) -> NWProtocolFramer.StartResult {
+        upgrade = USBControlTLSUpgrade.take(local: framer.local, remote: framer.remote)
+        guard upgrade != nil else {
+            framer.passThroughInput()
+            framer.passThroughOutput()
+            return .ready
+        }
+        return .willMarkReady
+    }
+
+    func handleInput(framer: NWProtocolFramer.Instance) -> Int {
+        guard let upgrade else { return 0 }
+        let headerSize = WireProtocol.headerSize
+        var matchesOffer = false
+        var reachedEnd = false
+        let parsedHeader = framer.parseInput(minimumIncompleteLength: headerSize, maximumLength: headerSize) { bytes, complete in
+            reachedEnd = complete && (bytes?.count ?? 0) < headerSize
+            if let bytes { matchesOffer = Data(bytes) == Self.offerHeader }
+            return 0 // Leave legacy readiness bytes for the ordinary SCST parser.
+        }
+        guard parsedHeader, !reachedEnd else {
+            if reachedEnd { framer.markFailed(error: .posix(.EPROTO)); return 0 }
+            return headerSize
+        }
+        if matchesOffer {
+            let length = headerSize + 16
+            var payload: Data?
+            let parsed = framer.parseInput(minimumIncompleteLength: length, maximumLength: length) { bytes, complete in
+                guard let bytes, bytes.count == length else { reachedEnd = complete; return 0 }
+                payload = Data(bytes.dropFirst(headerSize))
+                return length
+            }
+            if reachedEnd { framer.markFailed(error: .posix(.EPROTO)); return 0 }
+            guard parsed, let payload else { return length }
+            do { try framer.prependApplicationProtocol(options: upgrade.makeOptions()) }
+            catch { framer.markFailed(error: .posix(.EPROTO)); return 0 }
+            upgrade.markAdvertised()
+            framer.writeOutput(data: ConnectionControlProtocol.frame(type: WireMessageType.pong.rawValue,
+                payload: payload, flags: USBSessionIdentityProof.optInFlag | USBControlTLSUpgrade.flag))
+        }
+        self.upgrade = nil
+        framer.passThroughInput()
+        framer.passThroughOutput()
+        framer.markReady()
+        return 0
+    }
+
+    func wakeup(framer: NWProtocolFramer.Instance) {}
+    func handleOutput(framer: NWProtocolFramer.Instance, message: NWProtocolFramer.Message,
+                      messageLength: Int, isComplete: Bool) {}
+    func stop(framer: NWProtocolFramer.Instance) -> Bool { true }
+    func cleanup(framer: NWProtocolFramer.Instance) {}
 }

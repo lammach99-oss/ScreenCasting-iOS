@@ -1,5 +1,59 @@
 import XCTest
+import Network
 @testable import iPadCasting
+
+final class DiscoveryLifecycleTests: XCTestCase {
+    private final class Browser: DiscoveryBrowser, @unchecked Sendable {
+        var results: (@Sendable ([NWEndpoint]) -> Void)?
+        var state: (@Sendable (NWBrowser.State) -> Void)?
+        private(set) var cancelled = false
+
+        func start(queue: DispatchQueue, results: @escaping @Sendable ([NWEndpoint]) -> Void,
+                   state: @escaping @Sendable (NWBrowser.State) -> Void) {
+            self.results = results
+            self.state = state
+        }
+
+        func cancel() { cancelled = true }
+    }
+
+    @MainActor func testStopClearsPublishedRowsAndCancelsBrowser() async throws {
+        let browser = Browser()
+        let manager = DiscoveryManager(makeBrowser: { browser })
+        let endpoint = try XCTUnwrap(WifiReconnectTarget.service(name: "Fixture A", type: "_screencasting._tcp", domain: "local.").endpoint)
+        manager.startBrowsing()
+        browser.results?([endpoint])
+        await drainMainQueue()
+        XCTAssertEqual(manager.discoveredHosts.map(\.name), ["Fixture A"])
+        manager.stopBrowsing()
+        XCTAssertTrue(browser.cancelled)
+        XCTAssertTrue(manager.discoveredHosts.isEmpty)
+    }
+
+    @MainActor func testOldResultsAndFailureCannotPublishAfterRestart() async throws {
+        let old = Browser(), current = Browser()
+        var browsers = [old, current]
+        let manager = DiscoveryManager(makeBrowser: { browsers.removeFirst() })
+        let first = try XCTUnwrap(WifiReconnectTarget.service(name: "Fixture A", type: "_screencasting._tcp", domain: "local.").endpoint)
+        let second = try XCTUnwrap(WifiReconnectTarget.service(name: "Fixture B", type: "_screencasting._tcp", domain: "local.").endpoint)
+        manager.startBrowsing()
+        old.results?([first]) // Queued publication has not run yet.
+        manager.startBrowsing()
+        await drainMainQueue()
+        XCTAssertTrue(manager.discoveredHosts.isEmpty)
+        current.results?([second])
+        old.results?([first])
+        old.state?(.failed(.posix(.ECANCELED)))
+        await drainMainQueue()
+        XCTAssertEqual(manager.discoveredHosts.map(\.endpoint), [second])
+    }
+
+    @MainActor private func drainMainQueue() async {
+        let done = expectation(description: "Discovery publication")
+        DispatchQueue.main.async { done.fulfill() }
+        await fulfillment(of: [done], timeout: 2)
+    }
+}
 
 /// The connect screen's one status line: plain words, one tone, at most one action.
 final class ConnectScreenTests: XCTestCase {

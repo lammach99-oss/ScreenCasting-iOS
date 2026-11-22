@@ -820,6 +820,32 @@ final class RendererGeometryPublishGateTests: XCTestCase {
 }
 
 final class PresentationCadencePolicyTests: XCTestCase {
+    func testGameCadenceFollowsTheCurrentScreenWhenWindowMoves() {
+        struct Screen { var maximumFramesPerSecond: Int }
+        let builtIn = Screen(maximumFramesPerSecond: 60)
+        let external = Screen(maximumFramesPerSecond: 144)
+        var policy = PresentationCadencePolicy()
+        let rates = [builtIn, external, builtIn].map { screen in
+            policy.refresh(maximumPanelFPS: screen.maximumFramesPerSecond, mode: .game)
+        }
+
+        XCTAssertEqual(rates.map { $0.targetFPS }, [60, 120, 60])
+        XCTAssertEqual(rates.map { $0.changed }, [true, true, true])
+    }
+
+    func testGameCadenceFollowsLimitChangesOnTheSameScreen() {
+        final class Screen { var maximumFramesPerSecond = 120 }
+        let screen = Screen()
+        var policy = PresentationCadencePolicy()
+        let rates = [120, 60, 60, 120].map { limit in
+            screen.maximumFramesPerSecond = limit
+            return policy.refresh(maximumPanelFPS: screen.maximumFramesPerSecond, mode: .game)
+        }
+
+        XCTAssertEqual(rates.map { $0.targetFPS }, [120, 60, 60, 120])
+        XCTAssertEqual(rates.map { $0.changed }, [true, true, false, true])
+    }
+
     func testOfficeOn120HzPanelIs60() {
         let policy = PresentationCadencePolicy()
 

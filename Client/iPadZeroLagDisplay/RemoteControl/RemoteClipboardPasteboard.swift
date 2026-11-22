@@ -13,6 +13,13 @@ final class RemoteClipboardPasteboard: ObservableObject {
         let formats: UInt8
     }
 
+    struct ReadSource {
+        let changeCount: () -> Int
+        let itemCount: () -> Int
+        let types: () -> [String]
+        let providers: () -> [NSItemProvider]
+    }
+
     static let originType = "app.screencasting.clipboard-origin"
     private static let blockedTypes: Set<String> = [
         "org.nspasteboard.concealedtype", "org.nspasteboard.transienttype",
@@ -29,8 +36,9 @@ final class RemoteClipboardPasteboard: ObservableObject {
 
     private let authority: RemoteClipboardAuthority
     private let worker: RemoteClipboardContentWorker
-    private let send: (Grant, Int, RemoteClipboardContent) -> Void
+    private let send: (Grant, Int, RemoteClipboardContent, Bool) -> Void
     private let changed: (Grant, Int) -> Void
+    private let readSource: ReadSource
     private var grant: Grant?
     private var pollTask: Task<Void, Never>?
     private var progress: Progress?
@@ -42,12 +50,15 @@ final class RemoteClipboardPasteboard: ObservableObject {
     private var ownRevision: Int?
 
     init(authority: RemoteClipboardAuthority, worker: RemoteClipboardContentWorker,
-         send: @escaping (Grant, Int, RemoteClipboardContent) -> Void,
-         changed: @escaping (Grant, Int) -> Void) {
+         send: @escaping (Grant, Int, RemoteClipboardContent, Bool) -> Void,
+         changed: @escaping (Grant, Int) -> Void, readSource: ReadSource? = nil) {
         self.authority = authority
         self.worker = worker
         self.send = send
         self.changed = changed
+        self.readSource = readSource ?? ReadSource(changeCount: { Self.board.changeCount },
+            itemCount: { Self.board.numberOfItems }, types: { Self.types(on: Self.board) },
+            providers: { Self.board.itemProviders })
     }
 
     func update(supported: Bool, grant: Grant?, reason: Wire.Reason) {
@@ -67,7 +78,7 @@ final class RemoteClipboardPasteboard: ObservableObject {
         pollTask = nil
         guard let current else { return }
         // A new grant always baselines metadata. No copy made outside the grant is replayed.
-        lastCount = Self.board.changeCount
+        lastCount = readSource.changeCount()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 150_000_000)
@@ -87,7 +98,7 @@ final class RemoteClipboardPasteboard: ObservableObject {
         automatic = enabled && canSend
         pendingAutomaticRevision = nil
         stopReading()
-        if canSend, let grant, authority.allows(grant, direction: 1) { lastCount = Self.board.changeCount }
+        if canSend, let grant, authority.allows(grant, direction: 1) { lastCount = readSource.changeCount() }
     }
 
     func setTransferNotice(_ notice: String?, grant: Grant?) {
@@ -143,7 +154,7 @@ final class RemoteClipboardPasteboard: ObservableObject {
     func paste(_ providers: [NSItemProvider]) {
         guard canPaste(providers), let grant,
               let selected = Self.representation(providers[0].registeredTypeIdentifiers) else { return }
-        let revision = Self.board.changeCount
+        let revision = readSource.changeCount()
         changed(grant, revision)
         load(providers[0], selected: selected, revision: revision, grant: grant, automatic: false)
     }
@@ -172,8 +183,7 @@ final class RemoteClipboardPasteboard: ObservableObject {
     private func poll(grant: Grant) {
         guard self.grant == grant,
               authority.allows(grant, direction: 1) || authority.allows(grant, direction: 2) else { return }
-        let board = Self.board
-        let count = board.changeCount
+        let count = readSource.changeCount()
         guard !ownWritePending else { return }
         if count != lastCount {
             stopReading()
@@ -181,18 +191,18 @@ final class RemoteClipboardPasteboard: ObservableObject {
             pendingAutomaticRevision = nil
             if count == ownRevision { return }
             ownRevision = nil
-            if Self.types(on: board).contains(Self.originType) { return }
+            if readSource.types().contains(Self.originType) { return }
             changed(grant, count)
             if automatic { pendingAutomaticRevision = count }
             return
         }
         guard automatic, pendingAutomaticRevision == count, authority.allows(grant, direction: 1) else { return }
         pendingAutomaticRevision = nil
-        guard board.numberOfItems == 1, let selected = Self.representation(Self.types(on: board)) else { return }
+        guard readSource.itemCount() == 1, let selected = Self.representation(readSource.types()) else { return }
 
-        // The user explicitly enabled reads after setting Allow. Metadata alone never implies consent.
+        // The system enforces Paste from Other Apps permission when providers are requested.
         reading = true
-        let providers = board.itemProviders
+        let providers = readSource.providers()
         guard providers.count == 1,
               let providerType = Self.representation(providers[0].registeredTypeIdentifiers),
               providerType.format == selected.format else {
@@ -202,6 +212,11 @@ final class RemoteClipboardPasteboard: ObservableObject {
         }
         load(providers[0], selected: providerType, revision: count, grant: grant, automatic: true)
     }
+
+    #if targetEnvironment(simulator)
+    func pollForTesting(grant: Grant) { poll(grant: grant) }
+    func pollForTesting() { if let grant { poll(grant: grant) } }
+    #endif
 
     private func stopReading() {
         readID = UUID()
@@ -223,7 +238,7 @@ final class RemoteClipboardPasteboard: ObservableObject {
                 guard let self, self.readID == id else { return }
                 self.stopReading()
                 guard self.grant == grant, self.authority.allows(grant, direction: 1), !self.ownWritePending,
-                      Self.board.changeCount == revision else { return }
+                      self.readSource.changeCount() == revision else { return }
                 guard let content, content.bytes.count <= grant.maxBytes else {
                     if automatic && unavailable { self.setAutomatic(false) }
                     self.transferNotice = unavailable
@@ -231,28 +246,24 @@ final class RemoteClipboardPasteboard: ObservableObject {
                         : "This clipboard item couldn’t be sent."
                     return
                 }
-                self.send(grant, revision, content)
+                self.send(grant, revision, content, automatic)
             }
         }
-        let prepare: (Data?) -> Void = { bytes in
+        // The provider owns this temporary URL only for the completion handler.
+        progress = provider.loadFileRepresentation(forTypeIdentifier: selected.identifier) { url, _ in
             guard authority.allows(grant, direction: 1) else { return }
-            guard let bytes, bytes.count <= limit else { complete(nil, bytes == nil); return }
+            guard let url else { complete(nil, true); return }
+            let bytes: Data
+            switch RemoteClipboardContent.read(url, limit: limit) {
+            case .bytes(let data): bytes = data
+            case .tooLarge: complete(nil, false); return
+            case .unavailable: complete(nil, true); return
+            }
             if !worker.submit({
                 guard authority.allows(grant, direction: 1) else { return }
                 complete(RemoteClipboardContent.prepare(bytes, format: selected.format,
                                                         formats: selected.formats, fromWire: false), false)
             }) { complete(nil, false) }
-        }
-        // Automatic images must have a bounded file-backed representation.
-        if selected.format == .png && automatic {
-            progress = provider.loadFileRepresentation(forTypeIdentifier: selected.identifier) { url, _ in
-                guard authority.allows(grant, direction: 1) else { return }
-                prepare(url.flatMap { RemoteClipboardContent.read($0, limit: limit) })
-            }
-        } else {
-            progress = provider.loadDataRepresentation(forTypeIdentifier: selected.identifier) { bytes, _ in
-                prepare(bytes)
-            }
         }
     }
 }

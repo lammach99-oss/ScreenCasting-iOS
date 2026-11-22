@@ -51,6 +51,7 @@ import SwiftUI
             Form {
                 displaySection
                 streamSection
+                ClipboardSection(manager: networkManager, pasteboard: networkManager.remoteClipboardPasteboard)
                 Section {
                     Button {
                         isTransferPresented = true
@@ -88,6 +89,7 @@ import SwiftUI
         }
         .preferredColorScheme(.dark)
         .tint(Color(uiColor: SessionInk.accent))
+        .trustedHostForgetAlert(networkManager, visible: !isTransferPresented)
         .onReceive(networkManager.$desiredBitrateMbps) { newMbps in
             draftBitrate = newMbps
         }
@@ -325,6 +327,31 @@ import SwiftUI
         }
     }
 
+    @MainActor private struct ClipboardSection: View {
+        @ObservedObject var manager: NetworkManager
+        @ObservedObject var pasteboard: RemoteClipboardPasteboard
+
+        var body: some View {
+            Section {
+                Toggle("Sync clipboard with PC", isOn: Binding(
+                    get: { manager.remoteClipboardEnabled }, set: { manager.setRemoteClipboardEnabled($0) }))
+                Toggle("Automatically send copied items to the PC", isOn: Binding(
+                    get: { manager.automaticClipboardSending }, set: { manager.setAutomaticClipboardSending($0) }))
+                if !manager.isRemoteControlSession, pasteboard.canSend {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Send clipboard to PC")
+                        RemoteClipboardPasteButton(pasteboard: pasteboard).frame(height: 44)
+                    }
+                }
+            } header: {
+                Text("Clipboard")
+            } footer: {
+                Text("Copied passwords may be sent to the PC when automatic sending is on. Automatic sending uses your iPad paste permission.")
+            }
+            .listRowBackground(Color(uiColor: SessionInk.surface))
+        }
+    }
+
     @MainActor private struct ConnectionSection: View {
         let owner: SettingsView
         var body: some View {
@@ -350,8 +377,7 @@ import SwiftUI
                 .confirmationDialog("Forget this PC?", isPresented: owner.$showForgetConfirmation,
                                     titleVisibility: .visible) {
                     Button("Forget PC", role: .destructive) {
-                        owner.networkManager.forgetTrustedHost()
-                        owner.dismiss()
+                        owner.networkManager.forgetCurrentTrustedHost()
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
