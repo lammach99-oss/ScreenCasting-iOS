@@ -3463,6 +3463,19 @@ public class NetworkManager: ObservableObject {
         recordUsbLifecycleDiagnostic("[USB_SESSION_ACCEPT] generation=\(connectionGeneration) connectionId=\(ObjectIdentifier(candidate))")
         setupStateHandler(for: candidate)
         setState(.connecting)
+        if connectionSwitch.pending?.rollbackRoute == .usb {
+            // A peer can leave the readiness framer preparing without delivering EOF.
+            // Bound that dial independently of the TLS handshake and proof deadlines.
+            let generation = connectionGeneration
+            networkQueue.asyncAfter(deadline: .now() + USBControlTLSUpgrade.budget) { [weak self, weak candidate] in
+                guard let self, let candidate, self.connectionGeneration == generation,
+                      self.connection === candidate, self.usbScdpConnection === candidate,
+                      self.connectionSwitch.pending?.rollbackRoute == .usb,
+                      self.usbIdentity.phase == .initial,
+                      !self.usbControlTLSAwaitingProof else { return }
+                self.recoverConnectionControlOnQueue(.connectionLost)
+            }
+        }
         #if targetEnvironment(simulator)
         usbCandidateInstalledForTesting?(candidate)
         #endif
