@@ -7159,7 +7159,8 @@ public class NetworkManager: ObservableObject {
         clearPendingTransportOffer()
         wireParser.reset(generation: failedGeneration)
         dataTransfers?.retire(); dataTransfers = nil; transferReceivePending = 0
-        decoder.invalidate(waitForCompletion: activeTransportKind != .usb)
+        // A Wi-Fi incumbent can retire while the USB handoff listener already accepts on this queue.
+        decoder.invalidate(waitForCompletion: activeTransportKind != .usb && usbListener == nil)
         AudioManager.shared.reset()
         connection?.cancel()
         connection = nil

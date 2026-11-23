@@ -1874,13 +1874,17 @@ public class PencilUIKitView: UIView, UIPencilInteractionDelegate {
         let point = CGPoint(x: CGFloat(packet.xRatio.clamped(0, 1)), y: CGFloat(packet.yRatio.clamped(0, 1)))
         lastNormalizedPoint = point
         let type = touchEventType(for: packet.pointerFlags)
-        let x = UInt16(clamping: Int((point.x * 65535).rounded()))
-        let y = UInt16(clamping: Int((point.y * 65535).rounded()))
+        let x = Self.pencilWireCoordinate(point.x)
+        let y = Self.pencilWireCoordinate(point.y)
         let pressure = UInt8(clamping: Int((packet.pressure.clamped(0, 1) * 255).rounded()))
         if packet.pointerFlags == 4 { activeTouchIdentifier = nil; lastNormalizedPoint = nil }
         onSendTouchEvent?(type, x, y, pressure)
         onNetworkSend?(NetworkManager.mirrorPencilPayload(type: type, x: x, y: y, pressure: pressure))
         onPencilInput?(packet)
+    }
+
+    private static func pencilWireCoordinate(_ ratio: CGFloat) -> UInt16 {
+        UInt16(clamping: Int((ratio * 65535).rounded()))
     }
 
     func retirePencil() {
@@ -1976,8 +1980,8 @@ public class PencilUIKitView: UIView, UIPencilInteractionDelegate {
             // ── Map to wire-format integers ───────────────────────────────────
             // UInt16 space (0 – 65535) is resolution-independent; the C# host
             // divides by 65535 and multiplies by its virtual screen resolution.
-            let wireX        = UInt16(clamping: Int((xRatio       * 65535).rounded()))
-            let wireY        = UInt16(clamping: Int((yRatio        * 65535).rounded()))
+            let wireX = Self.pencilWireCoordinate(CGFloat(xRatio))
+            let wireY = Self.pencilWireCoordinate(CGFloat(yRatio))
             let wireType     = touchEventType(for: flags)
 
             if let inputGeometryContext {
