@@ -331,7 +331,8 @@ struct USBSessionIdentityProof {
                         tlsLeafHash: Data? = nil) -> UInt16 {
         guard phase == .initial else { return 0 }
         guard flags & Self.offerFlag != 0, let credential, credential.deviceID.count == 16,
-              credential.hostID.count == 16, credential.secret.count == 32, credential.sessionID.count == 16 else {
+              credential.hostID.count == 16, credential.secret.count == 32, credential.sessionID.count == 16,
+              tlsLeafHash != nil || (credential.usbControlTLSSeen != true && flags & USBControlTLSUpgrade.flag == 0) else {
             phase = .unidentified; return 0
         }
         self.credential = credential; self.tlsLeafHash = tlsLeafHash
@@ -376,6 +377,7 @@ struct USBSessionIdentityProof {
         tick(now: now)
         guard phase == .waitingResult, flags == 0, payload.count >= 1, payload[0] == 1,
               String(data: payload.dropFirst(), encoding: .utf8) != nil, let credential,
+              tlsLeafHash != nil || currentCredential?.usbControlTLSSeen != true,
               currentCredential == credential else { if pending { abandon() }; return false }
         phase = .identified; self.credential = nil; tlsLeafHash = nil
         return true

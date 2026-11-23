@@ -18,7 +18,7 @@ public struct ConnectionSwitchState: Equatable {
         fileprivate var token = Data()
         fileprivate var completed: ConnectionSelectResult?
         fileprivate var completedAt: TimeInterval?
-        fileprivate var replacement: UInt64?
+        fileprivate(set) var replacement: UInt64?
         fileprivate var rollbackReadyAt: TimeInterval?
         fileprivate var rollbackFailure: ConnectionReason?
     }

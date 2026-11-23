@@ -15,6 +15,7 @@ public enum ConnectionState: Equatable {
     case connecting
     case awaitingHostIdentity
     case awaitingPIN
+    case submittingPIN
     case authFailed(reason: String)
     case streaming
     case disconnected(reason: String)
@@ -264,6 +265,7 @@ public class NetworkManager: ObservableObject {
     private var verifiedHostIdentityCode: String?
     private var hostIdentityConfirmationRequired = false
     private var wifiAuthentication = WifiAuthenticationState()
+    private var pinResponseDeadline: DispatchWorkItem?
     private var hostIdentityConfirmed = false
     private var trustedCredential: TrustedHostCredential?
     private var trustedCredentialStore = TrustedHostCredentialStore()
@@ -555,6 +557,8 @@ public class NetworkManager: ObservableObject {
     private var usbReadinessPongWrittenGeneration: UInt64?
     private var usbIdentityDeadline: DispatchWorkItem?
     private var usbControlTLSUpgrade: USBControlTLSUpgrade?
+    // Remember offers across in-process retries. Only proven TLS is saved in the credential.
+    private var usbTLSAdvertisedHosts = Set<String>()
     private var connectionListenerCompletion: (() -> Void)?
     private var connectionListenerPreparationAt: TimeInterval?
     private var connectionVideo = CaptureTargetVideoBuffer()
@@ -586,6 +590,12 @@ public class NetworkManager: ObservableObject {
             guard self.remoteFilePacketIsCurrent(data, startingWrite: true),
                   self.remoteClipboardPacketIsCurrent(data, startingWrite: true) else { completion(.posix(.ECANCELED)); return }
             if self.captureAvailability.inputBlocked && (CaptureAvailabilityProtocol.isNewInputPacket(data) || self.isNewRemoteV2InputPacket(data)) {
+                completion(nil); return
+            }
+            if self.mirrorControl.isLegacyVirtualInputSuspended,
+               (data.count == TouchWireProtocol.packetSize && data.loadLittleEndian(UInt16.self, at: 0) == TouchWireProtocol.magic ||
+                data.count >= WireProtocol.headerSize && MirrorInputKind(rawValue: data[5]) != nil),
+               CaptureAvailabilityProtocol.isNewInputPacket(data) {
                 completion(nil); return
             }
             if !self.remoteInputPacketIsCurrent(data) || !self.captureTargetPacketIsCurrent(data) || !self.connectionControlPacketIsCurrent(data) {
@@ -1464,25 +1474,34 @@ public class NetworkManager: ObservableObject {
     }
 
     /// Sends the 4-digit PIN to the server as an 8-byte AuthPacketHeader.
-    /// Should only be called when state == .awaitingPIN.
+    /// A rejected PIN can be retried. A pending submission owns the next result.
     public func sendAuthPIN(_ pin: String) {
         networkQueue.async { [weak self] in
             guard let self,
                   (self.transportState == .awaitingPIN || self.isAuthFailedOnQueue),
-                  self.activeTransportKind == .usb || self.hostIdentityConfirmed,
+                  self.activeTransportKind == .wifi, self.hostIdentityConfirmed,
+                  self.wifiAuthentication.stage == .pin,
                   let pinValue = UInt32(pin), pin.count == 4 else { return }
-            guard self.activeTransportKind == .wifi else { return }
+            self.setState(.submittingPIN)
             var packet = Data(count: AuthProtocol.packetSize)
             packet.withUnsafeMutableBytes { buf in
                 buf.storeBytes(of: AuthProtocol.magic.littleEndian, toByteOffset: 0, as: UInt32.self)
                 buf.storeBytes(of: pinValue.littleEndian, toByteOffset: 4, as: UInt32.self)
             }
             let generation = self.connectionGeneration
+            let deadline = DispatchWorkItem { [weak self] in
+                guard let self, generation == self.connectionGeneration,
+                      self.transportState == .submittingPIN else { return }
+                self.handleStreamError("PIN response timed out.")
+            }
+            self.pinResponseDeadline = deadline
+            self.networkQueue.asyncAfter(deadline: .now() + 30, execute: deadline)
             self.enqueueControlData(packet) { [weak self] error in
-                guard let self else { return }
-                if let error {
-                    self.setState(.disconnected(reason: "PIN send failed: \(error)"))
-                } else if generation == self.connectionGeneration {
+                guard let self, generation == self.connectionGeneration,
+                      self.pinResponseDeadline === deadline else { return }
+                if error != nil {
+                    self.handleStreamError("PIN send failed.")
+                } else {
                     self.receiveAuthResponse(generation: generation)
                 }
             }
@@ -3103,6 +3122,7 @@ public class NetworkManager: ObservableObject {
         let credentialRemoved = trustedCredentialStore.delete(fingerprint: fingerprint)
         var outcome: TrustedHostForgetOutcome
         if credentialRemoved {
+            usbTLSAdvertisedHosts.remove(fingerprint)
             if ownsSavedTarget { clearSavedReconnectTarget() }
             if ownsSelectedEndpoint {
                 connectionSelectedEndpoint = nil
@@ -5409,7 +5429,7 @@ public class NetworkManager: ObservableObject {
             switch header.type {
             case .trustedDeviceChallenge: validPayload = payload.count == 112 && header.flags == 0
             case .pairingRequired, .trustedAuthResult: validPayload = !payload.isEmpty && payload[0] <= 1 && header.flags == 0
-            case .sessionResumeResult: validPayload = payload.count == 17 && payload.first == 1 && header.flags == 0
+            case .sessionResumeResult: validPayload = payload.count == 17 && payload[0] <= 1 && header.flags == 0
             default: validPayload = !payload.isEmpty && payload[0] <= 1 &&
                 header.flags & ~WireProtocol.realtimeNegotiationSupportedFlag == 0
             }
@@ -5442,6 +5462,7 @@ public class NetworkManager: ObservableObject {
             let accepted = payload[0] != 0
             let reason = String(data: payload.dropFirst(), encoding: .utf8) ?? ""
             if accepted {
+                if transportState == .submittingPIN { setState(.connecting) }
                 // Casting can authenticate and deliver a baseline on every failed cutover retry.
                 reconnectWorkItem?.cancel()
                 reconnectWorkItem = nil
@@ -7693,6 +7714,10 @@ public class NetworkManager: ObservableObject {
 
     private func setState(_ newState: ConnectionState) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        if newState != .submittingPIN {
+            pinResponseDeadline?.cancel()
+            pinResponseDeadline = nil
+        }
         transportState = newState
         if case .authFailed = newState { resetAutoAcceptOnQueue() }
         if newState == .streaming {
@@ -7729,6 +7754,7 @@ public class NetworkManager: ObservableObject {
     public func legacyInputIsCurrent(revision: UInt64) -> Bool {
         mirrorControl.legacyRegistrationIsCurrent(revision: revision)
     }
+    var legacyVirtualInputSuspended: Bool { mirrorControl.isLegacyVirtualInputSuspended }
 
     @MainActor public func requestCaptureTarget(_ id: UInt64, catalogue: CaptureTargetCatalogue) {
         let generation=connectionGenerationClock.current
@@ -8040,6 +8066,11 @@ public class NetworkManager: ObservableObject {
         usbControlTLSUpgrade?.advertisedAt != nil && wireAuthenticatedGeneration != connectionGeneration
     }
 
+    private func requiresUsbControlTLS(_ credential: TrustedHostCredential?) -> Bool {
+        guard let credential else { return false }
+        return credential.usbControlTLSSeen == true || usbTLSAdvertisedHosts.contains(credential.fingerprint)
+    }
+
     private func prepareUsbControlTLSOnQueue(_ candidate: NWConnection) {
         resetUsbControlTLSOnQueue()
         guard let port = usbListener?.port, let credential = selectedUsbCredentialOnQueue(),
@@ -8052,7 +8083,9 @@ public class NetworkManager: ObservableObject {
                  #endif
                  return USBServerTLSIdentity()
              }) { [weak self, weak candidate] advertisedAt in
-                guard let self, let candidate else { return }
+                guard let self, self.selectedUsbCredentialOnQueue() == credential else { return }
+                self.usbTLSAdvertisedHosts.insert(credential.fingerprint)
+                guard let candidate else { return }
                 self.networkQueue.asyncAfter(deadline: advertisedAt + USBControlTLSUpgrade.budget) { [weak self, weak candidate] in
                     guard let self, let candidate, self.connection === candidate,
                           self.connectionGeneration == generation, self.usbControlTLSAwaitingProof,
@@ -8107,10 +8140,15 @@ public class NetworkManager: ObservableObject {
         usbIdentity.tick(now: receivedAt)
         if header.type == .ping, !usbControlTLSAwaitingProof {
             let selected = selectedUsbCredentialOnQueue()
-            if selected?.usbControlTLSSeen == true { failSecureUsbOnQueue(); return }
             guard message.payload.count == 16 else {
                 handleStreamError("Expected a 16-byte SCDP Ping before USB session commit."); return
             }
+            if header.flags & USBControlTLSUpgrade.flag != 0 {
+                if let selected { usbTLSAdvertisedHosts.insert(selected.fingerprint) }
+                failSecureUsbOnQueue()
+                return
+            }
+            if requiresUsbControlTLS(selected) { failSecureUsbOnQueue(); return }
             var credential = header.flags & USBSessionIdentityProof.offerFlag != 0 ? selected : nil
             if connectionHandoffInProgress && !connectionPairingMatches(credential) { credential = nil }
             let flags = usbIdentity.offer(flags: header.flags, credential: credential, now: receivedAt)
@@ -8167,6 +8205,7 @@ public class NetworkManager: ObservableObject {
         }
         if header.type == .trustedAuthResult {
             let live = selectedUsbCredentialOnQueue()
+            if !usbControlTLSAwaitingProof && requiresUsbControlTLS(live) { failSecureUsbOnQueue(); return }
             let identified = usbIdentity.result(message.payload, flags: header.flags, currentCredential: live, now: connectionControlNow())
             if identified, var credential = live {
                 if usbControlTLSAwaitingProof, credential.usbControlTLSSeen != true {
@@ -9289,7 +9328,7 @@ public class NetworkManager: ObservableObject {
                     self.advanceMirrorTerminalSwitchOnQueue()
                 }
             } else {
-                if let retirement=self.mirrorControl.suspendInput() {
+                if let retirement=self.mirrorControl.suspendInput(stopLegacyInput: false) {
                     self.sendWireMessage(type:.mirrorAction,payload:retirement,sequence:0)
                 }
                 self.sendWireMessage(type:.mirrorSwitchRequest,payload:payload,sequence:0)
@@ -10070,6 +10109,7 @@ struct RemoteSessionInputConfiguration: Equatable {
     let context: RemoteInputContextCommand?
     let ready: Bool
     let revision: UInt64
+    var monitorSelectionWhilePaused = false
     // Closing local UI restores admission. Its controls may have armed a new drag.
     // Changes to transport or host authority still retire the originating scope.
     func requiresRetirement(comparedTo old: Self) -> Bool {
@@ -10089,7 +10129,8 @@ struct RemoteSessionInputConfiguration: Equatable {
     var sendReset: (RemoteInputResetCommand, UInt64) -> Void = { _, _ in }
     private weak var boundNetwork: NetworkManager?
     private func publishMonitorControl() {
-        boundNetwork?.updateRemoteMonitorControl(configuration: configuration, enabled: pointerEnabled, available: monitorControlAvailable)
+        boundNetwork?.updateRemoteMonitorControl(configuration: configuration,
+            enabled: monitorSelectionEnabled, available: monitorControlAvailable)
     }
     private var blockedToken: UInt64?
     private var hardwareUsages: Set<Int> = []
@@ -10102,19 +10143,21 @@ struct RemoteSessionInputConfiguration: Equatable {
     var generation: UInt64 { configuration?.generation ?? 0 }
     var token: UInt64 { configuration?.context?.token ?? 0 }
     var revision: UInt64 { configuration?.revision ?? 0 }
-    private var enabled: Bool {
-        guard let c = configuration, c.remote, c.connected, c.active, c.ready,
+    private var contextReady: Bool {
+        guard let c = configuration, c.remote, c.connected, c.ready,
               let context = c.context, context.state == 1, context.token != 0,
               [1, 2, 3].contains(context.desktop),
               context.width > 0, context.height > 0 else { return false }
         return !waitingForContext
     }
+    private var enabled: Bool { configuration?.active == true && contextReady }
     var keyboardEnabled: Bool { usesScanKeyboard && enabled }
     var pointerEnabled: Bool { usesEnhancedPointer && enabled }
+    var monitorSelectionEnabled: Bool { monitorControlAvailable && contextReady }
     /// Permission survives a missing capture source; normal input still uses the existing ready/context gate.
     var monitorControlAvailable: Bool {
         guard let c = configuration else { return false }
-        return c.remote && c.connected && c.active && c.features & 7 == 7
+        return c.remote && c.connected && (c.active || c.monitorSelectionWhilePaused) && c.features & 7 == 7
     }
 
     func bind(_ network: NetworkManager) {
@@ -10136,7 +10179,7 @@ struct RemoteSessionInputConfiguration: Equatable {
         // the old token/context still owns the keys and every pointer device.
         if !changedConnection && old?.context == value.context && old?.features == value.features
             && value.connected && (!value.active || !value.ready) {
-            suspend(reason: 0)
+            suspend(reason: 0, preserveMonitorContext: value.monitorSelectionWhilePaused && value.ready)
         }
         if retired {
             suppressedUsages.formUnion(hardwareUsages)
@@ -10144,8 +10187,6 @@ struct RemoteSessionInputConfiguration: Equatable {
             keyboard = RemoteKeyboardState(token: 0)
             mouse = RemoteMouseInput(context: nil, videoRect: videoRect,
                 generation: value.generation, mode: mouseMode, inputReady: false)
-        } else if old?.active == true && !value.active {
-            suspend(reason: 0)
         }
         if changedConnection {
             blockedToken = nil
@@ -10234,11 +10275,11 @@ struct RemoteSessionInputConfiguration: Equatable {
             generation: generation, mode: mode, inputReady: false)
     }
 
-    func suspend(reason: UInt8) {
+    func suspend(reason: UInt8, preserveMonitorContext: Bool = false) {
         if reason == 1 || reason == 2 {
             boundNetwork?.endRemoteFileControl(generation: generation)
         }
-        guard enabled, usesScanKeyboard || usesEnhancedPointer else { return }
+        guard enabled || monitorSelectionEnabled, usesScanKeyboard || usesEnhancedPointer else { return }
         defer { publishMonitorControl() }
         let t = token, g = generation
         let keys = keyboard.reset()
@@ -10254,6 +10295,7 @@ struct RemoteSessionInputConfiguration: Equatable {
         suppressedUsages.formUnion(hardwareUsages)
         hardwareUsages.removeAll()
         keyboard = RemoteKeyboardState(token: 0)
+        guard !preserveMonitorContext else { return }
         blockedToken = t
         waitingForContext = true
         _ = mouse.configure(context: configuration?.context, videoRect: videoRect,

@@ -161,17 +161,19 @@ public struct ScreenPickerSnapshot: Equatable {
     }
 
     private static func castingControl(state: MirrorControlState?, inputBlocked: Bool,
-                                       legacyInputAvailable: Bool) -> Control {
-        if state?.mode == .virtualDisplay || state == nil && legacyInputAvailable {
-            return inputBlocked ? .viewOnly : .on
+                                       legacyInputAvailable: Bool, legacyInputSuspended: Bool) -> Control {
+        if state?.mode == .virtualDisplay || state == nil && (legacyInputAvailable || legacyInputSuspended) {
+            return inputBlocked || legacyInputSuspended ? .viewOnly : .on
         }
         guard state?.geometry != nil else { return .unavailable }
         return state?.mode == .active && !inputBlocked ? .on : .viewOnly
     }
 
     public static func make(catalogue: MirrorMonitorCatalogue?, state: MirrorControlState?, switchingTo: UInt64?,
-                            switchPending: Bool, pickerSupported: Bool, permissionAsked: Bool, legacyInputAvailable: Bool = false) -> Self {
-        let control = castingControl(state: state, inputBlocked: switchPending, legacyInputAvailable: legacyInputAvailable)
+                            switchPending: Bool, pickerSupported: Bool, permissionAsked: Bool,
+                            legacyInputAvailable: Bool = false, legacyInputSuspended: Bool = false) -> Self {
+        let control = castingControl(state: state, inputBlocked: switchPending,
+            legacyInputAvailable: legacyInputAvailable, legacyInputSuspended: legacyInputSuspended)
         guard let catalogue else {
             return Self(phase: .loading, tiles: [], control: control, canAskPermission: false,
                         isSwitching: switchPending, currentLabel: nil)
@@ -197,10 +199,11 @@ public struct ScreenPickerSnapshot: Equatable {
     }
 
     public static func make(captureTargets: CaptureTargetState, state: MirrorControlState?,
-                            permissionAsked: Bool = false, legacyInputAvailable: Bool = false) -> Self {
+                            permissionAsked: Bool = false, legacyInputAvailable: Bool = false,
+                            legacyInputSuspended: Bool = false) -> Self {
         let current=captureTargets.unknownOutcome ? 0 : captureTargets.confirmedCurrentId
         let control = castingControl(state: state, inputBlocked: captureTargets.inputBlocked,
-            legacyInputAvailable: legacyInputAvailable)
+            legacyInputAvailable: legacyInputAvailable, legacyInputSuspended: legacyInputSuspended)
         let listUnavailableReason = captureTargets.listUnavailable
             ? "The screen list is unavailable. Refresh screens to try again." : nil
         guard let pickerCatalogue = captureTargets.pickerCatalogue else {

@@ -249,7 +249,8 @@ struct WifiAuthenticationState {
         case (.proofResult, .authResult): stage = accepted ? .trusted : .failed
         case (.paired, .pairingSuccess): stage = .resume
         case (.trusted, .trustedAuthResult): stage = accepted ? .resume : .failed
-        case (.resume, .sessionResumeResult): stage = accepted ? .complete : .failed
+        // Both validated result values establish a session.
+        case (.resume, .sessionResumeResult): stage = .complete
         default: stage = .failed; return false
         }
         return true

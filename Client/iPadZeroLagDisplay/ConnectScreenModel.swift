@@ -36,6 +36,8 @@ public struct ConnectScreenStatus: Equatable {
             return Self(text: "Check the code on the PC", detail: nil, tone: .busy, action: .cancel)
         case .awaitingPIN:
             return Self(text: "Enter the PIN shown on the PC", detail: nil, tone: .busy, action: .cancel)
+        case .submittingPIN:
+            return Self(text: "Checking the PIN…", detail: nil, tone: .busy, action: .cancel)
         case .authFailed:
             return Self(text: "Wrong PIN. Try again.", detail: nil, tone: .warning, action: .cancel)
         case .streaming:

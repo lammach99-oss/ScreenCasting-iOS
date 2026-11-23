@@ -170,6 +170,34 @@ final class PhysicalMirrorControlTests: XCTestCase {
             }
         }
     }
+    func testStopControlKeepsExtendInputSuspendedAcrossDescriptorRefresh() throws {
+        for advertised in [false, true] {
+            let model = MirrorClientControl()
+            model.beginSession(7)
+            func receiveExtend(revision: UInt64) throws {
+                let state = MirrorControlState(revision: revision, epoch: 1, source: 0, mode: .virtualDisplay,
+                    token: MirrorToken(low: 0, high: 0), geometry: nil, firstFrame: nil, lastSent: nil)
+                _ = try model.receiveState(session: 7, data: MirrorControlCodec.encodeState(state))
+            }
+            if advertised {
+                XCTAssertNotNil(model.helloIfAdvertised(session: 7, flags: MirrorControlCodec.advertisementFlag))
+                try receiveExtend(revision: 1)
+            }
+            XCTAssertTrue(model.allowsLegacyVirtualInput)
+            XCTAssertNil(model.suspendInput(stopLegacyInput: false))
+            XCTAssertTrue(model.allowsLegacyVirtualInput)
+            model.setSettingsPresented(true)
+            XCTAssertNil(model.suspendInput())
+            model.setSettingsPresented(false)
+            if advertised { try receiveExtend(revision: 2) }
+            XCTAssertFalse(model.allowsLegacyVirtualInput)
+            XCTAssertFalse(model.legacyRegistrationIsCurrent(revision: model.gestureRevision))
+            XCTAssertFalse(model.ownsClipboardControl)
+            model.beginSession(8)
+            XCTAssertTrue(model.allowsLegacyVirtualInput)
+        }
+    }
+
     func testTransportRetirementLeavesVirtualAndUnnegotiatedBehaviorUnchanged() throws {
         let legacy = MirrorClientControl()
         legacy.beginSession(7)
@@ -235,9 +263,15 @@ final class PhysicalMirrorControlTests: XCTestCase {
         surface.configureInputForTesting(container,coordinator:coordinator)
         XCTAssertEqual(buttons.map(\.action),[.leftDown,.leftUp]);XCTAssertEqual(contacts.map(\.phase),[.down,.cancel])
         down(2);XCTAssertEqual(buttons.count,2);XCTAssertEqual(contacts.count,2)
-        try receive(MirrorControlState(revision:2,epoch:2,source:1,mode:.awaitingPresentation,token:zero,geometry:geometry,firstFrame:100,lastSent:100))
-        await drain();surface.remoteKeyboardActive=true
+        network.releaseMirrorControl()
+        network.networkQueueForTesting.sync {}
+        await drain()
+        surface.remoteKeyboardActive=true
         surface.configureInputForTesting(container,coordinator:coordinator);down(3)
+        XCTAssertEqual(buttons.count,2);XCTAssertEqual(contacts.count,2)
+        try receive(MirrorControlState(revision:2,epoch:2,source:1,mode:.awaitingPresentation,token:zero,geometry:geometry,firstFrame:100,lastSent:100))
+        await drain()
+        surface.configureInputForTesting(container,coordinator:coordinator);down(4)
         XCTAssertEqual(buttons.count,2);XCTAssertEqual(contacts.count,2)
         ConnectedPresentationSurface.dismantleUIView(container,coordinator:coordinator)
         XCTAssertEqual(buttons.count,2);XCTAssertEqual(contacts.count,2)

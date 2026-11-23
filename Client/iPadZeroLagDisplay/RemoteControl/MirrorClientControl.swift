@@ -76,6 +76,7 @@ public final class MirrorClientControl {
     private let lock=NSLock()
     private var session:UInt64=0, revision:UInt64=0, ordinal:UInt64=0
     private var advertised=false, helloSent=false, foreground=true, suspended=false, settingsOpen=false
+    private var legacyVirtualInputSuspended = false
     private var state:MirrorControlState?
     private var rendered:UInt32?, acknowledgedEpoch:UInt64?
     private var lastAcknowledged:UInt32?
@@ -115,6 +116,7 @@ public final class MirrorClientControl {
             captureSuspended=false;captureDescriptorPending=false;captureDescriptorRevision=0;session=generation;revision &+= 1;ordinal=0;advertised=false;helloSent=false
             inputLifetime = InputLifetime()
             state=nil;rendered=nil;acknowledgedEpoch=nil;lastAcknowledged=nil;suspended=false;transportFloor=nil;settingsOpen=false
+            legacyVirtualInputSuspended = false
             terminalCapable=false;terminalSwitch=nil;screenPickerCapable=false;captureTargetInputBlocked=false;typedSources=false
         }
     }
@@ -140,14 +142,15 @@ public final class MirrorClientControl {
         }
     }
     /// Once PMR is advertised, absence of a descriptor is not permission to send legacy input.
-    public var allowsLegacyVirtualInput:Bool { synchronized{!captureSuspended && !captureDescriptorPending && !connectionInputBlocked && session != 0 && foreground && (!typedSources || !settingsOpen) && !captureTargetInputBlocked && (!advertised || state?.mode == .virtualDisplay)} }
+    public var allowsLegacyVirtualInput:Bool { synchronized{!legacyVirtualInputSuspended && !captureSuspended && !captureDescriptorPending && !connectionInputBlocked && session != 0 && foreground && (!typedSources || !settingsOpen) && !captureTargetInputBlocked && (!advertised || state?.mode == .virtualDisplay)} }
+    var isLegacyVirtualInputSuspended: Bool { synchronized { legacyVirtualInputSuspended } }
 
     var ownsClipboardControl: Bool {
         synchronized {
             guard session != 0, foreground, !suspended, !captureSuspended, !captureDescriptorPending,
                   !connectionInputBlocked, !captureTargetInputBlocked, terminalSwitch == nil,
                   transportFloor == nil else { return false }
-            if !advertised || state?.mode == .virtualDisplay { return true }
+            if !advertised || state?.mode == .virtualDisplay { return !legacyVirtualInputSuspended }
             guard let state, state.mode == .active, !state.token.isEmpty, acknowledgedEpoch == state.epoch,
                   let first = state.firstFrame, let seen = rendered else { return false }
             return MirrorControlCodec.sequenceAtOrAfter(seen, first)
@@ -161,7 +164,7 @@ public final class MirrorClientControl {
     }
     public func legacyRegistrationIsCurrent(revision captured: UInt64) -> Bool {
         synchronized {
-            !captureSuspended && !captureDescriptorPending && !connectionInputBlocked &&
+            !legacyVirtualInputSuspended && !captureSuspended && !captureDescriptorPending && !connectionInputBlocked &&
                 (!typedSources || captured == revision && !captureTargetInputBlocked)
         }
     }
@@ -270,8 +273,14 @@ public final class MirrorClientControl {
     }
     /// Explicit Release control: revokes the Host grant.
     public func suspendInput()->Data? {
+        suspendInput(stopLegacyInput: true)
+    }
+    func suspendInput(stopLegacyInput: Bool)->Data? {
         synchronized {
             revision &+= 1; ordinal=0; suspended=true
+            if stopLegacyInput && (!advertised || state?.mode == .virtualDisplay) {
+                legacyVirtualInputSuspended = true
+            }
             abandonTerminalSwitch()
             guard let s=state,s.epoch>0,s.source>0 else {return nil}
             return Self.action(kind:3,epoch:s.epoch,source:s.source,sequence:0)

@@ -370,6 +370,27 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         XCTAssertEqual(writes.snapshot.filter { $0[5] == 76 }.count, 1)
         XCTAssertEqual(writes.snapshot.first { $0[5] == 76 }, ConnectionControlProtocolTests.hello)
     }
+    @MainActor func testUsbTLSAdvertisementCannotFallBackToRawPairedControl() async {
+        let network = NetworkManager(); let writes = Writes()
+        let credential = ConnectionControlProtocolTests.usbCredential
+        defer { network.stopForTesting() }
+        network.usbIdentityCredentialLoadForTesting = { credential }
+        network.controlSendForAudioTesting = { data, done in writes.append(data); done(nil) }
+
+        let offers: [UInt16] = [0x2100, 0x0100]
+        for flags in offers {
+            _ = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+            network.beginTransferWriterForTesting(); network.configureUsbIdentityForTesting()
+            network.receiveIdentityWireForTesting(type: .ping, payload: Data(0..<16), flags: flags, sequence: 7)
+            await drain(network)
+            network.receiveIdentityWireForTesting(type: .trustedDeviceChallenge,
+                payload: ConnectionControlProtocolTests.usbChallenge)
+            network.receiveIdentityWireForTesting(type: .trustedAuthResult, payload: Data([1]))
+            await drain(network)
+            XCTAssertFalse(network.usbIdentityBoundForTesting)
+        }
+        XCTAssertFalse(writes.snapshot.contains { $0[5] == WireMessageType.clientHello.rawValue })
+    }
     @MainActor func testUsbOldHostNoCredentialAndWrongHostCannotEnableControl() async throws {
         for scenario in 0..<3 {
             let network = NetworkManager(); let writes = Writes()

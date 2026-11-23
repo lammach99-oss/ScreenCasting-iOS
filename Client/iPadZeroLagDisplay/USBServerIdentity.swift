@@ -338,9 +338,9 @@ final class USBControlTLSFramer: NWProtocolFramerImplementation {
             }
             if reachedEnd { framer.markFailed(error: .posix(.EPROTO)); return 0 }
             guard parsed, let payload else { return length }
+            upgrade.markAdvertised()
             do { try framer.prependApplicationProtocol(options: upgrade.makeOptions()) }
             catch { framer.markFailed(error: .posix(.EPROTO)); return 0 }
-            upgrade.markAdvertised()
             framer.writeOutput(data: ConnectionControlProtocol.frame(type: WireMessageType.pong.rawValue,
                 payload: payload, flags: USBSessionIdentityProof.optInFlag | USBControlTLSUpgrade.flag))
         }

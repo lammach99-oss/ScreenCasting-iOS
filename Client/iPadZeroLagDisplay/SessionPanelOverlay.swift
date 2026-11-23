@@ -175,7 +175,7 @@ struct SessionConnectionPresentation {
     }
 
     private var monitorControlEnabled: Bool {
-        networkManager.remoteMonitorState.isSourceRecovery ? remoteInput.monitorControlAvailable : remoteInput.pointerEnabled
+        networkManager.remoteMonitorState.isSourceRecovery ? remoteInput.monitorControlAvailable : remoteInput.monitorSelectionEnabled
     }
     private var picker: ScreenPickerSnapshot {
         if networkManager.isRemoteControlSession {
@@ -185,12 +185,14 @@ struct SessionConnectionPresentation {
         if networkManager.captureTargetState.enabled {
             return .make(captureTargets: networkManager.captureTargetState, state: networkManager.mirrorControlState,
                          permissionAsked: networkManager.screenSwitchPermissionPending,
-                         legacyInputAvailable: networkManager.permitsLegacyVirtualInput)
+                         legacyInputAvailable: networkManager.permitsLegacyVirtualInput,
+                         legacyInputSuspended: networkManager.legacyVirtualInputSuspended)
         }
         return .make(catalogue: networkManager.mirrorMonitorCatalogue, state: networkManager.mirrorControlState,
               switchingTo: switchingTo, switchPending: networkManager.mirrorMonitorSwitchPending,
               pickerSupported: networkManager.mirrorScreenPickerSupported, permissionAsked: networkManager.screenSwitchPermissionPending,
-              legacyInputAvailable: networkManager.permitsLegacyVirtualInput)
+              legacyInputAvailable: networkManager.permitsLegacyVirtualInput,
+              legacyInputSuspended: networkManager.legacyVirtualInputSuspended)
     }
 
     private var kind: SessionPanelKind {

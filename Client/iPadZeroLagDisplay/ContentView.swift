@@ -49,8 +49,11 @@ private extension Color {
     @Binding var pin: String
     let authFailed: Bool
     let failureReason: String
+    var submitting = false
     let onSubmit: () -> Void
     let onCancel: () -> Void
+
+    private var canSubmit: Bool { pin.count == 4 && !submitting }
 
     @FocusState private var isFocused: Bool
     @State private var shakeAttempts: CGFloat = 0
@@ -176,13 +179,13 @@ private extension Color {
                 Button(action: owner.onSubmit) {
                     Text("Confirm PIN")
                         .font(.headline)
-                        .foregroundStyle(owner.pin.count == 4 ? Color.inkOnAccent : Color.inkSecondary)
+                        .foregroundStyle(owner.canSubmit ? Color.inkOnAccent : Color.inkSecondary)
                         .frame(maxWidth: .infinity, minHeight: 50)
-                        .background(owner.pin.count == 4 ? Color.inkAccent : Color.inkRaised,
+                        .background(owner.canSubmit ? Color.inkAccent : Color.inkRaised,
                                     in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 }
-                .disabled(owner.pin.count != 4)
-                .animation(.easeInOut(duration: 0.2), value: owner.pin.count)
+                .disabled(!owner.canSubmit)
+                .animation(.easeInOut(duration: 0.2), value: owner.canSubmit)
 
                 Button(action: owner.onCancel) {
                     Text("Cancel")
@@ -424,7 +427,7 @@ extension View {
 
     private var isPINPhase: Bool {
         switch networkManager.connectionState {
-        case .awaitingPIN, .authFailed: return true
+        case .awaitingPIN, .submittingPIN, .authFailed: return true
         default: return false
         }
     }
@@ -483,12 +486,14 @@ extension View {
     // Metal and UIKit touch surfaces in one full-window container so that the
     // same normalized viewport describes both surfaces.
     private var remoteInputConfiguration: RemoteSessionInputConfiguration {
-        RemoteSessionInputConfiguration(remote: networkManager.isRemoteControlSession,
+        let inputActive = scenePhase == .active && !isSheetPresented && !showGestureGuide
+        return RemoteSessionInputConfiguration(remote: networkManager.isRemoteControlSession,
             connected: streamManager.isConnected,
-            active: scenePhase == .active && !isSheetPresented && !showGestureGuide && !isSessionPanelOpen,
+            active: inputActive && !isSessionPanelOpen,
             generation: networkManager.remoteKeyboardGeneration,
             features: networkManager.remoteInputFeatures, context: networkManager.remoteInputContext,
-            ready: networkManager.remoteInputReady, revision: networkManager.remoteInputRevision)
+            ready: networkManager.remoteInputReady, revision: networkManager.remoteInputRevision,
+            monitorSelectionWhilePaused: inputActive && isSessionPanelOpen)
     }
 
     @ViewBuilder
@@ -588,7 +593,7 @@ extension View {
         switch state {
         case .listening: setWifiBrowsing(false)
         case .idle, .disconnected: setWifiBrowsing(true)
-        case .connecting, .awaitingHostIdentity, .awaitingPIN, .authFailed, .streaming: setWifiBrowsing(!usbChosen)
+        case .connecting, .awaitingHostIdentity, .awaitingPIN, .submittingPIN, .authFailed, .streaming: setWifiBrowsing(!usbChosen)
         }
     }
 
@@ -785,6 +790,7 @@ extension View {
                     pin: owner.$enteredPIN,
                     authFailed: owner.isAuthFailed,
                     failureReason: owner.authFailureReason,
+                    submitting: owner.networkManager.connectionState == .submittingPIN,
                     onSubmit: {
                         owner.networkManager.sendAuthPIN(owner.enteredPIN)
                     },

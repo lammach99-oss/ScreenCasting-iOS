@@ -361,6 +361,73 @@ final class PairingReconnectRegressionTests: XCTestCase {
 
 final class AuthenticationStageRegressionTests: XCTestCase {
     #if targetEnvironment(simulator)
+    func testSessionResumeResultAcceptsNewAndResumedAfterPairingOnly() {
+        let cases: [(UInt8, Int, UInt16, Bool, Bool)] = [
+            (0, 17, 0, true, true), (1, 17, 0, true, true),
+            (2, 17, 0, true, false), (1, 16, 0, true, false), (0, 18, 0, true, false),
+            (1, 17, 1, true, false), (0, 17, 0, false, false), (1, 17, 0, false, false)
+        ]
+        for (value, length, flags, paired, accepted) in cases {
+            let network = NetworkManager(), credentials = MemoryBacking(), pins = MemoryBacking()
+            defer { network.stopForTesting() }
+            let endpoint = NWEndpoint.service(name: "fixture", type: "_fixture._tcp", domain: "local", interface: nil)
+            network.controlSendForAudioTesting = { _, done in done(nil) }
+            _ = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+            network.beginTransferWriterForTesting()
+            network.configureAuthenticationForTesting(confirmed: true, fingerprint: "fixture-pin",
+                endpoint: endpoint, credentials: credentials, pins: pins)
+            if paired {
+                network.receiveIdentityWireForTesting(type: .pairingRequired, payload: Data([0]))
+                network.sendAuthPIN("1234")
+                network.networkQueueForTesting.sync {}
+                network.receiveIdentityWireForTesting(type: .authResult, payload: Data([1]),
+                    flags: WireProtocol.realtimeNegotiationSupportedFlag)
+                let pairing = Data(repeating: 1, count: 16) + network.authenticationDeviceIDForTesting +
+                    Data(repeating: 2, count: 16) + Data(repeating: 3, count: 32)
+                network.receiveIdentityWireForTesting(type: .pairingSuccess, payload: pairing)
+            }
+            network.receiveIdentityWireForTesting(type: .sessionResumeResult,
+                payload: Data([value]) + Data(repeating: 4, count: length - 1), flags: flags)
+            network.networkQueueForTesting.sync {
+                let sessionID = TrustedHostCredentialStore(backing: credentials).load(fingerprint: "fixture-pin")?.sessionID
+                let expected: Data? = paired ? Data(repeating: accepted ? 4 : 2, count: 16) : nil
+                XCTAssertEqual(sessionID, expected)
+            }
+        }
+    }
+
+    @MainActor func testDuplicatePINSubmissionsWriteOnceAndRejectedPINCanRetry() async {
+        let network = NetworkManager(), credentials = MemoryBacking(), pins = MemoryBacking()
+        defer { network.stopForTesting() }
+        var pinWrites = 0
+        network.controlSendForAudioTesting = { data, done in
+            if data.count == 8 { pinWrites += 1 }
+            done(nil)
+        }
+        _ = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        network.beginTransferWriterForTesting()
+        network.configureAuthenticationForTesting(confirmed: true, fingerprint: "fixture-pin",
+            endpoint: .service(name: "fixture", type: "_fixture._tcp", domain: "local", interface: nil),
+            credentials: credentials, pins: pins)
+        network.receiveIdentityWireForTesting(type: .pairingRequired, payload: Data([0]))
+
+        func submitTwice() {
+            network.sendAuthPIN("1234")
+            network.sendAuthPIN("1234")
+            network.networkQueueForTesting.sync {}
+            network.networkQueueForTesting.sync {}
+        }
+        submitTwice()
+        network.networkQueueForTesting.sync { XCTAssertEqual(pinWrites, 1) }
+        network.receiveIdentityWireForTesting(type: .authResult, payload: Data([0]))
+        let rejected = expectation(description: "Retryable PIN result published")
+        DispatchQueue.main.async { rejected.fulfill() }
+        await fulfillment(of: [rejected], timeout: 2)
+        XCTAssertEqual(network.connectionState, .authFailed(reason: "Incorrect PIN. Please try again."))
+        submitTwice()
+        network.networkQueueForTesting.sync { XCTAssertEqual(pinWrites, 2) }
+    }
+
     func testQueuedButUnsentPINCannotAuthorizeASuccess() {
         let network = NetworkManager(), credentials = MemoryBacking(), pins = MemoryBacking()
         // Keep Hello in flight so the PIN can be queued but cannot reach the sender.

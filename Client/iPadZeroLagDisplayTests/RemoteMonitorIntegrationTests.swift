@@ -43,6 +43,48 @@ final class RemoteMonitorIntegrationTests: XCTestCase {
         XCTAssertEqual(RemoteMonitorCatalogueRequest.decode(Data(try XCTUnwrap(writes.last { $0[5] == 68 }).dropFirst(16)))?.knownRevision, 0)
         _ = input
     }
+    @MainActor func testPanelPausesPointerButStillSendsNormalAndRecoveryScreenSelection() async throws {
+        for recovery in [false, true] {
+            let network = NetworkManager(); var writes: [Data] = []
+            defer { network.stopForTesting() }
+            network.controlSendForAudioTesting = { bytes, done in writes.append(bytes); done(nil) }
+            let owner = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+            network.beginTransferWriterForTesting()
+            network.beginRemoteMonitorForTesting(acceptedFeatures: 7)
+            let catalogue = recovery ? RemoteMonitorStateTests.recoveryCatalogue() : RemoteMonitorStateTests.catalogue()
+            network.receiveMirrorWireForTesting(type: .remoteMonitorCatalogue, payload: try XCTUnwrap(catalogue.encode()),
+                generation: owner.generation, connection: owner.connection)
+            network.receiveRemoteMonitorContextForTesting(
+                recovery ? RemoteMonitorStateTests.pausedContext() : RemoteMonitorStateTests.context(), keyframe: !recovery)
+            await drain(network)
+            let input = bindMonitorInput(network, ready: !recovery)
+            input.configure(RemoteSessionInputConfiguration(remote: true, connected: true, active: false,
+                generation: owner.generation, features: 7, context: network.remoteInputContext,
+                ready: !recovery, revision: network.remoteInputRevision, monitorSelectionWhilePaused: true))
+            XCTAssertFalse(input.pointerEnabled)
+            XCTAssertFalse(input.keyboardEnabled)
+            await drain(network)
+            XCTAssertEqual(network.remoteInputReady, !recovery)
+            let picker = ScreenPickerSnapshot.make(remote: network.remoteMonitorState, inputReady: network.remoteInputReady,
+                controlEnabled: recovery ? input.monitorControlAvailable : input.monitorSelectionEnabled)
+            XCTAssertTrue(picker.tiles.contains { $0.id == 2 && $0.canSelect })
+            network.requestRemoteMonitor(2, catalogue: catalogue)
+            await drain(network)
+            XCTAssertEqual(writes.filter { $0[5] == WireMessageType.remoteMonitorSelectRequest.rawValue }.count, 1)
+        }
+    }
+    @MainActor func testPanelMonitorAuthorityStillRetiresOnExplicitInputReset() {
+        let input = RemoteSessionInputState()
+        var resets: [UInt8] = []
+        input.sendReset = { command, _ in resets.append(command.reason) }
+        input.configure(RemoteSessionInputConfiguration(remote: true, connected: true, active: false,
+            generation: 1, features: 7, context: RemoteMonitorStateTests.context(),
+            ready: true, revision: 1, monitorSelectionWhilePaused: true))
+        XCTAssertTrue(input.monitorSelectionEnabled)
+        input.suspend(reason: 2)
+        XCTAssertEqual(resets, [2])
+        XCTAssertFalse(input.monitorSelectionEnabled)
+    }
     @MainActor func testActualOldHostNeverReceivesMonitorCommandsAndResetClearsPicker() async throws {
         let network = NetworkManager(); var writes: [Data] = []
         network.controlSendForAudioTesting = { bytes, done in writes.append(bytes); done(nil) }

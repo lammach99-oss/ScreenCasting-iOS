@@ -850,6 +850,23 @@ final class SessionPanelTests: XCTestCase {
 }
 
 extension SessionPanelTests {
+    func testStoppedExtendShowsViewOnlyInBothPickerPaths() {
+        let extend = MirrorControlState(revision: 1, epoch: 1, source: 0, mode: .virtualDisplay,
+            token: MirrorToken(low: 0, high: 0), geometry: nil, firstFrame: nil, lastSent: nil)
+        let legacy = ScreenPickerSnapshot.make(catalogue: nil, state: nil, switchingTo: nil,
+            switchPending: false, pickerSupported: false, permissionAsked: false, legacyInputSuspended: true)
+        let typed = ScreenPickerSnapshot.make(captureTargets: CaptureTargetState(), state: extend,
+            legacyInputSuspended: true)
+        for picker in [legacy, typed] {
+            XCTAssertEqual(picker.control, .viewOnly)
+            XCTAssertFalse(picker.canType)
+            let session = SessionPanelSnapshot.make(hostLabel: "PC", transport: "Wi-Fi", connection: .streaming,
+                control: picker.control, mirrorLabel: nil, kind: .castingExtend, tailnet: false)
+            XCTAssertNil(SessionHeaderPresentation(session: session, canRequestControl: false,
+                permissionAsked: false).controlAction)
+        }
+    }
+
     func testExtendWithoutMirrorGeometryShowsControlAndEnablesKeyboard() {
         let extend = MirrorControlState(revision: 1, epoch: 1, source: 0, mode: .virtualDisplay,
             token: MirrorToken(low: 0, high: 0), geometry: nil, firstFrame: nil, lastSent: nil)
