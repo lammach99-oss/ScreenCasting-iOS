@@ -19,14 +19,16 @@ final class CaptureTargetStateTests: XCTestCase {
             kind: status == .accepted ? nil : kind, transaction: transaction, owner: 2, revision: revision,
             currentId: status == .accepted ? 0 : current, epoch: 5, source: 6, firstFrame: 0)
     }
-    func testTypedCycleIncludesExtendAndModeChoiceUsesOnlyConfirmedIdentity() {
+    func testTypedExtendCyclesToPhysicalAndModeChoiceUsesOnlyConfirmedIdentity() {
         var model = negotiated()
         let extended = ScreenPickerSnapshot.make(captureTargets: model, state: nil)
         let extendCycle = extended.cycle(kind: .castingExtend)
-        XCTAssertEqual(extendCycle.count, 2)
+        XCTAssertEqual(extendCycle.count, 1)
+        XCTAssertNil(extendCycle.position)
         XCTAssertEqual(extendCycle.currentLabel, "Extend iPad")
         XCTAssertTrue(extendCycle.enabled)
         XCTAssertEqual(extendCycle.nextTargetId, 4)
+        XCTAssertEqual(extendCycle.hint, "Switch to Mirror and show Panel")
         let modes = CaptureModePresentation.make(targets: model, kind: .castingExtend, lastPhysicalId: nil)
         XCTAssertTrue(modes.extend.selected); XCTAssertFalse(modes.extend.enabled)
         XCTAssertTrue(modes.mirror.enabled); XCTAssertEqual(modes.mirror.targetId, 4)
@@ -36,18 +38,24 @@ final class CaptureTargetStateTests: XCTestCase {
         XCTAssertFalse(pending.extend.enabled); XCTAssertFalse(pending.mirror.enabled)
     }
 
-    func testTypedCycleUsesReceivedOrderAcrossPhysicalAndExtendTargets() {
+    func testTypedCycleSkipsExtendAndPreservesReceivedPhysicalOrder() {
         var model = negotiated()
         let entries = [CaptureTargetEntry(id: 4, kind: .physical, name: "Screen"),
                        CaptureTargetEntry(id: 1, kind: .extend, name: "Extend iPad"),
                        CaptureTargetEntry(id: 8, kind: .physical, name: "Screen"),
                        CaptureTargetEntry(id: 6, kind: .physical, name: "Screen")]
-        for (revision, current, next) in [(UInt64(4), UInt64(4), UInt64(1)), (5, 1, 8), (6, 8, 6), (7, 6, 4)] {
+        for (revision, current, next) in [(UInt64(4), UInt64(4), UInt64(8)), (5, 1, 4), (6, 8, 6), (7, 6, 4)] {
             let list = CaptureTargetCatalogue(state: 1, allowed: true, owner: 2, revision: revision,
                 currentId: current, epoch: 5, entries: entries)
             _ = model.receiveCatalogue(list, session: model.session)
-            let cycle = ScreenPickerSnapshot.make(captureTargets: model, state: nil).cycle(kind: .castingMirror)
-            XCTAssertEqual(cycle.count, 4); XCTAssertEqual(cycle.nextTargetId, next)
+            let picker = ScreenPickerSnapshot.make(captureTargets: model, state: nil)
+            let cycle = picker.cycle(kind: .castingMirror)
+            XCTAssertEqual(cycle.count, 3); XCTAssertEqual(cycle.nextTargetId, next)
+            if current == 1 {
+                XCTAssertEqual(cycle.currentLabel, "Extend iPad")
+                XCTAssertNil(cycle.position)
+                XCTAssertEqual(picker.cycle(kind: .castingMirror, lastPhysicalId: 6).nextTargetId, 6)
+            }
             XCTAssertTrue(cycle.enabled)
         }
     }
@@ -77,7 +85,7 @@ final class CaptureTargetStateTests: XCTestCase {
         let picker = ScreenPickerSnapshot.make(captureTargets: model, state: nil)
         XCTAssertNil(picker.currentLabel)
         let cycle = picker.cycle(kind: .castingUnknown)
-        XCTAssertEqual(cycle.count, 2); XCTAssertTrue(cycle.enabled)
+        XCTAssertEqual(cycle.count, 1); XCTAssertTrue(cycle.enabled)
         XCTAssertEqual(cycle.currentLabel, "Choose a screen"); XCTAssertEqual(cycle.nextTargetId, 4)
         XCTAssertNotNil(model.select(4, catalogue: catalogue(revision: 4, current: 4), session: model.session))
     }
@@ -197,13 +205,13 @@ final class CaptureTargetStateTests: XCTestCase {
         XCTAssertEqual(model.confirmedCurrentId, 0)
         XCTAssertTrue(model.inputBlocked);XCTAssertTrue(model.needsCatalogueRefresh)
         let cycle = ScreenPickerSnapshot.make(captureTargets: model, state: nil).cycle(kind: .castingUnknown)
-        XCTAssertEqual(cycle.count, 2)
+        XCTAssertEqual(cycle.count, 1)
         XCTAssertTrue(SessionScreenPresentation.showsSwitchRow(kind: .castingUnknown, cycle: cycle))
         XCTAssertFalse(cycle.pending)
         XCTAssertFalse(cycle.enabled)
     }
 
-    func testFailedExtendKeepsPickerThroughBusyCatalogueAndReenablesItOnRestoredMirror() throws {
+    func testFailedExtendKeepsPickerVisibleAndRestoresExtendModeChoiceOnSingleMirror() throws {
         var model = negotiated()
         let session = model.session
         let mirror = catalogue(revision: 4, current: 4)
@@ -213,7 +221,9 @@ final class CaptureTargetStateTests: XCTestCase {
             ScreenPickerSnapshot.make(captureTargets: model, state: nil).cycle(kind: .castingMirror)
         }
         XCTAssertTrue(SessionScreenPresentation.showsSwitchRow(kind: .castingMirror, cycle: cycle()))
-        XCTAssertEqual(cycle().nextTargetId, 1)
+        XCTAssertNil(cycle().position)
+        XCTAssertEqual(cycle().nextTargetId, 4)
+        XCTAssertFalse(cycle().enabled)
         XCTAssertNotNil(model.select(1, catalogue: mirror, session: session))
         XCTAssertTrue(model.receiveResult(result(.accepted, revision: 4), session: session))
         let busy = CaptureTargetCatalogue(state: 2, allowed: false, owner: 2, revision: 5,
@@ -232,8 +242,9 @@ final class CaptureTargetStateTests: XCTestCase {
         XCTAssertEqual(model.issue, .failed)
         XCTAssertTrue(model.inputBlocked, "the restored decoder still owes a rendered frame")
         XCTAssertFalse(cycle().pending)
-        XCTAssertTrue(cycle().enabled)
-        XCTAssertEqual(cycle().nextTargetId, 11)
+        XCTAssertTrue(SessionScreenPresentation.showsSwitchRow(kind: .castingMirror, cycle: cycle()))
+        XCTAssertFalse(cycle().enabled)
+        XCTAssertEqual(cycle().nextTargetId, 14)
         XCTAssertTrue(CaptureModePresentation.make(targets: model, kind: .castingMirror,
             lastPhysicalId: nil).extend.enabled)
         XCTAssertTrue(model.observeRendered(sequence: 1, session: session))

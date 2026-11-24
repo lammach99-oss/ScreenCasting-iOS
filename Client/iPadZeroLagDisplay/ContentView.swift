@@ -460,8 +460,9 @@ extension View {
 
     @ViewBuilder
     private var backgroundLayer: some View {
-        if streamManager.isConnected {
+        if streamManager.isConnected || networkManager.retainedSwitchRoute != nil {
             connectedVideoSurface
+                .allowsHitTesting(networkManager.retainedSwitchRoute == nil)
                 .overlay {
                     if networkManager.remoteSecureDesktopCovered {
                         ZStack {
@@ -877,7 +878,15 @@ extension View {
     @MainActor private struct ForegroundLayer: View {
         let owner: ContentView
         @ViewBuilder var body: some View {
-            if owner.streamManager.isConnected {
+            if let route = owner.networkManager.retainedSwitchRoute {
+                Text("Switching to \(route.label)...")
+                    .font(.caption.weight(.semibold))
+                    .padding(8)
+                    .foregroundStyle(Color.inkText)
+                    .background(Color.inkSurface, in: Capsule())
+                    .frame(maxHeight: .infinity, alignment: .top)
+                    .allowsHitTesting(false)
+            } else if owner.streamManager.isConnected {
                 ZStack {
                     owner.streamingHUD
                     VStack {

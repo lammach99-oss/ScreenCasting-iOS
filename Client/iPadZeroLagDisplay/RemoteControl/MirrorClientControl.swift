@@ -112,11 +112,14 @@ public final class MirrorClientControl {
     private func synchronized<T>(_ body:() throws->T) rethrows->T { lock.lock();defer{lock.unlock()};return try body() }
 
     public func beginSession(_ generation:UInt64) {
+        beginSession(generation, preservingUserStop: false)
+    }
+    func beginSession(_ generation:UInt64, preservingUserStop: Bool) {
         synchronized {
             captureSuspended=false;captureDescriptorPending=false;captureDescriptorRevision=0;session=generation;revision &+= 1;ordinal=0;advertised=false;helloSent=false
             inputLifetime = InputLifetime()
             state=nil;rendered=nil;acknowledgedEpoch=nil;lastAcknowledged=nil;suspended=false;transportFloor=nil;settingsOpen=false
-            legacyVirtualInputSuspended = false
+            if !preservingUserStop { legacyVirtualInputSuspended = false }
             terminalCapable=false;terminalSwitch=nil;screenPickerCapable=false;captureTargetInputBlocked=false;typedSources=false
         }
     }

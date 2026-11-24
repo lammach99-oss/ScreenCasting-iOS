@@ -95,6 +95,7 @@
 		FA2300000000000000000003 /* PhysicalMirrorControlTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000003 /* PhysicalMirrorControlTests.swift */; };
 		FA2300000000000000000004 /* PencilKeyboardTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000004 /* PencilKeyboardTests.swift */; };
 		FA2300000000000000000005 /* SessionPanelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000005 /* SessionPanelTests.swift */; };
+		A81000000000000000000001 /* SettingsViewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A81000000000000000000002 /* SettingsViewTests.swift */; };
 		FA2300000000000000000006 /* ConnectScreenTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000006 /* ConnectScreenTests.swift */; };
 		FA2300000000000000000007 /* GestureHelpTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000007 /* GestureHelpTests.swift */; };
 		FA2300000000000000000008 /* SettingsCopyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000008 /* SettingsCopyTests.swift */; };
@@ -244,6 +245,7 @@
 		FA2200000000000000000003 /* PhysicalMirrorControlTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhysicalMirrorControlTests.swift; sourceTree = "<group>"; };
 		FA2200000000000000000004 /* PencilKeyboardTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PencilKeyboardTests.swift; sourceTree = "<group>"; };
 		FA2200000000000000000005 /* SessionPanelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionPanelTests.swift; sourceTree = "<group>"; };
+		A81000000000000000000002 /* SettingsViewTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsViewTests.swift; sourceTree = "<group>"; };
 		FA2200000000000000000006 /* ConnectScreenTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectScreenTests.swift; sourceTree = "<group>"; };
 		FA2200000000000000000007 /* GestureHelpTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GestureHelpTests.swift; sourceTree = "<group>"; };
 		FA2200000000000000000008 /* SettingsCopyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsCopyTests.swift; sourceTree = "<group>"; };
@@ -425,6 +427,7 @@
 				FA2200000000000000000003 /* PhysicalMirrorControlTests.swift */,
 				FA2200000000000000000004 /* PencilKeyboardTests.swift */,
 				FA2200000000000000000005 /* SessionPanelTests.swift */,
+				A81000000000000000000002 /* SettingsViewTests.swift */,
 				FA2200000000000000000006 /* ConnectScreenTests.swift */,
 				FA2200000000000000000007 /* GestureHelpTests.swift */,
 				FA2200000000000000000008 /* SettingsCopyTests.swift */,
@@ -664,6 +667,7 @@
 				FA2300000000000000000003 /* PhysicalMirrorControlTests.swift in Sources */,
 				FA2300000000000000000004 /* PencilKeyboardTests.swift in Sources */,
 				FA2300000000000000000005 /* SessionPanelTests.swift in Sources */,
+				A81000000000000000000001 /* SettingsViewTests.swift in Sources */,
 				FA2300000000000000000006 /* ConnectScreenTests.swift in Sources */,
 				FA2300000000000000000007 /* GestureHelpTests.swift in Sources */,
 				FA2300000000000000000008 /* SettingsCopyTests.swift in Sources */,

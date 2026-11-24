@@ -5,6 +5,38 @@ public enum ConnectionRoute: UInt8, CaseIterable {
     case unknown = 0, wifi = 1, usb = 2
     public var label: String { self == .usb ? "USB" : "Wi-Fi" }
 }
+enum ConnectionSwitchDiagnostic: String {
+    enum Source: String {
+        case stream, socket, eof, receive, send, usbCandidate, waiting
+        case candidateBusy, rollbackRoute, duplicateCandidate, promotion, listener, cleanup
+    }
+    case request, accepted, recover, failed, declined
+    case alreadyActive = "already_active"
+    case rollbackStart = "rollback_start"
+    case restored = "rollback_presented"
+    case userStop = "user_stop"
+    case probeFailed = "usb_probe_failed"
+    case retirement = "expected_retirement"
+    case dial = "target_dial_start"
+    case targetWaiting = "target_waiting"
+    case connected = "target_connected"
+    case tlsOK = "tls_ok"
+    case tlsFailed = "tls_failed"
+    case authSent = "auth_sent"
+    case resumeSent = "resume_sent"
+    case wifiRollback = "wifi_rollback"
+    case cancelled = "usb_candidate_cancelled"
+    case presented = "owned_render"
+    case rollbackAuthenticated = "rollback_authenticated"
+    case probeVerified = "usb_probe_verified"
+
+    static func line(_ event: Self, route: ConnectionRoute, reason: ConnectionReason,
+                     attempt: Int, elapsedMs: Int, source: Source? = nil) -> String {
+        let name = route == .usb ? "usb" : route == .wifi ? "wifi" : "unknown"
+        let suffix = source.map { " source=\($0.rawValue)" } ?? ""
+        return "[CONNECTION_CONTROL] event=\(event.rawValue) route=\(name) reason=\(reason) attempt=\(attempt) elapsed_ms=\(elapsedMs)\(suffix)"
+    }
+}
 public enum ConnectionAvailability: UInt8 { case unknown = 0, available = 1, unavailable = 2, detectedUnverified = 3 }
 public enum ConnectionHostState: UInt8 {
     case idle = 0, ready, preflighting, awaitingPermission, switching, waitingPeer, waitingFrame, failed

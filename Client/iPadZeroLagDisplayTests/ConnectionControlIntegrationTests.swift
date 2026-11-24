@@ -98,6 +98,41 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         XCTAssertTrue(writes.snapshot.contains { $0[5] == 78 })
         XCTAssertFalse(writes.snapshot.contains { $0[5] == 76 && (1...3).contains($0[17]) })
     }
+    @MainActor func testCommittedFallbackWithPreparedUsbListenerDoesNotWaitForDecoder() async throws {
+        let network = NetworkManager()
+        defer { network.stopForTesting() }
+        network.connectionListenerPortForTesting = 0
+        network.controlSendForAudioTesting = { _, done in done(nil) }
+        let wifi = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.wifiRTP)
+        network.beginTransferWriterForTesting()
+        network.setConnectionIdentityForTesting(verified: true)
+        network.setConnectionCredentialForTesting(ConnectionControlProtocolTests.usbCredential)
+        network.receiveIdentityWireForTesting(type: .displayCapabilities,
+            payload: CaptureTargetIntegrationTests.modes, flags: 0x0300)
+        network.receiveIdentityWireForTesting(type: .connectionState, payload: try ConnectionSwitchStateTests.snapshot().encode())
+        let ready = expectation(description: "USB listener ready")
+        network.connectionListenerReadyForTesting = { ready.fulfill() }
+        network.requestConnectionRoute(.usb)
+        await fulfillment(of: [ready], timeout: 3)
+        let port = try XCTUnwrap(network.preparedUSBListenerPortForTesting)
+        let release = DispatchSemaphore(value: 0)
+        let decoder = network.decoderForTesting
+        let held = expectation(description: "decoder queue blocked")
+        decoder.sessionQueueForTesting.async { held.fulfill(); release.wait() }
+        defer { release.signal() }
+        await fulfillment(of: [held], timeout: 3)
+        let completed = expectation(description: "fallback committed while decoder queue blocked")
+        network.networkQueueForTesting.async {
+            XCTAssertTrue(network.fallbackCommittedWifiToLegacy(generation: wifi.generation))
+            completed.fulfill()
+        }
+        let result = await XCTWaiter.fulfillment(of: [completed], timeout: 2)
+        XCTAssertEqual(result, .completed)
+        guard result == .completed else { return }
+        XCTAssertEqual(decoder.invalidateWaitModesForTesting.last, false)
+        XCTAssertEqual(network.preparedUSBListenerPortForTesting, port)
+    }
+
     @MainActor func testProtectedProbeHoldsEarlyReplacementUntilAccepted() async throws {
         let network = NetworkManager(); let writes = Writes()
         network.controlSendForAudioTesting = { data, done in writes.append(data); done(nil) }
@@ -224,6 +259,9 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         let readinessPing = Data([0x53, 0x43, 0x53, 0x54, 1, 6, 0, 1, 16, 0, 0, 0, 0, 0, 0, 0]) + Data(0..<16)
         restored.send(content: readinessPing, completion: .contentProcessed { XCTAssertNil($0) })
         await fulfillment(of: [identityHello], timeout: 3)
+        await drain(network)
+        XCTAssertEqual(network.connectionSwitchState.pending?.rollbackRoute, .usb)
+        XCTAssertNil(network.retainedSwitchRoute)
         XCTAssertFalse(network.usbIdentityBoundForTesting)
         XCTAssertNotEqual(network.usbSessionSnapshot().generation, incumbent.generation)
         network.receiveIdentityWireForTesting(type: .trustedDeviceChallenge, payload: ConnectionControlProtocolTests.usbChallenge)
@@ -272,8 +310,10 @@ final class ConnectionControlIntegrationTests: XCTestCase {
                 network.receiveIdentityWireForTesting(type: .connectionSelectResult, payload: try ConnectionSwitchStateTests.result(.accepted).encode())
                 await drain(network)
                 XCTAssertEqual(network.connectionSwitchState.pending?.accepted, true)
-                network.retireConnectionRouteForTesting(); await drain(network)
+                network.reportRouteStreamLossForTesting(); await drain(network)
                 XCTAssertEqual(network.connectionSwitchState.phase, .waitingPeer)
+                XCTAssertEqual(network.retainedSwitchRoute, .usb)
+                XCTAssertFalse(network.connectionSwitchState.pending?.rollingBack == true)
                 XCTAssertEqual(network.connectionSwitchState.message, "Connecting over USB...")
             } else {
                 network.networkQueueForTesting.sync { now = 15 }
@@ -370,7 +410,7 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         XCTAssertEqual(writes.snapshot.filter { $0[5] == 76 }.count, 1)
         XCTAssertEqual(writes.snapshot.first { $0[5] == 76 }, ConnectionControlProtocolTests.hello)
     }
-    @MainActor func testUsbTLSAdvertisementCannotFallBackToRawPairedControl() async {
+    @MainActor func testUnverifiedRawTLSOfferRejectsOnlyItsOwnAttempt() async {
         let network = NetworkManager(); let writes = Writes()
         let credential = ConnectionControlProtocolTests.usbCredential
         defer { network.stopForTesting() }
@@ -387,9 +427,9 @@ final class ConnectionControlIntegrationTests: XCTestCase {
                 payload: ConnectionControlProtocolTests.usbChallenge)
             network.receiveIdentityWireForTesting(type: .trustedAuthResult, payload: Data([1]))
             await drain(network)
-            XCTAssertFalse(network.usbIdentityBoundForTesting)
+            XCTAssertEqual(network.usbIdentityBoundForTesting, flags == 0x0100)
+            XCTAssertEqual(writes.snapshot.contains { $0[5] == WireMessageType.clientHello.rawValue }, flags == 0x0100)
         }
-        XCTAssertFalse(writes.snapshot.contains { $0[5] == WireMessageType.clientHello.rawValue })
     }
     @MainActor func testUsbOldHostNoCredentialAndWrongHostCannotEnableControl() async throws {
         for scenario in 0..<3 {
@@ -591,6 +631,27 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         return decoder
     }
 
+    @MainActor func testHeldSwitchPictureEndsOnlyOnReplacementRootRender() async throws {
+        let network = NetworkManager()
+        defer { network.stopForTesting() }
+        let decoder = try stageUsbHandoff(network)
+        let pixel = try makeHandoffPixel()
+        decoder.submitDecodeForTesting = { _ in pixel }
+        receiveHandoffVideo(network, sequence: 100, isIDR: true)
+        network.receiveIdentityWireForTesting(type: .connectionSelectResult,
+            payload: try ConnectionSwitchStateTests.result(.completed).encode())
+        decoder.sessionQueueForTesting.sync {}
+        await drain(network)
+        let generation = decoder.currentSessionGeneration
+        network.recordRenderCompletion(sequence: 100, generation: generation &- 1)
+        await drain(network)
+        XCTAssertEqual(network.retainedSwitchRoute, .usb)
+        network.recordRenderCompletion(sequence: 100, generation: generation)
+        await drain(network)
+        XCTAssertNil(network.retainedSwitchRoute)
+        XCTAssertEqual(network.connectionSwitchState.phase, .completed)
+    }
+
     private func makeHandoffPixel() throws -> CVPixelBuffer {
         var pixel: CVPixelBuffer?
         XCTAssertEqual(CVPixelBufferCreate(nil, 2, 2, kCVPixelFormatType_32BGRA, nil, &pixel), kCVReturnSuccess)
@@ -652,6 +713,12 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         XCTAssertFalse(writes.snapshot.contains { $0[5] == 76 && (1...3).contains($0[17]) })
     }
     #endif
+    func testSwitchDiagnosticUsesOnlyPhaseRouteReasonAttemptAndTime() {
+        XCTAssertEqual(ConnectionSwitchDiagnostic.line(.wifiRollback, route: .wifi,
+            reason: .peerTimeout, attempt: 2, elapsedMs: 1170),
+            "[CONNECTION_CONTROL] event=wifi_rollback route=wifi reason=peerTimeout attempt=2 elapsed_ms=1170")
+    }
+
     func testRecommendationAndPermissionCopy() throws {
         var state = ConnectionSwitchState()
         XCTAssertEqual(ConnectScreenStatus.connectionRecommendation(state), "USB availability not checked")

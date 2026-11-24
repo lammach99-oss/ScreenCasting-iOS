@@ -14,6 +14,7 @@ import SwiftUI
 
     // MARK: Local UI State
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     /// Client-owned desired values. Host reports are displayed separately.
     @State private var draftBitrate: Double = 20.0
@@ -51,25 +52,8 @@ import SwiftUI
             Form {
                 displaySection
                 streamSection
-                ClipboardSection(manager: networkManager, pasteboard: networkManager.remoteClipboardPasteboard)
-                Section {
-                    Button {
-                        isTransferPresented = true
-                    } label: {
-                        HStack {
-                            Label("Send or open files", systemImage: "arrow.left.arrow.right")
-                            Spacer()
-                            Image(systemName: "chevron.right")
-                                .font(.footnote.weight(.semibold))
-                                .foregroundStyle(secondary)
-                                .accessibilityHidden(true)
-                        }
-                        .foregroundStyle(Color(uiColor: SessionInk.text))
-                    }
-                } header: {
-                    Text("File transfer")
-                }
-                .listRowBackground(rowBackground)
+                ClipboardSection(manager: networkManager, pasteboard: networkManager.remoteClipboardPasteboard,
+                                 isTransferPresented: $isTransferPresented)
                 connectionSection
                 advancedSection
             }
@@ -210,8 +194,23 @@ import SwiftUI
     // Nominal view types bound metadata expansion across independently rendered sections.
     @MainActor private struct DisplaySection: View {
         let owner: SettingsView
+
+        private var performancePicker: some View {
+            Picker("Frame rate", selection: owner.$gameModeEnabled) {
+                Text("Smooth (60 fps)").accessibilityLabel("Smooth, 60 frames per second").tag(false)
+                Text("Fast motion (120 fps)").accessibilityLabel("Fast motion, up to 120 frames per second").tag(true)
+            }
+            .accessibilityLabel("Frame rate")
+            .frame(minHeight: 44)
+        }
+
         var body: some View {
             Section {
+                if owner.typeSize.isAccessibilitySize {
+                    performancePicker.pickerStyle(.menu)
+                } else {
+                    performancePicker.pickerStyle(.segmented)
+                }
                 if owner.networkManager.displayCapabilities != nil {
                     // Only a user's pick sends a request; drafts synced from the PC never do.
                     Picker("Orientation", selection: Binding(
@@ -248,12 +247,11 @@ import SwiftUI
                     Text("Connect to your PC to change the display.")
                         .foregroundStyle(owner.secondary)
                 }
-                Toggle("Game mode", isOn: owner.$gameModeEnabled).tint(owner.switchTint)
                 Toggle("Show frame rate on screen", isOn: owner.$showPerformanceHUD).tint(owner.switchTint)
             } header: {
-                Text("Display")
+                Text("Picture")
             } footer: {
-                Text("Game mode streams up to 120 frames a second for fast motion. Off keeps a steady 60.")
+                Text("Smooth keeps a steady 60 frames per second. Fast motion uses up to 120 for games and video.")
             }
             .listRowBackground(owner.rowBackground)
         }
@@ -263,10 +261,11 @@ import SwiftUI
         let owner: SettingsView
         var body: some View {
             let manualFallback = owner.networkManager.legacyAutomaticBitrateUnavailable
+            let automaticBitrate = owner.draftAdaptiveBitrateEnabled && owner.supportsAudioAndAuto && !manualFallback
             Section {
-                AdaptiveQualityControls(network:owner.networkManager)
+                AdaptiveQualityControls(network: owner.networkManager, switchTint: owner.switchTint)
                 Toggle("Automatic bitrate", isOn: Binding(
-                    get: { owner.draftAdaptiveBitrateEnabled && owner.supportsAudioAndAuto && !manualFallback },
+                    get: { automaticBitrate },
                     set: { value in
                         guard owner.supportsAudioAndAuto, !manualFallback else { return }
                         owner.draftAdaptiveBitrateEnabled = value
@@ -274,7 +273,8 @@ import SwiftUI
                     }))
                     .tint(owner.switchTint)
                     .disabled(!owner.supportsAudioAndAuto || manualFallback)
-                if !owner.draftAdaptiveBitrateEnabled || !owner.supportsAudioAndAuto || manualFallback {
+                if SettingsCopy.showsBitrateSlider(autoQuality: owner.networkManager.autoQualityEnabled,
+                                                  automaticBitrate: automaticBitrate) {
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
                             Text("Bitrate")
@@ -294,6 +294,7 @@ import SwiftUI
                         } onEditingChanged: { editing in
                             if !editing { owner.saveDesiredSettings() }
                         }
+                        .frame(minHeight: 44)
                         .accessibilityValue(String(format: "%.0f megabits per second", owner.draftBitrate))
                     }
                 }
@@ -306,21 +307,18 @@ import SwiftUI
                     }))
                     .tint(owner.switchTint)
                     .disabled(!owner.supportsAudioAndAuto)
+                if !owner.networkManager.settingsApplyStatus.isEmpty {
+                    Text(owner.networkManager.settingsApplyStatus)
+                        .font(.footnote)
+                        .foregroundStyle(owner.secondary)
+                }
             } header: {
-                Text("Stream quality")
+                Text("Quality")
             } footer: {
-                VStack(alignment: .leading, spacing: 4) {
-                    if !owner.supportsAudioAndAuto {
-                        Text(ClientStreamSettingsPreference.remoteUnsupportedReason)
-                    }
-                    if !owner.networkManager.isRemoteControlSession || owner.networkManager.effectiveQualitySummary == nil {
-                        Text(SettingsCopy.pcUsing(adaptive: owner.networkManager.isAdaptiveBitrate,
-                                                  mbps: owner.networkManager.effectiveBitrateMbps,
-                                                  audio: owner.networkManager.effectiveAudioEnabled))
-                    }
-                    if !owner.networkManager.settingsApplyStatus.isEmpty {
-                        Text(owner.networkManager.settingsApplyStatus)
-                    }
+                if !owner.supportsAudioAndAuto {
+                    Text(ClientStreamSettingsPreference.remoteUnsupportedReason)
+                } else if automaticBitrate || owner.networkManager.autoQualityEnabled {
+                    Text("Video adapts to your connection.")
                 }
             }
             .listRowBackground(owner.rowBackground)
@@ -330,6 +328,7 @@ import SwiftUI
     @MainActor private struct ClipboardSection: View {
         @ObservedObject var manager: NetworkManager
         @ObservedObject var pasteboard: RemoteClipboardPasteboard
+        @Binding var isTransferPresented: Bool
 
         var body: some View {
             Section {
@@ -343,10 +342,25 @@ import SwiftUI
                         RemoteClipboardPasteButton(pasteboard: pasteboard).frame(height: 44)
                     }
                 }
+                Button {
+                    isTransferPresented = true
+                } label: {
+                    HStack {
+                        Text("Send or open files")
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(Color(uiColor: SessionInk.secondary))
+                            .accessibilityHidden(true)
+                    }
+                    .foregroundStyle(Color(uiColor: SessionInk.text))
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
+                }
             } header: {
-                Text("Clipboard")
+                Text("Clipboard & files")
             } footer: {
-                Text("Copied passwords may be sent to the PC when automatic sending is on. Automatic sending uses your iPad paste permission.")
+                Text("Automatic sending can copy passwords to your PC.")
             }
             .listRowBackground(Color(uiColor: SessionInk.surface))
         }
@@ -356,10 +370,21 @@ import SwiftUI
         let owner: SettingsView
         var body: some View {
             Section {
+                if owner.networkManager.isConnected {
+                    if let code = owner.networkManager.hostIdentityCode {
+                        LabeledContent("PC identity code", value: code)
+                    }
+                    let route = owner.networkManager.transferSnapshot.transport
+                    if owner.networkManager.isRemoteControlSession {
+                        LabeledContent("Connection type", value: "Network")
+                    } else if route == "USB-C" || route == "Wi-Fi" {
+                        LabeledContent("Connection type", value: route)
+                    }
+                }
                 Button(role: .destructive) {
                     owner.showDisconnectConfirmation = true
                 } label: {
-                    Label("Disconnect", systemImage: "xmark.circle")
+                    Text("Disconnect").frame(minHeight: 44)
                 }
                 .confirmationDialog("Disconnect from your PC?", isPresented: owner.$showDisconnectConfirmation,
                                     titleVisibility: .visible) {
@@ -372,7 +397,7 @@ import SwiftUI
                 Button(role: .destructive) {
                     owner.showForgetConfirmation = true
                 } label: {
-                    Label("Forget this PC", systemImage: "trash")
+                    Text("Forget this PC").frame(minHeight: 44)
                 }
                 .confirmationDialog("Forget this PC?", isPresented: owner.$showForgetConfirmation,
                                     titleVisibility: .visible) {
@@ -385,8 +410,6 @@ import SwiftUI
                 }
             } header: {
                 Text("Connection")
-            } footer: {
-                Text("Forget this PC to pair again with a new PIN.")
             }
             .listRowBackground(owner.rowBackground)
         }
@@ -396,17 +419,23 @@ import SwiftUI
         let owner: SettingsView
         var body: some View {
             Section {
-                DisclosureGroup("Advanced", isExpanded: owner.$showAdvanced) {
-                    owner.latencyRow("Frame receive", owner.networkManager.lastFrameReceiveDurationMs)
-                    owner.latencyRow("Decode", owner.networkManager.lastDecodeLatencyMs)
+                DisclosureGroup("Connection details and logs", isExpanded: owner.$showAdvanced) {
+                    if !owner.networkManager.isRemoteControlSession || owner.networkManager.effectiveQualitySummary == nil {
+                        LabeledContent("PC is using", value: SettingsCopy.pcSettingsValue(
+                            adaptive: owner.networkManager.isAdaptiveBitrate,
+                            mbps: owner.networkManager.effectiveBitrateMbps,
+                            audio: owner.networkManager.effectiveAudioEnabled))
+                    }
+                    if let summary = owner.networkManager.effectiveQualitySummary {
+                        LabeledContent("Effective quality", value: summary)
+                    }
+                    owner.latencyRow("Receiving a frame", owner.networkManager.lastFrameReceiveDurationMs)
+                    owner.latencyRow("Decoding a frame", owner.networkManager.lastDecodeLatencyMs)
                     LabeledContent("Bitrate in use",
                                    value: String(format: "%.0f Mbps", owner.networkManager.effectiveBitrateMbps))
                     LabeledContent("Video received",
                                    value: String(format: "%.1f Mbps", owner.networkManager.hudTelemetry.videoRxMbps))
                     Toggle("Debug logging", isOn: owner.$clientDebugLoggingEnabled).tint(owner.switchTint)
-                    Text("Writes detailed logs for troubleshooting. Leave it off day to day.")
-                        .font(.footnote)
-                        .foregroundStyle(owner.secondary)
                     Button(role: .destructive) {
                         owner.showDeleteLogsConfirmation = true
                     } label: {
@@ -428,6 +457,8 @@ import SwiftUI
                             .foregroundStyle(owner.secondary)
                     }
                 }
+            } header: {
+                Text("Troubleshooting")
             }
             .listRowBackground(owner.rowBackground)
         }
@@ -437,22 +468,18 @@ import SwiftUI
 /// Explicit consent is separate from legacy AutoBitrate and the saved manual target.
 @MainActor private struct AdaptiveQualityControls: View {
     @ObservedObject var network: NetworkManager
+    let switchTint: Color
     var body: some View {
-        Toggle("Auto quality", isOn: Binding(get: { network.autoQualityEnabled }, set: { network.setAutoQualityEnabled($0) }))
+        Toggle("Automatic quality", isOn: Binding(get: { network.autoQualityEnabled }, set: { network.setAutoQualityEnabled($0) }))
             .disabled(!network.adaptiveQualityAvailable)
-        if network.adaptiveQualityAvailable {
-            Text(network.savedAutoQualityEnabled
-                ? "Auto remembered for this PC." : "Your quality choice is saved for this PC.")
+            .tint(switchTint)
+        if !network.adaptiveQualityAvailable {
+            Text(network.adaptiveQualityUnavailableReason)
                 .font(.footnote).foregroundStyle(.secondary)
-        } else {
-            Text(network.adaptiveQualityUnavailableReason).font(.footnote).foregroundStyle(.secondary)
             if network.savedAutoQualityEnabled {
-                Text("Auto is saved for this PC. Using Manual for this connection.").font(.footnote).foregroundStyle(.secondary)
+                Text("Auto quality is saved for this PC. Using manual for this connection.")
+                    .font(.footnote).foregroundStyle(.secondary)
             }
-        }
-        if let summary = network.effectiveQualitySummary {
-            Text(summary).font(.footnote).foregroundStyle(.secondary)
-                .accessibilityLabel("Effective quality: " + summary)
         }
     }
 }
@@ -460,6 +487,10 @@ import SwiftUI
 // MARK: - Plain wording
 
 enum SettingsCopy {
+    static func showsBitrateSlider(autoQuality: Bool, automaticBitrate: Bool) -> Bool {
+        !autoQuality && !automaticBitrate
+    }
+
     enum Level: Equatable { case good, fair, slow, none }
 
     static func nowShowing(width: UInt32, height: UInt32, refreshHz: UInt32, portrait: Bool) -> String {
@@ -467,7 +498,11 @@ enum SettingsCopy {
     }
 
     static func pcUsing(adaptive: Bool, mbps: Double, audio: Bool) -> String {
-        "The PC is using \(adaptive ? "Auto, " : "")\(String(format: "%.0f", mbps)) Mbps, audio \(audio ? "on" : "off")"
+        "The PC is using " + pcSettingsValue(adaptive: adaptive, mbps: mbps, audio: audio)
+    }
+
+    static func pcSettingsValue(adaptive: Bool, mbps: Double, audio: Bool) -> String {
+        "\(adaptive ? "Auto, " : "")\(String(format: "%.0f", mbps)) Mbps, audio \(audio ? "on" : "off")"
     }
 
     /// Thresholds match the old telemetry colours: under 10 ms good, under 20 ms fair.

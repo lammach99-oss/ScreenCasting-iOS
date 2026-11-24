@@ -45,7 +45,8 @@ final class USBControlTLSIntegrationTests: XCTestCase {
     @MainActor func testPinMismatchClosesAdvertisedSocket() async throws {
         let session = try Session(wrongPin: true)
         defer { session.stop() }
-        let host = dial(try await start(session), tls: true)
+        let port = try await start(session)
+        let host = dial(port, tls: true)
         defer { host.cancel() }
         try await waitUntil { session.manager.connectionState == Self.secureFailure }
         try await waitUntil {
@@ -55,6 +56,49 @@ final class USBControlTLSIntegrationTests: XCTestCase {
             }
         }
         XCTAssertNil(session.savedCredential()?.usbControlTLSSeen)
+        let legacy = dial(port, tls: false)
+        defer { legacy.cancel() }
+        try await authenticate(legacy, session: session, tls: false)
+        try await waitUntil { session.manager.usbIdentityBoundForTesting }
+    }
+
+    @MainActor func testChangedOrMissingCredentialRetiresAdvertisedCandidate() async throws {
+        for missing in [false, true] {
+            let session = try Session()
+            defer { session.stop() }
+            let port = try await start(session)
+            let original = session.credential
+            var changed = original
+            changed.usbControlTLSSeen = true
+            var loads = 0
+            session.manager.networkQueueForTesting.sync {
+                session.manager.usbIdentityCredentialLoadForTesting = {
+                    loads += 1
+                    return loads == 1 ? original : (missing ? nil : changed)
+                }
+            }
+            let host = dial(port, tls: false)
+            defer { host.cancel() }
+            let started = ProcessInfo.processInfo.systemUptime
+            try await send(host, .ping, Self.readiness, flags: 0x2100)
+            try await waitUntil { session.manager.connectionState == Self.secureFailure }
+            XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - started, 5)
+            XCTAssertFalse(session.manager.usbIdentityBoundForTesting)
+        }
+    }
+
+    @MainActor func testSilentTLSHandshakeExpiresAfterAdvertisement() async throws {
+        let session = try Session()
+        defer { session.stop() }
+        let host = dial(try await start(session), tls: false)
+        defer { host.cancel() }
+        let started = ProcessInfo.processInfo.systemUptime
+        try await send(host, .ping, Self.readiness, flags: 0x2100)
+        let pong = try await read(host, type: .pong, flags: 0x2080)
+        XCTAssertEqual(pong, Self.readiness)
+        try await waitUntil { session.manager.connectionState == Self.secureFailure }
+        XCTAssertGreaterThanOrEqual(ProcessInfo.processInfo.systemUptime - started, 5)
+        XCTAssertFalse(session.manager.usbIdentityBoundForTesting)
     }
 
     @MainActor func testRejectedProofClosesAdvertisedSocket() async throws {
@@ -79,6 +123,37 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         try await waitUntil { session.manager.connectionState == Self.secureFailure }
         let remaining = await receive(host, count: 1)
         XCTAssertTrue(remaining?.isEmpty ?? true)
+    }
+
+    @MainActor func testWifiRepairPreservesTLSRequirementForFreshUsbManager() async throws {
+        let session = try Session(tlsSeen: true)
+        defer { session.stop() }
+        let wifi = session.manager
+        wifi.controlSendForAudioTesting = { _, done in done(nil) }
+        _ = wifi.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
+        wifi.beginTransferWriterForTesting()
+        let old = session.credential
+        wifi.configureAuthenticationForTesting(confirmed: true, fingerprint: old.fingerprint,
+            endpoint: session.endpoint, credentials: session.credentials, pins: session.pins)
+        wifi.receiveIdentityWireForTesting(type: .pairingRequired, payload: Data([0]))
+        wifi.sendAuthPIN("1234")
+        wifi.networkQueueForTesting.sync {}
+        wifi.receiveIdentityWireForTesting(type: .authResult, payload: Data([1]),
+            flags: WireProtocol.realtimeNegotiationSupportedFlag)
+        let secret = Data(repeating: 0x27, count: 32)
+        wifi.receiveIdentityWireForTesting(type: .pairingSuccess,
+            payload: old.hostID + old.deviceID + old.sessionID + secret)
+        XCTAssertTrue(session.savedCredential()?.secret == secret)
+        XCTAssertEqual(session.savedCredential()?.usbControlTLSSeen, true)
+
+        let fresh = try Session()
+        defer { fresh.stop() }
+        fresh.manager.installTrustedHostStoresForTesting(credentials: session.credentials, pins: session.pins)
+        let host = dial(try await start(fresh), tls: false)
+        defer { host.cancel() }
+        try await send(host, .ping, Self.readiness, flags: 0x0100)
+        try await waitUntil { fresh.manager.connectionState == Self.secureFailure }
+        XCTAssertFalse(fresh.manager.usbIdentityBoundForTesting)
     }
 
     @MainActor func testForgetAndRepairAllowLegacyAgain() async throws {
@@ -149,6 +224,7 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         let wifi = try WifiHost(identity: session.hostIdentity)
         defer { wifi.stop() }
         let wifiPort = try await startWifiListener(wifi)
+        manager.releaseMirrorControl()
         manager.seedRouteEndpointForTesting(port: wifiPort)
         manager.requestConnectionRoute(.wifi)
         try await expectRouteRequest(incumbent, target: .wifi)
@@ -162,14 +238,21 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         let failedWifi = try await wifiPeer(wifi, index: 0)
         failedWifi.cancel()
         try await waitUntil { manager.connectionSwitchState.pending?.rollbackRoute == .usb }
-        let transaction = manager.connectionSwitchState.pending?.request
-        for _ in 0..<2 {
+        let transaction = try XCTUnwrap(manager.connectionSwitchState.pending?.request)
+        for silent in [false, true] {
             let generation = manager.usbSessionSnapshot().generation
             let interrupted = dial(usbPort, tls: false)
             try await waitUntil { manager.usbSessionSnapshot().generation > generation }
             let interruptedGeneration = manager.usbSessionSnapshot().generation
-            interrupted.cancel()
+            let installed = ProcessInfo.processInfo.systemUptime
+            defer { interrupted.cancel() }
+            if !silent { interrupted.cancel() }
             try await waitUntil { manager.usbSessionSnapshot().generation > interruptedGeneration }
+            if silent {
+                XCTAssertGreaterThanOrEqual(ProcessInfo.processInfo.systemUptime - installed, 4.8)
+                let eof = await receive(interrupted, count: 1)
+                XCTAssertTrue(eof?.isEmpty ?? true)
+            }
             XCTAssertTrue(manager.usbSessionSnapshot().listenerIntent)
             XCTAssertEqual(manager.connectionSwitchState.pending?.request, transaction)
             XCTAssertEqual(manager.connectionSwitchState.pending?.rollbackRoute, .usb)
@@ -181,6 +264,13 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         try await advertiseConnectionControl(replacement)
         try await expectOptIn(replacement)
         try await finishRollback(replacement, manager: manager, route: .usb, reason: .connectionLost)
+        XCTAssertTrue(manager.legacyVirtualInputSuspended)
+        let authenticated = manager.usbSessionSnapshot().generation
+        try await Task.sleep(nanoseconds: 5_200_000_000)
+        XCTAssertEqual(manager.usbSessionSnapshot().generation, authenticated)
+        try await send(replacement, .ping, Self.readiness)
+        let pong = try await read(replacement, type: .pong)
+        XCTAssertEqual(pong, Self.readiness)
     }
 
     private static let readiness = Data(0..<16)
@@ -495,6 +585,7 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         let wifi = try WifiHost(identity: session.hostIdentity)
         defer { wifi.stop() }
         let incumbent = try await startWifi(session, host: wifi)
+        session.manager.releaseMirrorControl()
         let port = try await acceptWifiToUsb(session, incumbent: incumbent)
         let usb = dial(port, tls: tlsSeen)
         defer { usb.cancel() }
@@ -523,6 +614,8 @@ final class USBControlTLSIntegrationTests: XCTestCase {
             hostState: .ready, transaction: 1, originOwner: 1, revision: 4, routeOwner: 3, token: resume.token,
             firstFrame: 1, frameDomain: .scst)
         try await presentReplacement(usb, manager: manager, terminal: completed)
+        XCTAssertFalse(manager.permitsLegacyVirtualInput)
+        XCTAssertTrue(manager.legacyVirtualInputSuspended)
         XCTAssertEqual(manager.connectionSwitchState.phase, .completed)
         XCTAssertTrue(manager.usbSessionSnapshot().listenerIntent)
     }

@@ -29,6 +29,7 @@ public struct ScreenCyclePresentation: Equatable {
     public let pending: Bool
     public let reason: String?
     let usesCaptureTargets: Bool
+    let showingTypedExtend: Bool
     public var enabled: Bool { nextTargetId != nil && reason == nil }
     public var accessibilityValue: String {
         position.map { "\(currentLabel), \($0) of \(count)" } ?? currentLabel
@@ -36,15 +37,24 @@ public struct ScreenCyclePresentation: Equatable {
     public var detail: String {
         position.map { "\(currentLabel) \u{00B7} \($0) of \(count)" } ?? currentLabel
     }
-    public var hint: String { reason ?? nextLabel.map { "Show \($0)" } ?? "Choose a screen" }
+    var accessibilityLabel: String {
+        position == nil ? currentLabel : "Showing \(accessibilityValue)"
+    }
+    public var hint: String {
+        if let reason { return reason }
+        guard let nextLabel else { return "Choose a screen" }
+        return showingTypedExtend ? "Switch to Mirror and show \(nextLabel)" : "Show \(nextLabel)"
+    }
 
     public static func make(candidates: [ScreenPickerTile], currentId: UInt64?, pending: Bool,
                             disabledReason: String? = nil, extendActive: Bool = false,
-                            usesCaptureTargets: Bool = false) -> Self {
-        let screens = usesCaptureTargets ? candidates : candidates.filter { !$0.isExtend }
+                            usesCaptureTargets: Bool = false, lastPhysicalId: UInt64? = nil) -> Self {
+        let screens = candidates.filter { !$0.isExtend }
         let index = screens.firstIndex { $0.id == currentId }
+        let showingTypedExtend = usesCaptureTargets && (extendActive || candidates.contains { $0.id == currentId && $0.isExtend })
+        let remembered = showingTypedExtend ? screens.first { $0.id == lastPhysicalId } : nil
         let next = index.map { screens[($0 + 1) % screens.count] } ??
-            screens.first { !$0.isExtend } ?? screens.first
+            remembered ?? screens.first
         let legacyExtend = extendActive && !usesCaptureTargets
         let reason: String?
         if pending { reason = "Switching screens\u{2026}" }
@@ -54,10 +64,10 @@ public struct ScreenCyclePresentation: Equatable {
         else if screens.count == 1 && index != nil { reason = "Only one screen is available." }
         else if next?.canSelect != true { reason = "Screen selection is not ready. Refresh screens to try again." }
         else { reason = nil }
-        return Self(currentLabel: legacyExtend ? "Extend iPad" : index.map { screens[$0].label } ?? "Choose a screen",
-                    position: legacyExtend ? nil : index.map { $0 + 1 }, count: screens.count,
+        return Self(currentLabel: legacyExtend || showingTypedExtend ? "Extend iPad" : index.map { screens[$0].label } ?? "Choose a screen",
+                    position: screens.count < 2 || legacyExtend || showingTypedExtend ? nil : index.map { $0 + 1 }, count: screens.count,
                     nextTargetId: next?.id, nextLabel: next?.label, pending: pending, reason: reason,
-                    usesCaptureTargets: usesCaptureTargets)
+                    usesCaptureTargets: usesCaptureTargets, showingTypedExtend: showingTypedExtend)
     }
 }
 
@@ -152,12 +162,12 @@ public struct ScreenPickerSnapshot: Equatable {
     public var selectionDisabledReason: String? = nil
     var usesCaptureTargets = false
 
-    public func cycle(kind: SessionPanelKind, disabledReason: String? = nil) -> ScreenCyclePresentation {
+    public func cycle(kind: SessionPanelKind, disabledReason: String? = nil, lastPhysicalId: UInt64? = nil) -> ScreenCyclePresentation {
         let fallback: String? = phase == .loading ? "Loading screens..."
             : phase == .locked ? "Screen switching is off on the PC." : nil
         return .make(candidates: tiles, currentId: tiles.first { $0.status == .showing }?.id,
                      pending: isSwitching, disabledReason: disabledReason ?? selectionDisabledReason ?? fallback,
-                     extendActive: kind == .castingExtend, usesCaptureTargets: usesCaptureTargets)
+                     extendActive: kind == .castingExtend, usesCaptureTargets: usesCaptureTargets, lastPhysicalId: lastPhysicalId)
     }
 
     private static func castingControl(state: MirrorControlState?, inputBlocked: Bool,

@@ -72,7 +72,7 @@ struct SessionInputPresentation {
 
 enum SessionScreenPresentation {
     static func showsSwitchRow(kind: SessionPanelKind, cycle: ScreenCyclePresentation) -> Bool {
-        if cycle.usesCaptureTargets { return cycle.count > 1 }
+        if cycle.usesCaptureTargets { return cycle.count > 0 || cycle.showingTypedExtend }
         return (kind == .castingMirror || kind == .wholePCRemote) &&
             cycle.count > 1 && cycle.position != nil && cycle.enabled
     }
@@ -249,7 +249,7 @@ struct SessionConnectionPresentation {
                 reason = screenWords(networkManager.remoteMonitorState.statusMessage ?? "Screens are unavailable.")
             } else { reason = "Screen switching is off on the PC." }
         } else { reason = nil }
-        return p.cycle(kind: kind, disabledReason: reason)
+        return p.cycle(kind: kind, disabledReason: reason, lastPhysicalId: rememberedPhysical.id)
     }
 
     private var modeChoices: CaptureModePresentation {
@@ -735,7 +735,7 @@ struct SessionConnectionPresentation {
         let owner: SessionPanelOverlay
         var body: some View {
             Button { owner.cycleScreen() } label: {
-                Group {
+                VStack(alignment: .leading, spacing: 4) {
                     if owner.typeSize.isAccessibilitySize {
                         VStack(alignment: .leading, spacing: 8) { title; screen }
                     } else {
@@ -744,24 +744,32 @@ struct SessionConnectionPresentation {
                             VStack(alignment: .leading, spacing: 8) { title; screen }
                         }
                     }
+                    if owner.cycle.showingTypedExtend || !owner.cycle.enabled {
+                        Text(owner.cycle.hint)
+                            .font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(!owner.cycle.enabled)
-            .accessibilityLabel("Switch screen")
-            .accessibilityValue(owner.cycle.accessibilityValue)
+            .accessibilityLabel(owner.cycle.accessibilityLabel)
             .accessibilityHint(owner.cycle.hint)
             .accessibilityIdentifier("session.switch-screen")
             .accessibilityFocused(owner.$switchFocused)
         }
 
-        private var title: some View { Text("Showing").font(.subheadline.weight(.semibold)) }
+        @ViewBuilder private var title: some View {
+            if !owner.cycle.showingTypedExtend { Text("Showing").font(.subheadline.weight(.semibold)) }
+        }
         private var screen: some View {
             HStack(spacing: 8) {
-                Text(owner.cycle.currentLabel).fixedSize(horizontal: false, vertical: true)
-                Image(systemName: "chevron.right").accessibilityHidden(true)
+                Text(owner.cycle.detail).fixedSize(horizontal: false, vertical: true)
+                if owner.cycle.enabled {
+                    Image(systemName: "chevron.right").accessibilityHidden(true)
+                }
             }
             .font(.footnote).foregroundStyle(Color(ink: SessionInk.secondary))
         }

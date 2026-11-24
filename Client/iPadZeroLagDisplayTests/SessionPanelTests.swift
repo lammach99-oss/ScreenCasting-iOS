@@ -508,6 +508,66 @@ final class SessionPanelTests: XCTestCase {
             pending: false).nextTargetId, 30)
     }
 
+    private let typedScreens = [
+        ScreenPickerTile(id: 1, label: "Extend iPad", isBuiltIn: false, status: .available, isExtend: true),
+        ScreenPickerTile(id: 2, label: "Built-in display", isBuiltIn: true, status: .available),
+        ScreenPickerTile(id: 3, label: "External display", isBuiltIn: false, status: .available)
+    ]
+
+    func testTypedShowingWrapsBetweenPhysicalMonitors() {
+        for (current, next, position) in [(UInt64(2), UInt64(3), 1), (3, 2, 2)] {
+            let cycle = ScreenCyclePresentation.make(candidates: typedScreens, currentId: current,
+                pending: false, usesCaptureTargets: true)
+            XCTAssertTrue(cycle.enabled)
+            XCTAssertEqual(cycle.count, 2)
+            XCTAssertEqual(cycle.position, position)
+            XCTAssertEqual(cycle.nextTargetId, next)
+            XCTAssertEqual(cycle.accessibilityValue, position == 1 ? "Built-in display, 1 of 2" : "External display, 2 of 2")
+            XCTAssertEqual(cycle.hint, position == 1 ? "Show External display" : "Show Built-in display")
+        }
+    }
+
+    func testTypedShowingFromExtendUsesRememberedOrFirstPhysicalMonitor() {
+        for (remembered, next) in [(UInt64?.none, UInt64(2)), (3, 3), (99, 2)] {
+            let cycle = ScreenCyclePresentation.make(candidates: typedScreens, currentId: 1,
+                pending: false, usesCaptureTargets: true, lastPhysicalId: remembered)
+            XCTAssertTrue(cycle.enabled)
+            XCTAssertEqual(cycle.accessibilityValue, "Extend iPad")
+            XCTAssertNil(cycle.position)
+            XCTAssertEqual(cycle.nextTargetId, next)
+            XCTAssertEqual(cycle.hint, next == 2 ? "Switch to Mirror and show Built-in display" : "Switch to Mirror and show External display")
+        }
+    }
+
+    func testTypedShowingKeepsDisabledRowAndPendingReason() {
+        let one = ScreenCyclePresentation.make(candidates: Array(typedScreens.prefix(2)), currentId: 2,
+            pending: false, usesCaptureTargets: true)
+        XCTAssertFalse(one.enabled)
+        XCTAssertNil(one.position)
+        XCTAssertEqual(one.detail, "Built-in display")
+        XCTAssertEqual(one.accessibilityLabel, "Built-in display")
+        XCTAssertEqual(one.reason, "Only one screen is available.")
+        XCTAssertTrue(SessionScreenPresentation.showsSwitchRow(kind: .castingMirror, cycle: one))
+        let fromExtend = ScreenCyclePresentation.make(candidates: Array(typedScreens.prefix(2)), currentId: 1,
+            pending: false, usesCaptureTargets: true)
+        XCTAssertTrue(fromExtend.enabled)
+        XCTAssertEqual(fromExtend.nextTargetId, 2)
+        XCTAssertNil(fromExtend.position)
+        let loading = ScreenCyclePresentation.make(candidates: [], currentId: nil, pending: false,
+            usesCaptureTargets: true)
+        XCTAssertEqual(loading.accessibilityLabel, "Choose a screen")
+        XCTAssertFalse(SessionScreenPresentation.showsSwitchRow(kind: .castingUnknown, cycle: loading))
+        for pending in [false, true] {
+            let empty = ScreenCyclePresentation.make(candidates: Array(typedScreens.prefix(1)), currentId: 1,
+                pending: pending, usesCaptureTargets: true)
+            XCTAssertFalse(empty.enabled)
+            XCTAssertNil(empty.nextTargetId)
+            XCTAssertEqual(empty.currentLabel, "Extend iPad")
+            XCTAssertEqual(empty.reason, pending ? "Switching screens\u{2026}" : "No screens are available.")
+            XCTAssertTrue(SessionScreenPresentation.showsSwitchRow(kind: .castingExtend, cycle: empty))
+        }
+    }
+
     func testSingleScreenDisablesOnlyWhenItIsCurrentAndRecoveryRemainsSelectable() {
         let entries = [ScreenPickerTile(id: 7, label: "Screen 1", isBuiltIn: false, status: .available)]
         let current = ScreenCyclePresentation.make(candidates: entries, currentId: 7, pending: false)

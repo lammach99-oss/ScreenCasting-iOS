@@ -227,6 +227,16 @@ final class PhysicalMirrorControlTests: XCTestCase {
     #if targetEnvironment(simulator)
     @MainActor
     func testActualSurfaceAdmissionAndRetirementPreserveLegacyAndDenyViewOnly() async throws {
+        try await exerciseSurfaceRetirement(stopExtend: false)
+    }
+
+    @MainActor
+    func testActualSurfaceRejectsExtendInputAfterStop() async throws {
+        try await exerciseSurfaceRetirement(stopExtend: true)
+    }
+
+    @MainActor
+    private func exerciseSurfaceRetirement(stopExtend: Bool) async throws {
         let network=NetworkManager()
         network.controlSendForAudioTesting={_,done in done(nil)}
         let session=network.simulateCommittedWifiSessionForTesting()
@@ -263,15 +273,15 @@ final class PhysicalMirrorControlTests: XCTestCase {
         surface.configureInputForTesting(container,coordinator:coordinator)
         XCTAssertEqual(buttons.map(\.action),[.leftDown,.leftUp]);XCTAssertEqual(contacts.map(\.phase),[.down,.cancel])
         down(2);XCTAssertEqual(buttons.count,2);XCTAssertEqual(contacts.count,2)
-        network.releaseMirrorControl()
-        network.networkQueueForTesting.sync {}
-        await drain()
         surface.remoteKeyboardActive=true
-        surface.configureInputForTesting(container,coordinator:coordinator);down(3)
-        XCTAssertEqual(buttons.count,2);XCTAssertEqual(contacts.count,2)
-        try receive(MirrorControlState(revision:2,epoch:2,source:1,mode:.awaitingPresentation,token:zero,geometry:geometry,firstFrame:100,lastSent:100))
+        if stopExtend {
+            network.releaseMirrorControl()
+            network.networkQueueForTesting.sync {}
+        } else {
+            try receive(MirrorControlState(revision:2,epoch:2,source:1,mode:.awaitingPresentation,token:zero,geometry:geometry,firstFrame:100,lastSent:100))
+        }
         await drain()
-        surface.configureInputForTesting(container,coordinator:coordinator);down(4)
+        surface.configureInputForTesting(container,coordinator:coordinator);down(3)
         XCTAssertEqual(buttons.count,2);XCTAssertEqual(contacts.count,2)
         ConnectedPresentationSurface.dismantleUIView(container,coordinator:coordinator)
         XCTAssertEqual(buttons.count,2);XCTAssertEqual(contacts.count,2)
