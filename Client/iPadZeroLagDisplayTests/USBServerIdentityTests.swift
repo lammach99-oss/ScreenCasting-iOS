@@ -269,7 +269,7 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         try await Task.sleep(nanoseconds: 5_200_000_000)
         XCTAssertEqual(manager.usbSessionSnapshot().generation, authenticated)
         try await send(replacement, .ping, Self.readiness)
-        let pong = try await read(replacement, type: .pong)
+        let pong = try await read(replacement, type: .pong, streaming: true)
         XCTAssertEqual(pong, Self.readiness)
     }
 
@@ -778,9 +778,16 @@ final class USBControlTLSIntegrationTests: XCTestCase {
     }
 
     private func read(_ host: NWConnection, type: WireMessageType, flags: UInt16 = 0,
-                      rejectClipboardHello: Bool = false) async throws -> Data {
-        for _ in 0..<20 {
-            guard let header = await receive(host, count: 16), header.count == 16 else { throw TestError.closed }
+                      rejectClipboardHello: Bool = false, streaming: Bool = false) async throws -> Data {
+        // Five seconds of streaming queues both framed feedback and 8-byte legacy stage packets.
+        let deadline = ProcessInfo.processInfo.systemUptime + 3
+        var framesRead = 0
+        while streaming ? ProcessInfo.processInfo.systemUptime < deadline : framesRead < 20 {
+            guard let prefix = await receive(host, count: 8), prefix.count == 8 else { throw TestError.closed }
+            if streaming && prefix.prefix(4) == Data([0x45, 0x54, 0, 0]) { continue }
+            guard let suffix = await receive(host, count: 8), suffix.count == 8 else { throw TestError.closed }
+            let header = prefix + suffix
+            framesRead += 1
             let length = Int(header.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 8, as: UInt32.self).littleEndian })
             guard header.prefix(5) == Data([0x53, 0x43, 0x53, 0x54, 1]), length <= 65_536 else {
                 throw TestError.invalidFrame

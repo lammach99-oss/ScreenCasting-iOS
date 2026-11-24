@@ -3790,6 +3790,13 @@ public class NetworkManager: ObservableObject {
             case .waiting(let error):
                 if self.connectionHandoffInProgress {
                     if self.handleConnectionRetirementOnQueue(connection: connection, generation: generation, source: .waiting) { return }
+                    if self.connectionSwitch.pending?.request.target == .wifi,
+                       self.connectionSwitch.pending?.rollingBack == false,
+                       WifiNetworkErrorPolicy.disposition(for: error) == .terminal {
+                        // The failed Wi-Fi dial may already have a USB restore dial queued.
+                        self.recoverConnectionControlOnQueue(.connectionLost)
+                        return
+                    }
                     // Network.framework may still reach ready. TCP/auth and handoff deadlines remain armed.
                     self.logSwitch(.targetWaiting, route: self.committedConnectionRoute, source: .waiting)
                     return
