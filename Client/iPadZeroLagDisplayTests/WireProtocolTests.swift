@@ -2535,7 +2535,7 @@ final class AudioInterruptionOwnershipTests: XCTestCase {
         let f = LivenessFixture()
         let entered = expectation(description: "audio queue blocked")
         let release = DispatchSemaphore(value: 0)
-        f.audio.audioQueueForTesting.async { entered.fulfill(); release.wait() }
+        f.audio.audioQueueForTesting.async { entered.fulfill(); XCTAssertEqual(release.wait(timeout: .now() + 30), .success, "Timed out waiting for release") }
         await fulfillment(of: [entered], timeout: 1)
         let posted = expectation(description: "notification returns without waiting for audio queue")
         DispatchQueue.global().async {
@@ -3449,6 +3449,7 @@ final class USBListenerLifetimeTests: XCTestCase {
     override func setUp() {
         super.setUp()
         manager = NetworkManager()
+        manager.usbIdentityCredentialLoadForTesting = { nil }
         manager.startListening(port: 0)
     }
 
@@ -3565,6 +3566,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         manager.stopForTesting()
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "test.usb.pcm.\(UUID().uuidString)"))
         manager = NetworkManager(userDefaults: defaults)
+        manager.usbIdentityCredentialLoadForTesting = { nil }
         manager.startListening(port: 0)
         let audio = AudioManager.shared
         audio.audioQueueForTesting.sync { }
@@ -4107,7 +4109,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         let decoderQueue = manager.decoderForTesting.sessionQueueForTesting
         decoderQueue.async {
             decoderBlocked.fulfill()
-            releaseDecoder.wait()
+            XCTAssertEqual(releaseDecoder.wait(timeout: .now() + 30), .success, "Timed out waiting for releaseDecoder")
         }
         wait(for: [decoderBlocked], timeout: 5)
         defer {
@@ -4135,14 +4137,12 @@ final class USBListenerLifetimeTests: XCTestCase {
 
     func testReadinessProbeArmedAfterBindStillObservesReady() throws {
         let listener = try XCTUnwrap(manager.usbSessionSnapshot().listener)
-        let probe = manager.networkQueueForTesting.sync { () -> ListenerReadinessProbe in
-            // Hold the queue until Network.framework binds, so its ready block is queued
-            // behind arming: the interleaving that failed CI run 41862858597.
-            let deadline = Date().addingTimeInterval(5)
-            // `port` reads Port(0), not nil, until the socket binds.
-            while (listener.port?.rawValue ?? 0) == 0, Date() < deadline { usleep(1_000) }
-            XCTAssertNotEqual(listener.port?.rawValue ?? 0, 0, "precondition: listener binds while the network queue is held")
-            return armListenerReadiness(listener, stage: "armed_after_bind")
+        let ready = manager.networkQueueForTesting.sync {
+            armListenerReadiness(listener, stage: "initial_bind")
+        }
+        try finishListenerReadiness(ready, waitResult: XCTWaiter.wait(for: [ready.ready], timeout: 5))
+        let probe = manager.networkQueueForTesting.sync {
+            armListenerReadiness(listener, stage: "armed_after_bind")
         }
         try finishListenerReadiness(probe, waitResult: XCTWaiter.wait(for: [probe.ready], timeout: 5))
     }
@@ -4377,7 +4377,7 @@ final class USBListenerLifetimeTests: XCTestCase {
         let entered = expectation(description: "decoder barrier held")
         let release = DispatchSemaphore(value: 0)
         defer { release.signal() }
-        decoder.sessionQueueForTesting.async { entered.fulfill(); release.wait() }
+        decoder.sessionQueueForTesting.async { entered.fulfill(); XCTAssertEqual(release.wait(timeout: .now() + 30), .success, "Timed out waiting for release") }
         let barrier = await XCTWaiter.fulfillment(of: [entered], timeout: 10)
         XCTAssertEqual(barrier, .completed)
         guard barrier == .completed else { return }
@@ -4571,16 +4571,31 @@ final class USBListenerLifetimeTests: XCTestCase {
         let incumbent = try connect()
         let probe = LegacyPcmProbe()
         func waitForPing(_ nonce: UInt64) throws -> Data {
-            func matchingPing() -> Data? {
-                probe.pings.first { payload in
-                    payload.withUnsafeBytes {
-                        $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self).littleEndian
-                    } == nonce
+            let sent = XCTestExpectation(description: "Matching USB probe written")
+            let matches: (Data) -> Bool = { payload in
+                payload.withUnsafeBytes {
+                    $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self).littleEndian
+                } == nonce
+            }
+            // Record and subscribe on the writer queue so an early send is replayed.
+            manager.networkQueueForTesting.sync {
+                if probe.pings.contains(where: matches) {
+                    sent.fulfill()
+                } else {
+                    probe.observePing {
+                        if probe.pings.contains(where: matches) {
+                            probe.observePing(nil)
+                            sent.fulfill()
+                        }
+                    }
                 }
             }
-            let sent = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in matchingPing() != nil }, object: nil)
-            wait(for: [sent], timeout: 5)
-            return try XCTUnwrap(matchingPing())
+            defer { probe.observePing(nil) }
+            guard XCTWaiter.wait(for: [sent], timeout: 10) == .completed else {
+                XCTFail("Expected USB probe was never written")
+                throw USBListenerFixtureError.readinessFailure("probe write")
+            }
+            return try XCTUnwrap(probe.pings.first(where: matches))
         }
         let sendingManager = try XCTUnwrap(manager)
         // The freshness expectation observes only the PCM probe. After that
@@ -5040,6 +5055,10 @@ final class USBListenerLifetimeTests: XCTestCase {
 
     private func finishListenerReadiness(_ probe: ListenerReadinessProbe,
                                          waitResult: XCTWaiter.Result) throws {
+        guard waitResult == .completed else {
+            XCTFail("USB listener readiness timed out [\(probe.stage)]")
+            throw USBListenerFixtureError.readinessFailure(probe.stage)
+        }
         let owner = try XCTUnwrap(manager)
         let reading = owner.networkQueueForTesting.sync {
             owner.usbListenerStateObservedForTesting = nil
@@ -5049,7 +5068,7 @@ final class USBListenerLifetimeTests: XCTestCase {
             return (ready: probe.genuineReady, state: probe.observedState, terminal: probe.terminalFailure,
                     sameOwner: current.listener === probe.listener, intent: current.listenerIntent)
         }
-        guard waitResult == .completed, reading.ready, reading.terminal == nil,
+        guard reading.ready, reading.terminal == nil,
               reading.sameOwner, reading.intent else {
             let reason = "stage=\(probe.stage) waiter=\(waitResult) state=\(reading.state) " +
                          "terminal=\(reading.terminal ?? "none") sameOwner=\(reading.sameOwner) " +
@@ -5069,32 +5088,39 @@ final class USBListenerLifetimeTests: XCTestCase {
         let port = try XCTUnwrap(listener.port)
         let acceptedReady = expectation(description: "USB candidate ready or rejected")
         var acceptedPeer: NWConnection?
-        manager.networkQueueForTesting.sync {
-            listener.newConnectionHandler = { connection in
-                acceptHandler(connection)
-                acceptedPeer = connection
-                guard self.manager.usbSessionSnapshot().connection === connection else {
-                    acceptedReady.fulfill()
-                    return
-                }
-                let stateHandler = connection.stateUpdateHandler
+        let owner = try XCTUnwrap(manager)
+        queue.sync {
+            owner.usbCandidateInstalledForTesting = { connection in
+                let handler = connection.stateUpdateHandler
                 connection.stateUpdateHandler = { state in
-                    stateHandler?(state)
+                    handler?(state)
                     if case .ready = state {
-                        connection.stateUpdateHandler = stateHandler
+                        connection.stateUpdateHandler = handler
                         acceptedReady.fulfill()
                     }
                 }
             }
+            listener.newConnectionHandler = { connection in
+                acceptedPeer = connection
+                acceptHandler(connection)
+                if owner.usbSessionSnapshot().connection !== connection { acceptedReady.fulfill() }
+            }
         }
-        let client = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
+        defer {
+            queue.async {
+                owner.usbCandidateInstalledForTesting = nil
+                listener.newConnectionHandler = acceptHandler
+            }
+        }
+        let client = NWConnection(host: .ipv4(.loopback), port: port, using: .tcp)
         peers.append(client)
-        client.start(queue: manager.networkQueueForTesting)
-        wait(for: [acceptedReady], timeout: 5)
-        let accepted = try manager.networkQueueForTesting.sync {
-            listener.newConnectionHandler = acceptHandler
-            return try XCTUnwrap(acceptedPeer)
+        client.start(queue: queue)
+        guard XCTWaiter.wait(for: [acceptedReady], timeout: 10) == .completed else {
+            client.cancel()
+            XCTFail("USB candidate did not reach ready or rejection [\(stage)]")
+            throw USBListenerFixtureError.readinessFailure(stage)
         }
+        let accepted = try queue.sync { try XCTUnwrap(acceptedPeer) }
         return accepted
     }
 
@@ -5652,7 +5678,7 @@ final class WifiShortBackgroundSameSessionTests: XCTestCase {
         defer { released.signal() }
         decoder.sessionQueueForTesting.async {
             entered.fulfill()
-            released.wait()
+            XCTAssertEqual(released.wait(timeout: .now() + 30), .success, "Timed out waiting for released")
         }
         // Watchdogs bound a hung test; they are not production latency requirements.
         let barrier = await XCTWaiter.fulfillment(of: [entered], timeout: 10)
@@ -6709,7 +6735,7 @@ final class WireProtocolTests: XCTestCase {
                 group.leave()
             }
         }
-        group.wait()
+        XCTAssertEqual(group.wait(timeout: .now() + 30), .success, "Timed out waiting for group")
 
         networkQueue.sync {
             received.removeAll()

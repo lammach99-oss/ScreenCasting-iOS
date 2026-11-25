@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 import Network
 import CoreVideo
@@ -54,10 +55,13 @@ final class ConnectionControlIntegrationTests: XCTestCase {
     }
     @MainActor private func drain(_ network: NetworkManager) async {
         for _ in 0..<4 {
-            network.networkQueueForTesting.sync {}
-            let done = expectation(description: "connection state publication")
-            DispatchQueue.main.async { done.fulfill() }
-            await fulfillment(of: [done], timeout: 2)
+            let done = XCTestExpectation(description: "connection state publication")
+            network.networkQueueForTesting.async {
+                DispatchQueue.main.async { done.fulfill() }
+            }
+            guard await XCTWaiter.fulfillment(of: [done], timeout: 10) == .completed else {
+                return XCTFail("Connection state publication queues did not drain")
+            }
         }
     }
     @MainActor func testOldHostAndUnverifiedIdentityNeverReceiveExtensionTraffic() async {
@@ -118,7 +122,7 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         let release = DispatchSemaphore(value: 0)
         let decoder = network.decoderForTesting
         let held = expectation(description: "decoder queue blocked")
-        decoder.sessionQueueForTesting.async { held.fulfill(); release.wait() }
+        decoder.sessionQueueForTesting.async { held.fulfill(); XCTAssertEqual(release.wait(timeout: .now() + 30), .success, "Timed out waiting for release") }
         defer { release.signal() }
         await fulfillment(of: [held], timeout: 3)
         let completed = expectation(description: "fallback committed while decoder queue blocked")
@@ -252,6 +256,14 @@ final class ConnectionControlIntegrationTests: XCTestCase {
                 if data[5] == WireMessageType.clientHello.rawValue { identityHello.fulfill() }
             }
             wifiPeer?.cancel()
+        }
+        let rollback = XCTestExpectation(description: "Wi-Fi failure opened the USB rollback route")
+        let observation = network.$connectionSwitchState
+            .first(where: { $0.pending?.rollbackRoute == .usb })
+            .sink { _ in rollback.fulfill() }
+        defer { observation.cancel() }
+        guard await XCTWaiter.fulfillment(of: [rollback], timeout: 10) == .completed else {
+            return XCTFail("USB rollback route never opened")
         }
         let restored = NWConnection(host: .ipv4(.loopback), port: usbPort, using: .tcp)
         defer { restored.cancel() }

@@ -108,7 +108,7 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         defer { host.cancel() }
         try await authenticate(host, session: session, tls: true, accepted: false)
         try await waitUntil { session.manager.connectionState == Self.secureFailure }
-        let remaining = await receive(host, count: 1)
+        let remaining = try await receive(host, count: 1)
         XCTAssertTrue(remaining?.isEmpty ?? true)
         XCTAssertNil(session.savedCredential()?.usbControlTLSSeen)
     }
@@ -121,7 +121,7 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         defer { host.cancel() }
         try await send(host, .ping, Self.readiness)
         try await waitUntil { session.manager.connectionState == Self.secureFailure }
-        let remaining = await receive(host, count: 1)
+        let remaining = try await receive(host, count: 1)
         XCTAssertTrue(remaining?.isEmpty ?? true)
     }
 
@@ -189,7 +189,7 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         let usb = dial(port, tls: false)
         defer { usb.cancel() }
         try await send(usb, .ping, Self.readiness, flags: 0x0100)
-        let plaintext = await receive(usb, count: 1)
+        let plaintext = try await receive(usb, count: 1)
         XCTAssertTrue(plaintext?.isEmpty ?? true)
         try await assertWifiRollback(session, host: wifi)
     }
@@ -241,16 +241,16 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         let transaction = try XCTUnwrap(manager.connectionSwitchState.pending?.request)
         for silent in [false, true] {
             let generation = manager.usbSessionSnapshot().generation
+            let dialStarted = ProcessInfo.processInfo.systemUptime
             let interrupted = dial(usbPort, tls: false)
+            defer { interrupted.cancel() }
             try await waitUntil { manager.usbSessionSnapshot().generation > generation }
             let interruptedGeneration = manager.usbSessionSnapshot().generation
-            let installed = ProcessInfo.processInfo.systemUptime
-            defer { interrupted.cancel() }
             if !silent { interrupted.cancel() }
             try await waitUntil { manager.usbSessionSnapshot().generation > interruptedGeneration }
             if silent {
-                XCTAssertGreaterThanOrEqual(ProcessInfo.processInfo.systemUptime - installed, 4.8)
-                let eof = await receive(interrupted, count: 1)
+                XCTAssertGreaterThanOrEqual(ProcessInfo.processInfo.systemUptime - dialStarted, 4.8)
+                let eof = try await receive(interrupted, count: 1)
                 XCTAssertTrue(eof?.isEmpty ?? true)
             }
             XCTAssertTrue(manager.usbSessionSnapshot().listenerIntent)
@@ -562,9 +562,9 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         let ping = ConnectionControlProtocolTests.bytes("ce83cdcbb78c7b9e432ce98f2d889d4517be4f89e5b949888f30f45f93bfdb5e")
         let pong = ConnectionControlProtocolTests.bytes("41cb339cb7b174f97c05521fb67d601bdda65fdb8b7709ca9c785155132041af")
         try await send(probe, .ping, ping, flags: 0x0400)
-        let probeReply = await receive(probe, count: 48)
+        let probeReply = try await receive(probe, count: 48)
         XCTAssertTrue(probeReply == Self.frame(.pong, pong, flags: 0x0400))
-        let trailingPlaintext = await receive(probe, count: 1)
+        let trailingPlaintext = try await receive(probe, count: 1)
         XCTAssertTrue(trailingPlaintext?.isEmpty ?? true)
         if case .cancelled = probe.state { XCTFail("Probe did not close before the fixture timeout") }
         XCTAssertTrue(manager.connectionSwitchState.enabled)
@@ -706,12 +706,9 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         return port
     }
 
-    @MainActor private func waitUntil(_ condition: () -> Bool) async throws {
-        let deadline = ProcessInfo.processInfo.systemUptime + 6
-        while !condition() {
-            guard ProcessInfo.processInfo.systemUptime < deadline else { throw TestError.timedOut }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
+    @MainActor private func waitUntil(file: StaticString = #filePath, line: UInt = #line,
+                                      _ condition: @escaping @MainActor () -> Bool) async throws {
+        try await awaitFixtureCondition("USB integration state transition", file: file, line: line, condition: condition)
     }
 
     private func dial(_ port: NWEndpoint.Port, tls: Bool) -> NWConnection {
@@ -722,7 +719,6 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         }
         let host = NWConnection(host: .ipv4(.loopback), port: port, using: parameters)
         host.start(queue: DispatchQueue.global())
-        DispatchQueue.global().asyncAfter(deadline: .now() + 12) { [weak host] in host?.cancel() }
         return host
     }
 
@@ -759,40 +755,72 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         return bytes + payload
     }
 
-    private func send(_ host: NWConnection, _ type: WireMessageType, _ data: Data, flags: UInt16 = 0,
-                      sequence: UInt32 = 0) async throws {
-        let error: NWError? = await withCheckedContinuation { continuation in
-            host.send(content: Self.frame(type, data, flags: flags, sequence: sequence), completion: .contentProcessed {
-                continuation.resume(returning: $0)
-            })
+    private final class IOCompletion<Value>: @unchecked Sendable {
+        let done: XCTestExpectation
+        private let lock = NSLock()
+        private var value: Value
+
+        init(_ description: String, initial: Value) {
+            done = XCTestExpectation(description: description)
+            value = initial
         }
-        if let error { throw error }
+
+        func finish(_ result: Value) {
+            lock.lock()
+            value = result
+            lock.unlock()
+            done.fulfill()
+        }
+
+        func result() -> Value {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
     }
 
-    private func receive(_ host: NWConnection, count: Int) async -> Data? {
-        await withCheckedContinuation { continuation in
-            host.receive(minimumIncompleteLength: count, maximumLength: count) { data, _, _, _ in
-                continuation.resume(returning: data)
-            }
+    private func send(_ host: NWConnection, _ type: WireMessageType, _ data: Data, flags: UInt16 = 0,
+                      sequence: UInt32 = 0) async throws {
+        let write = IOCompletion<NWError?>("TLS fixture send", initial: nil)
+        host.send(content: Self.frame(type, data, flags: flags, sequence: sequence),
+                  completion: .contentProcessed { write.finish($0) })
+        guard await XCTWaiter.fulfillment(of: [write.done], timeout: 10) == .completed else {
+            host.cancel()
+            XCTFail("TLS fixture send timed out for message \(type)")
+            throw TestError.timedOut
         }
+        if let error = write.result() { throw error }
+    }
+
+    private func receive(_ host: NWConnection, count: Int, timeout: TimeInterval = 10) async throws -> Data? {
+        let read = IOCompletion<Data?>("TLS fixture receive", initial: nil)
+        host.receive(minimumIncompleteLength: count, maximumLength: count) { data, _, _, _ in
+            read.finish(data)
+        }
+        guard await XCTWaiter.fulfillment(of: [read.done], timeout: max(0, timeout)) == .completed else {
+            host.cancel()
+            XCTFail("TLS fixture receive timed out waiting for \(count) bytes")
+            throw TestError.timedOut
+        }
+        return read.result()
     }
 
     private func read(_ host: NWConnection, type: WireMessageType, flags: UInt16 = 0,
                       rejectClipboardHello: Bool = false, streaming: Bool = false) async throws -> Data {
         // Five seconds of streaming queues both framed feedback and 8-byte legacy stage packets.
-        let deadline = ProcessInfo.processInfo.systemUptime + 3
+        let deadline = ProcessInfo.processInfo.systemUptime + 10
         var framesRead = 0
-        while streaming ? ProcessInfo.processInfo.systemUptime < deadline : framesRead < 20 {
-            guard let prefix = await receive(host, count: 8), prefix.count == 8 else { throw TestError.closed }
+        while ProcessInfo.processInfo.systemUptime < deadline, streaming || framesRead < 20 {
+            guard let prefix = try await receive(host, count: 8, timeout: deadline - ProcessInfo.processInfo.systemUptime), prefix.count == 8 else { throw TestError.closed }
             if streaming && prefix.prefix(4) == Data([0x45, 0x54, 0, 0]) { continue }
-            guard let suffix = await receive(host, count: 8), suffix.count == 8 else { throw TestError.closed }
+            guard let suffix = try await receive(host, count: 8, timeout: deadline - ProcessInfo.processInfo.systemUptime), suffix.count == 8 else { throw TestError.closed }
             let header = prefix + suffix
             framesRead += 1
             let length = Int(header.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 8, as: UInt32.self).littleEndian })
             guard header.prefix(5) == Data([0x53, 0x43, 0x53, 0x54, 1]), length <= 65_536 else {
                 throw TestError.invalidFrame
             }
-            let payload = length == 0 ? Data() : await receive(host, count: length)
+            let payload = length == 0 ? Data() : try await receive(host, count: length, timeout: deadline - ProcessInfo.processInfo.systemUptime)
             guard let payload, payload.count == length else { throw TestError.closed }
             if rejectClipboardHello { XCTAssertNotEqual(header[5], WireMessageType.castingClipboardHello.rawValue) }
             let actualFlags = UInt16(header[6]) | (UInt16(header[7]) << 8)

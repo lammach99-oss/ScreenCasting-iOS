@@ -10,8 +10,10 @@ NETWORK = (APP / "NetworkManager.swift").read_text(encoding="utf-8")
 class SecureDesktopWiring(unittest.TestCase):
     def test_opt_in_and_authenticated_state_are_wired(self):
         self.assertTrue("requestSecureDesktop: remoteSecureDesktopEnabled" in NETWORK)
-        self.assertTrue("remoteFeaturesPingChallenge == payload" in NETWORK)
-        self.assertTrue("case .remoteSecureDesktopState:" in NETWORK)
+        self.assertIn("wireAuthenticatedGeneration == generation,\n               let clipboardProbe = remoteFeatures.consumeProbeReply(payload)", NETWORK)
+        negotiation = (APP / "RemoteControl/RemoteFeatureNegotiation.swift").read_text(encoding="utf-8")
+        self.assertIn("guard phase == .pong, let clipboard = probeChallenges[payload] else { return nil }", negotiation)
+        self.assertTrue("case .remoteSecureDesktopState, .remoteSasAvailability:" in NETWORK)
         self.assertTrue("receiveRemoteSecureDesktopOnQueue(header, payload: payload)" in NETWORK)
 
     def test_ack_comes_from_renderer_presentation(self):

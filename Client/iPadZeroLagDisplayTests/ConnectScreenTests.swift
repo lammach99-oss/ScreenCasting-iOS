@@ -1,6 +1,30 @@
+import Combine
 import XCTest
 import Network
 @testable import iPadCasting
+
+// Some integration conditions combine state from multiple queues without a publisher.
+// Sample those on the main actor and stop sampling as soon as the waiter returns.
+@MainActor
+func awaitFixtureCondition(_ description: String, file: StaticString = #filePath, line: UInt = #line,
+                           condition: @escaping @MainActor () -> Bool) async throws {
+    if condition() { return }
+    let reached = XCTestExpectation(description: description)
+    let deadline = ProcessInfo.processInfo.systemUptime + 10
+    let observation = Task { @MainActor in
+        while !Task.isCancelled, ProcessInfo.processInfo.systemUptime < deadline {
+            if condition() { reached.fulfill(); return }
+            do { try await Task.sleep(nanoseconds: 10_000_000) } catch { return }
+        }
+    }
+    defer { observation.cancel() }
+    guard await XCTWaiter.fulfillment(of: [reached], timeout: 10) == .completed else {
+        XCTFail("Timed out waiting for \(description)", file: file, line: line)
+        throw FixtureWaitError.timedOut
+    }
+}
+
+private enum FixtureWaitError: Error { case timedOut }
 
 final class DiscoveryLifecycleTests: XCTestCase {
     private final class Browser: DiscoveryBrowser, @unchecked Sendable {
@@ -22,8 +46,15 @@ final class DiscoveryLifecycleTests: XCTestCase {
         let manager = DiscoveryManager(makeBrowser: { browser })
         let endpoint = try XCTUnwrap(WifiReconnectTarget.service(name: "Fixture A", type: "_screencasting._tcp", domain: "local.").endpoint)
         manager.startBrowsing()
-        browser.results?([endpoint])
-        await drainMainQueue()
+        let published = XCTestExpectation(description: "Fixture A published by the active browser")
+        let observation = manager.$discoveredHosts.first(where: { $0.map(\.endpoint) == [endpoint] })
+            .sink { _ in published.fulfill() }
+        defer { observation.cancel() }
+        let publish = try XCTUnwrap(browser.results)
+        publish([endpoint])
+        guard await XCTWaiter.fulfillment(of: [published], timeout: 10) == .completed else {
+            return XCTFail("Active browser did not publish Fixture A")
+        }
         XCTAssertEqual(manager.discoveredHosts.map(\.name), ["Fixture A"])
         manager.stopBrowsing()
         XCTAssertTrue(browser.cancelled)

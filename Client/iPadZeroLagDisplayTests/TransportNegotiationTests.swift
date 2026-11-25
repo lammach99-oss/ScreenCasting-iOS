@@ -677,8 +677,12 @@ final class RendererConstantOwnershipTests: XCTestCase {
             encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             encoder.endEncoding()
         }
+        let rendered = XCTestExpectation(description: "Both encoded draws completed")
+        command.addCompletedHandler { _ in rendered.fulfill() }
         command.commit()
-        command.waitUntilCompleted()
+        guard XCTWaiter.wait(for: [rendered], timeout: 30) == .completed else {
+            return XCTFail("Metal command buffer did not complete both draws")
+        }
         XCTAssertEqual(command.status, .completed)
         for (texture, expected) in zip(targets, [SIMD2<Float>(0.25, 0.5), SIMD2<Float>(0.75, 1)]) {
             var pixel = SIMD4<Float>.zero
