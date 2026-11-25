@@ -4509,7 +4509,8 @@ public class NetworkManager: ObservableObject {
             type: .videoFeedback,
             payload: payload,
             sequence: feedback.0,
-            flags: feedbackFlags)
+            flags: feedbackFlags,
+            coalesceFeedback: !(reportDecodeLoss && activeTransportKind == .usb))
         // The legacy 8-byte stage packet remains valid for older hosts and carries
         // receive p95, which intentionally has no slot in v1 VideoFeedback.
         sendLegacyFrameStagePacket(
@@ -5210,6 +5211,7 @@ public class NetworkManager: ObservableObject {
         payload: Data,
         sequence: UInt32,
         flags: UInt16 = 0,
+        coalesceFeedback: Bool = true,
         movement: Bool = false,
         bulk: Bool = false,
         completion: @escaping (NWError?) -> Void = { _ in }
@@ -5230,7 +5232,7 @@ public class NetworkManager: ObservableObject {
         message.append(payload)
         enqueueControlData(
             message,
-            telemetry: type == .videoFeedback && flags != CaptureTargetProtocol.recoveryFlag,
+            telemetry: coalesceFeedback && type == .videoFeedback && flags != CaptureTargetProtocol.recoveryFlag,
             movement: movement,
             bulk: bulk,
             completion: { [weak self] error in
@@ -5687,7 +5689,11 @@ public class NetworkManager: ObservableObject {
                   let mode = PipelineMode.decode(payload),
                   committedPipelineMode.acknowledge(mode) else { return }
             if !remoteInputConnection { decoder.configureRefreshRate(UInt32(mode.targetFps)) }
-            if captureTargetOwnsPresentation { abandonCaptureTargetPresentationOnQueue() }
+            // The USB request already reconciled source ownership. An FPS echo
+            // can arrive between retirement and the confirming catalogue.
+            if (activeTransportKind != .usb || connectionHandoffInProgress) && captureTargetOwnsPresentation {
+                abandonCaptureTargetPresentationOnQueue()
+            }
             transportTelemetry.beginFreshFrameRate(generation: generation)
             return
 
@@ -5739,6 +5745,8 @@ public class NetworkManager: ObservableObject {
                        firstPhysicalAnchor || (resumedVirtualDisplay && !connectionHandoffInProgress) {
                         if committedRealtimeMode == RealtimeTransportMode.wifiRTP {
                             wifiMediaReceiver.requestImmediateRecoveryFeedback(generation: generation)
+                        } else if activeTransportKind == .usb && resumedVirtualDisplay {
+                            requestVideoRecoveryOnQueue()
                         } else if let recovery=mirrorControl.presentationRecoveryRequest() {
                             sendWireMessage(type:.mirrorAction,payload:recovery,sequence:0)
                         }
@@ -6590,6 +6598,7 @@ public class NetworkManager: ObservableObject {
     private func sendDesiredPipelineMode(reason: String) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard wireAuthenticatedGeneration == connectionGeneration else { return }
+        if activeTransportKind == .usb && !connectionHandoffInProgress { releasePresentedSourceOnQueue() }
         if captureTargets.pending != nil || captureTargets.applied != nil { abandonCaptureTargetPresentationOnQueue() }
         committedPipelineMode.request(desiredPipelineMode)
         sendWireMessage(
@@ -6632,6 +6641,16 @@ public class NetworkManager: ObservableObject {
         if connectionHandoffInProgress, connectionSwitch.pending != nil {
             trackConnectionDisplayRequestOnQueue(request.requestId)
         }
+        releasePresentedSourceOnQueue()
+        pendingDisplayPreference = reconciledPreference
+        DispatchQueue.main.async { [weak self] in
+            self?.isDisplayConfigurationPending = true
+            self?.displayConfigurationFailureMessage = nil
+        }
+        sendDisplayConfigurationRequest(request)
+    }
+
+    private func releasePresentedSourceOnQueue() {
         if captureTargets.releasePresentedSourceForDisplayChange() {
             // This source already rendered. Return video to the ordinary display
             // path and preserve the completed switch outcome.
@@ -6648,12 +6667,6 @@ public class NetworkManager: ObservableObject {
             captureTargetLastVideoSequence = nil
             publishMirrorStateOnQueue()
         }
-        pendingDisplayPreference = reconciledPreference
-        DispatchQueue.main.async { [weak self] in
-            self?.isDisplayConfigurationPending = true
-            self?.displayConfigurationFailureMessage = nil
-        }
-        sendDisplayConfigurationRequest(request)
     }
 
     private func sendDisplayConfigurationRequest(

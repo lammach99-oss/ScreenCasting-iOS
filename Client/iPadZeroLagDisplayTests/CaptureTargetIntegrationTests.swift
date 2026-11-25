@@ -185,6 +185,52 @@ final class CaptureTargetIntegrationTests: XCTestCase {
         XCTAssertEqual(network.captureTargetState.confirmedCurrentId, 14)
     }
 
+    @MainActor func testUSBModeEchoKeepsPresentedExtendDecoderInBothDirections() async throws {
+        let network = NetworkManager()
+        defer { network.stopForTesting() }
+        network.controlSendForAudioTesting = { _, done in done(nil) }
+        network.captureTargetScheduleForTesting = { _, _ in }
+        network.captureTargetDecodeForTesting = { _, _, _ in }
+        let peer = network.commitCastingClipboardRouteForTesting(usb: true, tls: true)
+        func receive(_ type: WireMessageType, _ payload: Data, flags: UInt16 = 0) {
+            network.receiveCaptureTargetWireForTesting(type: type, payload: payload, flags: flags,
+                generation: peer.generation, connection: peer.connection)
+        }
+        receive(.displayCapabilities, Self.modes, flags: 0x7c00)
+        receive(.mirrorState, try Self.mode(revision: 1, epoch: 2, physical: true))
+        receive(.sourceCatalogue, Self.catalogue(revision: 3, current: 4))
+        await drain(network)
+        network.requestCaptureTarget(1, catalogue: try XCTUnwrap(network.captureTargetState.catalogue))
+        await drain(network)
+        receive(.sourceSwitchResult, Self.result(status: 9, revision: 3, current: 0))
+        receive(.sourceCatalogue, Self.catalogue(revision: 4, current: 11, virtualId: 11, physicalId: 14))
+        receive(.mirrorState, try Self.mode(revision: 2, epoch: 3, physical: false))
+        receive(.sourceSwitchResult, Self.result())
+        receive(.video, Data([1]), flags: 3)
+        let decoder = try XCTUnwrap(network.captureTargetDecoderForTesting)
+        network.recordRenderCompletion(sequence: 0, generation: decoder)
+        await drain(network)
+        XCTAssertFalse(network.captureTargetState.inputBlocked)
+        for mode in [PipelineMode.game, .office] {
+            network.setDesiredPipelineMode(mode)
+            await drain(network)
+            receive(.pipelineMode, mode.encode())
+            await drain(network)
+            XCTAssertEqual(network.decoder.currentSessionGeneration, decoder)
+            XCTAssertFalse(network.captureTargetState.unknownOutcome)
+            XCTAssertFalse(network.captureTargetState.inputBlocked)
+        }
+        let before = network.videoFeedbackCountForTesting
+        let unavailable = MirrorControlState(revision: 3, epoch: 4, source: 0, mode: .unavailable,
+            token: MirrorToken(low: 0, high: 0), geometry: nil, firstFrame: nil, lastSent: nil)
+        receive(.mirrorState, try MirrorControlCodec.encodeState(unavailable))
+        let replacement = network.decoder.currentSessionGeneration
+        XCTAssertNotEqual(replacement, decoder)
+        receive(.mirrorState, try Self.mode(revision: 4, epoch: 5, physical: false))
+        XCTAssertEqual(network.decoder.currentSessionGeneration, replacement)
+        XCTAssertEqual(network.videoFeedbackCountForTesting, before + 1)
+    }
+
     @MainActor func testDisplayChangeWaitsForSuccessfulSourcePresentation() async throws {
         let network = NetworkManager()
         network.useAutomaticOrientationForTesting()
