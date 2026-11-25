@@ -6168,7 +6168,8 @@ public class NetworkManager: ObservableObject {
             receiveRemoteSecureDesktopOnQueue(header, payload: payload)
         case .remoteAudioState, .remoteAudioPacket, .remoteTimedVideo:
             receiveRemoteAudioOnQueue(message, generation: generation)
-        case .remoteFileControl, .remoteAudioSet, .remoteSecureDesktopRequest:
+        case .remoteFileControl, .remoteAudioSet, .remoteSecureDesktopRequest, .remoteVideoStandby:
+            // The client does not negotiate RemoteVideoStandby yet, so the host never sends it.
             handleStreamError("Unnegotiated remote feature message.")
         case .clipboardState, .clipboardOffer, .clipboardOfferResponse, .clipboardChunk,
              .clipboardEnd, .clipboardResult, .clipboardCancel:
