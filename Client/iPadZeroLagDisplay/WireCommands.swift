@@ -74,6 +74,7 @@ enum WireMessageType: UInt8 {
     case remoteSecureDesktopRequest = 108, remoteSecureDesktopState = 109
     case remoteSasAvailability = 110
     case castingClipboardHello = 111
+    case remoteVideoStandby = 112
 }
 
 /// Toolbar actions the remote host runs on the PC. Payload: [version 1, command, flags(bit0 confirm)].

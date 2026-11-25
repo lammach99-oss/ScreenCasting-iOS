@@ -8821,3 +8821,31 @@ final class H1TextOwnershipTests: XCTestCase {
         XCTAssertEqual(keys.count, 2, "retired hardware owners never replay")
     }
 }
+
+final class RemoteVideoStandbyTests: XCTestCase {
+    func testStandbyNegotiationAcceptsLegacyResult() throws {
+        let standby = RemoteFeatureNegotiation.remoteVideoStandby
+        for accepted in [UInt64(3), 3 | standby] {
+            var negotiation = RemoteFeatureNegotiation(requestedFeatures: 3 | standby)
+            XCTAssertTrue(negotiation.begin(now: 0))
+            let request = try XCTUnwrap(negotiation.pong(flags: RemoteFeatureNegotiation.supportedFlag, now: 0))
+            XCTAssertEqual(RemoteFeaturesMessage.decode(request)?.features, 3 | standby)
+            XCTAssertTrue(negotiation.result(flags: 0, payload: RemoteFeaturesMessage(features: accepted).encode()))
+            XCTAssertEqual(negotiation.accepted, accepted)
+        }
+    }
+
+    func testStandbyVectors() throws {
+        let golden = ["010000000807060504030201", "010100000807060504030201",
+                      "010200000807060504030201", "010300000807060504030201"]
+        for (index, hex) in golden.enumerated() {
+            let op = try XCTUnwrap(RemoteVideoStandbyMessage.Operation(rawValue: UInt8(index)))
+            let message = RemoteVideoStandbyMessage(operation: op, serial: 0x0102030405060708)
+            let data = try XCTUnwrap(message.encode())
+            XCTAssertEqual(data.map { String(format: "%02x", $0) }.joined(), hex)
+            XCTAssertEqual(RemoteVideoStandbyMessage.decode(data, flags: 0, request: index < 2), message)
+            XCTAssertNil(RemoteVideoStandbyMessage.decode(data, flags: 0, request: index >= 2))
+            XCTAssertNil(RemoteVideoStandbyMessage.decode(data, flags: 1, request: index < 2))
+        }
+    }
+}

@@ -120,11 +120,12 @@ struct RemoteFeatureNegotiation {
     private static let pongTimeout: TimeInterval = 2
     static let phaseAFeaturesEnabled = false
     static let remoteFileFeature: UInt64 = 0x100
+    static let remoteVideoStandby: UInt64 = 0x2000
     static let remoteAudioFeature: UInt64 = 0x200
     static let remoteSecureDesktopFeature: UInt64 = 0x400
     static let remoteSasAvailabilityFeature: UInt64 = 0x800
     static let phaseAFeatures = remoteFileFeature | remoteAudioFeature | remoteSecureDesktopFeature | remoteSasAvailabilityFeature
-    static let knownFeatures: UInt64 = 0x1f | phaseAFeatures | RemoteClipboardProtocol.features
+    static let knownFeatures: UInt64 = 0x1f | remoteVideoStandby | phaseAFeatures | RemoteClipboardProtocol.features
     private var requestedFeatures: UInt64
     // Input-only callers retain their mask; remote sessions explicitly request 0x1f.
     init(requestedFeatures: UInt64 = 3) {
@@ -211,5 +212,29 @@ struct RemoteFeatureNegotiation {
     var inputReady: Bool { context?.state == 1 && freshKeyframe }
     func maySend(feature: UInt64, token: UInt64) -> Bool {
         accepted & feature == feature && context?.state == 1 && context?.token == token && token != 0 && freshKeyframe
+    }
+}
+
+struct RemoteVideoStandbyMessage: Equatable {
+    enum Operation: UInt8 { case park, resume, parked, resuming }
+    let operation: Operation
+    let serial: UInt64
+
+    func encode() -> Data? {
+        guard serial != 0 else { return nil }
+        var bytes = Data(count: 12)
+        bytes[0] = 1
+        bytes[1] = operation.rawValue
+        bytes.storeLittleEndian(serial, at: 4)
+        return bytes
+    }
+
+    static func decode(_ payload: Data, flags: UInt16, request: Bool) -> Self? {
+        let bytes = Data(payload)
+        guard flags == 0, bytes.count == 12, bytes[0] == 1, bytes[2] == 0, bytes[3] == 0,
+              let operation = Operation(rawValue: bytes[1]),
+              (operation == .park || operation == .resume) == request else { return nil }
+        let serial = bytes.loadLittleEndian(UInt64.self, at: 4)
+        return serial == 0 ? nil : Self(operation: operation, serial: serial)
     }
 }
