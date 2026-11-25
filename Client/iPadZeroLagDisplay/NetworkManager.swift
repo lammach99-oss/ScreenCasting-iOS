@@ -918,20 +918,13 @@ public class NetworkManager: ObservableObject {
         var sentAt: TimeInterval?
         var readyAt: TimeInterval?
         var presentedAt: TimeInterval?
-
-        func matchesPresentation(_ size: CGSize) -> Bool {
-            guard size.width > 0, size.height > 0,
-                  (size.width > size.height) == (request.width > request.height) else { return false }
-            let source = size.width * CGFloat(request.height)
-            let target = size.height * CGFloat(request.width)
-            // Allow pixel alignment when the encoder scales the desktop.
-            return abs(source - target) <= target * 0.02
-        }
     }
+    private var usbRotationRecovery: (request: UInt32, display: DisplayReady, ack: TimeInterval)?
     private var displayRotationDiagnostic: DisplayRotationDiagnostic?
     private var displayRotationChainID: UInt32?
     #if targetEnvironment(simulator)
     var displayRotationDiagnosticSinkForTesting: ((String) -> Void)?
+    var usbRotationScheduleForTesting: ((TimeInterval, @escaping () -> Void) -> Void)?
     #endif
     private static let usbTouchMoveDiagnosticInterval: TimeInterval = 0.25
     private var usbTouchDiagnosticSequence: UInt64 = 0
@@ -6672,6 +6665,10 @@ public class NetworkManager: ObservableObject {
     private func sendDisplayConfigurationRequest(
         _ request: DisplayConfigurationRequest, continuingChain: Bool = false
     ) {
+        usbRotationRecovery = nil
+        if isCurrentCommittedUsbStreamingSessionOnQueue(), !connectionHandoffInProgress {
+            scheduleUsbDisplayAckTimeout(request.requestId, generation: connectionGeneration)
+        }
         let inheritedChain = continuingChain ? displayRotationChainID : displayRotationDiagnostic?.chainID
         finishDisplayRotationDiagnostic(outcome: "superseded")
         let changesOrientation = displayRequestGate.effective.map { $0.orientation != request.orientation } ?? false
@@ -6725,6 +6722,54 @@ public class NetworkManager: ObservableObject {
         finishDisplayRotationDiagnostic(outcome: "presented")
     }
 
+    private func scheduleUsbDisplayAckTimeout(_ request: UInt32, generation: UInt64) {
+        afterUsbDisplayDelay(90) { [weak self] in
+            guard let self, self.isCurrentCommittedUsbStreamingSessionOnQueue(generation: generation),
+                  self.displayRequestGate.pending?.requestId == request, !self.connectionHandoffInProgress else { return }
+            guard self.isForegroundActive, !self.captureAvailability.wireSuspended else {
+                self.scheduleUsbDisplayAckTimeout(request, generation: generation)
+                return
+            }
+            self.recordUsbLifecycleDiagnostic("[USB_ROTATION_RECOVERY] stage=ack_timeout request=\(request)")
+            self.handleStreamError("USB display configuration timed out.")
+        }
+    }
+
+    private func scheduleUsbRotationRecovery(_ request: UInt32, generation: UInt64, attempt: Int) {
+        afterUsbDisplayDelay(1.5) { [weak self] in
+            guard let self, let watch = self.usbRotationRecovery, watch.request == request,
+                  self.isCurrentCommittedUsbStreamingSessionOnQueue(generation: generation),
+                  !self.connectionHandoffInProgress else { return }
+            guard self.isForegroundActive, !self.captureAvailability.wireSuspended else {
+                self.scheduleUsbRotationRecovery(request, generation: generation, attempt: attempt)
+                return
+            }
+            let elapsed = Int((CACurrentMediaTime() - watch.ack) * 1000)
+            let stage = attempt <= 2 ? "request_idr" : "reset"
+            self.recordUsbLifecycleDiagnostic("[USB_ROTATION_RECOVERY] stage=\(stage) request=\(request) attempt=\(attempt) elapsed_ms=\(elapsed)")
+            if attempt <= 2 {
+                self.sendVideoFeedback(reportDecodeLoss: true)
+                self.scheduleUsbRotationRecovery(request, generation: generation, attempt: attempt + 1)
+            } else {
+                self.usbRotationRecovery = nil
+                self.handleStreamError("USB display configuration produced no fresh presentation.")
+            }
+        }
+    }
+
+    private func afterUsbDisplayDelay(_ seconds: TimeInterval, _ check: @escaping () -> Void) {
+        #if targetEnvironment(simulator)
+        if let schedule = usbRotationScheduleForTesting { schedule(seconds, check); return }
+        #endif
+        networkQueue.asyncAfter(deadline: .now() + seconds, execute: DispatchWorkItem(block: check))
+    }
+
+    private func armUsbRotationRecovery(_ request: UInt32, display: DisplayReady) {
+        guard !connectionHandoffInProgress, isCurrentCommittedUsbStreamingSessionOnQueue() else { return }
+        usbRotationRecovery = (request, display, CACurrentMediaTime())
+        scheduleUsbRotationRecovery(request, generation: connectionGeneration, attempt: 1)
+    }
+
     private func receiveDisplayReady(_ ready: DisplayReady) {
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard displayRequestGate.pending?.requestId == ready.requestId else {
@@ -6732,7 +6777,10 @@ public class NetworkManager: ObservableObject {
         }
         let nextRequest = displayRequestGate.accept(ready)
         guard displayRequestGate.effective?.requestId == ready.requestId else { return }
-        if captureTargetOwnsPresentation { abandonCaptureTargetPresentationOnQueue() }
+        // A source rollback/reattachment can still own its first IDR when Ready arrives.
+        if (activeTransportKind != .usb || connectionHandoffInProgress) && captureTargetOwnsPresentation {
+            abandonCaptureTargetPresentationOnQueue()
+        }
         if displayRotationDiagnostic?.request.requestId == ready.requestId {
             displayRotationDiagnostic?.readyAt = CACurrentMediaTime()
             finishPresentedDisplayRotationIfReady()
@@ -6746,6 +6794,7 @@ public class NetworkManager: ObservableObject {
             sendDisplayConfigurationRequest(nextRequest, continuingChain: true)
             return
         }
+        armUsbRotationRecovery(ready.requestId, display: ready)
         guard let appliedPreference = pendingDisplayPreference else {
             return
         }
@@ -6788,6 +6837,9 @@ public class NetworkManager: ObservableObject {
             return
         }
         guard displayRequestGate.pending == nil else { return }
+        if let restored = displayRequestGate.effective {
+            armUsbRotationRecovery(failure.requestId, display: restored)
+        }
         pendingDisplayPreference = nil
         latestDisplayPreference = nil
         DispatchQueue.main.async { [weak self] in
@@ -6802,6 +6854,7 @@ public class NetworkManager: ObservableObject {
         committedPipelineMode.reset()
         decoder.configureRefreshRate(remoteInputConnection ? 120 : UInt32(PipelineMode.office.targetFps))
         finishDisplayRotationDiagnostic(outcome: "session_ended")
+        usbRotationRecovery = nil
         displayRotationChainID = nil
         orientationDebounceWorkItem?.cancel()
         orientationDebounceWorkItem = nil
@@ -7292,13 +7345,15 @@ public class NetworkManager: ObservableObject {
     }
 
     #if targetEnvironment(simulator)
-    func commitCastingClipboardRouteForTesting(usb: Bool, tls: Bool) -> (connection: NWConnection, generation: UInt64) {
+    func commitCastingClipboardRouteForTesting(usb: Bool, tls: Bool, listenerStarted: Bool = false)
+        -> (connection: NWConnection, generation: UInt64) {
         let owner = simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
         networkQueue.sync {
             controlChannelWriter.abandonConnection()
             controlChannelWriter.begin(generation: owner.generation)
             wireParser.reset(generation: owner.generation)
             committedConnectionRoute = usb ? .usb : .wifi
+            if usb && listenerStarted { usbListenerExplicitlyStarted = true }
             usbScdpConnection = usb ? owner.connection : nil
             pairedControlGeneration = owner.generation
             castingClipboardTLSForTesting = tls
@@ -7842,6 +7897,7 @@ public class NetworkManager: ObservableObject {
             guard let request=captureTargets.select(id, catalogue: catalogue, session: session) else {
                 recordDiagnosticLine("[CAPTURE_TARGET] event=local_rejection reason=selection_unavailable"); return nil
             }
+            usbRotationRecovery = nil
             retirePendingAdaptiveOnQueue()
             cancelCaptureTargetRecoveryOnQueue()
             captureTargetMirrorRevisionAtTap=mirrorControl.currentState?.revision ?? 0
@@ -9540,9 +9596,15 @@ public class NetworkManager: ObservableObject {
         let presentedAt = CACurrentMediaTime()
         networkQueue.async { [weak self] in
             guard let self, self.decoder.currentSessionGeneration == generation else { return }
+            if let watch = self.usbRotationRecovery, presentedAt >= watch.ack,
+               let sourceSize, sourceSize.matchesPresentation(width: watch.display.width, height: watch.display.height) {
+                self.usbRotationRecovery = nil
+                let elapsed = Int((presentedAt - watch.ack) * 1000)
+                self.recordUsbLifecycleDiagnostic("[USB_ROTATION_RECOVERY] stage=presented request=\(watch.request) elapsed_ms=\(elapsed)")
+            }
             if let rotation = self.displayRotationDiagnostic, rotation.presentedAt == nil,
                presentedAt >= rotation.startedAt,
-               let sourceSize, rotation.matchesPresentation(sourceSize) {
+               let sourceSize, sourceSize.matchesPresentation(width: rotation.request.width, height: rotation.request.height) {
                 self.displayRotationDiagnostic?.presentedAt = presentedAt
                 self.finishPresentedDisplayRotationIfReady()
             }
@@ -10179,6 +10241,17 @@ public class NetworkManager: ObservableObject {
 }
 
 // MARK: - Private Extensions
+
+private extension CGSize {
+    func matchesPresentation(width expectedWidth: UInt32, height expectedHeight: UInt32) -> Bool {
+        guard width > 0, height > 0,
+              (width > height) == (expectedWidth > expectedHeight) else { return false }
+        let source = width * CGFloat(expectedHeight)
+        let target = height * CGFloat(expectedWidth)
+        // Allow pixel alignment when the encoder scales the desktop.
+        return abs(source - target) <= target * 0.02
+    }
+}
 
 /// Clamps a `Float` to [lo, hi] inclusive.
 /// Used by `sendTouchEventNormalized` to guard against out-of-range gesture values.

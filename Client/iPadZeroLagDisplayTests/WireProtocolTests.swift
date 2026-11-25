@@ -1491,16 +1491,19 @@ final class VirtualDisplayRotationRecoveryTests: XCTestCase {
         let connection: NWConnection
         var packetSequence: UInt16 = 100
 
-        init(_ manager: NetworkManager) {
+        init(_ manager: NetworkManager, usb: Bool = false) {
             self.manager = manager
-            let session = manager.simulateCommittedWifiSessionForTesting()
+            let session = usb ? manager.commitCastingClipboardRouteForTesting(usb: true, tls: true, listenerStarted: true)
+                              : manager.simulateCommittedWifiSessionForTesting()
             generation = session.generation
             connection = session.connection
             manager.beginMirrorControlForTesting(generation: generation)
             manager.networkQueueForTesting.sync {
                 manager.controlSendForAudioTesting = { _, completion in completion(nil) }
-                manager.wifiMediaReceiverForTesting.installMediaProcessorForTesting(
-                    generation: generation, initialSequence: packetSequence)
+                if !usb {
+                    manager.wifiMediaReceiverForTesting.installMediaProcessorForTesting(
+                        generation: generation, initialSequence: packetSequence)
+                }
             }
         }
 
@@ -1769,6 +1772,101 @@ final class VirtualDisplayRotationRecoveryTests: XCTestCase {
             XCTAssertTrue(lines.contains { $0.contains("request=2 ") && $0.contains("chain=2 ") && $0.contains("outcome=superseded") })
             XCTAssertTrue(lines.contains { $0.contains("request=3 ") && $0.contains("chain=2 ") && $0.contains("outcome=presented") })
         }
+    }
+
+    func testUSBRotationRetriesTwiceThenRetiresUnpresentedStream() {
+        let manager = NetworkManager()
+        defer { manager.stopForTesting() }
+        let feed = Feed(manager, usb: true)
+        var timers: [() -> Void] = []
+        feed.beginDisplayConfiguration()
+        manager.usbRotationScheduleForTesting = { delay, callback in
+            if delay == 1.5 { timers.append(callback) }
+        }
+        feed.request(.portrait)
+        let decoder = manager.decoderForTesting.currentSessionGeneration
+        manager.recordCapturePresentation(sequence: 1, generation: decoder,
+            sourceSize: CGSize(width: 834, height: 1194))
+        feed.ready(.portrait, id: 2)
+        manager.recordCapturePresentation(sequence: 2, generation: decoder &- 1,
+            sourceSize: CGSize(width: 834, height: 1194))
+        manager.recordCapturePresentation(sequence: 3, generation: decoder,
+            sourceSize: CGSize(width: 1194, height: 834))
+        let before = manager.videoFeedbackCountForTesting
+        for attempt in 1...3 {
+            manager.networkQueueForTesting.sync {
+                guard timers.count == 1 else { return XCTFail("expected one outstanding timer") }
+                timers.removeFirst()()
+            }
+            XCTAssertEqual(manager.videoFeedbackCountForTesting, before + min(attempt, 2))
+        }
+        XCTAssertTrue(timers.isEmpty)
+        XCTAssertFalse(manager.usbIdentityBoundForTesting)
+    }
+
+    func testUSBRotationIgnoresSupersededTimerAndStopsOnScaledPresentation() {
+        let manager = NetworkManager()
+        defer { manager.stopForTesting() }
+        let feed = Feed(manager, usb: true)
+        var timers: [() -> Void] = []
+        feed.beginDisplayConfiguration()
+        manager.usbRotationScheduleForTesting = { delay, callback in
+            if delay == 1.5 { timers.append(callback) }
+        }
+        feed.request(.portrait)
+        feed.ready(.portrait, id: 2)
+        feed.request(.landscape)
+        feed.request(.portrait)
+        feed.ready(.landscape, id: 3)
+        feed.ready(.portrait, id: 4)
+        let before = manager.videoFeedbackCountForTesting
+        manager.recordCapturePresentation(sequence: 4, generation: manager.decoderForTesting.currentSessionGeneration,
+            sourceSize: CGSize(width: 834, height: 1194))
+        manager.networkQueueForTesting.sync {
+            XCTAssertEqual(timers.count, 2)
+            timers.forEach { $0() }
+        }
+        XCTAssertEqual(manager.videoFeedbackCountForTesting, before)
+    }
+
+    func testUSBMissingDisplayAckResetsOnlyTheStillPendingRequest() {
+        let manager = NetworkManager()
+        defer { manager.stopForTesting() }
+        let feed = Feed(manager, usb: true)
+        var deadlines: [() -> Void] = []
+        manager.usbRotationScheduleForTesting = { delay, callback in
+            if delay == 90 { deadlines.append(callback) }
+        }
+        feed.beginDisplayConfiguration()
+        feed.request(.portrait)
+        manager.networkQueueForTesting.sync {
+            guard deadlines.count == 2 else { return XCTFail("expected both USB ack deadlines") }
+            deadlines[0]()
+        }
+        XCTAssertTrue(manager.usbIdentityBoundForTesting)
+        manager.networkQueueForTesting.sync { deadlines.last?() }
+        XCTAssertFalse(manager.usbIdentityBoundForTesting)
+    }
+
+    func testUSBRejectedRotationWaitsForPreviousGeometry() {
+        let manager = NetworkManager()
+        defer { manager.stopForTesting() }
+        let feed = Feed(manager, usb: true)
+        feed.beginDisplayConfiguration()
+        var checks: [() -> Void] = []
+        manager.usbRotationScheduleForTesting = { delay, callback in
+            if delay == 1.5 { checks.append(callback) }
+        }
+        feed.request(.portrait)
+        feed.control(.displayConfigurationFailed, Data([1, 2, 0, 0, 2, 0, 0, 0]))
+        let generation = manager.decoderForTesting.currentSessionGeneration
+        manager.recordCapturePresentation(sequence: 1, generation: generation, sourceSize: CGSize(width: 834, height: 1194))
+        let before = manager.videoFeedbackCountForTesting
+        manager.networkQueueForTesting.sync { checks.first?() }
+        XCTAssertEqual(manager.videoFeedbackCountForTesting, before + 1)
+        manager.recordCapturePresentation(sequence: 2, generation: generation, sourceSize: CGSize(width: 1194, height: 834))
+        manager.networkQueueForTesting.sync { checks.last?() }
+        XCTAssertEqual(manager.videoFeedbackCountForTesting, before + 1)
     }
 
     func testVirtualRestartRetiresOnceAndRequestsRecoveryAfterVideoReadmission() throws {

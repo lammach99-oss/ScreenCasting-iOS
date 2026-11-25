@@ -231,6 +231,45 @@ final class CaptureTargetIntegrationTests: XCTestCase {
         XCTAssertEqual(network.videoFeedbackCountForTesting, before + 1)
     }
 
+    @MainActor func testUSBDisplayAckDuringRollbackPreservesDecoderUntilFirstPresentation() async throws {
+        let network = NetworkManager()
+        defer { network.stopForTesting() }
+        var display: Data?
+        network.controlSendForAudioTesting = { bytes, done in
+            if bytes[5] == WireMessageType.displayConfigurationRequest.rawValue { display = Data(bytes.dropFirst(16)) }
+            done(nil)
+        }
+        network.captureTargetScheduleForTesting = { _, _ in }
+        network.captureTargetDecodeForTesting = { _, _, _ in }
+        let peer = network.commitCastingClipboardRouteForTesting(usb: true, tls: true)
+        func receive(_ type: WireMessageType, _ payload: Data, flags: UInt16 = 0) {
+            network.receiveCaptureTargetWireForTesting(type: type, payload: payload, flags: flags,
+                generation: peer.generation, connection: peer.connection)
+        }
+        receive(.displayCapabilities, Self.modes, flags: 0x7c00)
+        receive(.mirrorState, try Self.mode(revision: 1, epoch: 4, physical: true))
+        receive(.sourceCatalogue, Self.catalogue(revision: 3, current: 4, epoch: 4))
+        await drain(network)
+        network.requestCaptureTarget(1, catalogue: try XCTUnwrap(network.captureTargetState.catalogue))
+        await drain(network)
+        receive(.sourceSwitchResult, Self.result(status: 9, revision: 3, current: 0, retiringEpoch: 4, retiringSource: 6))
+        network.applyDisplayPreference(.defaultValue, interfaceOrientation: .portrait)
+        await drain(network)
+        XCTAssertNil(display)
+        receive(.sourceCatalogue, Self.catalogue(revision: 4, current: 14, virtualId: 11, physicalId: 14))
+        receive(.sourceSwitchResult, Self.result(status: 7, kind: 1, current: 14))
+        receive(.mirrorState, try Self.mode(revision: 2, epoch: 5, physical: true))
+        receive(.video, Data([1]), flags: 3)
+        let owner = try XCTUnwrap(network.captureTargetDecoderForTesting)
+        var ready = try XCTUnwrap(display)
+        ready.append(contentsOf: [1, 0, 0, 0])
+        receive(.displayReady, ready)
+        XCTAssertEqual(network.captureTargetDecoderForTesting, owner)
+        network.recordRenderCompletion(sequence: 0, generation: owner)
+        await drain(network)
+        XCTAssertFalse(network.captureTargetState.inputBlocked)
+    }
+
     @MainActor func testDisplayChangeWaitsForSuccessfulSourcePresentation() async throws {
         let network = NetworkManager()
         network.useAutomaticOrientationForTesting()
