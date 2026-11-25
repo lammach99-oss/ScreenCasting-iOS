@@ -238,3 +238,62 @@ struct RemoteVideoStandbyMessage: Equatable {
         return serial == 0 ? nil : Self(operation: operation, serial: serial)
     }
 }
+
+enum RemoteStandbyPhase { case idle, parking, parked, resuming }
+
+struct RemoteStandbyStatus: Equatable {
+    let generation: UInt64
+    let negotiated: Bool
+    let phase: RemoteStandbyPhase
+}
+
+// Owned exclusively by one authenticated connection's network queue.
+struct RemoteStandbyClient {
+    private(set) var phase: RemoteStandbyPhase = .idle
+    private(set) var serial: UInt64 = 0
+    private(set) var resumeAcknowledged = false
+
+    var dropsVideo: Bool { phase == .parking || phase == .parked || (phase == .resuming && !resumeAcknowledged) }
+
+    mutating func request(park: Bool) -> RemoteVideoStandbyMessage? {
+        guard serial < UInt64.max, park != (phase == .parking || phase == .parked) else { return nil }
+        serial += 1
+        phase = park ? .parking : .resuming
+        resumeAcknowledged = false
+        return .init(operation: park ? .park : .resume, serial: serial)
+    }
+
+    mutating func receive(_ reply: RemoteVideoStandbyMessage) {
+        guard reply.serial == serial else { return }
+        switch (phase, reply.operation) {
+        case (.parking, .parked): phase = .parked
+        case (.resuming, .resuming): resumeAcknowledged = true
+        default: break
+        }
+    }
+
+    mutating func admitVideo(parameterSetIDR: Bool) -> Bool {
+        guard !dropsVideo else { return false }
+        if phase == .resuming {
+            guard parameterSetIDR else { return false }
+            phase = .idle
+        }
+        return true
+    }
+
+    static func isResumePicture(_ bytes: Data, isIDR: Bool, lengthPrefixed: Bool) -> Bool {
+        guard isIDR, lengthPrefixed, let ranges = LengthPrefixedNALScanner.ranges(in: bytes) else { return false }
+        var sets = Set<UInt8>()
+        var foundIDR = false
+        for range in ranges {
+            guard range.count >= 2 else { return false }
+            let kind = (bytes[range.lowerBound] >> 1) & 63
+            if (32...34).contains(kind) { sets.insert(kind) }
+            if kind < 32 {
+                guard sets.count == 3, kind == 19 || kind == 20 else { return false }
+                foundIDR = true
+            }
+        }
+        return foundIDR
+    }
+}

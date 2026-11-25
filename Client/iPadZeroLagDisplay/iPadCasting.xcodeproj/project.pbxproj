@@ -36,6 +36,7 @@
 		A317B0000000000000000002 /* SessionSwitcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = A317F0000000000000000002 /* SessionSwitcher.swift */; };
 		A317B0000000000000000003 /* RemotePairStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A317F0000000000000000003 /* RemotePairStore.swift */; };
 		A11500000000000000000001 /* RemoteFeatureNegotiation.swift in Sources */ = {isa = PBXBuildFile; fileRef = A11400000000000000000001 /* RemoteFeatureNegotiation.swift */; };
+		A318B0000000000000000001 /* RemoteSlotRole.swift in Sources */ = {isa = PBXBuildFile; fileRef = A318F0000000000000000001 /* RemoteSlotRole.swift */; };
 		C71500000000000000000002 /* RemoteMonitorState.swift in Sources */ = {isa = PBXBuildFile; fileRef = C71400000000000000000002 /* RemoteMonitorState.swift */; };
 		C81500000000000000000001 /* CaptureTargetProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = C81400000000000000000001 /* CaptureTargetProtocol.swift */; };
 		C81500000000000000000002 /* CaptureTargetState.swift in Sources */ = {isa = PBXBuildFile; fileRef = C81400000000000000000002 /* CaptureTargetState.swift */; };
@@ -189,6 +190,7 @@
 		A317F0000000000000000002 /* SessionSwitcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionSwitcher.swift; sourceTree = "<group>"; };
 		A317F0000000000000000003 /* RemotePairStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemotePairStore.swift; sourceTree = "<group>"; };
 		A11400000000000000000001 /* RemoteFeatureNegotiation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteFeatureNegotiation.swift; sourceTree = "<group>"; };
+		A318F0000000000000000001 /* RemoteSlotRole.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteSlotRole.swift; sourceTree = "<group>"; };
 		C71400000000000000000002 /* RemoteMonitorState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteMonitorState.swift; sourceTree = "<group>"; };
 		C81400000000000000000001 /* CaptureTargetProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/CaptureTargetProtocol.swift; sourceTree = "<group>"; };
 		C81400000000000000000002 /* CaptureTargetState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/CaptureTargetState.swift; sourceTree = "<group>"; };
@@ -368,6 +370,7 @@
 				A317F0000000000000000002 /* SessionSwitcher.swift */,
 				A317F0000000000000000003 /* RemotePairStore.swift */,
 				A11400000000000000000001 /* RemoteFeatureNegotiation.swift */,
+				A318F0000000000000000001 /* RemoteSlotRole.swift */,
 				C71400000000000000000002 /* RemoteMonitorState.swift */,
 				C81400000000000000000001 /* CaptureTargetProtocol.swift */,
 				C81400000000000000000002 /* CaptureTargetState.swift */,
@@ -625,6 +628,7 @@
 				A317B0000000000000000002 /* SessionSwitcher.swift in Sources */,
 				A317B0000000000000000003 /* RemotePairStore.swift in Sources */,
 				A11500000000000000000001 /* RemoteFeatureNegotiation.swift in Sources */,
+				A318B0000000000000000001 /* RemoteSlotRole.swift in Sources */,
 				C71500000000000000000002 /* RemoteMonitorState.swift in Sources */,
 				C81500000000000000000001 /* CaptureTargetProtocol.swift in Sources */,
 				C81500000000000000000002 /* CaptureTargetState.swift in Sources */,

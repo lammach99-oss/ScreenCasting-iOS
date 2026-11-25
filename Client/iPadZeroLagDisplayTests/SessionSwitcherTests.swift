@@ -1,3 +1,4 @@
+import Network
 import XCTest
 @testable import iPadCasting
 
@@ -192,3 +193,169 @@ final class SessionSwitcherTests: XCTestCase {
         XCTAssertEqual(model[.one].phase, .parked)
     }
 }
+#if targetEnvironment(simulator)
+final class SlotTransportTests: XCTestCase {
+    private final class Peer {
+        let manager: NetworkManager
+        private let suite = "SlotTransportTests." + UUID().uuidString
+        let defaults: UserDefaults
+        private var packets: [Data] = []
+        private var reader: ((Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void)?
+
+        init(_ role: RemoteSlotRole) {
+            defaults = UserDefaults(suiteName: suite)!
+            RecentWifiResumeStore.mark(defaults: defaults)
+            manager = NetworkManager(userDefaults: defaults, role: role)
+            manager.transferReceiveForTesting = { [weak self] _, read in
+                XCTAssertNil(self?.reader)
+                self?.reader = read
+            }
+            manager.controlSendForAudioTesting = { [weak self] bytes, completion in
+                self?.packets.append(bytes)
+                completion(nil)
+            }
+        }
+
+        func send(_ type: WireMessageType, _ payload: Data, flags: UInt16 = 0) throws {
+            let frame = ConnectionControlProtocol.frame(type: type.rawValue, payload: payload, flags: flags)
+            try manager.networkQueueForTesting.sync {
+                let read = try XCTUnwrap(reader)
+                reader = nil
+                read(frame, nil, false, nil)
+            }
+        }
+
+        func payloads(_ type: WireMessageType) -> [Data] {
+            manager.networkQueueForTesting.sync {} // Flush the enqueued request before its writer hop.
+            return manager.networkQueueForTesting.sync {
+                packets.filter { $0.count >= 16 && $0[5] == type.rawValue }.map { Data($0.dropFirst(16)) }
+            }
+        }
+
+        func finish() {
+            manager.stopForTesting()
+            defaults.removePersistentDomain(forName: suite)
+        }
+    }
+
+    func testIndependentFeatureExchangesAndPingReaders() throws {
+        let a = Peer(.primary), b = Peer(.secondaryRemote)
+        defer { a.finish(); b.finish() }
+        b.manager.startListening()
+        b.manager.networkQueueForTesting.sync {}
+        XCTAssertNil(b.manager.preparedUSBListenerPortForTesting)
+        XCTAssertTrue(RecentWifiResumeStore.consumeIfValid(defaults: b.defaults))
+        XCTAssertFalse(RecentWifiResumeStore.consumeIfValid(defaults: a.defaults))
+        let first = a.manager.beginSlotProbeForTesting(), second = b.manager.beginSlotProbeForTesting()
+        for peer in [a, b] {
+            let ping = try XCTUnwrap(peer.payloads(.ping).last)
+            try peer.send(.pong, ping, flags: RemoteFeatureNegotiation.supportedFlag)
+            let request = try XCTUnwrap(peer.payloads(.remoteFeaturesRequest).last.flatMap(RemoteFeaturesMessage.decode))
+            XCTAssertNotEqual(request.features & RemoteFeatureNegotiation.remoteVideoStandby, 0)
+            try peer.send(.remoteFeaturesResult, RemoteFeaturesMessage(features: peer === a ? 3 : 3 | RemoteFeatureNegotiation.remoteVideoStandby).encode())
+            peer.manager.requestVideoStandby(park: true)
+        }
+        XCTAssertTrue(a.payloads(.remoteVideoStandby).isEmpty)
+        let park = try XCTUnwrap(b.payloads(.remoteVideoStandby).last)
+        XCTAssertEqual(RemoteVideoStandbyMessage.decode(park, flags: 0, request: true)?.operation, .park)
+        func reply(_ operation: RemoteVideoStandbyMessage.Operation, serial: UInt64) throws {
+            let bytes = try XCTUnwrap(RemoteVideoStandbyMessage(operation: operation, serial: serial).encode())
+            try b.send(.remoteVideoStandby, bytes)
+        }
+        func video(_ kinds: [UInt8]) throws {
+            let bytes = Data(kinds.flatMap { [UInt8(0), 0, 0, 2, $0 << 1, 1] })
+            try b.send(.video, bytes, flags: WireProtocol.videoFlagIDR | WireProtocol.videoFlagLengthPrefixed)
+        }
+        let parked = try XCTUnwrap(RemoteVideoStandbyMessage.decode(park, flags: 0, request: true))
+        try reply(.parked, serial: parked.serial)
+        try reply(.parked, serial: parked.serial)
+        try video([32, 33, 34, 19])
+        XCTAssertEqual(b.manager.slotStandbyPhaseForTesting, .parked)
+        b.manager.requestVideoStandby(park: false, expectedGeneration: second.generation)
+        let request = try XCTUnwrap(b.payloads(.remoteVideoStandby).last)
+        let resume = try XCTUnwrap(RemoteVideoStandbyMessage.decode(request, flags: 0, request: true))
+        try reply(.parked, serial: parked.serial)
+        try video([32, 33, 34, 19])
+        XCTAssertEqual(b.manager.slotStandbyPhaseForTesting, .resuming)
+        try reply(.resuming, serial: resume.serial)
+        try video([19])
+        XCTAssertEqual(b.manager.slotStandbyPhaseForTesting, .resuming)
+        try video([32, 33, 34, 19])
+        try reply(.resuming, serial: resume.serial)
+        XCTAssertEqual(b.manager.slotStandbyPhaseForTesting, .idle)
+        let oldLifetime = a.manager.remoteKeyboardGeneration
+        try a.send(.remoteVideoStandby, try XCTUnwrap(RemoteVideoStandbyMessage(operation: .parked, serial: 1).encode()))
+        XCTAssertNotEqual(a.manager.remoteKeyboardGeneration, oldLifetime, "Unnegotiated standby must close this peer")
+        a.manager.stopForTesting()
+        let echo = Data(repeating: 9, count: 16)
+        let ping = ConnectionControlProtocol.frame(type: WireMessageType.ping.rawValue, payload: echo, flags: 0)
+        b.manager.receiveClipboardWireForTesting(ping, generation: second.generation, connection: first.connection)
+        XCTAssertFalse(b.payloads(.pong).contains(echo))
+        try b.send(.ping, echo)
+        XCTAssertEqual(b.payloads(.pong).last, echo)
+        try b.send(.remoteVideoStandby, Data(repeating: 0, count: 11))
+        XCTAssertNotEqual(b.manager.remoteKeyboardGeneration, second.generation, "Malformed reply must close the negotiated peer")
+    }
+
+    @MainActor func testStreamRebindingDiscardsOldManagerEvents() {
+        let a = Peer(.primary), b = Peer(.secondaryRemote)
+        defer { a.finish(); b.finish() }
+        let first = a.manager.beginSlotProbeForTesting()
+        let second = b.manager.beginSlotProbeForTesting()
+        let stream = StreamManager(networkManager: a.manager)
+        stream.observe(a.manager, slot: .one, generation: first.generation)
+        a.manager.stopForTesting()
+        stream.observe(b.manager, slot: .two, generation: second.generation)
+        let selected = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in stream.isConnected }, object: nil)
+        wait(for: [selected], timeout: 2)
+    }
+
+    func testSecondaryRejectsDiscoveredAndCastingTargets() {
+        let peer = Peer(.secondaryRemote)
+        defer { peer.finish() }
+        let generation = peer.manager.remoteKeyboardGeneration
+        let casting = NWEndpoint.hostPort(host: .ipv4(.loopback), port: 27015)
+        let remote = NWEndpoint.hostPort(host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: NetworkManager.remoteControlPort)!)
+        peer.manager.connect(to: casting)
+        peer.manager.updateDiscoveredWifiEndpoints([remote])
+        peer.manager.connectDiscoveredHostIfNeeded(remote)
+        peer.manager.reconnectLastPC()
+        peer.manager.networkQueueForTesting.sync {}
+        XCTAssertEqual(peer.manager.remoteKeyboardGeneration, generation)
+        XCTAssertFalse(peer.manager.hasReconnectTarget)
+        XCTAssertTrue(RecentWifiResumeStore.consumeIfValid(defaults: peer.defaults))
+    }
+
+    func testResumeRequiresOrderedParameterSetsAndRealIDR() {
+        func picture(_ kinds: [UInt8]) -> Bool {
+            let data = Data(kinds.flatMap { [UInt8(0), 0, 0, 2, $0 << 1, 1] })
+            return RemoteStandbyClient.isResumePicture(data, isIDR: true, lengthPrefixed: true)
+        }
+        XCTAssertFalse(picture([19, 32, 33, 34]))
+        XCTAssertFalse(picture([32, 34, 19]))
+        XCTAssertFalse(picture([32, 33, 34, 1]))
+        XCTAssertTrue(picture([32, 33, 34, 20]))
+    }
+
+    func testStandbyReplyFenceAndFreshPicture() throws {
+        var state = RemoteStandbyClient()
+        let park = try XCTUnwrap(state.request(park: true))
+        XCTAssertFalse(state.admitVideo(parameterSetIDR: true))
+        state.receive(.init(operation: .parked, serial: park.serial))
+        XCTAssertEqual(state.phase, .parked)
+        let resume = try XCTUnwrap(state.request(park: false))
+        XCTAssertGreaterThan(resume.serial, park.serial)
+        XCTAssertFalse(state.admitVideo(parameterSetIDR: true))
+        state.receive(.init(operation: .parked, serial: park.serial))
+        state.receive(.init(operation: .parked, serial: resume.serial))
+        XCTAssertFalse(state.admitVideo(parameterSetIDR: true))
+        state.receive(.init(operation: .resuming, serial: resume.serial))
+        XCTAssertFalse(state.admitVideo(parameterSetIDR: false))
+        XCTAssertEqual(state.phase, .resuming)
+        XCTAssertTrue(state.admitVideo(parameterSetIDR: true))
+        state.receive(.init(operation: .resuming, serial: resume.serial))
+        XCTAssertEqual(state.phase, .idle)
+        XCTAssertTrue(state.admitVideo(parameterSetIDR: false))
+    }
+}
+#endif

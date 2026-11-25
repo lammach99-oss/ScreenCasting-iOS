@@ -50,7 +50,11 @@ private enum USBListenerError: LocalizedError {
 private enum TrustedDeviceIdentity {
     private static let defaultsKey = "trustedDeviceId.v1"
 
+    private static let lock = NSLock()
+
     static func loadOrCreate() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
         if let stored = UserDefaults.standard.data(forKey: defaultsKey),
            stored.count == 16 { return stored }
         var uuid = UUID().uuid
@@ -437,7 +441,9 @@ public class NetworkManager: ObservableObject {
     }
     var remoteKeyboardGeneration: UInt64 { connectionGenerationClock.current }
     private var remoteInputConnection = false
-    private var remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: 0x1f)
+    private var standby = RemoteStandbyClient()
+    @Published private(set) var videoStandby = RemoteStandbyStatus(generation: 0, negotiated: false, phase: .idle)
+    private var remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: 0x1f | RemoteFeatureNegotiation.remoteVideoStandby)
     private var remoteMonitors = RemoteMonitorState()
     private let remoteMonitorControl = RemoteMonitorControlAuthority()
     private var remoteMonitorAdmission: (requestId: UInt64, inputRevision: UInt64, controlRevision: UInt64)?
@@ -772,8 +778,9 @@ public class NetworkManager: ObservableObject {
             self.submitVideoOnQueue(data, sequence: sequence, isIDR: isIDR,
                 lengthPrefixed: true, receivedAt: receivedAt)
         },
-        audioConsumer: { data, sequence, timestamp, generation in
-            AudioManager.shared.playOpusData(
+        audioConsumer: { [weak self] data, sequence, timestamp, generation in
+            guard let self, self.connectionGeneration == generation else { return }
+            self.castingAudio?.playOpusData(
                 data,
                 sequence: sequence,
                 timestamp: timestamp,
@@ -938,7 +945,13 @@ public class NetworkManager: ObservableObject {
     var videoFeedbackCountForTesting: Int { testingVideoFeedbackCount }
     #endif
 
-    public init(userDefaults: UserDefaults = .standard, receivedFilesDirectory: URL? = nil) {
+    public let role: RemoteSlotRole
+    private var castingAudio: AudioManager? { role == .primary ? AudioManager.shared : nil }
+    private var secondaryRetryEndpoint: NWEndpoint?
+
+    public init(userDefaults: UserDefaults = .standard, receivedFilesDirectory: URL? = nil,
+                role: RemoteSlotRole = .primary) {
+        self.role = role
         streamSettingsDefaults = userDefaults
         trustedHostCleanup = userDefaults.dictionary(forKey: Self.trustedHostCleanupKey) as? [String: Bool] ?? [:]
         remoteClipboardEnabled = userDefaults.bool(forKey: Clipboard.preferenceKey)
@@ -955,7 +968,7 @@ public class NetworkManager: ObservableObject {
         desiredBitrateMbps = desired.bitrateMbps
         desiredAudioEnabled = desired.audioEnabled
         desiredAdaptiveBitrateEnabled = desired.adaptiveBitrateEnabled
-        reconnectEnabled = RecentWifiResumeStore.consumeIfValid(defaults: userDefaults)
+        reconnectEnabled = role == .primary && RecentWifiResumeStore.consumeIfValid(defaults: userDefaults)
         print(
             "[IPAD][APP_LIFECYCLE] state=relaunch_resume " +
             "intent=\(reconnectEnabled ? "accepted" : "expired_or_absent")")
@@ -1022,8 +1035,9 @@ public class NetworkManager: ObservableObject {
         }
         decoder.onRecoveryNeeded = { [weak self] in
             guard let self else { return }
+            let generation = self.connectionGeneration
             self.networkQueue.async {
-                guard self.wireAuthenticatedGeneration == self.connectionGeneration, !self.captureAvailability.inputBlocked else { return }
+                guard self.connectionGeneration == generation, self.wireAuthenticatedGeneration == generation, !self.captureAvailability.inputBlocked else { return }
                 // The sequence-bearing drop callback owns recovery during handoff and its drain.
                 if self.currentConnectionDecoder?.network == self.connectionGeneration,
                    self.connectionVideoStarted && (self.connectionHandoffInProgress || self.connectionVideoDraining) { return }
@@ -1073,13 +1087,16 @@ public class NetworkManager: ObservableObject {
     }
 
     private func connect(to endpoint: NWEndpoint, legacyHost: String?) {
+        guard role.permits(endpoint) else { return }
         networkQueue.async { [weak self] in
             guard let self else { return }
             guard self.transportState == .idle || self.isDisconnectedOnQueue,
                   self.pendingTrustedHostForget == nil,
                   !self.wifiTargetHasPendingCleanup(endpoint) else { return }
             self.remoteSecureControlIntent = false
-            if let target = WifiReconnectTargetPolicy.target(from: endpoint) {
+            if self.role == .secondaryRemote {
+                self.secondaryRetryEndpoint = endpoint
+            } else if let target = WifiReconnectTargetPolicy.target(from: endpoint) {
                 WifiReconnectTargetStore.save(target, defaults: self.streamSettingsDefaults)
                 if let legacyHost { self.streamSettingsDefaults.set(legacyHost, forKey: Self.lastKnownHostKey) }
             }
@@ -1095,12 +1112,14 @@ public class NetworkManager: ObservableObject {
     }
 
     private var savedWifiReconnectTarget: WifiReconnectTarget? {
-        WifiReconnectTargetSelection.preferred(
+        guard role == .primary else { return nil }
+        return WifiReconnectTargetSelection.preferred(
             structured: WifiReconnectTargetStore.load(defaults: streamSettingsDefaults),
             legacyHost: streamSettingsDefaults.string(forKey: Self.lastKnownHostKey))
     }
 
     func updateDiscoveredWifiEndpoints(_ endpoints: [NWEndpoint]) {
+        guard role == .primary else { return }
         networkQueue.async { [weak self] in self?.discoveredWifiEndpoints = endpoints }
     }
 
@@ -1118,6 +1137,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func connectOnQueue(to endpoint: NWEndpoint, expectedFingerprint: String? = nil) {
+        guard role.permits(endpoint) else { return }
         dispatchPrecondition(condition: .onQueue(networkQueue))
         if let expectedFingerprint, trustedHostCleanup[expectedFingerprint] != nil { return }
         guard !wifiTargetHasPendingCleanup(endpoint) else { return }
@@ -1260,7 +1280,7 @@ public class NetworkManager: ObservableObject {
             }
             self.wifiBackgroundDisconnectWorkItem?.cancel()
             self.wifiBackgroundDisconnectWorkItem = nil
-            RecentWifiResumeStore.clear(defaults: self.streamSettingsDefaults)
+            if self.role == .primary { RecentWifiResumeStore.clear(defaults: self.streamSettingsDefaults) }
 
             if let generation = self.consumeUsbForegroundDecoderRearmIfEligibleOnQueue() {
                 self.recordUsbLifecycleDiagnostic(
@@ -1385,7 +1405,7 @@ public class NetworkManager: ObservableObject {
                     if self.legacyUsbPlaybackEnabledGeneration == self.connectionGeneration {
                         self.cancelLegacyUsbPcmFreshFence()
                         self.usbLegacyPcmFreshFenceGeneration = self.connectionGeneration
-                        AudioManager.shared.suspendLegacySessionForLifecycle(
+                        self.castingAudio?.suspendLegacySessionForLifecycle(
                             generation: self.connectionGeneration,
                             newBackgroundCycle: self.pendingUsbForegroundDecoderRearmGeneration != self.connectionGeneration)
                     }
@@ -1449,6 +1469,7 @@ public class NetworkManager: ObservableObject {
     }
 
     public func connectDiscoveredHostIfNeeded(_ endpoint: NWEndpoint) {
+        guard role == .primary else { return }
         networkQueue.async { [weak self] in
             guard let self,
                   self.isForegroundActive,
@@ -1769,6 +1790,32 @@ public class NetworkManager: ObservableObject {
             if contextChanged { self.remoteInputRevision &+= 1 }
         }
     }
+    private var standbyNegotiated: Bool {
+        remoteInputConnection && wireAuthenticatedGeneration == connectionGeneration &&
+            remoteFeatures.accepted & RemoteFeatureNegotiation.remoteVideoStandby != 0
+    }
+
+    private func publishStandbyOnQueue() {
+        let status = RemoteStandbyStatus(generation: connectionGeneration, negotiated: standbyNegotiated, phase: standby.phase)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.connectionGeneration == status.generation else { return }
+            self.videoStandby = status
+        }
+    }
+
+    func requestVideoStandby(park: Bool, expectedGeneration: UInt64? = nil) {
+        let generation = expectedGeneration ?? connectionGeneration
+        networkQueue.async { [weak self] in
+            guard let self, self.connectionGeneration == generation, self.standbyNegotiated else { return }
+            guard self.standby.serial < UInt64.max else { self.handleStreamError("Standby serial exhausted."); return }
+            guard let message = self.standby.request(park: park), let bytes = message.encode() else { return }
+            self.resetRemoteTimedVideoOnQueue()
+            self.decoder.fenceCaptureContinuation(requiringAuthorization: false)
+            self.publishStandbyOnQueue()
+            self.sendWireMessage(type: .remoteVideoStandby, payload: bytes, sequence: 0)
+        }
+    }
+
     private func resetRemoteInputOnQueue() {
         castingClipboardRoute = nil
         castingClipboardParserGeneration = nil
@@ -1787,7 +1834,9 @@ public class NetworkManager: ObservableObject {
         remoteFileAccess = nil
         retireRemoteFileIOOnQueue()
         remoteFilePacing = RemoteFileMediaPacing()
-        remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: 0x1f)
+        remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: 0x1f | RemoteFeatureNegotiation.remoteVideoStandby)
+        standby = RemoteStandbyClient()
+        publishStandbyOnQueue()
         remoteMonitors.begin(session: UUID(), acceptedFeatures: 0)
         remoteMonitorControl.update(generation: 0, context: nil, enabled: false)
         remoteMonitorAdmission = nil
@@ -2028,6 +2077,7 @@ public class NetworkManager: ObservableObject {
                 handleStreamError("Timed video arrived before remote audio streaming.")
                 return
             }
+            if standby.dropsVideo { return }
             if offset == 0 && remoteTimedVideo.hasPartial { recoverRemoteTimedVideoOnQueue() }
             switch remoteTimedVideo.push(flags: flags, frame: frame, total: total, offset: offset,
                                          captureUs: captureUs, fragment: fragment, receivedAt: message.firstByteAt) {
@@ -3101,6 +3151,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func clearSavedReconnectTarget() {
+        guard role == .primary else { return }
         WifiReconnectTargetStore.clear(defaults: streamSettingsDefaults)
         streamSettingsDefaults.removeObject(forKey: Self.lastKnownHostKey)
         RecentWifiResumeStore.clear(defaults: streamSettingsDefaults)
@@ -3207,14 +3258,16 @@ public class NetworkManager: ObservableObject {
         #if targetEnvironment(simulator)
         testingSimulatedWifiSession = false
         #endif
-        RecentWifiResumeStore.clear(defaults: streamSettingsDefaults)
+        if role == .primary { RecentWifiResumeStore.clear(defaults: streamSettingsDefaults) }
+        secondaryRetryEndpoint = nil
         let stoppedGeneration = connectionGenerationClock.advance()
+        publishStandbyOnQueue()
         resetAutoAcceptOnQueue()
         advanceReceivedRevisionOnQueue()
         resetDirectTouchSessionOnQueue()
         listenerGeneration &+= 1
         decoder.invalidate()
-        AudioManager.shared.reset()
+        self.castingAudio?.reset()
         connection?.cancel()
         connection = nil
         usbListener?.cancel()
@@ -3305,6 +3358,7 @@ public class NetworkManager: ObservableObject {
     /// identity. The bundled identity is imported again on the next explicit
     /// listener start; the Windows host must also explicitly reset its pin.
     public func resetUSBPairing() {
+        guard role == .primary else { return }
         stop()
         USBServerIdentityStore.delete()
         DispatchQueue.main.async { self.usbServerFingerprint = nil }
@@ -3318,6 +3372,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func startListeningOnQueue(port: UInt16) {
+        guard role == .primary else { return }
         dispatchPrecondition(condition: .onQueue(networkQueue))
         // Repeated Start must not create a gap in an already owned listener.
         guard !usbListenerExplicitlyStarted || usbListener == nil else { return }
@@ -3334,6 +3389,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func createOrdinaryUsbListenerOnQueue(port: UInt16) {
+        guard role == .primary else { return }
         dispatchPrecondition(condition: .onQueue(networkQueue))
         listenerGeneration &+= 1
         let generation = listenerGeneration
@@ -3448,6 +3504,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func installUsbCandidate(_ candidate: NWConnection, preserveContinuation: Bool = false) {
+        guard role == .primary else { candidate.cancel(); return }
         dispatchPrecondition(condition: .onQueue(networkQueue))
         if !preserveContinuation { resetConnectionControlOnQueue() }
         usbIdentity = USBSessionIdentityProof(); usbReadinessPongWrittenGeneration = nil
@@ -3496,6 +3553,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func holdUsbCandidate(_ candidate: NWConnection, incumbent: NWConnection) {
+        guard role == .primary else { candidate.cancel(); return }
         let id = nextUsbCandidateID
         nextUsbCandidateID &+= 1
         pendingUsbCandidate = PendingUsbCandidate(id: id, candidate: candidate,
@@ -3956,6 +4014,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func markRecentWifiResumeIntentIfEligible() {
+        guard role == .primary else { return }
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard reconnectEnabled,
               !usbListenerExplicitlyStarted, activeTransportKind == .wifi,
@@ -3969,6 +4028,7 @@ public class NetworkManager: ObservableObject {
 
     private func loadWifiReconnectEndpoint() -> NWEndpoint? {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        if role == .secondaryRemote { return secondaryRetryEndpoint }
         guard let target = savedWifiReconnectTarget, let endpoint = target.endpoint else { return nil }
         if WifiReconnectTargetStore.load(defaults: streamSettingsDefaults) == nil,
            target.kind == .hostPort {
@@ -3982,7 +4042,7 @@ public class NetworkManager: ObservableObject {
               pendingTrustedHostForget == nil, let saved = loadWifiReconnectEndpoint(),
               !wifiTargetHasPendingCleanup(saved) else { return }
         let fingerprint = trustedHostFingerprintStore.load(endpoint: saved)
-        let endpoints = fingerprint.map { reconnectEndpoints(saved: saved, fingerprint: $0) } ?? [saved]
+        let endpoints = role == .secondaryRemote ? [saved] : (fingerprint.map { reconnectEndpoints(saved: saved, fingerprint: $0) } ?? [saved])
         let routes = endpoints.compactMap { endpoint in
             WifiReconnectTargetPolicy.target(from: endpoint).map { ($0, endpoint) }
         }
@@ -4037,7 +4097,7 @@ public class NetworkManager: ObservableObject {
         guard !connectionHandoffInProgress, !connectionSwitch.offersReconnect else { return }
         guard isForegroundActive,
               reconnectEnabled,
-              pendingTrustedHostForget == nil, hasReconnectTarget else {
+              pendingTrustedHostForget == nil, (role == .secondaryRemote ? secondaryRetryEndpoint != nil : hasReconnectTarget) else {
             publishAutoReconnectAttempt(0) // Nothing is scheduled, so the screen must not say "Reconnecting".
             return
         }
@@ -4046,8 +4106,9 @@ public class NetworkManager: ObservableObject {
         reconnectAttempt += 1
         publishAutoReconnectAttempt(reconnectAttempt)
         print("[IPAD][AUTO_RECONNECT_ATTEMPT] attempt=\(reconnectAttempt) delay=\(delay)")
+        let generation = connectionGeneration
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.isForegroundActive, self.reconnectEnabled else { return }
+            guard let self, self.connectionGeneration == generation, self.isForegroundActive, self.reconnectEnabled else { return }
             guard self.connection == nil else { return }
             print("[IPAD][AUTO_RECONNECT_BEGIN] endpoint=persisted_target")
             self.connectSavedWifiOnQueue()
@@ -4454,7 +4515,7 @@ public class NetworkManager: ObservableObject {
             committedRealtimeMode == RealtimeTransportMode.usbSplitTLS
         let profile = activeTransportKind == .usb ? "usb" : "wifi"
         let rejects = "parse_reject=\(wifiMediaReceiver.audioParseRejects) crypto_reject=\(wifiMediaReceiver.audioCryptoRejects)"
-        AudioManager.shared.publishDiagnostics(generation: generation, profile: profile,
+        self.castingAudio?.publishDiagnostics(generation: generation, profile: profile,
             opus: opus, receiveRejects: rejects) { [weak self] line in
                 self?.networkQueue.async { [weak self] in
                     guard let self, self.connectionGeneration == generation,
@@ -4614,7 +4675,7 @@ public class NetworkManager: ObservableObject {
               let owner = usbScdpConnection, connection === owner else { return }
         cancelLegacyUsbPcmFreshFence()
         usbLegacyPcmFreshFenceGeneration = generation
-        AudioManager.shared.suspendLegacySessionForLifecycle(generation: generation)
+        self.castingAudio?.suspendLegacySessionForLifecycle(generation: generation)
         guard isForegroundActive else { return }
         sendClientPing(force: true, purpose: .usbLegacyPcmFreshFence)
         recordUsbLifecycleDiagnostic(
@@ -5525,7 +5586,7 @@ public class NetworkManager: ObservableObject {
                 let supportsNegotiation =
                     (header.flags &
                      WireProtocol.realtimeNegotiationSupportedFlag) != 0
-                if supportsNegotiation {
+                if supportsNegotiation && role == .primary {
                     sendClientCapabilities(for: activeTransportKind)
                 } else {
                     commitLegacyTransport(generation: generation)
@@ -5932,7 +5993,7 @@ public class NetworkManager: ObservableObject {
                    committedRealtimeMode == RealtimeTransportMode.legacyTLS {
                     usbLegacyPcmFreshFenceNonce = nil
                     usbLegacyPcmFreshFenceGeneration = nil
-                    AudioManager.shared.resumeLegacySessionAfterFreshFence(generation: generation)
+                    self.castingAudio?.resumeLegacySessionAfterFreshFence(generation: generation)
                     recordUsbLifecycleDiagnostic(
                         "[USB_PCM_RESUME_FENCE] generation=\(generation) action=released nonce=\(nonce)")
                 }
@@ -5955,7 +6016,7 @@ public class NetworkManager: ObservableObject {
             case .opus:
                 let audioSequence = UInt16(truncatingIfNeeded: header.sequence)
                 let audioTimestamp = header.sequence &* 480
-                AudioManager.shared.playOpusData(
+                self.castingAudio?.playOpusData(
                     payload,
                     sequence: audioSequence,
                     timestamp: audioTimestamp,
@@ -5964,10 +6025,10 @@ public class NetworkManager: ObservableObject {
                 if activeTransportKind == .usb,
                    isForegroundActive,
                    usbLegacyPcmFreshFenceGeneration == generation {
-                    AudioManager.shared.recordLegacyResumeFenceDrop(generation: generation)
+                    self.castingAudio?.recordLegacyResumeFenceDrop(generation: generation)
                     return
                 }
-                AudioManager.shared.playPCMData(payload, generation: generation)
+                self.castingAudio?.playPCMData(payload, generation: generation)
             case .reject:
                 return
             }
@@ -5996,6 +6057,7 @@ public class NetworkManager: ObservableObject {
             handleStreamError("Unexpected authentication response during streaming.")
 
         case .transportOffer:
+            guard role == .primary else { handleStreamError("Unexpected casting negotiation."); return }
             guard committedTransportGeneration != generation else { return }
             guard var offer = TransportOffer.decode(payload) else {
                 handleStreamError("Malformed transport offer.")
@@ -6072,6 +6134,7 @@ public class NetworkManager: ObservableObject {
             }
 
         case .transportCommit:
+            guard role == .primary else { handleStreamError("Unexpected casting negotiation."); return }
             if committedTransportGeneration == generation {
                 guard committedRealtimeMode == RealtimeTransportMode.wifiRTP,
                       wifiLegacyFallbackGeneration != generation,
@@ -6168,8 +6231,15 @@ public class NetworkManager: ObservableObject {
             receiveRemoteSecureDesktopOnQueue(header, payload: payload)
         case .remoteAudioState, .remoteAudioPacket, .remoteTimedVideo:
             receiveRemoteAudioOnQueue(message, generation: generation)
-        case .remoteFileControl, .remoteAudioSet, .remoteSecureDesktopRequest, .remoteVideoStandby:
-            // The client does not negotiate RemoteVideoStandby yet, so the host never sends it.
+        case .remoteVideoStandby:
+            guard standbyNegotiated else { handleStreamError("Unnegotiated remote feature message."); return }
+            guard let reply = RemoteVideoStandbyMessage.decode(payload, flags: header.flags, request: false) else {
+                handleStreamError("Malformed standby reply."); return
+            }
+            let previous = standby.phase
+            standby.receive(reply)
+            if standby.phase != previous { publishStandbyOnQueue() }
+        case .remoteFileControl, .remoteAudioSet, .remoteSecureDesktopRequest:
             handleStreamError("Unnegotiated remote feature message.")
         case .clipboardState, .clipboardOffer, .clipboardOfferResponse, .clipboardChunk,
              .clipboardEnd, .clipboardResult, .clipboardCancel:
@@ -6180,6 +6250,7 @@ public class NetworkManager: ObservableObject {
             guard remoteInputConnection, remoteFeatures.result(flags: header.flags, payload: payload) else {
                 handleStreamError("Invalid remote feature result."); return
             }
+            publishStandbyOnQueue()
             beginRemoteClipboard()
             let intent = remoteSecureDesktop.begin(accepted: remoteFeatures.accepted,
                                                    control: remoteSecureControlIntent && remoteSecureDesktopEnabled)
@@ -6262,6 +6333,21 @@ public class NetworkManager: ObservableObject {
         }
         let isIDR = header.flags & WireProtocol.videoFlagIDR != 0
         let lengthPrefixed = header.flags & WireProtocol.videoFlagLengthPrefixed != 0
+        if standby.phase != .idle {
+            if standby.dropsVideo && remoteSecureDesktop.expectsIDR {
+                // Drain an in-flight DS7 atomic pair without installing or presenting it.
+                let verified = isIDR && RemoteSecureDesktopState.hasIDR(payload, lengthPrefixed: lengthPrefixed)
+                if case .invalid = remoteSecureDesktop.admit(sequence: header.sequence, isIDR: verified,
+                                                            decoder: decoder.currentSessionGeneration) {
+                    handleStreamError("Invalid secure desktop first picture.")
+                }
+                return
+            }
+            let fresh = !standby.dropsVideo && RemoteStandbyClient.isResumePicture(payload, isIDR: isIDR,
+                                                                                   lengthPrefixed: lengthPrefixed)
+            guard standby.admitVideo(parameterSetIDR: fresh) else { return }
+            publishStandbyOnQueue()
+        }
         #if targetEnvironment(simulator)
         let receivedAt = connectionVideoReceivedAtForTesting ?? CACurrentMediaTime()
         #else
@@ -6498,7 +6584,7 @@ public class NetworkManager: ObservableObject {
         }
         beginOwnedDecoderSession(networkGeneration: generation)
         wifiMediaReceiver.reanchorForPreservedSessionRecovery(generation: generation)
-        AudioManager.shared.resumeCurrentRealtimeSession(generation: generation, profile: .wifi)
+        self.castingAudio?.resumeCurrentRealtimeSession(generation: generation, profile: .wifi)
         sendClientPingIfDue()
         let complete = "[WIFI_MEDIA_RECOVERY] generation=\(generation) " +
             "action=decoder_rearmed recovery_requested=true"
@@ -7074,7 +7160,7 @@ public class NetworkManager: ObservableObject {
         }
         wifiLegacyFallbackRequestGeneration = generation
         wifiMediaReceiver.clearOffer()
-        AudioManager.shared.reset()
+        self.castingAudio?.reset()
         let ready = TransportReady(
             version: 1,
             mode: RealtimeTransportMode.legacyTLS,
@@ -7142,7 +7228,7 @@ public class NetworkManager: ObservableObject {
         transportTelemetry.beginRuntimeSession()
         if committedPipelineMode.active != nil { transportTelemetry.beginFreshFrameRate(generation: generation) }
         startLegacyTelemetryTimers()
-        AudioManager.shared.reset()
+        self.castingAudio?.reset()
         reconcileRealtimeAudioPlayback(
             generation: generation, mode: RealtimeTransportMode.legacyTLS,
             audioEnabled: clientSettingsState.effective.audioEnabled)
@@ -7248,6 +7334,7 @@ public class NetworkManager: ObservableObject {
         connectionTimeoutWorkItem?.cancel()
         connectionTimeoutWorkItem = nil
         let failedGeneration = connectionGenerationClock.advance()
+        publishStandbyOnQueue()
         resetAutoAcceptOnQueue()
         advanceReceivedRevisionOnQueue()
         resetDirectTouchSessionOnQueue()
@@ -7268,7 +7355,7 @@ public class NetworkManager: ObservableObject {
         dataTransfers?.retire(); dataTransfers = nil; transferReceivePending = 0
         // A Wi-Fi incumbent can retire while the USB handoff listener already accepts on this queue.
         decoder.invalidate(waitForCompletion: activeTransportKind != .usb && usbListener == nil)
-        AudioManager.shared.reset()
+        self.castingAudio?.reset()
         connection?.cancel()
         connection = nil
         // The socket is retired; late completion IDs must not gate its successor.
@@ -7297,13 +7384,13 @@ public class NetworkManager: ObservableObject {
                 legacyUsbPlaybackEnabledGeneration = nil
             } else if legacyUsbPlaybackEnabledGeneration != generation {
                 legacyUsbPlaybackEnabledGeneration = generation
-                AudioManager.shared.beginLegacySession(generation: generation)
+                self.castingAudio?.beginLegacySession(generation: generation)
                 armLegacyUsbPcmFreshFence(generation: generation)
             }
         }
         if mode == RealtimeTransportMode.legacyTLS, playbackEnabled,
            activeTransportKind != .usb {
-            AudioManager.shared.beginLegacySession(generation: generation)
+            self.castingAudio?.beginLegacySession(generation: generation)
         }
         guard RealtimeAudioTimerPolicy.shouldRun(
             mode: mode,
@@ -7315,7 +7402,7 @@ public class NetworkManager: ObservableObject {
                     return
                 }
                 #endif
-                AudioManager.shared.reset()
+                self.castingAudio?.reset()
             }
             return
         }
@@ -7325,7 +7412,7 @@ public class NetworkManager: ObservableObject {
             return
         }
         #endif
-        AudioManager.shared.beginRealtimeSession(
+        self.castingAudio?.beginRealtimeSession(
             generation: generation,
             profile: mode == RealtimeTransportMode.wifiRTP ? .wifi : .usb)
     }
@@ -7359,6 +7446,21 @@ public class NetworkManager: ObservableObject {
             pairedControlGeneration = owner.generation
             castingClipboardTLSForTesting = tls
             refreshClipboardOnQueue()
+        }
+        return owner
+    }
+
+    var slotStandbyPhaseForTesting: RemoteStandbyPhase {
+        networkQueue.sync { standby.phase }
+    }
+
+    func beginSlotProbeForTesting() -> (connection: NWConnection, generation: UInt64) {
+        let owner = simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS, remote: true)
+        networkQueue.sync {
+            controlChannelWriter.begin(generation: owner.generation)
+            wireParser.reset(generation: owner.generation)
+            beginRemoteFeaturesOnQueue(generation: owner.generation)
+            receiveWireChunk(generation: owner.generation)
         }
         return owner
     }
@@ -8540,6 +8642,7 @@ public class NetworkManager: ObservableObject {
         listener.cancel(); usbListener = nil; listenerGeneration &+= 1
     }
     private func startUSBHandoffProbeOnQueue(_ probe: NWConnection) {
+        guard role == .primary else { probe.cancel(); return }
         guard let pending = connectionSwitch.pending, pending.sent,
               pending.originGeneration == connectionGeneration,
               !connectionUSBProbeAttempted else { probe.cancel(); return }
@@ -8657,6 +8760,7 @@ public class NetworkManager: ObservableObject {
         publishConnectionControlOnQueue()
     }
     private func negotiateConnectionControlOnQueue() {
+        guard role == .primary else { return }
         guard !remoteInputConnection, wireAuthenticatedGeneration == connectionGeneration,
               pairedControlGeneration == connectionGeneration else { return }
         defer { refreshClipboardOnQueue() }
@@ -8703,6 +8807,7 @@ public class NetworkManager: ObservableObject {
     }
     @MainActor public func requestConnectionRoute(_ route: ConnectionRoute, askPC: Bool = false,
                                                  retirePanelInput: (() -> Void)? = nil) {
+        guard role == .primary else { return }
         guard networkQueue.sync(execute: { !screenSwitchInProgressOnQueue && connectionSwitch.pending == nil }) else { return }
         // Existing UI cancellation releases contacts/keys before the serialized request fence.
         retirePanelInput?()
@@ -8812,6 +8917,7 @@ public class NetworkManager: ObservableObject {
         } catch { handleStreamError("Malformed connection control message.") }
     }
     private func ensureRouteUsbListenerOnQueue(ready: @escaping () -> Void) {
+        guard role == .primary else { return }
         dispatchPrecondition(condition: .onQueue(networkQueue))
         if let listener = usbListener, case .ready = listener.state { ready(); return }
         guard connectionListenerCompletion == nil, activeTransportKind == .wifi else { return }
