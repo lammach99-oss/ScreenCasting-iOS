@@ -1,5 +1,16 @@
 import Foundation
 
+extension IPadInputSession {
+    /// Phone roots share this session between the surface and the input bar.
+    /// Keep phone input preferences in their own persistent domain.
+    static func phoneRemote() -> IPadInputSession {
+        let defaults = UserDefaults(suiteName: "ScreenCasting.client.phoneRemote")!
+        let input = IPadInputSession(defaults: defaults)
+        input.selectTouchMode(.trackpad)
+        return input
+    }
+}
+
 // Bit positions match UIEvent.ButtonMask; unknown auxiliary buttons are ignored.
 struct RemoteMouseButtons: OptionSet {
     let rawValue: UInt

@@ -1,8 +1,61 @@
 import XCTest
+import UIKit
 import Network
 @testable import iPadCasting
 
 final class RemoteHostDirectoryTests: XCTestCase {
+    func testDeviceCapabilitiesByIdiom() {
+        let rows: [(UIUserInterfaceIdiom, ClientDeviceCapabilities.Family, [Bool])] = [
+            (.phone, .phone, [false, false, false, false, false, true]),
+            (.pad, .pad, [true, true, true, true, true, true]),
+            (.unspecified, .unknown, [false, false, false, false, false, false])
+        ]
+        for (idiom, family, flags) in rows {
+            let caps = ClientDeviceCapabilities.resolve(idiom)
+            XCTAssertEqual(caps.family, family)
+            XCTAssertEqual([caps.allowsCasting, caps.allowsUSB, caps.allowsSecondPC,
+                            caps.allowsFileTransfer, caps.allowsPencil, caps.allowsRemoteControl], flags)
+        }
+    }
+
+    func testRemoteIntentAdmissionAcrossFamilies() throws {
+        let host = "192.0.2.1"
+        let address = try XCTUnwrap(RemoteHostAddress.parse(host))
+        let target = RemoteIntent.Target(host: host, port: 27020)
+        let wrong = RemoteIntent.Target(host: host, port: 27015)
+        let recent = RecentRemoteHost(host: host, remoteControl: true, lastUsed: Date())
+        let casting = RecentRemoteHost(host: host, remoteControl: false, lastUsed: Date())
+        let context = RemoteIntent.ResumeContext(generation: 7, fingerprint: "fixture")
+        let rows: [(RemoteIntent, Result<RemoteHostAddress, RemoteAdmissionRejection>)] = [
+            (.manual(target), .success(address)),
+            (.manual(wrong), .failure(.wrongPort)),
+            (.manual(.init(host: "/", port: 27020)), .failure(.invalidAddress)),
+            (.recent(recent), .success(address)),
+            (.recent(casting), .failure(.castingMode)),
+            (.discovered(serviceType: "_sc-remote._tcp", resolved: target), .success(address)),
+            (.discovered(serviceType: "_sc-remote._tcp", resolved: wrong), .failure(.wrongPort)),
+            (.discovered(serviceType: "_sc-remote._tcp", resolved: nil), .failure(.unresolvedService)),
+            (.discovered(serviceType: nil, resolved: target), .failure(.unclassifiedService)),
+            (.discovered(serviceType: "_screencasting._tcp", resolved: target), .failure(.unclassifiedService)),
+            (.resume(target, remoteControl: true, saved: context), .success(address)),
+            (.resume(wrong, remoteControl: true, saved: context), .failure(.wrongPort)),
+            (.resume(target, remoteControl: false, saved: context), .failure(.castingMode)),
+            (.resume(target, remoteControl: true, saved: .init(generation: 6, fingerprint: "fixture")), .failure(.staleResume)),
+            (.resume(target, remoteControl: true, saved: .init(generation: 7, fingerprint: "other")), .failure(.staleResume)),
+            (.usb, .failure(.usbTransport)),
+            (.pairSelection, .failure(.pairSelection))
+        ]
+        for idiom in [UIUserInterfaceIdiom.phone, .pad, .unspecified] {
+            let caps = ClientDeviceCapabilities.resolve(idiom)
+            for (intent, expected) in rows {
+                XCTAssertEqual(RemoteSessionPolicy.admit(intent, for: caps, current: context),
+                               idiom == .unspecified ? .failure(.unsupportedFamily) : expected)
+            }
+        }
+        XCTAssertEqual(RemoteSessionPolicy.admit(.resume(target, remoteControl: true, saved: context),
+                                                  for: .resolve(.phone)), .failure(.staleResume))
+    }
+
     func testAddressParsingAcceptsIPv4AndNormalisesDNSNames() {
         let cases: [(raw: String, host: String, kind: RemoteHostAddress.Kind)] = [
             ("100.64.0.10", "100.64.0.10", .ipv4),

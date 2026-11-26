@@ -19,6 +19,19 @@ struct SessionWindowsShortcut: Identifiable {
     ]
 }
 
+extension RemoteMouseControls {
+    /// A trackpad-only surface has one fixed mode and no mode-switch action.
+    @ViewBuilder static func choices(directTouchAllowed: Bool) -> some View {
+        if directTouchAllowed {
+            RemoteMouseControls()
+        } else {
+            SessionSegmentLabel(title: "Trackpad", selected: true, enabled: true)
+                .accessibilityLabel("Trackpad")
+                .accessibilityAddTraits(.isSelected)
+        }
+    }
+}
+
 /// Shared by Extend, controlled Mirror and whole-PC remote. Input policy stays in the session.
 @MainActor struct SessionInputBar: View {
     @EnvironmentObject private var inputSession: IPadInputSession
@@ -54,6 +67,13 @@ struct SessionWindowsShortcut: Identifiable {
             .stroke(Color(uiColor: SessionInk.hairline), lineWidth: 0.5))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("session.input.bar")
+        .onDisappear { Self.releaseHeldModifiers(in: inputSession) }
+    }
+
+    static func releaseHeldModifiers(in session: IPadInputSession) {
+        for modifier in IPadModifier.allCases where session.modifierState(modifier) != .off {
+            session.setModifier(modifier, .off)
+        }
     }
 
     @MainActor private struct InputSections: View {
@@ -85,7 +105,7 @@ struct SessionWindowsShortcut: Identifiable {
                         .font(.footnote).foregroundStyle(Color(uiColor: SessionInk.warning))
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                SessionActionLayout(accessibility: owner.typeSize.isAccessibilitySize) {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: owner.typeSize.isAccessibilitySize ? 160 : 88), spacing: 8)], spacing: 8) {
                     ForEach(Array(IPadModifier.allCases.enumerated()), id: \.offset) { entry in
                         SessionModifierButton(session: owner.inputSession, modifier: entry.element)
                     }

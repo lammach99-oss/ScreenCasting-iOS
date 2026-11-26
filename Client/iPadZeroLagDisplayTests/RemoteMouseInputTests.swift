@@ -1,7 +1,65 @@
+import UIKit
 import XCTest
 @testable import iPadCasting
 
 final class RemoteMouseInputTests: XCTestCase {
+    @MainActor func testLocalGesturesHaveAnExclusiveHitTargetUntilFit() throws {
+        let surface = ConnectedPresentationContainer(frame: CGRect(x: 0, y: 0, width: 400, height: 300),
+                                                    pencilInteractionsEnabled: false)
+        let controls = LocalViewportControls()
+        surface.configureLocalViewport(controls)
+        surface.layoutIfNeeded()
+        surface.setBaseViewport(VideoContentViewport(rect: CGRect(x: 0, y: 0, width: 1, height: 1)))
+        let center = CGPoint(x: 200, y: 150)
+        XCTAssertTrue(surface.hitTest(center, with: nil) === surface.touchView)
+        controls.isZoomMode = true
+        let localTarget = surface.hitTest(center, with: nil)
+        let gesture = try XCTUnwrap(localTarget as? LocalViewportGestureView)
+        var packets = 0
+        let session = IPadInputSession.preview()
+        session.configure(identity: "viewport", point: true, type: true, direct: true, zoom: true,
+                          reason: nil) { _ in packets += 1 }
+        surface.touchView.inputSession = session
+        surface.touchView.onPointerInput = { _ in packets += 1 }
+        surface.touchView.onDirectTouchContact = { _ in packets += 1 }
+        let first = NSObject(), second = NSObject()
+        let a = ObjectIdentifier(first), b = ObjectIdentifier(second)
+        gesture.update([a: center, b: CGPoint(x: 220, y: 150)], phase: .began)
+        gesture.update([b: CGPoint(x: 240, y: 150)], phase: .moved)
+        XCTAssertEqual(controls.scale, 2)
+        gesture.update([b: .zero], phase: .ended)
+        gesture.update([a: CGPoint(x: 210, y: 150)], phase: .moved)
+        XCTAssertTrue(surface.hitTest(center, with: nil) === localTarget)
+        controls.fit()
+        XCTAssertEqual(controls.scale, 1)
+        XCTAssertTrue(surface.hitTest(center, with: nil) === localTarget)
+        gesture.update([a: .zero], phase: .ended)
+        XCTAssertEqual(packets, 0)
+        XCTAssertTrue(surface.hitTest(center, with: nil) === surface.touchView)
+    }
+
+    @MainActor func testPhoneSkipsPencilRegistrationsAndTabletKeepsDefaults() {
+        for enabled in [false, true] {
+            let view = enabled ? PencilUIKitView() : PencilUIKitView(frame: .zero, pencilInteractionsEnabled: false)
+            XCTAssertEqual(view.interactions.contains { $0 is UIPencilInteraction }, enabled)
+            XCTAssertEqual(view.gestureRecognizers?.contains { $0.name == "IPadInput.pencilHover" }, enabled)
+            XCTAssertEqual(view.subviews.contains { $0 is UILabel }, enabled)
+        }
+    }
+
+    @MainActor func testDismissingInputBarClearsHeldModifiers() {
+        let session = IPadInputSession.preview()
+        var events: [IPadInputEvent] = []
+        session.configure(identity: "modifiers", point: true, type: true, direct: true, zoom: false,
+                          reason: nil) { events.append($0) }
+        session.setModifier(.control, .locked)
+        session.setModifier(.shift, .oneShot)
+        SessionInputBar.releaseHeldModifiers(in: session)
+        XCTAssertEqual(session.modifierState(.control), .off)
+        XCTAssertEqual(session.modifierState(.shift), .off)
+        XCTAssertEqual(events, [.key(0xe0, 0), .key(0xe0, 1)])
+    }
+
     private let token: UInt64 = 7
     private let generation: UInt64 = 3
     private let video = CGRect(x: 100, y: 50, width: 200, height: 100)
@@ -25,6 +83,70 @@ final class RemoteMouseInputTests: XCTestCase {
     private func command(_ kind: UInt8, _ a: Int32 = 0, _ b: Int32 = 0,
                          button: UInt8 = 0) -> RemotePointerCommand {
         RemotePointerCommand(kind: kind, button: button, token: token, a: a, b: b)
+    }
+
+    @MainActor func testPhoneSurfaceRejectsNegotiatedDirectContacts() {
+        let view = PencilUIKitView(frame: CGRect(x: 0, y: 0, width: 320, height: 240),
+                                   pencilInteractionsEnabled: false, directTouchAllowed: false)
+        var contacts: [DirectTouchContactCommand] = []
+        view.onDirectTouchContact = { contacts.append($0) }
+        view.contentViewport = VideoContentViewport(rect: CGRect(x: 0, y: 0, width: 1, height: 1))
+        view.configureDirectTouch(active: true, generation: 1)
+        let point = CGPoint(x: 100, y: 100)
+        view.emitDirectOutputs([.directTouch(.down, 1, point, 255), .directTouch(.up, 1, point, 255)])
+        XCTAssertTrue(contacts.isEmpty)
+    }
+
+    @MainActor func testPhoneSessionLeavesTabletModePreferenceUntouched() {
+        let key = IPadInputSession.touchModeKey
+        let before = UserDefaults.standard.string(forKey: key)
+        let phone = IPadInputSession.phoneRemote()
+        XCTAssertEqual(phone.touchMode, .trackpad)
+        XCTAssertEqual(UserDefaults.standard.string(forKey: key), before)
+    }
+
+    @MainActor func testPhoneFingerWithDirectPreferenceClicksOnlyInsideVideo() {
+        let view = PencilUIKitView(frame: CGRect(x: 0, y: 0, width: 400, height: 300),
+                                   pencilInteractionsEnabled: false, directTouchAllowed: false)
+        view.contentViewport = VideoContentViewport(rect: CGRect(x: 0, y: 0.25, width: 1, height: 0.5))
+        let session = IPadInputSession.phoneRemote()
+        session.engine.mode = .direct
+        var events: [IPadInputEvent] = []
+        session.configure(identity: "phone", point: true, type: false, direct: true, zoom: false,
+                          reason: nil) { events.append($0) }
+        let finger = NSObject()
+        let key = ObjectIdentifier(finger)
+        view.beginV2Contact(key, point: .zero, pencil: false, tapCount: 1, session: session)
+        XCTAssertTrue(events.isEmpty)
+        let center = CGPoint(x: 200, y: 150)
+        view.beginV2Contact(key, point: center, pencil: false, tapCount: 1, session: session)
+        view.endV2Contact(key, point: center, cancelled: false, session: session)
+        XCTAssertEqual(events, [.button(1, 0, 1), .button(1, 1, 1)])
+    }
+
+    @MainActor func testResizeReleasesTrackpadDragAndIgnoresOldLift() {
+        let surface = ConnectedPresentationContainer(frame: CGRect(x: 0, y: 0, width: 320, height: 640),
+            pencilInteractionsEnabled: false, directTouchAllowed: false)
+        surface.configureLocalViewport(LocalViewportControls())
+        surface.layoutIfNeeded()
+        surface.setBaseViewport(VideoContentViewport(rect: CGRect(x: 0, y: 0, width: 1, height: 1)))
+        let view = surface.touchView
+        let session = IPadInputSession.phoneRemote()
+        view.inputSession = session
+        var events: [IPadInputEvent] = []
+        session.configure(identity: "rotation", point: true, type: false, direct: false, zoom: false,
+                          reason: nil) { events.append($0) }
+        let finger = NSObject()
+        let key = ObjectIdentifier(finger)
+        let p = CGPoint(x: 100, y: 100)
+        view.beginV2Contact(key, point: p, pencil: false, tapCount: 2, session: session)
+        XCTAssertEqual(events, [.button(1, 0, 1)])
+        surface.bounds.size = CGSize(width: 640, height: 320)
+        surface.layoutIfNeeded()
+        XCTAssertNil(view.contentViewport)
+        view.endV2Contact(key, point: p, cancelled: false, session: session)
+        view.beginV2Contact(key, point: p, pencil: false, tapCount: 1, session: session)
+        XCTAssertEqual(events, [.button(1, 0, 1), .button(1, 1, 1)])
     }
 
     func testDeviceDefaultsAndManualOverrides() {

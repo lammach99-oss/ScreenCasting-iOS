@@ -1,5 +1,37 @@
 import Foundation
 
+struct PhoneConnectScreenModel {
+    enum Section: String, CaseIterable {
+        case recent = "Recent remote hosts"
+        case manual = "Manual address"
+        case discovered = "Discovered remote hosts"
+    }
+
+    struct Preview {
+        let destination: String
+        let purpose = "Remote control"
+    }
+
+    let sections = Section.allCases
+    let recentHosts: [RecentRemoteHost]
+    private let capabilities: ClientDeviceCapabilities
+
+    init?(capabilities: ClientDeviceCapabilities, history: [RecentRemoteHost]) {
+        guard capabilities.family == .phone else { return nil }
+        self.capabilities = capabilities
+        recentHosts = history.filter {
+            if case .success = RemoteSessionPolicy.admit(.recent($0), for: capabilities) { return true }
+            return false
+        }
+    }
+
+    func preview(_ intent: RemoteIntent, current: RemoteIntent.ResumeContext? = nil) -> Preview? {
+        guard case .success(let address) = RemoteSessionPolicy.admit(intent, for: capabilities, current: current)
+        else { return nil }
+        return Preview(destination: address.host)
+    }
+}
+
 /// The connect screen's single status line: plain words, one tone, at most one action.
 public struct ConnectScreenStatus: Equatable {
     public static func connectionRecommendation(_ state: ConnectionSwitchState) -> String { state.recommendationText }

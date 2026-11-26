@@ -4,6 +4,18 @@ import XCTest
 @testable import iPadCasting
 
 final class RemoteFeatureCodecTests: XCTestCase {
+    func testPhoneFeatureRequestKeepsClipboardAndMonitor() throws {
+        for family in [ClientDeviceCapabilities.Family.phone, .pad] {
+            let capabilities = ClientDeviceCapabilities(family: family)
+            var features = RemoteFeatureNegotiation(requestedFeatures: capabilities.remoteInputFeatureMask)
+            XCTAssertTrue(features.begin(now: 0))
+            let bytes = try XCTUnwrap(features.pong(flags: RemoteClipboardProtocol.marker, now: 1,
+                requestRemoteFiles: capabilities.allowsFileTransfer, requestClipboard: true))
+            let expected: UInt64 = family == .phone ? 0x17 : 0x11f
+            XCTAssertEqual(RemoteFeaturesMessage.decode(bytes)?.features, expected | RemoteClipboardProtocol.features)
+        }
+    }
+
     private struct Fixture: Decodable {
         let version: Int
         let vectors: [Vector]

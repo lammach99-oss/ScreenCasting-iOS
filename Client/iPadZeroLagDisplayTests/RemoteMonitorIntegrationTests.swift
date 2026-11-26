@@ -284,7 +284,9 @@ final class RemoteMonitorIntegrationTests: XCTestCase {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         let source = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/NetworkManager.swift"), encoding: .utf8)
         // Slice 4 adds the standby bit on top of the input/monitor/clipboard mask.
-        XCTAssertTrue(source.contains("RemoteFeatureNegotiation(requestedFeatures: 0x1f | RemoteFeatureNegotiation.remoteVideoStandby)"))
+        // The mask is per device family: iPad keeps 0x1f, phone drops direct touch.
+        XCTAssertTrue(source.contains("RemoteFeatureNegotiation(requestedFeatures: capabilities.remoteInputFeatureMask | RemoteFeatureNegotiation.remoteVideoStandby)"))
+        XCTAssertEqual(ClientDeviceCapabilities(family: .pad).remoteInputFeatureMask, 0x1f)
         // Input-v2 adds negotiated bits; authority still comes from the captured
         // connection generation/context, never from the latest state at send time.
         let routing = try String(contentsOf: root.appendingPathComponent("iPadZeroLagDisplay/Input/IPadInputRouting.swift"), encoding: .utf8)

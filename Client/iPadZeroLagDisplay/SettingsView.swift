@@ -9,6 +9,10 @@ import SwiftUI
 ///   `NetworkManager`; Host reports never move these controls.
 @MainActor public struct SettingsView: View {
 
+    @State private var phoneForgetTarget: RecentRemoteHost?
+    @State private var phoneHistory: [RecentRemoteHost] = []
+    private var phone: Bool { networkManager.capabilities.family == .phone }
+
     // MARK: Dependencies
     @ObservedObject var networkManager: NetworkManager
 
@@ -61,29 +65,72 @@ import SwiftUI
         }
     }
 
+    @ViewBuilder private var padSections: some View {
+        displaySection
+        streamSection
+        ClipboardSection(manager: networkManager, pasteboard: networkManager.remoteClipboardPasteboard,
+                         isTransferPresented: $isTransferPresented)
+        if let focus = pairFocus {
+            Section("Remote control") {
+                Text(PairSession.shared.name(.one))
+                Text(PairSession.shared.name(.two))
+                Button("Remove second PC", role: .destructive) {
+                    PairSession.shared.remove(scene: pairScene)
+                    dismiss()
+                }
+                Button("Export diagnostics") { exportPair(focus) }
+                if let exportIssue { Text(exportIssue) }
+            }
+        }
+        connectionSection
+        advancedSection
+    }
+
+    private var phoneSections: some View {
+        ForEach(PhoneSettingsSection.allCases, id: \.self) { section in
+            switch section {
+            case .quality:
+                streamSection
+            case .clipboard:
+                ClipboardSection(manager: networkManager, pasteboard: networkManager.remoteClipboardPasteboard,
+                                 isTransferPresented: $isTransferPresented, showsFiles: false)
+            case .trusted:
+                Section("Trusted PCs") {
+                    if let code = networkManager.hostIdentityCode {
+                        LabeledContent("PC identity code", value: code)
+                    }
+                    ForEach(phoneHistory) { host in
+                        Button(host.host) { phoneForgetTarget = host }
+                    }
+                    .confirmationDialog("Forget this saved PC?", isPresented: Binding(
+                        get: { phoneForgetTarget != nil }, set: { if !$0 { phoneForgetTarget = nil } }),
+                        presenting: phoneForgetTarget) { host in
+                            Button("Forget PC", role: .destructive) {
+                                networkManager.forgetTrustedHost(host: host.host, port: host.port)
+                                phoneHistory = RecentRemoteHostStore.remove(host: host.host, remoteControl: true).filter(\.remoteControl)
+                            }
+                        }
+                    Button("Forget this PC", role: .destructive) { showForgetConfirmation = true }
+                        .disabled(!networkManager.isConnected)
+                        .confirmationDialog("Forget this PC?", isPresented: $showForgetConfirmation) {
+                            Button("Forget PC", role: .destructive) { networkManager.forgetCurrentTrustedHost() }
+                        }
+                }
+            case .diagnostics: advancedSection
+            }
+        }
+    }
+
     // MARK: Body
 
     public var body: some View {
         NavigationStack {
             Form {
-                displaySection
-                streamSection
-                ClipboardSection(manager: networkManager, pasteboard: networkManager.remoteClipboardPasteboard,
-                                 isTransferPresented: $isTransferPresented)
-                if let focus = pairFocus {
-                    Section("Remote control") {
-                        Text(PairSession.shared.name(.one))
-                        Text(PairSession.shared.name(.two))
-                        Button("Remove second PC", role: .destructive) {
-                            PairSession.shared.remove(scene: pairScene)
-                            dismiss()
-                        }
-                        Button("Export diagnostics") { exportPair(focus) }
-                        if let exportIssue { Text(exportIssue) }
-                    }
+                if phone {
+                    phoneSections
+                } else {
+                    padSections
                 }
-                connectionSection
-                advancedSection
             }
             .scrollContentBackground(.hidden)
             .background(Color(uiColor: SessionInk.canvas))
@@ -134,6 +181,7 @@ import SwiftUI
             networkManager.setClientDebugLoggingEnabled(enabled)
         }
         .onAppear {
+            if phone { phoneHistory = RecentRemoteHostStore.load().filter(\.remoteControl) }
             draftBitrate = networkManager.desiredBitrateMbps
             draftAudioEnabled = networkManager.desiredAudioEnabled
             draftAdaptiveBitrateEnabled = networkManager.desiredAdaptiveBitrateEnabled
@@ -331,15 +379,23 @@ import SwiftUI
                         .accessibilityValue(String(format: "%.0f megabits per second", owner.draftBitrate))
                     }
                 }
-                Toggle("Sound from the PC", isOn: Binding(
-                    get: { owner.draftAudioEnabled && owner.supportsAudioAndAuto },
-                    set: { value in
-                        if !owner.supportsAudioAndAuto { return }
-                        owner.draftAudioEnabled = value
-                        owner.saveDesiredSettings()
-                    }))
-                    .tint(owner.switchTint)
-                    .disabled(!owner.supportsAudioAndAuto)
+                if owner.phone {
+                    if let status = owner.networkManager.remoteAudioStatus {
+                        Toggle("Play PC audio", isOn: Binding(get: { owner.networkManager.remoteAudioPreferred },
+                               set: { owner.networkManager.setRemoteAudioPreferred($0) }))
+                        Text(status).font(.footnote)
+                    }
+                } else {
+                    Toggle("Sound from the PC", isOn: Binding(
+                        get: { owner.draftAudioEnabled && owner.supportsAudioAndAuto },
+                        set: { value in
+                            if !owner.supportsAudioAndAuto { return }
+                            owner.draftAudioEnabled = value
+                            owner.saveDesiredSettings()
+                        }))
+                        .tint(owner.switchTint)
+                        .disabled(!owner.supportsAudioAndAuto)
+                }
                 if !owner.networkManager.settingsApplyStatus.isEmpty {
                     Text(owner.networkManager.settingsApplyStatus)
                         .font(.footnote)
@@ -348,7 +404,7 @@ import SwiftUI
             } header: {
                 Text("Quality")
             } footer: {
-                if !owner.supportsAudioAndAuto {
+                if !owner.phone && !owner.supportsAudioAndAuto {
                     Text(ClientStreamSettingsPreference.remoteUnsupportedReason)
                 } else if automaticBitrate || owner.networkManager.autoQualityEnabled {
                     Text("Video adapts to your connection.")
@@ -362,6 +418,7 @@ import SwiftUI
         @ObservedObject var manager: NetworkManager
         @ObservedObject var pasteboard: RemoteClipboardPasteboard
         @Binding var isTransferPresented: Bool
+        var showsFiles = true
 
         var body: some View {
             Section {
@@ -375,23 +432,25 @@ import SwiftUI
                         RemoteClipboardPasteButton(pasteboard: pasteboard).frame(height: 44)
                     }
                 }
-                Button {
-                    isTransferPresented = true
-                } label: {
-                    HStack {
-                        Text("Send or open files")
-                        Spacer()
-                        Image(systemName: "chevron.right")
-                            .font(.footnote.weight(.semibold))
-                            .foregroundStyle(Color(uiColor: SessionInk.secondary))
-                            .accessibilityHidden(true)
+                if showsFiles {
+                    Button {
+                        isTransferPresented = true
+                    } label: {
+                        HStack {
+                            Text("Send or open files")
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(Color(uiColor: SessionInk.secondary))
+                                .accessibilityHidden(true)
+                        }
+                        .foregroundStyle(Color(uiColor: SessionInk.text))
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
                     }
-                    .foregroundStyle(Color(uiColor: SessionInk.text))
-                    .frame(minHeight: 44)
-                    .contentShape(Rectangle())
                 }
             } header: {
-                Text("Clipboard & files")
+                Text(showsFiles ? "Clipboard & files" : "Clipboard")
             } footer: {
                 Text("Automatic sending can copy passwords to your PC.")
             }
@@ -475,7 +534,7 @@ import SwiftUI
                         Text(owner.isDeletingClientLogs ? "Deleting logs…" : "Delete logs")
                     }
                     .disabled(owner.isDeletingClientLogs)
-                    .confirmationDialog("Delete the iPad's logs?", isPresented: owner.$showDeleteLogsConfirmation,
+                    .confirmationDialog(owner.phone ? "Delete this device's logs?" : "Delete the iPad's logs?", isPresented: owner.$showDeleteLogsConfirmation,
                                         titleVisibility: .visible) {
                         Button("Delete logs", role: .destructive) {
                             owner.deleteClientLogs()
@@ -547,4 +606,8 @@ enum SettingsCopy {
         default: ("Slow", .slow)
         }
     }
+}
+
+enum PhoneSettingsSection: String, CaseIterable {
+    case quality = "Quality", clipboard = "Clipboard", trusted = "Trusted PCs", diagnostics = "Diagnostics"
 }

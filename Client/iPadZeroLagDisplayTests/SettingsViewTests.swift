@@ -2,6 +2,11 @@ import XCTest
 @testable import iPadCasting
 
 final class SettingsViewTests: XCTestCase {
+    func testPhoneSettingsOnlyOfferRemotePreferences() {
+        XCTAssertEqual(PhoneSettingsSection.allCases.map(\.rawValue),
+                       ["Quality", "Clipboard", "Trusted PCs", "Diagnostics"])
+    }
+
     func testTroubleshootingPCSettingsValue() {
         XCTAssertEqual(SettingsCopy.pcSettingsValue(adaptive: true, mbps: 24, audio: false),
                        "Auto, 24 Mbps, audio off")

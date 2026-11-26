@@ -341,19 +341,19 @@ enum TrustedHostForgetOutcome: Equatable {
 
     var message: String {
         switch self {
-        case .both: return "Pairing was removed from this iPad and the PC."
+        case .both: return "Pairing was removed from this device and the PC."
         case .localOnly:
-            return "Pairing was removed from this iPad only. The PC may still list this iPad as paired. Remove it from the PC’s paired devices."
-        case .savedTargetRemoved: return "The saved reconnect target was removed from this iPad."
-        case .noSavedPairing: return "This iPad has no saved pairing for this PC."
+            return "Pairing was removed from this device only. The PC may still list this device as paired. Remove it from the PC’s paired devices."
+        case .savedTargetRemoved: return "The saved reconnect target was removed from this device."
+        case .noSavedPairing: return "This device has no saved pairing for this PC."
         case .localFailed(let pcConfirmed):
             return pcConfirmed
-                ? "The PC removed this iPad from its paired devices. This iPad couldn’t remove its saved pairing."
-                : "This iPad couldn’t remove its saved pairing. The PC may still list this iPad as paired."
+                ? "The PC removed this device from its paired devices. This device couldn’t remove its saved pairing."
+                : "This device couldn’t remove its saved pairing. The PC may still list this device as paired."
         case .cleanupIncomplete(let pcConfirmed):
             return pcConfirmed
-                ? "The PC removed this iPad from its paired devices. This iPad blocked the saved pairing and still has records to remove. Retry cleanup."
-                : "This iPad blocked the saved pairing and still has records to remove. The PC may still list this iPad as paired. Retry cleanup."
+                ? "The PC removed this device from its paired devices. This device blocked the saved pairing and still has records to remove. Retry cleanup."
+                : "This device blocked the saved pairing and still has records to remove. The PC may still list this device as paired. Retry cleanup."
         }
     }
 }

@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import MetalKit
 import UIKit
 import GameController
@@ -282,9 +283,135 @@ struct ClientCursorState {
     var visible: Bool { ownership == .clientActive }
 }
 
+/// Keep one controller per connected surface. Leaving Zoom keeps the chosen
+/// magnification for remote input. Fit restores the full desktop and exits Zoom.
+@MainActor public final class LocalViewportControls: ObservableObject {
+    fileprivate struct State {
+        var editing = false
+        var scale: CGFloat = 1
+        var pan = CGPoint.zero
+    }
+
+    @Published fileprivate var state = State()
+    public init() {}
+    public var scale: CGFloat { state.scale }
+    public var isZoomMode: Bool {
+        get { state.editing }
+        set { if newValue != state.editing { state.editing = newValue } }
+    }
+    public func fit() { state = State() }
+}
+
+/// This sibling receives UIKit's entire touch lifetime, including lift after Fit.
+final class LocalViewportGestureView: UIView {
+    private var contacts: [ObjectIdentifier: CGPoint] = [:]
+    private var editing = false
+    private var interrupted = false
+    var adjust: ((CGFloat, CGPoint) -> Void)?
+    var hasContacts: Bool { !contacts.isEmpty }
+
+    func setEditing(_ enabled: Bool) {
+        editing = enabled
+        if !enabled && hasContacts { interrupted = true }
+        isHidden = !enabled && !hasContacts
+    }
+
+    func interrupt() { interrupted = hasContacts }
+
+    func update(_ points: [ObjectIdentifier: CGPoint], phase: UITouch.Phase) {
+        let previous = contacts
+        for (id, point) in points {
+            switch phase {
+            case .began: contacts[id] = point
+            case .moved: if contacts[id] != nil { contacts[id] = point }
+            case .ended, .cancelled: contacts.removeValue(forKey: id)
+            default: break
+            }
+        }
+        if contacts.isEmpty { interrupted = false; isHidden = !editing }
+        guard editing, !interrupted, phase == .moved, previous.count == contacts.count,
+              let id = contacts.keys.first, let from = previous[id], let to = contacts[id] else { return }
+        if contacts.count == 1 {
+            adjust?(1, CGPoint(x: to.x - from.x, y: to.y - from.y))
+        } else if contacts.count == 2, let other = contacts.keys.first(where: { $0 != id }),
+                  let a = previous[other], let b = contacts[other] {
+            let oldDistance = hypot(a.x - from.x, a.y - from.y)
+            if oldDistance > 0 { adjust?(hypot(b.x - to.x, b.y - to.y) / oldDistance, .zero) }
+        }
+    }
+
+    private func update(_ touches: Set<UITouch>, phase: UITouch.Phase) {
+        update(Dictionary(uniqueKeysWithValues: touches.map { (ObjectIdentifier($0), $0.location(in: self)) }), phase: phase)
+    }
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) { update(touches, phase: .began) }
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) { update(touches, phase: .moved) }
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) { update(touches, phase: .ended) }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { update(touches, phase: .cancelled) }
+}
+
 public final class ConnectedPresentationContainer: UIView {
     let metalView = MTKView()
-    let touchView = PencilUIKitView()
+    let touchView: PencilUIKitView
+    private let gestureSurface = LocalViewportGestureView()
+    private let fallbackViewportControls = LocalViewportControls()
+    fileprivate lazy var phoneInput = IPadInputSession.phoneRemote()
+    private var viewportControls: LocalViewportControls?
+    private var viewportObservation: AnyCancellable?
+    private var baseViewport: VideoContentViewport?
+    private var baseBounds: CGSize?
+    fileprivate var viewportChanged: ((VideoContentViewport?) -> Void)?
+
+    func configureLocalViewport(_ controls: LocalViewportControls?) {
+        guard controls !== viewportControls else { return }
+        viewportObservation = nil
+        viewportControls = controls
+        touchView.requiresVideoHit = controls != nil
+        viewportObservation = controls?.$state.sink { [weak self] state in self?.applyViewport(state) }
+        if controls == nil { applyViewport(.init()) }
+    }
+
+    fileprivate func configureViewportPolicy(enabled: Bool, controls: LocalViewportControls?) {
+        configureLocalViewport(enabled ? (controls ?? fallbackViewportControls) : nil)
+    }
+
+    func setBaseViewport(_ viewport: VideoContentViewport?) {
+        if baseViewport != viewport { gestureSurface.interrupt() }
+        baseViewport = viewport
+        baseBounds = bounds.size
+        applyViewport(viewportControls?.state ?? .init())
+    }
+
+    private func limitedPan(_ pan: CGPoint, scale: CGFloat) -> CGPoint {
+        guard let rect = baseViewport?.contentRect(in: bounds) else { return .zero }
+        let x = max(0, (rect.width * scale - bounds.width) / 2)
+        let y = max(0, (rect.height * scale - bounds.height) / 2)
+        return CGPoint(x: min(x, max(-x, pan.x)), y: min(y, max(-y, pan.y)))
+    }
+
+    func adjustViewport(by factor: CGFloat, translation: CGPoint) {
+        guard let controls = viewportControls, baseViewport != nil, factor.isFinite, factor > 0 else { return }
+        var state = controls.state
+        state.scale = min(6, max(1, state.scale * factor))
+        state.pan = limitedPan(CGPoint(x: state.pan.x + translation.x, y: state.pan.y + translation.y),
+                               scale: state.scale)
+        controls.state = state
+    }
+
+    private func applyViewport(_ state: LocalViewportControls.State) {
+        if state.editing && !touchView.localGestureOwnsInput { touchView.retireViewportContacts() }
+        gestureSurface.setEditing(state.editing)
+        if state.editing { touchView.localGestureOwnsInput = true }
+        let pan = limitedPan(state.pan, scale: state.scale)
+        let transform = CGAffineTransform(a: state.scale, b: 0, c: 0, d: state.scale, tx: pan.x, ty: pan.y)
+        metalView.transform = transform
+        let viewport = transform == .identity ? baseViewport : baseViewport?.transformed(in: bounds, by: transform)
+        if touchView.contentViewport != viewport {
+            touchView.contentViewport = viewport
+            viewportChanged?(viewport)
+        }
+        touchView.localGestureOwnsInput = state.editing
+    }
+
     let softwareTextView = RemoteSoftwareKeyboardTextView(frame: .zero, textContainer: nil)
     private var clientCursor = ClientCursorState()
     let keyboardButton = UIButton(type: .system)
@@ -324,7 +451,13 @@ public final class ConnectedPresentationContainer: UIView {
     var onGeometryChanged: ((PresentationSurfaceGeometry) -> Void)?
     private var publishedGeometry: PresentationSurfaceGeometry?
 
-    override init(frame: CGRect) {
+    override convenience init(frame: CGRect) {
+        self.init(frame: frame, pencilInteractionsEnabled: true)
+    }
+
+    init(frame: CGRect, pencilInteractionsEnabled: Bool, directTouchAllowed: Bool = true) {
+        touchView = PencilUIKitView(frame: .zero, pencilInteractionsEnabled: pencilInteractionsEnabled,
+                                   directTouchAllowed: directTouchAllowed)
         super.init(frame: frame)
         isOpaque = true
         clipsToBounds = true
@@ -396,6 +529,12 @@ public final class ConnectedPresentationContainer: UIView {
         touchView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(metalView)
         addSubview(touchView)
+        gestureSurface.isHidden = true
+        gestureSurface.isMultipleTouchEnabled = true
+        gestureSurface.adjust = { [weak self] factor, translation in
+            self?.adjustViewport(by: factor, translation: translation)
+        }
+        addSubview(gestureSurface)
         // UIButton owns only its 48pt target, above the unchanged remote touch surface.
         bringSubviewToFront(softwareTextView)
         addSubview(keyboardButton)
@@ -425,6 +564,11 @@ public final class ConnectedPresentationContainer: UIView {
 
     override public func layoutSubviews() {
         super.layoutSubviews()
+        gestureSurface.frame = bounds
+        if viewportControls != nil, baseBounds != bounds.size {
+            gestureSurface.interrupt()
+            setBaseViewport(nil)
+        }
         keyboardButton.frame = FloatingKeyboardPlacement.frame(bounds: bounds, safeArea: safeAreaInsets, keyboard: keyboardFrame)
         if !keyboardHintLabel.isHidden {
             keyboardHintLabel.frame = keyboardHintLabel.frame(above: keyboardButton.frame, bounds: bounds, safeArea: safeAreaInsets)
@@ -731,6 +875,10 @@ public final class ConnectedPresentationContainer: UIView {
 
 public struct ConnectedPresentationSurface: UIViewRepresentable {
     @ObservedObject var networkManager: NetworkManager
+    var pencilInteractionsEnabled: Bool
+    var directTouchAllowed: Bool
+    var localZoomEnabled: Bool
+    var viewportControls: LocalViewportControls?
     var gameModeEnabled: Bool
     public var onFrameRendered: (() -> Void)?
     public var onContentViewportChanged: ((VideoContentViewport?) -> Void)?
@@ -753,6 +901,10 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     public init(
         networkManager: NetworkManager,
         gameModeEnabled: Bool = false,
+        pencilInteractionsEnabled: Bool = true,
+        directTouchAllowed: Bool = true,
+        localZoomEnabled: Bool = false,
+        viewportControls: LocalViewportControls? = nil,
         remoteKeyboardActive: Bool = false,
         sessionInputActive: Bool? = nil,
         onKeyboardInput: ((KeyboardInputCommand) -> Void)? = nil,
@@ -770,6 +922,10 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     ) {
         self.networkManager = networkManager
         self.gameModeEnabled = gameModeEnabled
+        self.pencilInteractionsEnabled = pencilInteractionsEnabled
+        self.directTouchAllowed = directTouchAllowed
+        self.localZoomEnabled = localZoomEnabled
+        self.viewportControls = viewportControls
         self.onFrameRendered = onFrameRendered
         self.onContentViewportChanged = onContentViewportChanged
         self.onGeometrySnapshotChanged = onGeometrySnapshotChanged
@@ -817,7 +973,8 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     }
 
     public func makeUIView(context: Context) -> ConnectedPresentationContainer {
-        let container = ConnectedPresentationContainer(frame: .zero)
+        let container = ConnectedPresentationContainer(frame: .zero, pencilInteractionsEnabled: pencilInteractionsEnabled,
+                                                      directTouchAllowed: directTouchAllowed)
         configure(
             container,
             coordinator: context.coordinator,
@@ -869,6 +1026,8 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         }
         container.setNeedsLayout()
 
+        container.viewportChanged = { [weak coordinator] viewport in coordinator?.onContentViewportChanged?(viewport) }
+        container.configureViewportPolicy(enabled: localZoomEnabled, controls: viewportControls)
         let touchView = container.touchView
         if let remoteInput, inputAllowed, networkManager.isRemoteControlSession {
             remoteInput.bind(networkManager)
@@ -1001,13 +1160,14 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             coordinator?.onTouchBoundsChanged?(bounds)
         }
 
-        if let sharedInput {
+        if let sharedInput = sharedInput ?? (directTouchAllowed ? nil : container.phoneInput) {
             touchView.inputSession = sharedInput
             sharedInput.clearTextHistory = { [weak container] in container?.softwareTextView.clearCommittedHistory() }
             sharedInput.requestSoftwareKeyboard = { [weak container] in container?.showSoftwareKeyboardFromInputBar() }
             sharedInput.engine.openSettings = { [weak touchView] in touchView?.onOpenSettings?() }
             sharedInput.engine.setHardwareCaptureEnabled(remoteKeyboardActive && !networkManager.captureInputBlocked)
             sharedInput.bind(networkManager, active: sessionInputActive ?? remoteKeyboardActive)
+            if !directTouchAllowed { sharedInput.engine.mode = .trackpad }
             touchView.updatePencilIndicator()
             container.softwareTextView.keySourceRoutingEnabled = true
         }
@@ -1027,6 +1187,8 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             return
         }
 
+        if localZoomEnabled { container.setBaseViewport(nil) }
+        if localZoomEnabled { metalView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1) }
         coordinator.renderer?.setPresentationSurfaceActive(false)
         coordinator.focusBinding = focus
         let lifetime = focus.map { _ in FocusSurfaceLifetime() }
@@ -1062,14 +1224,18 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
                 sequence: sequence,
                 generation: generation)
         }
-        renderer.onContentViewportChanged = { [weak coordinator] viewport in
+        renderer.onContentViewportChanged = { [weak container] viewport in
             guard lifetime?.isLive != false else { return }
-            coordinator?.touchView?.contentViewport = viewport
-            coordinator?.onContentViewportChanged?(viewport)
+            if viewport == nil || container?.touchView.requiresVideoHit == false {
+                container?.setBaseViewport(viewport)
+            }
         }
         renderer.onGeometrySnapshotChanged = {
-            [weak coordinator, weak networkManager] snapshot in
+            [weak coordinator, weak networkManager, weak container] snapshot in
             guard lifetime?.isLive != false else { return }
+            if let container, container.touchView.requiresVideoHit, snapshot.metalBounds.size == container.bounds.size {
+                container.setBaseViewport(snapshot.contentViewport)
+            }
             if let networkManager {
                 let inputGeometryContext = InputGeometryDiagnosticContext(
                     sessionGeneration:

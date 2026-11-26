@@ -1426,3 +1426,204 @@ struct RemoteAddressField: View {
         }
     }
 }
+
+
+@MainActor struct PhoneRootView: View {
+    @StateObject private var network: NetworkManager
+    @StateObject private var discovery: DiscoveryManager
+    @Environment(\.scenePhase) private var phase
+    @State private var history = RecentRemoteHostStore.load()
+    @State private var address = ""
+    @State private var destination = ""
+    @State private var selection: RemoteIntent?
+    @State private var pin = ""
+    @State private var settings = false
+    @State private var confirmedActive = false
+
+    init(capabilities: ClientDeviceCapabilities) {
+        _network = StateObject(wrappedValue: NetworkManager(capabilities: capabilities))
+        _discovery = StateObject(wrappedValue: DiscoveryManager(capabilities: capabilities))
+    }
+
+    var body: some View {
+        ZStack {
+            if network.connectionState == .streaming {
+                PhoneSessionView(network: network, host: destination, foreground: confirmedActive && phase == .active)
+                    .id(network.remoteKeyboardGeneration)
+            } else {
+                connectScreen
+                authentication
+            }
+            if phase != .active {
+                Color.black.ignoresSafeArea().accessibilityLabel("Session hidden")
+            }
+        }
+        .preferredColorScheme(.dark)
+        .sheet(isPresented: $settings, onDismiss: { history = RecentRemoteHostStore.load() }) {
+            SettingsView(networkManager: network).modifier(PhonePrivacyCover())
+        }
+        .onAppear { lifecycle(phase) }
+        .onChange(of: phase) { _, value in lifecycle(value) }
+        .onChange(of: network.connectionState) { _, state in
+            if state == .streaming {
+                pin = ""
+                if let selection, let preview = PhoneConnectScreenModel(capabilities: network.capabilities, history: history)?.preview(selection) {
+                    history = RecentRemoteHostStore.record(host: preview.destination, remoteControl: true)
+                }
+                discovery.stopBrowsing()
+            } else if canChooseHost {
+                pin = ""
+                selection = nil
+                if phase == .active { discovery.startBrowsing() }
+            }
+        }
+        .onDisappear { discovery.stopBrowsing(); network.setRemoteClipboardSceneActive(false) }
+    }
+
+    private func isAvailable(_ intent: RemoteIntent, model: PhoneConnectScreenModel) -> Bool {
+        guard case .discovered = intent else { return true }
+        let destination = model.preview(intent)?.destination
+        return discovery.discoveredRemoteIntents.contains { model.preview($0)?.destination == destination }
+    }
+
+    private var canChooseHost: Bool {
+        switch network.connectionState {
+        case .idle, .disconnected: return true
+        default: return false
+        }
+    }
+
+    private var connectScreen: some View {
+        NavigationStack {
+            Form {
+                if let model = PhoneConnectScreenModel(capabilities: network.capabilities, history: history) {
+                    Group {
+                        if network.hasReconnectTarget {
+                            Button("Reconnect last PC") {
+                                destination = "Last paired PC"
+                                selection = nil
+                                network.reconnectLastPC()
+                            }
+                        }
+                        ForEach(model.sections, id: \.self) { section in
+                            Section(section.rawValue) {
+                                switch section {
+                                case .recent:
+                                    if model.recentHosts.isEmpty { Text("No recent remote hosts.") }
+                                    ForEach(model.recentHosts) { host in
+                                        Button(host.host) { selection = .recent(host) }
+                                    }
+                                case .manual:
+                                    RemoteAddressField(address: $address)
+                                        .onChange(of: address) { _, _ in selection = nil }
+                                    Text("Enter an IP address or Tailscale DNS name.")
+                                    Button("Review address") {
+                                        selection = .manual(.init(host: address, port: NetworkManager.remoteControlPort))
+                                    }.disabled(address.isEmpty)
+                                case .discovered:
+                                    if discovery.discoveredRemoteIntents.isEmpty {
+                                        Text("No PCs found. If local network access is off, use Manual address.")
+                                    }
+                                    ForEach(Array(discovery.discoveredRemoteIntents.enumerated()), id: \.offset) { entry in
+                                        if let preview = model.preview(entry.element) {
+                                            Button(preview.destination) { selection = entry.element }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let selection {
+                            if let preview = model.preview(selection), isAvailable(selection, model: model) {
+                                Section(preview.purpose) {
+                                    Text(preview.destination)
+                                    Button("Connect") {
+                                        if let host = model.connect(selection, using: network.connect(remote:)) {
+                                            destination = host
+                                        }
+                                    }
+                                }
+                            } else { Text("Enter a valid IP address or DNS name.") }
+                        }
+                    }.disabled(!canChooseHost)
+                }
+                if let error = network.admissionError { Text(error.phoneMessage) }
+                switch network.connectionState {
+                case .connecting:
+                    Text("Connecting...")
+                    Button("Cancel") { network.stop() }
+                case .disconnected(let reason): Text(reason)
+                default: EmptyView()
+                }
+            }
+            .environment(\.defaultMinListRowHeight, 44)
+            .navigationTitle("Remote control")
+            .toolbar { Button("Settings") { settings = true } }
+        }
+    }
+
+    @ViewBuilder private var authentication: some View {
+        switch network.connectionState {
+        case .awaitingHostIdentity:
+            HostIdentityConfirmationView(identityCode: network.hostIdentityCode ?? "Unavailable",
+                                        onConfirm: { network.confirmHostIdentity() }, onCancel: cancelPairing)
+        case .awaitingPIN, .submittingPIN, .authFailed:
+            let reason: String = {
+                if case .authFailed(let message) = network.connectionState { return message }
+                return ""
+            }()
+            PINEntryView(pin: $pin, authFailed: !reason.isEmpty, failureReason: reason,
+                         submitting: network.connectionState == .submittingPIN,
+                         onSubmit: { network.sendAuthPIN(pin) }, onCancel: cancelPairing)
+        default: EmptyView()
+        }
+    }
+
+    private func cancelPairing() { pin = ""; network.stop() }
+
+    private func lifecycle(_ value: ScenePhase) {
+        confirmedActive = false
+        network.setRemoteClipboardSceneActive(value == .active)
+        switch value {
+        case .active:
+            network.applicationDidBecomeActive()
+            confirmedActive = true
+            if network.connectionState != .streaming { discovery.startBrowsing() }
+        case .inactive, .background:
+            settings = false
+            discovery.stopBrowsing()
+            if value == .inactive { network.applicationWillResignActive() }
+            else { network.applicationDidEnterBackground() }
+        @unknown default: break
+        }
+    }
+}
+
+extension PhoneConnectScreenModel {
+    func connect(_ intent: RemoteIntent, using dial: (RemoteIntent) -> Void) -> String? {
+        guard let destination = preview(intent)?.destination else { return nil }
+        dial(intent)
+        return destination
+    }
+}
+
+struct PhonePrivacyCover: ViewModifier {
+    @Environment(\.scenePhase) private var phase
+    func body(content: Content) -> some View {
+        content.overlay {
+            if phase != .active { Color.black.ignoresSafeArea().accessibilityLabel("Session hidden") }
+        }
+    }
+}
+
+private extension RemoteAdmissionRejection {
+    var phoneMessage: String {
+        switch self {
+        case .invalidAddress: return "Enter a valid IP address or DNS name."
+        case .wrongPort: return "Remote control uses port 27020."
+        case .unresolvedService, .unclassifiedService: return "Could not resolve this PC. Use Manual address."
+        case .staleResume: return "The saved pairing has changed. Select the PC again."
+        case .unsupportedFamily, .castingMode, .usbTransport, .pairSelection:
+            return "Select a network PC that offers Remote control."
+        }
+    }
+}

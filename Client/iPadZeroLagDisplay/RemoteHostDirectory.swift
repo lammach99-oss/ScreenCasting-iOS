@@ -1,5 +1,26 @@
 import Foundation
 import Network
+import UIKit
+
+struct ClientDeviceCapabilities: Equatable {
+    enum Family { case pad, phone, unknown }
+    let family: Family
+
+    var allowsCasting: Bool { family == .pad }
+    var allowsUSB: Bool { family == .pad }
+    var allowsSecondPC: Bool { family == .pad }
+    var allowsFileTransfer: Bool { family == .pad }
+    var allowsPencil: Bool { family == .pad }
+    var allowsRemoteControl: Bool { family == .pad || family == .phone }
+
+    static func resolve(_ idiom: UIUserInterfaceIdiom) -> Self {
+        switch idiom {
+        case .pad: return Self(family: .pad)
+        case .phone: return Self(family: .phone)
+        default: return Self(family: .unknown)
+        }
+    }
+}
 
 struct RemoteHostAddress: Equatable {
     enum Kind: Equatable { case ipv4, ipv6, dnsName }
@@ -85,7 +106,65 @@ struct RemoteHostAddress: Equatable {
     }
 }
 
+enum RemoteIntent {
+    struct Target {
+        let host: String
+        let port: UInt16
+    }
+
+    struct ResumeContext: Equatable {
+        let generation: UInt64
+        let fingerprint: String
+    }
+
+    case manual(Target)
+    case recent(RecentRemoteHost)
+    /// Supply the advertised type and its resolution from the same browse result.
+    case discovered(serviceType: String?, resolved: Target?)
+    case resume(Target, remoteControl: Bool, saved: ResumeContext)
+    case usb
+    case pairSelection
+}
+
+enum RemoteAdmissionRejection: Error, Equatable {
+    case unsupportedFamily, wrongPort, invalidAddress, castingMode, unresolvedService
+    case unclassifiedService, staleResume, usbTransport, pairSelection
+}
+
 enum RemoteSessionPolicy {
+    static let remoteServiceType = "_sc-remote._tcp"
+
+    /// Every success is a Remote IP dial on NetworkManager.remoteControlPort.
+    static func admit(_ intent: RemoteIntent, for capabilities: ClientDeviceCapabilities,
+                      current: RemoteIntent.ResumeContext? = nil) -> Result<RemoteHostAddress, RemoteAdmissionRejection> {
+        guard capabilities.allowsRemoteControl else { return .failure(.unsupportedFamily) }
+        let target: RemoteIntent.Target
+        switch intent {
+        case .manual(let manual):
+            guard manual.port == NetworkManager.remoteControlPort else { return .failure(.wrongPort) }
+            guard let address = RemoteHostAddress.parseManual(manual.host, port: manual.port) else { return .failure(.invalidAddress) }
+            return .success(address)
+        case .recent(let recent):
+            guard recent.remoteControl else { return .failure(.castingMode) }
+            target = .init(host: recent.host, port: recent.port)
+        case .discovered(let serviceType, let resolved):
+            let type = serviceType?.lowercased()
+            guard type == remoteServiceType || type == remoteServiceType + "." else { return .failure(.unclassifiedService) }
+            guard let resolved else { return .failure(.unresolvedService) }
+            target = resolved
+        case .resume(let savedTarget, let remoteControl, let saved):
+            guard remoteControl else { return .failure(.castingMode) }
+            guard !saved.fingerprint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  saved == current else { return .failure(.staleResume) }
+            target = savedTarget
+        case .usb: return .failure(.usbTransport)
+        case .pairSelection: return .failure(.pairSelection)
+        }
+        guard target.port == NetworkManager.remoteControlPort else { return .failure(.wrongPort) }
+        guard let address = RemoteHostAddress.parse(target.host) else { return .failure(.invalidAddress) }
+        return .success(address)
+    }
+
     static func isRemoteControl(endpoint: NWEndpoint) -> Bool {
         guard case .hostPort(_, let port) = endpoint else { return false }
         return port.rawValue == NetworkManager.remoteControlPort

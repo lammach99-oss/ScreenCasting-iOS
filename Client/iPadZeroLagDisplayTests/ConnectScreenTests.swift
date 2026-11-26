@@ -88,6 +88,25 @@ final class DiscoveryLifecycleTests: XCTestCase {
 
 /// The connect screen's one status line: plain words, one tone, at most one action.
 final class ConnectScreenTests: XCTestCase {
+    func testPhoneConnectPresentationFiltersHistoryAndPreviewsOnlyAdmittedTargets() throws {
+        let host = "192.0.2.2"
+        let remote = RecentRemoteHost(host: host, remoteControl: true, lastUsed: Date())
+        let casting = RecentRemoteHost(host: host, remoteControl: false, lastUsed: Date())
+        let malformed = RecentRemoteHost(host: "/", remoteControl: true, lastUsed: Date())
+        let history = [casting, remote, malformed]
+        let model = try XCTUnwrap(PhoneConnectScreenModel(capabilities: .resolve(.phone), history: history))
+        XCTAssertEqual(model.sections.map(\.rawValue), ["Recent remote hosts", "Manual address", "Discovered remote hosts"])
+        XCTAssertEqual(model.recentHosts, [remote])
+        XCTAssertEqual(history, [casting, remote, malformed])
+        let preview = try XCTUnwrap(model.preview(.recent(remote)))
+        XCTAssertEqual(preview.destination, host)
+        XCTAssertEqual(preview.purpose, "Remote control")
+        XCTAssertNil(model.preview(.recent(casting)))
+        XCTAssertNil(model.preview(.discovered(serviceType: "_sc-remote._tcp", resolved: nil)))
+        XCTAssertNil(PhoneConnectScreenModel(capabilities: .resolve(.pad), history: history))
+        XCTAssertNil(PhoneConnectScreenModel(capabilities: .resolve(.unspecified), history: history))
+    }
+
     private func status(_ state: ConnectionState, pc: String? = "Lam-Laptop", found: Int = 0, attempt: Int = 0) -> ConnectScreenStatus {
         .make(state: state, pcName: pc, discoveredCount: found, reconnectAttempt: attempt)
     }

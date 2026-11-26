@@ -282,3 +282,13 @@ struct GestureToastView: View {
             .accessibilityHidden(true)
     }
 }
+
+enum PhoneGestureHelp {
+    static let items = [
+        GestureGuideItem(symbol: "hand.draw", gesture: "One-finger move", result: "Move the PC pointer"),
+        GestureGuideItem(symbol: "hand.tap", gesture: "Tap", result: "Left click"),
+        GestureGuideItem(symbol: "hand.tap", gesture: "Two-finger tap", result: "Right click"),
+        GestureGuideItem(symbol: "arrow.up.arrow.down", gesture: "Two-finger slide", result: "Scroll"),
+        GestureGuideItem(symbol: "hand.pinch", gesture: "Zoom mode", result: "Pinch to zoom and drag to pan. Fit restores the full desktop.")
+    ]
+}

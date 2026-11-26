@@ -1146,9 +1146,27 @@ public class NetworkManager: ObservableObject {
     private var castingAudio: AudioManager? { role == .primary ? AudioManager.shared : nil }
     private var secondaryRetryEndpoint: NWEndpoint?
 
-    public init(userDefaults: UserDefaults = .standard, receivedFilesDirectory: URL? = nil,
-                role: RemoteSlotRole = .primary) {
+    let capabilities: ClientDeviceCapabilities
+    @Published private(set) var admissionError: RemoteAdmissionRejection?
+    private static let phoneResumeKey = "ScreenCasting.phone.remoteResume.v1"
+    #if targetEnvironment(simulator)
+    var usbListenerFactoryForTesting: (() -> Void)?
+    var dialForTesting: ((NWEndpoint, String?) -> Void)?
+    #endif
+
+    public convenience init(userDefaults: UserDefaults = .standard, receivedFilesDirectory: URL? = nil,
+                            role: RemoteSlotRole = .primary) {
+        self.init(userDefaults: userDefaults, receivedFilesDirectory: receivedFilesDirectory,
+                  role: role, capabilities: .init(family: .pad))
+    }
+
+    init(userDefaults: UserDefaults = .standard, receivedFilesDirectory: URL? = nil,
+                role: RemoteSlotRole = .primary, capabilities: ClientDeviceCapabilities) {
+        self.capabilities = capabilities
         self.role = role
+        if !capabilities.allowsCasting {
+            remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: capabilities.remoteInputFeatureMask | RemoteFeatureNegotiation.remoteVideoStandby)
+        }
         streamSettingsDefaults = userDefaults
         trustedHostCleanup = userDefaults.dictionary(forKey: Self.trustedHostCleanupKey) as? [String: Bool] ?? [:]
         remoteClipboardEnabled = userDefaults.bool(forKey: Clipboard.preferenceKey)
@@ -1264,6 +1282,7 @@ public class NetworkManager: ObservableObject {
     }
 
     public func setDesiredPipelineMode(_ mode: PipelineMode) {
+        guard capabilities.allowsCasting else { return }
         networkQueue.async { [weak self] in
             guard let self else { return }
             self.desiredPipelineMode = mode
@@ -1283,29 +1302,78 @@ public class NetworkManager: ObservableObject {
         connect(to: endpoint, legacyHost: nil)
     }
 
+    private func rejectAdmission(_ error: RemoteAdmissionRejection) {
+        DispatchQueue.main.async { self.admissionError = error }
+    }
+
+    private var phoneResumeRecord: [String: String]? {
+        streamSettingsDefaults.dictionary(forKey: Self.phoneResumeKey) as? [String: String]
+    }
+
+    private var currentResumeContext: RemoteIntent.ResumeContext? {
+        guard let fingerprint = phoneResumeRecord?["fingerprint"] else { return nil }
+        return .init(generation: connectionGeneration, fingerprint: fingerprint)
+    }
+
+    private func admittedEndpoint(_ intent: RemoteIntent) -> NWEndpoint? {
+        dispatchPrecondition(condition: .onQueue(networkQueue))
+        guard role == .primary || capabilities.allowsSecondPC else { rejectAdmission(.pairSelection); return nil }
+        let current: RemoteIntent.ResumeContext?
+        if case .resume = intent { current = currentResumeContext } else { current = nil }
+        switch RemoteSessionPolicy.admit(intent, for: capabilities, current: current) {
+        case .failure(let reason):
+            rejectAdmission(reason)
+            return nil
+        case .success(let address):
+            return .hostPort(host: RemoteHostAddress.networkHost(address.host), port: 27020)
+        }
+    }
+
+    func connect(remote intent: RemoteIntent) {
+        networkQueue.async {
+            guard let endpoint = self.admittedEndpoint(intent) else { return }
+            if case .resume = intent, !self.capabilities.allowsCasting,
+               self.phoneResumeRecord?["host"] != WifiReconnectTargetPolicy.target(from: endpoint)?.host {
+                self.rejectAdmission(.staleResume)
+                return
+            }
+            self.beginDialOnQueue(endpoint, legacyHost: nil, intent: intent)
+        }
+    }
+
     private func connect(to endpoint: NWEndpoint, legacyHost: String?) {
+        guard capabilities.allowsCasting else { connect(remote: .discovered(serviceType: nil, resolved: nil)); return }
         guard role.permits(endpoint) else { return }
         networkQueue.async { [weak self] in
             guard let self else { return }
-            guard self.transportState == .idle || self.isDisconnectedOnQueue,
-                  self.pendingTrustedHostForget == nil,
-                  !self.wifiTargetHasPendingCleanup(endpoint) else { return }
-            self.remoteSecureControlIntent = false
-            if self.role == .secondaryRemote {
-                self.secondaryRetryEndpoint = endpoint
-            } else if let target = WifiReconnectTargetPolicy.target(from: endpoint) {
-                WifiReconnectTargetStore.save(target, defaults: self.streamSettingsDefaults)
-                if let legacyHost { self.streamSettingsDefaults.set(legacyHost, forKey: Self.lastKnownHostKey) }
-            }
-            self.triedWifiReconnectTargets.removeAll()
-            self.publishAutoReconnectAttempt(0)
-            self.connectOnQueue(to: endpoint)
+            self.beginDialOnQueue(endpoint, legacyHost: legacyHost, intent: nil)
         }
+    }
+
+    private func beginDialOnQueue(_ endpoint: NWEndpoint, legacyHost: String?, intent: RemoteIntent?) {
+        guard role.permits(endpoint), transportState == .idle || isDisconnectedOnQueue,
+              self.pendingTrustedHostForget == nil,
+              !self.wifiTargetHasPendingCleanup(endpoint) else { return }
+        self.remoteSecureControlIntent = false
+        if self.role == .secondaryRemote {
+            self.secondaryRetryEndpoint = endpoint
+        } else if let target = WifiReconnectTargetPolicy.target(from: endpoint) {
+            WifiReconnectTargetStore.save(target, defaults: self.streamSettingsDefaults)
+            if let legacyHost { self.streamSettingsDefaults.set(legacyHost, forKey: Self.lastKnownHostKey) }
+        }
+        self.triedWifiReconnectTargets.removeAll()
+        self.publishAutoReconnectAttempt(0)
+        if !capabilities.allowsCasting, phoneResumeRecord?["host"] != WifiReconnectTargetPolicy.target(from: endpoint)?.host {
+            streamSettingsDefaults.removeObject(forKey: Self.phoneResumeKey)
+        }
+        var fingerprint: String?
+        if case .some(.resume(_, _, let saved)) = intent { fingerprint = saved.fingerprint }
+        self.connectOnQueue(to: endpoint, expectedFingerprint: fingerprint, intent: intent)
     }
 
     /// The last Wi-Fi PC (saved target, or the legacy typed host) can be reconnected to.
     public var hasReconnectTarget: Bool {
-        savedWifiReconnectTarget?.endpoint != nil
+        capabilities.allowsCasting ? savedWifiReconnectTarget?.endpoint != nil : phoneResumeRecord != nil
     }
 
     private var savedWifiReconnectTarget: WifiReconnectTarget? {
@@ -1317,6 +1385,7 @@ public class NetworkManager: ObservableObject {
 
     func updateDiscoveredWifiEndpoints(_ endpoints: [NWEndpoint]) {
         guard role == .primary else { return }
+        guard capabilities.allowsCasting else { return }
         networkQueue.async { [weak self] in self?.discoveredWifiEndpoints = endpoints }
     }
 
@@ -1324,7 +1393,7 @@ public class NetworkManager: ObservableObject {
     public func reconnectLastPC() {
         networkQueue.async { [weak self] in
             guard let self else { return }
-            self.publishAutoReconnectAttempt(0)
+            if self.capabilities.allowsCasting { self.publishAutoReconnectAttempt(0) }
             self.connectSavedWifiOnQueue()
         }
     }
@@ -1333,7 +1402,11 @@ public class NetworkManager: ObservableObject {
         DispatchQueue.main.async { self.autoReconnectAttempt = attempt }
     }
 
-    private func connectOnQueue(to endpoint: NWEndpoint, expectedFingerprint: String? = nil) {
+    private func connectOnQueue(to endpoint: NWEndpoint, expectedFingerprint: String? = nil, intent: RemoteIntent? = nil) {
+        if !capabilities.allowsCasting {
+            guard admittedEndpoint(intent ?? .discovered(serviceType: nil, resolved: nil)) == endpoint else { return }
+            DispatchQueue.main.async { self.admissionError = nil }
+        }
         guard role.permits(endpoint) else { return }
         dispatchPrecondition(condition: .onQueue(networkQueue))
         if let expectedFingerprint, trustedHostCleanup[expectedFingerprint] != nil { return }
@@ -1383,6 +1456,9 @@ public class NetworkManager: ObservableObject {
         wifiAuthentication = WifiAuthenticationState()
         reconnectWorkItem?.cancel()
         resetDisplaySession()
+        #if targetEnvironment(simulator)
+        if let dialForTesting { dialForTesting(endpoint, expectedFingerprint); return }
+        #endif
         let parameters = buildTLSParameters(for: endpoint, expectedFingerprint: expectedFingerprint)
         let newConnection = NWConnection(to: endpoint, using: parameters)
         connection = newConnection
@@ -1417,6 +1493,11 @@ public class NetworkManager: ObservableObject {
     ///   - host: Host IP or mDNS hostname (e.g. "192.168.1.10" or "LÂM-DESKTOP.local")
     ///   - port: TCP port the Windows NetworkManager listens on (default 27015)
     public func connect(to host: String, port: UInt16 = 27015) {
+        guard capabilities.allowsCasting else {
+            if port == Self.remoteControlPort { connect(remote: .discovered(serviceType: nil, resolved: nil)) }
+            else { connect(remote: .manual(.init(host: host, port: port))) }
+            return
+        }
         guard let port = NWEndpoint.Port(rawValue: port) else { return }
         let endpoint = NWEndpoint.hostPort(
             host: RemoteHostAddress.networkHost(host),
@@ -1667,6 +1748,7 @@ public class NetworkManager: ObservableObject {
 
     public func connectDiscoveredHostIfNeeded(_ endpoint: NWEndpoint) {
         guard role == .primary else { return }
+        guard capabilities.allowsCasting else { connect(remote: .discovered(serviceType: nil, resolved: nil)); return }
         networkQueue.async { [weak self] in
             guard let self,
                   self.isForegroundActive,
@@ -2041,7 +2123,7 @@ public class NetworkManager: ObservableObject {
         remoteFileAccess = nil
         retireRemoteFileIOOnQueue()
         remoteFilePacing = RemoteFileMediaPacing()
-        remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: 0x1f | RemoteFeatureNegotiation.remoteVideoStandby)
+        remoteFeatures = RemoteFeatureNegotiation(requestedFeatures: capabilities.remoteInputFeatureMask | RemoteFeatureNegotiation.remoteVideoStandby)
         standby = RemoteStandbyClient()
         publishStandbyOnQueue()
         remoteMonitors.begin(session: UUID(), acceptedFeatures: 0)
@@ -2153,10 +2235,21 @@ public class NetworkManager: ObservableObject {
             self.sendRemoteAudioOnQueue(self.remoteAudio.prefer(enabled))
             self.updateRemoteAudioSuspensionOnQueue()
             if enabled, !self.remoteAudioRequested, let endpoint = self.connectionSelectedEndpoint {
+                if !self.capabilities.allowsCasting {
+                    guard let current = self.currentResumeContext,
+                          current.fingerprint == self.verifiedHostFingerprint,
+                          let host = WifiReconnectTargetPolicy.target(from: endpoint)?.host,
+                          self.admittedEndpoint(.resume(.init(host: host, port: Self.remoteControlPort),
+                              remoteControl: true, saved: current)) == endpoint else {
+                        self.rejectAdmission(.staleResume)
+                        return
+                    }
+                }
                 // SCST 61/62 is a one-time negotiation on each TLS connection.
                 self.teardownCurrentSession()
                 self.setState(.disconnected(reason: "Reconnecting to enable remote audio"))
-                self.connectOnQueue(to: endpoint)
+                if self.capabilities.allowsCasting { self.connectOnQueue(to: endpoint) }
+                else { self.connectSavedWifiOnQueue() }
             }
         }
     }
@@ -3028,6 +3121,7 @@ public class NetworkManager: ObservableObject {
     }
 
     func sendRemoteDirectTouch(_ command: RemoteDirectTouchCommand, expectedGeneration: UInt64) {
+        guard capabilities.allowsCasting else { return }
         networkQueue.async { [weak self] in
             guard let self, self.remoteInputConnection, self.connectionGeneration == expectedGeneration,
                   self.transportState == .streaming, self.committedTransportGeneration == expectedGeneration,
@@ -3042,6 +3136,7 @@ public class NetworkManager: ObservableObject {
     }
 
     public func sendDirectTouchContact(_ command: DirectTouchContactCommand) {
+        guard capabilities.allowsCasting else { return }
         let requestedGeneration = connectionGenerationClock.current
         let requestedRevision = mirrorControl.gestureRevision
         let mayStart = mirrorControl.allowsLegacyVirtualInput
@@ -3365,6 +3460,7 @@ public class NetworkManager: ObservableObject {
 
     private func clearSavedReconnectTarget() {
         guard role == .primary else { return }
+        if !capabilities.allowsCasting { streamSettingsDefaults.removeObject(forKey: Self.phoneResumeKey) }
         WifiReconnectTargetStore.clear(defaults: streamSettingsDefaults)
         streamSettingsDefaults.removeObject(forKey: Self.lastKnownHostKey)
         RecentWifiResumeStore.clear(defaults: streamSettingsDefaults)
@@ -3540,6 +3636,7 @@ public class NetworkManager: ObservableObject {
     }
 
     func updateInterfaceOrientation(_ orientation: ClientDisplayOrientation) {
+        guard capabilities.allowsCasting else { return }
         networkQueue.async { [weak self] in
             guard let self else { return }
             self.observedInterfaceOrientation = orientation
@@ -3579,6 +3676,7 @@ public class NetworkManager: ObservableObject {
 
     /// Starts the fixed-port TCP endpoint used to carry SCDP through iproxy.
     public func startListening(port: UInt16 = 42042) {
+        guard capabilities.allowsUSB else { connect(remote: .usb); return }
         networkQueue.async { [weak self] in
             self?.startListeningOnQueue(port: port)
         }
@@ -3586,6 +3684,7 @@ public class NetworkManager: ObservableObject {
 
     private func startListeningOnQueue(port: UInt16) {
         guard role == .primary else { return }
+        guard capabilities.allowsUSB else { rejectAdmission(.usbTransport); return }
         dispatchPrecondition(condition: .onQueue(networkQueue))
         // Repeated Start must not create a gap in an already owned listener.
         guard !usbListenerExplicitlyStarted || usbListener == nil else { return }
@@ -3603,6 +3702,7 @@ public class NetworkManager: ObservableObject {
 
     private func createOrdinaryUsbListenerOnQueue(port: UInt16) {
         guard role == .primary else { return }
+        guard capabilities.allowsUSB else { rejectAdmission(.usbTransport); return }
         dispatchPrecondition(condition: .onQueue(networkQueue))
         listenerGeneration &+= 1
         let generation = listenerGeneration
@@ -3613,6 +3713,9 @@ public class NetworkManager: ObservableObject {
                 NWProtocolFramer.Options(definition: USBControlTLSFramer.definition), at: 0)
             guard let listenerPort = NWEndpoint.Port(rawValue: port) else { throw USBListenerError.invalidPort }
             parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: listenerPort)
+            #if targetEnvironment(simulator)
+            if let usbListenerFactoryForTesting { usbListenerFactoryForTesting(); return }
+            #endif
             let listener = try NWListener(using: parameters)
             usbListener = listener
 
@@ -3718,6 +3821,7 @@ public class NetworkManager: ObservableObject {
 
     private func installUsbCandidate(_ candidate: NWConnection, preserveContinuation: Bool = false) {
         guard role == .primary else { candidate.cancel(); return }
+        guard capabilities.allowsUSB else { candidate.cancel(); return }
         dispatchPrecondition(condition: .onQueue(networkQueue))
         if !preserveContinuation { resetConnectionControlOnQueue() }
         usbIdentity = USBSessionIdentityProof(); usbReadinessPongWrittenGeneration = nil
@@ -3767,6 +3871,7 @@ public class NetworkManager: ObservableObject {
 
     private func holdUsbCandidate(_ candidate: NWConnection, incumbent: NWConnection) {
         guard role == .primary else { candidate.cancel(); return }
+        guard capabilities.allowsUSB else { candidate.cancel(); return }
         let id = nextUsbCandidateID
         nextUsbCandidateID &+= 1
         pendingUsbCandidate = PendingUsbCandidate(id: id, candidate: candidate,
@@ -3966,6 +4071,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func buildUSBListenerParameters() throws -> NWParameters {
+        guard capabilities.allowsUSB else { throw USBListenerError.identityUnavailable }
         guard let identity = USBServerTLSIdentity() else {
             throw USBListenerError.identityUnavailable
         }
@@ -4241,6 +4347,10 @@ public class NetworkManager: ObservableObject {
 
     private func loadWifiReconnectEndpoint() -> NWEndpoint? {
         dispatchPrecondition(condition: .onQueue(networkQueue))
+        if !capabilities.allowsCasting {
+            guard let host = phoneResumeRecord?["host"], let current = currentResumeContext else { return nil }
+            return admittedEndpoint(.resume(.init(host: host, port: Self.remoteControlPort), remoteControl: true, saved: current))
+        }
         if role == .secondaryRemote { return secondaryRetryEndpoint }
         guard let target = savedWifiReconnectTarget, let endpoint = target.endpoint else { return nil }
         if WifiReconnectTargetStore.load(defaults: streamSettingsDefaults) == nil,
@@ -4251,6 +4361,28 @@ public class NetworkManager: ObservableObject {
     }
 
     private func connectSavedWifiOnQueue() {
+        if !capabilities.allowsCasting {
+            guard let host = phoneResumeRecord?["host"], let context = currentResumeContext else {
+                rejectAdmission(.staleResume)
+                return
+            }
+            func resume(_ host: String) -> RemoteIntent {
+                .resume(.init(host: host, port: Self.remoteControlPort), remoteControl: true, saved: context)
+            }
+            guard let saved = admittedEndpoint(resume(host)), pendingTrustedHostForget == nil,
+                  transportState == .idle || isDisconnectedOnQueue else { return }
+            for endpoint in reconnectEndpoints(saved: saved, fingerprint: context.fingerprint) {
+                guard let target = WifiReconnectTargetPolicy.target(from: endpoint), let name = target.host,
+                      target.port == Self.remoteControlPort, admittedEndpoint(resume(name)) == endpoint,
+                      !triedWifiReconnectTargets.contains(target) else { continue }
+                triedWifiReconnectTargets.insert(target)
+                connectOnQueue(to: endpoint, expectedFingerprint: context.fingerprint, intent: resume(name))
+                return
+            }
+            triedWifiReconnectTargets.removeAll()
+            connectOnQueue(to: saved, expectedFingerprint: context.fingerprint, intent: resume(host))
+            return
+        }
         guard transportState == .idle || isDisconnectedOnQueue,
               pendingTrustedHostForget == nil, let saved = loadWifiReconnectEndpoint(),
               !wifiTargetHasPendingCleanup(saved) else { return }
@@ -4298,6 +4430,7 @@ public class NetworkManager: ObservableObject {
             guard entry.port == port.rawValue, let address = RemoteHostAddress.parse(entry.host),
                   address.kind == .dnsName else { return nil }
             let endpoint = NWEndpoint.hostPort(host: RemoteHostAddress.networkHost(address.host), port: port)
+            if !capabilities.allowsCasting, admittedEndpoint(.recent(entry)) != endpoint { return nil }
             return trustedHostFingerprintStore.load(endpoint: endpoint) == fingerprint ? endpoint : nil
         }
         // Probe unfamiliar Bonjour services only after the saved address, under the same TLS identity check.
@@ -4320,8 +4453,13 @@ public class NetworkManager: ObservableObject {
         publishAutoReconnectAttempt(reconnectAttempt)
         print("[IPAD][AUTO_RECONNECT_ATTEMPT] attempt=\(reconnectAttempt) delay=\(delay)")
         let generation = connectionGeneration
+        let resumeContext = capabilities.allowsCasting ? nil : currentResumeContext
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.connectionGeneration == generation, self.isForegroundActive, self.reconnectEnabled else { return }
+            guard self.capabilities.allowsCasting || self.currentResumeContext == resumeContext else {
+                self.rejectAdmission(.staleResume)
+                return
+            }
             guard self.connection == nil else { return }
             print("[IPAD][AUTO_RECONNECT_BEGIN] endpoint=persisted_target")
             self.connectSavedWifiOnQueue()
@@ -4564,6 +4702,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func adoptUsbLane(_ token: UsbLaneBindToken, connection: NWConnection) {
+        guard capabilities.allowsUSB else { connection.cancel(); return }
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard usbLaneServer.owns(token, connection: connection),
               token.connectionGeneration == connectionGeneration,
@@ -4948,6 +5087,7 @@ public class NetworkManager: ObservableObject {
     }
     func refreshReceivedFiles() { networkQueue.async { [weak self] in self?.refreshReceivedFilesOnQueue() } }
     private func refreshReceivedFilesOnQueue() {
+        guard capabilities.allowsFileTransfer else { return }
         if receivedRefreshInFlight { receivedRefreshRequested = true; return }
         receivedRefreshInFlight = true
         let revision = receivedActionClock.current
@@ -4974,6 +5114,7 @@ public class NetworkManager: ObservableObject {
         publishReceivedUI(revision: revision) { $0.receivedClearMessage = text }
     }
     func requestClearReceivedFiles() {
+        guard capabilities.allowsFileTransfer else { return }
         networkQueue.async { [weak self] in
             guard let self, self.pendingReceivedClearID == nil else { return }
             let id = UUID(), revision = self.receivedActionClock.current, session = self.connectionGeneration
@@ -5018,6 +5159,7 @@ public class NetworkManager: ObservableObject {
         }
     }
     func confirmClearReceivedFiles(id: UUID) {
+        guard capabilities.allowsFileTransfer else { return }
         networkQueue.async { [weak self] in
             guard let self, self.pendingReceivedClearID == id else { return }
             self.pendingReceivedClearID = nil // Consume before dispatch: double taps cannot enqueue a second delete.
@@ -5062,6 +5204,7 @@ public class NetworkManager: ObservableObject {
         }
     }
     func requestReceivedFileExport(_ url: URL, completion: @escaping (UUID?) -> Void) {
+        guard capabilities.allowsFileTransfer else { DispatchQueue.main.async { completion(nil) }; return }
         networkQueue.async { [weak self] in
             guard let self else { DispatchQueue.main.async { completion(nil) }; return }
             self.advanceReceivedRevisionOnQueue()
@@ -5076,6 +5219,7 @@ public class NetworkManager: ObservableObject {
         }
     }
     func releaseReceivedFileExport(_ token: UUID) {
+        guard capabilities.allowsFileTransfer else { return }
         networkQueue.async { [weak self] in
             guard let self else { return }
             self.receivedFilesQueue.async {
@@ -5098,6 +5242,7 @@ public class NetworkManager: ObservableObject {
     @Published private(set) var autoAcceptIncomingFiles = false
     @Published private(set) var canEnableAutoAccept = false
     private func currentAutoAcceptScopeOnQueue() -> AutoAcceptScope? {
+        guard capabilities.allowsFileTransfer else { return nil }
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard let connection, wireAuthenticatedGeneration == connectionGeneration,
               committedTransportGeneration == connectionGeneration else { return nil }
@@ -5218,7 +5363,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private var mayReceiveRemoteFiles: Bool {
-        remoteInputConnection && wireAuthenticatedGeneration == connectionGeneration &&
+        capabilities.allowsFileTransfer && remoteInputConnection && wireAuthenticatedGeneration == connectionGeneration &&
             remoteFeatures.accepted & RemoteFeatureNegotiation.remoteFileFeature != 0
     }
 
@@ -5245,6 +5390,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func startRemoteFileActionOnQueue(_ selection: RemoteFileAccess.Selection) {
+        guard capabilities.allowsFileTransfer else { return }
         guard mayStartRemoteFiles, remoteFileIO?.hasActiveTransfer != true,
               remoteFileAccess?.waiting == false else { return }
         if case let .upload(urls) = selection, let access = remoteFileAccess, access.grant != nil, access.mayUpload {
@@ -5351,6 +5497,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func mayWriteRemoteFileMessage(_ message: RemoteFileProtocol.Message, startingWrite: Bool) -> Bool {
+        guard capabilities.allowsFileTransfer else { return false }
         switch message {
         case .control(let operation, let request, _, let grant):
             if operation == .release { return true }
@@ -5371,6 +5518,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func beginRemoteFileIOOnQueue(grant: UUID) {
+        guard capabilities.allowsFileTransfer else { return }
         retireRemoteFileIOOnQueue()
         let generation = connectionGeneration
         let identity = remoteFileAccess?.identity
@@ -5402,6 +5550,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func receiveRemoteFileOnQueue(_ header: WireHeader, payload: Data) {
+        guard capabilities.allowsFileTransfer else { return }
         guard mayReceiveRemoteFiles, let message = RemoteFileProtocol.decode(type: header.type, payload: payload, flags: header.flags) else {
             handleStreamError("Invalid remote file message."); return
         }
@@ -5448,6 +5597,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func beginDataTransfer(generation: UInt64) {
+        guard capabilities.allowsFileTransfer else { return }
         guard !remoteInputConnection, generation == connectionGeneration, dataTransfers == nil else { return }
         let manager = DataTransferManager(generation: generation, directory: retainedTransferRoot,
                                           transport: activeTransportKind == .usb ? "USB-C" : "Wi-Fi",
@@ -5499,6 +5649,10 @@ public class NetworkManager: ObservableObject {
         bulk: Bool = false,
         completion: @escaping (NWError?) -> Void = { _ in }
     ) {
+        guard capabilities.allowsCasting || !type.requiresCastingClient else {
+            completion(.posix(.EACCES))
+            return
+        }
         if remoteInputConnection && (!focusOutputAllowed || (focusTransport != nil &&
             (focusTransport != connectionGeneration || focusRevision != remoteFeatures.revision))) {
             switch type {
@@ -5759,6 +5913,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func handleWireMessage(_ message: WireMessage, generation: UInt64) {
+        guard capabilities.allowsCasting || !message.header.type.requiresCastingClient else { return }
         let header = message.header
         let payload = message.payload
         if remoteSecureDesktop.expectsIDR, header.type != .video {
@@ -5815,6 +5970,11 @@ public class NetworkManager: ObservableObject {
                 reconnectWorkItem = nil
                 print("[IPAD][AUTO_RECONNECT_SUCCESS] generation=\(generation)")
                 wireAuthenticatedGeneration = generation
+                if !capabilities.allowsCasting, remoteInputConnection, hostIdentityConfirmed,
+                   let fingerprint = verifiedHostFingerprint, let endpoint = connectionSelectedEndpoint,
+                   let host = WifiReconnectTargetPolicy.target(from: endpoint)?.host {
+                    streamSettingsDefaults.set(["host": host, "fingerprint": fingerprint], forKey: Self.phoneResumeKey)
+                }
                 committedTransportGeneration = nil
                 beginRemoteFeaturesAfterAuthentication(generation: generation)
                 committedTransportAudioAvailable = false
@@ -5825,7 +5985,7 @@ public class NetworkManager: ObservableObject {
                 let supportsNegotiation =
                     (header.flags &
                      WireProtocol.realtimeNegotiationSupportedFlag) != 0
-                if supportsNegotiation && role == .primary {
+                if supportsNegotiation && role == .primary && capabilities.allowsCasting {
                     sendClientCapabilities(for: activeTransportKind)
                 } else {
                     commitLegacyTransport(generation: generation)
@@ -6198,7 +6358,7 @@ public class NetworkManager: ObservableObject {
                 remoteAudio = RemoteAudioSession(preferred: audioPreferred)
                 updateRemoteAudioSuspensionOnQueue()
                 if let request = remoteFeatures.pong(flags: header.flags, now: ProcessInfo.processInfo.systemUptime,
-                                                     requestRemoteFiles: true, requestSecureDesktop: remoteSecureDesktopEnabled,
+                                                     requestRemoteFiles: capabilities.allowsFileTransfer, requestSecureDesktop: remoteSecureDesktopEnabled,
                                                      requestRemoteAudio: audioPreferred,
                                                       requestClipboard: clipboardProbe && wantsRemoteClipboard) {
                     remoteAudioRequested = audioPreferred
@@ -6308,7 +6468,7 @@ public class NetworkManager: ObservableObject {
                 offer.mode == RealtimeTransportMode.legacyTLS ||
                 (offer.mode == RealtimeTransportMode.wifiRTP &&
                  activeTransportKind == .wifi) ||
-                (offer.mode == RealtimeTransportMode.usbSplitTLS &&
+                (offer.mode == RealtimeTransportMode.usbSplitTLS && capabilities.allowsUSB &&
                  activeTransportKind == .usb)
             var accepted =
                 modeAccepted &&
@@ -6917,6 +7077,7 @@ public class NetworkManager: ObservableObject {
     }
 
     private func sendDesiredPipelineMode(reason: String) {
+        guard capabilities.allowsCasting else { return }
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard wireAuthenticatedGeneration == connectionGeneration else { return }
         if activeTransportKind == .usb && !connectionHandoffInProgress { releasePresentedSourceOnQueue() }
@@ -6942,6 +7103,7 @@ public class NetworkManager: ObservableObject {
         preference: DisplayPreference,
         interfaceOrientation: ClientDisplayOrientation
     ) {
+        guard capabilities.allowsCasting else { return }
         dispatchPrecondition(condition: .onQueue(networkQueue))
         guard wireAuthenticatedGeneration == connectionGeneration,
               let capabilities = activeDisplayCapabilities else {
@@ -6993,6 +7155,7 @@ public class NetworkManager: ObservableObject {
     private func sendDisplayConfigurationRequest(
         _ request: DisplayConfigurationRequest, continuingChain: Bool = false
     ) {
+        guard capabilities.allowsCasting else { return }
         usbRotationRecovery = nil
         if isCurrentCommittedUsbStreamingSessionOnQueue(), !connectionHandoffInProgress {
             scheduleUsbDisplayAckTimeout(request.requestId, generation: connectionGeneration)
@@ -8281,6 +8444,7 @@ public class NetworkManager: ObservableObject {
         }
     }
     private func negotiateCaptureTargetsOnQueue() {
+        guard capabilities.allowsCasting else { return }
         let generation = connectionGeneration
         guard !remoteInputConnection, wireAuthenticatedGeneration == generation,
               committedTransportGeneration == generation, captureTargetAdvertisementGeneration == generation,
@@ -8796,6 +8960,7 @@ public class NetworkManager: ObservableObject {
         }
     }
     public func reconnectConnectionOverWifi() {
+        guard capabilities.allowsCasting else { return }
         networkQueue.async { [weak self] in
             guard let self, self.connectionSwitch.offersReconnect,
                   let endpoint = self.connectionSelectedEndpoint ?? self.loadWifiReconnectEndpoint() else { return }
@@ -8836,6 +9001,7 @@ public class NetworkManager: ObservableObject {
         connectionProof?.erase(); connectionProof = nil
     }
     private func handleConnectionSwitchUSBCandidateOnQueue(_ candidate: NWConnection) -> Bool {
+        guard capabilities.allowsUSB else { candidate.cancel(); return true }
         guard let pending = connectionSwitch.pending else { return false }
         if pending.protectedUSB && !pending.accepted && !pending.rollingBack {
             if pending.probeAnswered { holdConnectionSwitchUSBCandidateOnQueue(candidate) }
@@ -9011,6 +9177,7 @@ public class NetworkManager: ObservableObject {
     }
     private func negotiateConnectionControlOnQueue() {
         guard role == .primary else { return }
+        guard capabilities.allowsCasting else { return }
         guard !remoteInputConnection, wireAuthenticatedGeneration == connectionGeneration,
               pairedControlGeneration == connectionGeneration else { return }
         defer { refreshClipboardOnQueue() }
@@ -9058,6 +9225,7 @@ public class NetworkManager: ObservableObject {
     @MainActor public func requestConnectionRoute(_ route: ConnectionRoute, askPC: Bool = false,
                                                  retirePanelInput: (() -> Void)? = nil) {
         guard role == .primary else { return }
+        guard capabilities.allowsCasting else { return }
         guard networkQueue.sync(execute: { !screenSwitchInProgressOnQueue && connectionSwitch.pending == nil }) else { return }
         // Existing UI cancellation releases contacts/keys before the serialized request fence.
         retirePanelInput?()
@@ -9168,6 +9336,7 @@ public class NetworkManager: ObservableObject {
     }
     private func ensureRouteUsbListenerOnQueue(ready: @escaping () -> Void) {
         guard role == .primary else { return }
+        guard capabilities.allowsUSB else { rejectAdmission(.usbTransport); return }
         dispatchPrecondition(condition: .onQueue(networkQueue))
         if let listener = usbListener, case .ready = listener.state { ready(); return }
         guard connectionListenerCompletion == nil, activeTransportKind == .wifi else { return }
@@ -9597,6 +9766,9 @@ public class NetworkManager: ObservableObject {
         }
     }
     var usbIdentityBoundForTesting: Bool { networkQueue.sync { pairedControlGeneration == connectionGeneration } }
+    func rearmUSBListenerForTesting() {
+        networkQueue.async { self.createOrdinaryUsbListenerOnQueue(port: 42042) }
+    }
     var preparedUSBListenerPortForTesting: NWEndpoint.Port? { networkQueue.sync { usbListener?.port } }
     var connectionProofPresentForTesting: Bool { networkQueue.sync { connectionProof != nil } }
     func captureContinuationForTesting(sequence: UInt32, decoder: UInt64, isIDR: Bool) {
@@ -10860,5 +11032,25 @@ struct RemoteSessionInputConfiguration: Equatable {
         _ = mouse.configure(context: configuration?.context, videoRect: videoRect,
             generation: g, inputReady: false)
         sendReset(RemoteInputResetCommand(reason: reason, token: t), g)
+    }
+}
+
+extension ClientDeviceCapabilities {
+    var remoteInputFeatureMask: UInt64 { allowsCasting ? 0x1f : 0x17 } // Bit 3 requests direct touch.
+}
+
+private extension WireMessageType {
+    var requiresCastingClient: Bool {
+        switch self {
+        case .clientCapabilities, .transportOffer, .transportReady, .transportCommit, .usbLaneBind, .usbLaneBindResult,
+             .displayCapabilities, .displayConfigurationRequest, .displayReady, .displayConfigurationFailed, .pipelineMode,
+             .mirrorHello, .mirrorState, .mirrorInput, .mirrorAction, .mirrorCatalogue, .mirrorSwitchRequest,
+             .sourceHello, .sourceCatalogue, .sourceSwitchRequest, .sourceSwitchResult,
+             .connectionHello, .connectionState, .connectionSelectRequest, .connectionSelectResult,
+             .captureAvailabilityHello, .captureAvailability, .directTouchContact, .remoteDirectTouch, .iPadPointerV2:
+            return true
+        default:
+            return false
+        }
     }
 }

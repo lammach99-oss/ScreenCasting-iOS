@@ -1101,8 +1101,41 @@ public class PencilUIKitView: UIView, UIPencilInteractionDelegate {
     public var onOpenSettings: (() -> Void)?
     /// A right-click, drag, pinch or scroll was recognised; drives the first-use toasts.
     var onGestureHint: ((GestureHint) -> Void)?
+    var requiresVideoHit = false
+    var localGestureOwnsInput = false
+    private let directTouchAllowed: Bool
+    private let pencilInteractionsEnabled: Bool
+
+    override public func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        super.point(inside: point, with: event) && (!requiresVideoHit ||
+            contentViewport?.normalizedPoint(for: point, in: bounds) != nil)
+    }
+
+    func retireViewportContacts() {
+        retirePencil()
+        retireViewportPointerContacts()
+    }
+
+    private func retireViewportPointerContacts() {
+        if let scope = remotePointerScope, let input = remoteSessionInput {
+            cancelRemotePointerScope(device: scope.device, input: input)
+        }
+        discardRemoteTouches()
+        if let session = inputSession {
+            session.releaseAll()
+            // UIKit may deliver the old lifts while the local surface owns input.
+            // Finish their retired IDs now so they cannot survive the viewport.
+            for id in v2IDs.values {
+                session.engine.end(id: id, point: .zero, normalized: .zero, cancelled: true)
+            }
+        }
+        v2IDs.removeAll()
+        retireDirectTouch()
+        retireExternalPointer()
+    }
+
     public var contentViewport: VideoContentViewport? {
-        willSet { if newValue != contentViewport { inputSession?.releaseAll(); retirePencil(); retireDirectTouch(); retireExternalPointer() } }
+        willSet { if newValue != contentViewport && !localGestureOwnsInput { retireViewportContacts() } }
         didSet { updateRemoteVideoRect() }
     }
     private var directTouchEnabled = false
@@ -1206,15 +1239,23 @@ public class PencilUIKitView: UIView, UIPencilInteractionDelegate {
         togglePencilRight()
     }
 
-    override public init(frame: CGRect) {
+    override public convenience init(frame: CGRect) {
+        self.init(frame: frame, pencilInteractionsEnabled: true)
+    }
+
+    init(frame: CGRect, pencilInteractionsEnabled: Bool, directTouchAllowed: Bool = true) {
+        self.directTouchAllowed = directTouchAllowed
+        self.pencilInteractionsEnabled = pencilInteractionsEnabled
         super.init(frame: frame)
         isMultipleTouchEnabled = true
         backgroundColor = .clear
         installExternalPointerRecognizers()
-        installPencilMouseInteraction()
+        if pencilInteractionsEnabled { installPencilMouseInteraction() }
     }
 
     required init?(coder: NSCoder) {
+        directTouchAllowed = true
+        pencilInteractionsEnabled = true
         super.init(coder: coder)
         installExternalPointerRecognizers()
         installPencilMouseInteraction()
@@ -1223,7 +1264,10 @@ public class PencilUIKitView: UIView, UIPencilInteractionDelegate {
     override public func layoutSubviews() {
         super.layoutSubviews()
         guard bounds != lastReportedBounds else { return }
-        if lastReportedBounds != nil { inputSession?.releaseAll(); retirePencil(); retireDirectTouch(); retireExternalPointer() }
+        if lastReportedBounds != nil {
+            retirePencil()
+            retireViewportPointerContacts()
+        }
         lastReportedBounds = bounds
         updateRemoteVideoRect()
         onBoundsChanged?(bounds)
@@ -1253,12 +1297,16 @@ public class PencilUIKitView: UIView, UIPencilInteractionDelegate {
         event: UIEvent?,
         cancelled: Bool = false
     ) {
+        guard !localGestureOwnsInput else { return }
+        let touches = pencilInteractionsEnabled ? touches : touches.filter { $0.type != .pencil }
+        guard !touches.isEmpty else { return }
         if let session = inputSession {
             session.engine.withPointerCommand(event.map { $0.modifierFlags.contains(.command) }) {
                 routeV2Touches(touches, flags: flags, event: event, cancelled: cancelled, session: session)
             }
             return
         }
+        guard directTouchAllowed else { return } // Phone uses the shared trackpad session.
         if let input = remoteSessionInput, input.usesEnhancedPointer {
             routeRemoteTouches(touches, flags: flags, event: event, cancelled: cancelled, input: input)
             return
@@ -1371,18 +1419,31 @@ public class PencilUIKitView: UIView, UIPencilInteractionDelegate {
             guard touch.type == .direct || touch.type == .pencil else { continue }
             let key = ObjectIdentifier(touch)
             if flags == 1 {
-                guard window != nil, let mapped else { continue }
-                session.clearTextHistory?()
-                let id = session.engine.allocateContactID(); v2IDs[key] = id
-                session.engine.begin(id: id,pencil: touch.type == .pencil,point: point,normalized: mapped,tapCount: touch.tapCount)
+                guard window != nil else { continue }
+                beginV2Contact(key, point: point, pencil: touch.type == .pencil, tapCount: touch.tapCount, session: session)
             } else if let id = v2IDs[key] {
                 if flags == 4 {
-                    session.engine.end(id: id,point: point,normalized: mapped ?? .zero,cancelled: cancelled || mapped == nil)
-                    v2IDs.removeValue(forKey: key)
+                    endV2Contact(key, point: point, cancelled: cancelled, session: session)
                 } else if let mapped { session.engine.move(id: id,point: point,normalized: mapped) }
                 else { session.engine.end(id: id,point: point,normalized: .zero,cancelled: true); v2IDs.removeValue(forKey: key) }
             }
         }
+    }
+
+    func beginV2Contact(_ key: ObjectIdentifier, point: CGPoint, pencil: Bool, tapCount: Int, session: IPadInputSession) {
+        guard !localGestureOwnsInput, !pencil || pencilInteractionsEnabled,
+              let mapped = contentViewport?.normalizedPoint(for: point, in: bounds) else { return }
+        if !directTouchAllowed { session.engine.mode = .trackpad }
+        session.clearTextHistory?()
+        let id = session.engine.allocateContactID()
+        v2IDs[key] = id
+        session.engine.begin(id: id, pencil: pencil, point: point, normalized: mapped, tapCount: tapCount)
+    }
+
+    func endV2Contact(_ key: ObjectIdentifier, point: CGPoint, cancelled: Bool, session: IPadInputSession) {
+        guard let id = v2IDs.removeValue(forKey: key) else { return }
+        let mapped = contentViewport?.normalizedPoint(for: point, in: bounds)
+        session.engine.end(id: id, point: point, normalized: mapped ?? .zero, cancelled: cancelled || mapped == nil)
     }
 
     func routeV2IndirectPointer(point: CGPoint, normalized: CGPoint?, buttons: UInt,
@@ -1489,9 +1550,9 @@ public class PencilUIKitView: UIView, UIPencilInteractionDelegate {
 
     func configureDirectTouch(active: Bool, generation: UInt64) {
         if directTouchGeneration != generation || !active { retirePencil(); retireDirectTouch() }
-        pencilInputEnabled = active
+        pencilInputEnabled = active && pencilInteractionsEnabled
         directTouchGeneration = generation
-        directTouchEnabled = active
+        directTouchEnabled = active && directTouchAllowed
     }
 
     func configureExternalPointer(active: Bool, generation: UInt64) {

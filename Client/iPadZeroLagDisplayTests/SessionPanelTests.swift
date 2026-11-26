@@ -5,6 +5,35 @@ import SwiftUI
 
 /// The session pill is the one visible handle for every session: what it says, and how Disconnect is confirmed.
 final class SessionPanelTests: XCTestCase {
+    func testPhonePanelOnlyOffersRemoteTools() {
+        XCTAssertEqual(PhonePanelSection.allCases.map(\.rawValue),
+                       ["Input", "PC monitors", "Clipboard", "Audio", "PC actions"])
+    }
+
+    func testPhoneConnectionActionDialsOnlyAnAdmittedSelection() throws {
+        let model = try XCTUnwrap(PhoneConnectScreenModel(capabilities: .init(family: .phone), history: []))
+        var calls = 0
+        let dial: (RemoteIntent) -> Void = { intent in
+            guard case .manual(let target) = intent else { return XCTFail("Expected manual Remote intent") }
+            XCTAssertEqual(target.port, NetworkManager.remoteControlPort)
+            calls += 1
+        }
+        XCTAssertNil(model.connect(.pairSelection, using: dial))
+        let host = String(repeating: "a", count: 4)
+        XCTAssertEqual(model.connect(.manual(.init(host: host, port: NetworkManager.remoteControlPort)),
+                                     using: dial), host)
+        XCTAssertEqual(calls, 1)
+        XCTAssertNil(PhoneConnectScreenModel(capabilities: .init(family: .pad), history: []))
+    }
+
+    @MainActor func testPadRetainsDefaultPresentationSurface() {
+        let surface = ConnectedPresentationSurface(networkManager: NetworkManager())
+        XCTAssertTrue(surface.pencilInteractionsEnabled)
+        XCTAssertTrue(surface.directTouchAllowed)
+        XCTAssertFalse(surface.localZoomEnabled)
+        XCTAssertNil(surface.viewportControls)
+    }
+
     func testExpandedPillLeavesStatusToTheHeader() {
         let session = SessionPanelSnapshot.make(hostLabel: "PC", transport: "Wi-Fi", connection: .streaming,
             control: .viewOnly, mirrorLabel: "Display 2", kind: .castingMirror)

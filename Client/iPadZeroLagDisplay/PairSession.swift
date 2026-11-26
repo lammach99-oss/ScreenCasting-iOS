@@ -6,7 +6,8 @@ import SwiftUI
     @Published private(set) var focus: FocusCoordinator?
     private var authenticatedGenerations: [SlotOrdinal: UInt64] = [:]
     private var names: [SlotOrdinal: String] = [:]
-    private let store = RemotePairStore()
+    private let store: RemotePairStore
+    init(store: RemotePairStore = RemotePairStore()) { self.store = store }
     private var activeScenes = Set<String>()
     var hasActiveScene: Bool { !activeScenes.isEmpty }
 
@@ -24,6 +25,7 @@ import SwiftUI
     }
 
     func restore(primary: NetworkManager) {
+        guard primary.capabilities.allowsSecondPC else { return }
         let pair = store.load()
         guard focus == nil, pair.first != nil, pair.second != nil else { return }
         let coordinator = FocusCoordinator.shared(primary: primary, pair: pair)
@@ -34,6 +36,7 @@ import SwiftUI
     }
 
     func add(primary: NetworkManager, text: String, firstName: String) -> String? {
+        guard primary.capabilities.allowsSecondPC else { return "A second PC is unavailable on this device." }
         let transport = primary.remoteKeyboardGeneration
         guard focus == nil, let target = PairPanelModel.address(text),
               primary.authenticatedRemoteIP(transport),
@@ -68,7 +71,7 @@ import SwiftUI
     }
 
     func retry(_ slot: SlotOrdinal) {
-        guard let focus, [.idle, .offline].contains(focus.model[slot].phase),
+        guard let focus, focus.manager(.one).capabilities.allowsSecondPC, [.idle, .offline].contains(focus.model[slot].phase),
               let target = address(for: focus.model[slot].peer) ?? names[slot].flatMap(PairPanelModel.address) else { return }
         // A watchdog-offline slot keeps its authenticated connection; resume it before dialing again.
         if focus.retryRetainedSlot(slot) { objectWillChange.send(); return }

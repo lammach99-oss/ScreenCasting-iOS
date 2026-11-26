@@ -12,6 +12,129 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         var snapshot: [Data] { lock.lock(); defer { lock.unlock() }; return storage }
     }
     #if targetEnvironment(simulator)
+    @MainActor func testPhoneOnlyDialsExplicitRemoteIntent() async throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: UUID().uuidString))
+        let phone = NetworkManager(userDefaults: defaults, capabilities: .init(family: .phone))
+        var ports: [UInt16] = []
+        phone.dialForTesting = { endpoint, _ in
+            if case .hostPort(_, let port) = endpoint { ports.append(port.rawValue) }
+        }
+        phone.usbListenerFactoryForTesting = { XCTFail("Unexpected listener allocation") }
+        phone.rearmUSBListenerForTesting()
+        phone.startListening()
+        await drain(phone)
+        phone.connect(to: .hostPort(host: .ipv4(.loopback), port: 27020))
+        phone.connect(to: "127.0.0.1")
+        await drain(phone)
+        XCTAssertEqual(phone.admissionError, .wrongPort)
+        WifiReconnectTargetStore.save(.hostPort(host: "127.0.0.1", port: 27015), defaults: defaults)
+        phone.reconnectLastPC()
+        await drain(phone)
+        XCTAssertEqual(phone.admissionError, .staleResume)
+        XCTAssertNil(phone.preparedUSBListenerPortForTesting)
+        XCTAssertTrue(ports.isEmpty)
+        phone.connect(remote: .manual(.init(host: "127.0.0.1", port: 27020)))
+        await drain(phone)
+        XCTAssertEqual(ports, [27020])
+        XCTAssertNil(phone.admissionError)
+    }
+
+    @MainActor func testPhoneRetryFencesGenerationAndPinsSavedIdentity() async throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: UUID().uuidString))
+        let fingerprint = String(repeating: "A", count: 64)
+        defaults.set(["host": "127.0.0.1", "fingerprint": fingerprint], forKey: "ScreenCasting.phone.remoteResume.v1")
+        let phone = NetworkManager(userDefaults: defaults, capabilities: .init(family: .phone))
+        var dials = 0
+        phone.dialForTesting = { endpoint, expected in
+            XCTAssertEqual(endpoint, .hostPort(host: .ipv4(.loopback), port: 27020))
+            XCTAssertTrue(expected == fingerprint)
+            dials += 1
+        }
+        let target = RemoteIntent.Target(host: "127.0.0.1", port: 27020)
+        phone.connect(remote: .resume(target, remoteControl: true,
+            saved: .init(generation: phone.remoteKeyboardGeneration &+ 1, fingerprint: fingerprint)))
+        await drain(phone)
+        XCTAssertEqual(phone.admissionError, .staleResume)
+        XCTAssertEqual(dials, 0)
+        phone.reconnectLastPC()
+        await drain(phone)
+        XCTAssertEqual(dials, 1)
+    }
+
+    private final class PhoneBrowser: DiscoveryBrowser, @unchecked Sendable {
+        var publish: (@Sendable ([NWEndpoint]) -> Void)?
+        func start(queue: DispatchQueue, results: @escaping @Sendable ([NWEndpoint]) -> Void,
+                   state: @escaping @Sendable (NWBrowser.State) -> Void) { publish = results }
+        func cancel() {}
+    }
+
+    @MainActor func testPhoneDiscoveryAdmitsOnlyLiveRemoteResults() async throws {
+        let browser = PhoneBrowser()
+        var completions: [String: (RemoteIntent.Target?) -> Void] = [:]
+        let discovery = DiscoveryManager(capabilities: .init(family: .phone), browserForType: { type in
+            XCTAssertEqual(type, "_sc-remote._tcp")
+            return browser
+        }, resolveService: { name, _, complete in
+            completions[name] = complete
+            return {}
+        })
+        discovery.startBrowsing()
+        let endpoints: [NWEndpoint] = ["A", "B", "C"].map {
+            .service(name: $0, type: "_sc-remote._tcp", domain: "local.", interface: nil)
+        }
+        browser.publish?(endpoints + [.service(name: "D", type: "_screencasting._tcp", domain: "local.", interface: nil)])
+        let deadline = Date().addingTimeInterval(3)
+        while completions.count < 3 && Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertEqual(Set(completions.keys), Set(["A", "B", "C"]))
+        completions["A"]?(.init(host: "127.0.0.1", port: 27020))
+        completions["B"]?(.init(host: "127.0.0.1", port: 27020))
+        completions["C"]?(.init(host: "127.0.0.1", port: 27015))
+        await Task.yield()
+        while discovery.discoveredRemoteIntents.isEmpty && Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertEqual(discovery.discoveredRemoteIntents.count, 1)
+        XCTAssertTrue(discovery.discoveredHosts.isEmpty)
+        discovery.stopBrowsing()
+        completions["A"]?(.init(host: "127.0.0.1", port: 27020))
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async { done.resume() }
+        }
+        XCTAssertTrue(discovery.discoveredRemoteIntents.isEmpty)
+    }
+
+    @MainActor func testPhoneDeclinesCastingAfterRemoteAuthentication() async {
+        let phone = NetworkManager(capabilities: .init(family: .phone))
+        let writes = Writes()
+        phone.controlSendForAudioTesting = { bytes, done in writes.append(bytes); done(nil) }
+        phone.usbListenerFactoryForTesting = { XCTFail("Unexpected USB listener") }
+        let peer = phone.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS, remote: true)
+        defer { phone.stopForTesting() }
+        phone.beginTransferWriterForTesting()
+        for (type, payload) in [(WireMessageType.displayCapabilities, CaptureTargetIntegrationTests.modes),
+                                (.transportOffer, Data()), (.transportCommit, Data())] {
+            phone.receiveCaptureTargetWireForTesting(type: type, payload: payload, flags: 0xffff,
+                generation: peer.generation, connection: peer.connection)
+        }
+        await drain(phone)
+        XCTAssertNil(phone.displayCapabilities)
+        XCTAssertTrue(writes.snapshot.isEmpty)
+        XCTAssertEqual(phone.connectionState, .streaming)
+    }
+
+    @MainActor func testPhoneRefusesSavedPairAndRetry() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: UUID().uuidString))
+        let store = RemotePairStore(defaults: defaults, isTrusted: { _ in true }, legacyReference: { nil })
+        let first = try XCTUnwrap(TrustedPeerReference(String(repeating: "A", count: 64)))
+        let second = try XCTUnwrap(TrustedPeerReference(String(repeating: "B", count: 64)))
+        XCTAssertTrue(store.save(first: first, second: second, selected: .two))
+        let pair = PairSession(store: store)
+        let phone = NetworkManager(userDefaults: defaults, capabilities: .init(family: .phone))
+        pair.restore(primary: phone)
+        XCTAssertNotNil(pair.add(primary: phone, text: "127.0.0.1", firstName: ""))
+        pair.retry(.two)
+        XCTAssertNil(pair.focus)
+        XCTAssertEqual(store.load().selected, .two)
+    }
+
     @MainActor func testUnidentifiedUsbPingNeverCommitsAuthority() async {
         let network = NetworkManager()
         var now: TimeInterval = 0

@@ -438,6 +438,18 @@ public struct VideoContentViewport: Equatable {
             height: rect.height * container.height)
     }
 
+    /// UIKit applies a view transform about its center. Resolve that same transform
+    /// into a normalized video rectangle for direct input and letterbox rejection.
+    func transformed(in bounds: CGRect, by transform: CGAffineTransform) -> Self {
+        guard bounds.width > 0, bounds.height > 0 else { return self }
+        let centered = contentRect(in: bounds).offsetBy(dx: -bounds.midX, dy: -bounds.midY)
+        let result = centered.applying(transform)
+        return Self(rect: CGRect(x: 0.5 + result.minX / bounds.width,
+                                 y: 0.5 + result.minY / bounds.height,
+                                 width: result.width / bounds.width,
+                                 height: result.height / bounds.height))
+    }
+
     static func aspectFit(
         containerSize: CGSize,
         videoSize: CGSize

@@ -45,7 +45,6 @@
 		A317B0000000000000000003 /* RemotePairStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A317F0000000000000000003 /* RemotePairStore.swift */; };
 		A11500000000000000000001 /* RemoteFeatureNegotiation.swift in Sources */ = {isa = PBXBuildFile; fileRef = A11400000000000000000001 /* RemoteFeatureNegotiation.swift */; };
 		A318B0000000000000000001 /* RemoteSlotRole.swift in Sources */ = {isa = PBXBuildFile; fileRef = A318F0000000000000000001 /* RemoteSlotRole.swift */; };
-		AF22B0000000000000000001 /* RemoteUsbTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF22F0000000000000000001 /* RemoteUsbTransport.swift */; };
 		C71500000000000000000002 /* RemoteMonitorState.swift in Sources */ = {isa = PBXBuildFile; fileRef = C71400000000000000000002 /* RemoteMonitorState.swift */; };
 		C81500000000000000000001 /* CaptureTargetProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = C81400000000000000000001 /* CaptureTargetProtocol.swift */; };
 		C81500000000000000000002 /* CaptureTargetState.swift in Sources */ = {isa = PBXBuildFile; fileRef = C81400000000000000000002 /* CaptureTargetState.swift */; };
@@ -113,7 +112,6 @@
 		FA2300000000000000000007 /* GestureHelpTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000007 /* GestureHelpTests.swift */; };
 		FA2300000000000000000008 /* SettingsCopyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000008 /* SettingsCopyTests.swift */; };
 		FA2300000000000000000009 /* RemoteHostDirectoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000009 /* RemoteHostDirectoryTests.swift */; };
-		AF22B0000000000000000002 /* RemoteUsbTransportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF22F0000000000000000002 /* RemoteUsbTransportTests.swift */; };
 		A317B0000000000000000004 /* SessionSwitcherTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A317F0000000000000000004 /* SessionSwitcherTests.swift */; };
 		A323B0000000000000000004 /* PairPanelModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A323F0000000000000000004 /* PairPanelModelTests.swift */; };
 		A321B0000000000000000005 /* SlotDataLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A321F0000000000000000005 /* SlotDataLifecycleTests.swift */; };
@@ -212,7 +210,6 @@
 		A317F0000000000000000003 /* RemotePairStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemotePairStore.swift; sourceTree = "<group>"; };
 		A11400000000000000000001 /* RemoteFeatureNegotiation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteFeatureNegotiation.swift; sourceTree = "<group>"; };
 		A318F0000000000000000001 /* RemoteSlotRole.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteSlotRole.swift; sourceTree = "<group>"; };
-		AF22F0000000000000000001 /* RemoteUsbTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteUsbTransport.swift; sourceTree = "<group>"; };
 		C71400000000000000000002 /* RemoteMonitorState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteMonitorState.swift; sourceTree = "<group>"; };
 		C81400000000000000000001 /* CaptureTargetProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/CaptureTargetProtocol.swift; sourceTree = "<group>"; };
 		C81400000000000000000002 /* CaptureTargetState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/CaptureTargetState.swift; sourceTree = "<group>"; };
@@ -281,7 +278,6 @@
 		FA2200000000000000000007 /* GestureHelpTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GestureHelpTests.swift; sourceTree = "<group>"; };
 		FA2200000000000000000008 /* SettingsCopyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsCopyTests.swift; sourceTree = "<group>"; };
 		FA2200000000000000000009 /* RemoteHostDirectoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteHostDirectoryTests.swift; sourceTree = "<group>"; };
-		AF22F0000000000000000002 /* RemoteUsbTransportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteUsbTransportTests.swift; sourceTree = "<group>"; };
 		A317F0000000000000000004 /* SessionSwitcherTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionSwitcherTests.swift; sourceTree = "<group>"; };
 		A323F0000000000000000004 /* PairPanelModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairPanelModelTests.swift; sourceTree = "<group>"; };
 		A321F0000000000000000005 /* SlotDataLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SlotDataLifecycleTests.swift; sourceTree = "<group>"; };
@@ -405,7 +401,6 @@
 				A317F0000000000000000003 /* RemotePairStore.swift */,
 				A11400000000000000000001 /* RemoteFeatureNegotiation.swift */,
 				A318F0000000000000000001 /* RemoteSlotRole.swift */,
-				AF22F0000000000000000001 /* RemoteUsbTransport.swift */,
 				C71400000000000000000002 /* RemoteMonitorState.swift */,
 				C81400000000000000000001 /* CaptureTargetProtocol.swift */,
 				C81400000000000000000002 /* CaptureTargetState.swift */,
@@ -481,7 +476,6 @@
 				FA2200000000000000000007 /* GestureHelpTests.swift */,
 				FA2200000000000000000008 /* SettingsCopyTests.swift */,
 				FA2200000000000000000009 /* RemoteHostDirectoryTests.swift */,
-				AF22F0000000000000000002 /* RemoteUsbTransportTests.swift */,
 				A317F0000000000000000004 /* SessionSwitcherTests.swift */,
 				A323F0000000000000000004 /* PairPanelModelTests.swift */,
 				A321F0000000000000000005 /* SlotDataLifecycleTests.swift */,
@@ -676,7 +670,6 @@
 				A317B0000000000000000003 /* RemotePairStore.swift in Sources */,
 				A11500000000000000000001 /* RemoteFeatureNegotiation.swift in Sources */,
 				A318B0000000000000000001 /* RemoteSlotRole.swift in Sources */,
-				AF22B0000000000000000001 /* RemoteUsbTransport.swift in Sources */,
 				C71500000000000000000002 /* RemoteMonitorState.swift in Sources */,
 				C81500000000000000000001 /* CaptureTargetProtocol.swift in Sources */,
 				C81500000000000000000002 /* CaptureTargetState.swift in Sources */,
@@ -739,7 +732,6 @@
 				FA2300000000000000000007 /* GestureHelpTests.swift in Sources */,
 				FA2300000000000000000008 /* SettingsCopyTests.swift in Sources */,
 				FA2300000000000000000009 /* RemoteHostDirectoryTests.swift in Sources */,
-				AF22B0000000000000000002 /* RemoteUsbTransportTests.swift in Sources */,
 				A317B0000000000000000004 /* SessionSwitcherTests.swift in Sources */,
 				A323B0000000000000000004 /* PairPanelModelTests.swift in Sources */,
 				A321B0000000000000000005 /* SlotDataLifecycleTests.swift in Sources */,

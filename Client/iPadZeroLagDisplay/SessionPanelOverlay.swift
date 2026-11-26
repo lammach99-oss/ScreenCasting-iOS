@@ -1075,7 +1075,7 @@ struct SessionConnectionPresentation {
         }
     }
 
-    @MainActor private struct RemoteClipboardSection: View {
+    @MainActor struct RemoteClipboardSection: View {
         @ObservedObject var manager: NetworkManager
         @ObservedObject var pasteboard: RemoteClipboardPasteboard
 
@@ -1606,6 +1606,203 @@ struct CaptureAvailabilityNotice: View {
     private func announce() {
         if let text = announcement.update(message) {
             UIAccessibility.post(notification: .announcement, argument: text)
+        }
+    }
+}
+
+
+enum PhonePanelSection: String, CaseIterable {
+    case input = "Input", monitors = "PC monitors", clipboard = "Clipboard", audio = "Audio", actions = "PC actions"
+}
+
+@MainActor struct PhoneSessionView: View {
+    @ObservedObject var network: NetworkManager
+    let host: String
+    let foreground: Bool
+    @StateObject private var input = IPadInputSession.phoneRemote()
+    @StateObject private var remote = RemoteSessionInputState()
+    @StateObject private var viewport = LocalViewportControls()
+    @State private var panel = false
+    @State private var keys = false
+    @State private var frameGeneration: UInt64?
+    @State private var keyboardAfterPanel = false
+    @State private var command: PCAction?
+
+    private enum PCAction: String { case lock = "Lock PC", restart = "Restart PC" }
+
+    private var configuration: RemoteSessionInputConfiguration {
+        .init(remote: network.isRemoteControlSession, connected: network.connectionState == .streaming,
+              active: foreground && !panel && !viewport.isZoomMode, generation: network.remoteKeyboardGeneration,
+              features: network.remoteInputFeatures, context: network.remoteInputContext,
+              ready: network.remoteInputReady, revision: network.remoteInputRevision,
+              monitorSelectionWhilePaused: foreground && panel)
+    }
+
+    private var inputReady: Bool {
+        guard configuration.active, configuration.connected, configuration.remote,
+              frameGeneration == configuration.generation, !network.captureInputBlocked else { return false }
+        if network.remoteInputFeatures & 3 == 0 { return network.permitsLegacyVirtualInput }
+        return network.remoteInputReady && network.remoteInputContext?.state == 1
+    }
+
+    var body: some View {
+        let generation = configuration.generation
+        ZStack(alignment: .bottom) {
+            Color.black.ignoresSafeArea()
+            ConnectedPresentationSurface(networkManager: network, pencilInteractionsEnabled: false,
+                directTouchAllowed: false, localZoomEnabled: true, viewportControls: viewport,
+                remoteKeyboardActive: inputReady, sessionInputActive: inputReady,
+                onKeyboardInput: network.sendKeyboardInput, onTextCommit: network.sendTextCommit,
+                onFrameRendered: {
+                    if foreground && generation == network.remoteKeyboardGeneration && frameGeneration != generation {
+                        frameGeneration = generation
+                    }
+                },
+                onPointerInput: network.sendPointerInput, onOpenSettings: { panel = true })
+                .remoteSessionInput(remote)
+                .iPadInputSession(input)
+                .ignoresSafeArea()
+                .allowsHitTesting(foreground && !panel && (inputReady || viewport.isZoomMode))
+            VStack(spacing: 4) {
+                if keys {
+                    SessionInputBar(onClose: { keys = false; input.releaseAll() })
+                        .environmentObject(input)
+                }
+                HStack {
+                    Button { input.releaseAll(); panel = true } label: {
+                        Text("Session").frame(minWidth: 44, minHeight: 44)
+                    }
+                    zoomButton
+                    Button { viewport.fit() } label: { Text("Fit").frame(minWidth: 44, minHeight: 44) }
+                }
+                .contentShape(Rectangle())
+                .buttonStyle(.bordered)
+                .padding(.horizontal, 8)
+                .background(Color(ink: SessionInk.raised), in: Capsule())
+            }
+            .padding(.bottom, 4)
+        }
+        .preferredColorScheme(.dark)
+        .sheet(isPresented: $panel, onDismiss: {
+            if keyboardAfterPanel && foreground {
+                keys = true
+                input.bind(network, active: inputReady)
+                input.showSoftwareKeyboard()
+            }
+            keyboardAfterPanel = false
+            command = nil
+        }) { sessionPanel.modifier(PhonePrivacyCover()) }
+        .onChange(of: configuration, initial: true) { old, new in
+            if new.requiresRetirement(comparedTo: old) { input.releaseAll() }
+            remote.bind(network)
+            remote.configure(new)
+        }
+        .onChange(of: foreground) { _, active in
+            if !active {
+                frameGeneration = nil
+                keyboardAfterPanel = false
+                panel = false
+                keys = false
+                command = nil
+                input.releaseAll()
+                remote.suspend(reason: 0)
+            }
+        }
+        .onDisappear { input.releaseAll(); remote.suspend(reason: 2) }
+    }
+
+    private var zoomButton: some View {
+        Button {
+            input.releaseAll()
+            viewport.isZoomMode.toggle()
+        } label: {
+            Text(viewport.isZoomMode ? "Exit Zoom" : "Zoom").frame(minWidth: 44, minHeight: 44)
+        }
+    }
+
+    private var monitorSection: some View {
+        Section(PhonePanelSection.monitors.rawValue) {
+            let state = network.remoteMonitorState
+            let enabled = state.isSourceRecovery ? remote.monitorControlAvailable : remote.monitorSelectionEnabled
+            let picker = ScreenPickerSnapshot.make(remote: state, inputReady: network.remoteInputReady,
+                                                   controlEnabled: enabled)
+            ForEach(picker.tiles) { tile in
+                Button {
+                    guard foreground, tile.canSelect, enabled, let catalogue = state.catalogue else { return }
+                    input.releaseAll()
+                    network.requestRemoteMonitor(tile.id, catalogue: catalogue)
+                } label: {
+                    LabeledContent(tile.label, value: tile.status == .showing ? "Showing" : "")
+                }.disabled(!tile.canSelect || !enabled)
+            }
+            if let message = state.statusMessage { Text(message) }
+            else if picker.tiles.isEmpty { Text("Monitor list unavailable.") }
+        }
+    }
+
+    private var sessionPanel: some View {
+        NavigationStack {
+            List {
+                Text(host.isEmpty ? "Connected PC" : host)
+                Text("Remote control connected")
+                ForEach(PhonePanelSection.allCases, id: \.self) { section in
+                    switch section {
+                    case .input:
+                        Section(section.rawValue) {
+                            RemoteMouseControls.choices(directTouchAllowed: false)
+                            Button("Keyboard and special keys") {
+                                viewport.fit()
+                                keyboardAfterPanel = true
+                                panel = false
+                            }.disabled(!network.remoteInputReady && !network.permitsLegacyVirtualInput)
+                            zoomButton
+                            Button("Fit") { viewport.fit() }
+                            DisclosureGroup("Trackpad gestures") {
+                                ForEach(PhoneGestureHelp.items, id: \.gesture) { item in
+                                    LabeledContent(item.gesture, value: item.result)
+                                }
+                            }
+                        }
+                    case .monitors:
+                        monitorSection
+                    case .clipboard:
+                        Section(section.rawValue) {
+                            SessionPanelOverlay.RemoteClipboardSection(manager: network, pasteboard: network.remoteClipboardPasteboard)
+                        }
+                    case .audio:
+                        if let status = network.remoteAudioStatus {
+                            Section(section.rawValue) {
+                                Toggle("Play PC audio", isOn: Binding(get: { network.remoteAudioPreferred },
+                                                                    set: { network.setRemoteAudioPreferred($0) }))
+                                Text(status)
+                            }
+                        }
+                    case .actions:
+                        Section(section.rawValue) {
+                            Button("Lock PC") { command = .lock }
+                            Button("Restart PC") { command = .restart }
+                            NavigationLink("Settings") { SettingsView(networkManager: network) }
+                            Button("Disconnect", role: .destructive) { network.stop() }
+                        }
+                    }
+                }
+            }
+            .environment(\.defaultMinListRowHeight, 44)
+            .navigationTitle("Session")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { Button("Done") { panel = false } }
+            .confirmationDialog(command?.rawValue ?? "", isPresented: Binding(
+                get: { command != nil }, set: { if !$0 { command = nil } }), titleVisibility: .visible,
+                presenting: command) { action in
+                    Button(action.rawValue, role: .destructive) {
+                        guard foreground else { return }
+                        switch action {
+                        case .lock: network.sendRemoteCommand(.lock)
+                        case .restart: network.sendRemoteCommand(.restart, confirmed: true)
+                        }
+                    }
+                    Button("Cancel", role: .cancel) {}
+                }
         }
     }
 }

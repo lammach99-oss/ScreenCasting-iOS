@@ -39,7 +39,7 @@ struct SessionSpecialKey: Identifiable {
     }
 
     private var columns: [GridItem] {
-        [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? 180 : 100), spacing: 8)]
+        typeSize.isAccessibilitySize ? [GridItem(.flexible())] : [GridItem(.adaptive(minimum: 100), spacing: 8)]
     }
 
     var body: some View {
