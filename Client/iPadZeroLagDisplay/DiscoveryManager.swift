@@ -121,36 +121,99 @@ struct RemoteServiceRecord {
 }
 
 // Resolve DNS-SD records without connecting to an unvalidated advertised port.
-private final class RemoteServiceResolution: NSObject, NetServiceDelegate {
-    private let service: NetService
-    let completion: (RemoteServiceRecord?) -> Void
+private final class RemoteServiceResolution {
+    // Apple mDNSShared/dns_sd.h: DNSServiceResolveReply supplies a network-order
+    // port and interface index. DNSServiceGetAddrInfoReply borrows a sockaddr.
+    // DNSServiceSetDispatchQueue and DNSServiceRefDeallocate share this serial queue.
+    private let queue = DispatchQueue(label: "ScreenCasting.remote-resolution")
+    private let name: String
+    private let domain: String
+    private var completion: ((RemoteServiceRecord?) -> Void)?
+    private var ref: DNSServiceRef?
+    private var host: String?
+    private var port: UInt16 = 0
+    private var addresses: [Data] = []
 
     init(name: String, domain: String, completion: @escaping (RemoteServiceRecord?) -> Void) {
-        service = NetService(domain: domain, type: RemoteSessionPolicy.remoteServiceType + ".", name: name)
+        self.name = name
+        self.domain = domain
         self.completion = completion
-        super.init()
     }
 
     func start() {
-        service.delegate = self
-        service.resolve(withTimeout: 5)
+        queue.async {
+            self.queue.asyncAfter(deadline: .now() + 5) { [weak self] in self?.finish() }
+            var service: DNSServiceRef?
+            let error = DNSServiceResolve(&service, 0, 0, self.name, RemoteSessionPolicy.remoteServiceType,
+                                          self.domain, { _, _, interface, error, _, target, port, _, _, context in
+                guard let context else { return }
+                let owner = Unmanaged<RemoteServiceResolution>.fromOpaque(context).takeUnretainedValue()
+                guard error == kDNSServiceErr_NoError, let target else { owner.finish(); return }
+                owner.resolved(String(cString: target), port: UInt16(bigEndian: port), interface: interface)
+            }, Unmanaged.passUnretained(self).toOpaque())
+            self.schedule(service, error: error)
+        }
+    }
+
+    private func schedule(_ service: DNSServiceRef?, error: DNSServiceErrorType) {
+        guard error == kDNSServiceErr_NoError, let service else { finish(); return }
+        ref = service
+        if DNSServiceSetDispatchQueue(service, queue) != kDNSServiceErr_NoError { finish() }
+    }
+
+    private func resolved(_ target: String, port: UInt16, interface: UInt32) {
+        guard port == NetworkManager.remoteControlPort else { finish(); return }
+        self.host = target
+        self.port = port
+        if RemoteHostAddress.parse(target) != nil { finish(); return }
+
+        releaseRef()
+        var service: DNSServiceRef?
+        let families = DNSServiceProtocol(kDNSServiceProtocol_IPv4 | kDNSServiceProtocol_IPv6)
+        let error = DNSServiceGetAddrInfo(&service, 0, interface, families, target, {
+            _, flags, _, error, _, address, _, context in
+            guard let context else { return }
+            let owner = Unmanaged<RemoteServiceResolution>.fromOpaque(context).takeUnretainedValue()
+            // A negative answer for one family can precede a positive answer for the other.
+            if error == kDNSServiceErr_NoSuchRecord { return }
+            guard error == kDNSServiceErr_NoError, let address else { owner.finish(); return }
+            owner.update(address, flags: flags)
+        }, Unmanaged.passUnretained(self).toOpaque())
+        schedule(service, error: error)
+    }
+
+    private func update(_ address: UnsafePointer<sockaddr>, flags: DNSServiceFlags) {
+        let family = Int32(address.pointee.sa_family)
+        guard family == AF_INET || family == AF_INET6 else { return }
+        let size = family == AF_INET ? MemoryLayout<sockaddr_in>.size : MemoryLayout<sockaddr_in6>.size
+        guard Int(address.pointee.sa_len) == size else { return }
+        let data = Data(bytes: address, count: size)
+        addresses.removeAll { $0 == data }
+        if flags & DNSServiceFlags(kDNSServiceFlagsAdd) != 0 { addresses.append(data) }
+        // Keep IPv6 until the deadline so a later IPv4 answer can take precedence.
+        if flags & DNSServiceFlags(kDNSServiceFlagsMoreComing) == 0,
+           addresses.contains(where: { $0[1] == UInt8(AF_INET) }) { finish() }
+    }
+
+    private func releaseRef() {
+        if let ref { DNSServiceRefDeallocate(ref) }
+        ref = nil
+    }
+
+    private func finish() {
+        releaseRef()
+        let callback = completion
+        completion = nil
+        guard let callback else { return }
+        let record = host.map { RemoteServiceRecord(host: $0, port: port, addresses: addresses) }
+        DispatchQueue.main.async { callback(record) }
     }
 
     func cancel() {
-        service.delegate = nil
-        service.stop()
-    }
-
-    func netServiceDidResolveAddress(_ sender: NetService) {
-        guard sender === service, let port = UInt16(exactly: sender.port) else {
-            completion(nil)
-            return
+        queue.async {
+            self.releaseRef()
+            self.completion = nil
         }
-        completion(.init(host: sender.hostName, port: port, addresses: sender.addresses ?? []))
-    }
-
-    func netService(_ sender: NetService, didNotResolve errorDict: [String: NSNumber]) {
-        completion(nil)
     }
 }
 

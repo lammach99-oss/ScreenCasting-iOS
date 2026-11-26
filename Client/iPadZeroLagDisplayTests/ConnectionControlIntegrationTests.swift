@@ -119,6 +119,61 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         discovery.stopBrowsing()
     }
 
+    @MainActor func testPhoneResolverTimeoutWithdrawalStopAndReadmission() async throws {
+        let browser = PhoneBrowser()
+        var replies: [(RemoteServiceRecord?) -> Void] = []
+        var cancelled: [Int] = []
+        let discovery = DiscoveryManager(capabilities: .init(family: .phone), browserForType: { _ in browser },
+                                        resolveService: { _, _, reply in
+            let index = replies.count
+            replies.append(reply)
+            return { cancelled.append(index) }
+        })
+        func waitFor(_ condition: () -> Bool) async throws {
+            let deadline = Date().addingTimeInterval(3)
+            while !condition() && Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
+            enum WaitError: Error { case resolverDeadlineExceeded }
+            if !condition() { throw WaitError.resolverDeadlineExceeded }
+        }
+        let endpoint = NWEndpoint.service(name: "A", type: "_sc-remote._tcp", domain: "local.", interface: nil)
+        let srv = RemoteServiceRecord(host: "srv.example.", port: 27020, addresses: [])
+        let numeric = Data([16, 2, 0, 0, 192, 0, 2, 1] + Array(repeating: UInt8(0), count: 8))
+        discovery.startBrowsing()
+        browser.changeState?(.ready)
+        browser.publish?([endpoint])
+        try await waitFor { replies.count == 1 }
+        try XCTUnwrap(replies.first)(nil) // Timeout through the resolver seam.
+        try await waitFor { cancelled == [0] && discovery.status == .empty }
+        browser.publish?([endpoint])
+        try await waitFor { replies.count == 2 }
+        browser.publish?([])
+        try await waitFor { cancelled == [0, 1] }
+        browser.publish?([endpoint])
+        try await waitFor { replies.count == 3 }
+        replies[1](srv) // Withdrawn generation of the same endpoint.
+        replies[2](.init(host: nil, port: 27015, addresses: [numeric]))
+        try await waitFor { discovery.status == .empty && cancelled.contains(2) }
+        XCTAssertTrue(discovery.remoteRows.isEmpty)
+        browser.publish?([endpoint])
+        try await waitFor { replies.count == 4 }
+        replies[3](srv)
+        try await waitFor { discovery.remoteRows.first?.target.host == "srv.example" }
+        discovery.stopBrowsing()
+        discovery.startBrowsing()
+        browser.publish?([endpoint])
+        try await waitFor { replies.count == 5 }
+        discovery.stopBrowsing()
+        XCTAssertTrue(cancelled.contains(4))
+        replies[4](srv)
+        discovery.startBrowsing()
+        browser.publish?([endpoint])
+        try await waitFor { replies.count == 6 }
+        XCTAssertTrue(discovery.remoteRows.isEmpty)
+        replies[5](.init(host: nil, port: 27020, addresses: [numeric]))
+        try await waitFor { discovery.remoteRows.first?.target.host == "192.0.2.1" }
+        discovery.stopBrowsing()
+    }
+
     @MainActor func testPadDiscoveryStillPublishesCastingEndpointWithoutRemoteResolution() async throws {
         let browser = PhoneBrowser()
         let discovery = DiscoveryManager(capabilities: .init(family: .pad), browserForType: { type in
