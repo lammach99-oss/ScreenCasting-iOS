@@ -222,10 +222,21 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         }
     }
 
+    // Poll inline so every sleep yields the main actor to pasteboard/apply work
+    // (the shared Task+XCTWaiter helper starved it: 0.3 s pass became a 27 s timeout).
     @MainActor private func waitFor(_ traffic: String = "clipboard traffic", file: StaticString = #filePath,
-                                    line: UInt = #line, _ condition: @escaping @MainActor () -> Bool) async throws {
-        try await awaitFixtureCondition(traffic, file: file, line: line, condition: condition)
+                                    line: UInt = #line, _ condition: @MainActor () -> Bool) async throws {
+        let deadline = ProcessInfo.processInfo.systemUptime + 10
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            if condition() { return }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        if condition() { return }
+        XCTFail("Timed out waiting for \(traffic)", file: file, line: line)
+        throw ClipboardWaitError.timedOut
     }
+
+    private enum ClipboardWaitError: Error { case timedOut }
 
     @MainActor private func acknowledgeProbe(_ host: Host, owner: Owner) async throws -> UUID {
         try await waitFor { !host.frames(6, flags: 0x1000).isEmpty }
