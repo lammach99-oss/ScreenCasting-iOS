@@ -96,6 +96,48 @@ final class ClipboardProviderReadTests: XCTestCase {
         }
     }
 
+    @MainActor func testInboundCompletionCanImmediatelyPaste() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let bytes = Data("manual paste".utf8)
+        try bytes.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let type = UTType.utf8PlainText
+        let provider = makeProvider(type, file: url)
+        let worker = RemoteClipboardContentWorker()
+        let sent = expectation(description: "Manual paste after inbound completion")
+        let (reader, _, _) = makeReader(provider, type: type, worker: worker) { content in
+            XCTAssertEqual(content.bytes, bytes)
+            sent.fulfill()
+        }
+        defer { reader.update(supported: false, grant: nil, reason: .ok) }
+        XCTAssertTrue(worker.submit {
+            XCTAssertNotNil(RemoteClipboardContent.prepare(Data([65]), format: .text, formats: 1, fromWire: true))
+            // Hold this stack frame until the provider has attempted to submit the next copy.
+            DispatchQueue.main.sync { reader.paste([provider]) }
+        })
+        await fulfillment(of: [sent], timeout: 2)
+        XCTAssertEqual(provider.fileReads, 1)
+    }
+
+    @MainActor func testManualPasteDuringPreparationShowsTransferNotice() async {
+        let provider = makeProvider(.utf8PlainText, file: FileManager.default.temporaryDirectory)
+        let worker = RemoteClipboardContentWorker()
+        let pasted = expectation(description: "Busy paste handled")
+        let (reader, _, _) = makeReader(provider, type: .utf8PlainText, worker: worker) { _ in
+            XCTFail("Busy paste unexpectedly sent")
+        }
+        defer { reader.update(supported: false, grant: nil, reason: .ok) }
+        XCTAssertTrue(worker.submit {
+            DispatchQueue.main.sync {
+                reader.paste([provider])
+                XCTAssertNotNil(reader.transferNotice)
+                XCTAssertEqual(provider.fileReads, 0)
+                pasted.fulfill()
+            }
+        })
+        await fulfillment(of: [pasted], timeout: 2)
+    }
+
     private func makeProvider(_ type: UTType, file: URL) -> Provider {
         let provider = Provider()
         provider.file = file
@@ -104,7 +146,8 @@ final class ClipboardProviderReadTests: XCTestCase {
     }
 
     @MainActor private func makeReader(
-        _ provider: Provider, type: UTType, send: @escaping (RemoteClipboardContent) -> Void
+        _ provider: Provider, type: UTType, worker: RemoteClipboardContentWorker = RemoteClipboardContentWorker(),
+        send: @escaping (RemoteClipboardContent) -> Void
     ) -> (RemoteClipboardPasteboard, () -> Void, RemoteClipboardAuthority.Grant) {
         var revision = 0
         let source = RemoteClipboardPasteboard.ReadSource(
@@ -116,7 +159,7 @@ final class ClipboardProviderReadTests: XCTestCase {
             maxChunk: 128, formats: 3, nonce: UUID(), token: token, epoch: 1, requestID: 1, reason: .ok)
         authority.setSceneActive(true)
         authority.update(state, deadline: ProcessInfo.processInfo.systemUptime + 10, transfer: nil)
-        let reader = RemoteClipboardPasteboard(authority: authority, worker: RemoteClipboardContentWorker(),
+        let reader = RemoteClipboardPasteboard(authority: authority, worker: worker,
             send: { _, _, content, _ in send(content) }, changed: { _, _ in }, readSource: source)
         reader.update(supported: true, grant: grant, reason: .ok)
         return (reader, { revision += 1 }, grant)
@@ -472,13 +515,21 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         host.manager.remoteClipboardPasteboard.pollForTesting()
         host.manager.remoteClipboardPasteboard.pollForTesting()
         XCTAssertEqual(provider.fileReads, 0)
-        XCTAssertTrue(host.manager.remoteClipboardPasteboard.canPaste([provider]))
-        host.manager.remoteClipboardPasteboard.paste([provider])
-        let payload = try await host.frame(87)
+        let pasteboard = host.manager.remoteClipboardPasteboard
+        XCTAssertFalse(pasteboard.automatic)
+        XCTAssertTrue(pasteboard.canPaste([provider]))
+        pasteboard.paste([provider])
+        XCTAssertEqual(provider.fileReads, 1)
+        let payload: Data
+        do {
+            payload = try await host.frame(87)
+        } catch {
+            XCTFail("Manual paste ended with canSend=\(pasteboard.canSend), notice=\(pasteboard.transferNotice ?? "none")")
+            throw error
+        }
         guard case .offer(let offer)? = Wire.decode(type: .clipboardOffer, payload: payload) else {
             return XCTFail("Expected iPad offer")
         }
-        XCTAssertEqual(provider.fileReads, 1)
         XCTAssertEqual(offer.digest, Data(SHA256.hash(data: seed)))
         host.send(.response(offer.prefix, true, .ok, 1), to: owner)
         _ = try await host.frame(90)

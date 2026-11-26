@@ -13,6 +13,8 @@ struct RemoteClipboardContent {
 
     static func prepare(_ bytes: Data, format: Wire.Format, formats: UInt8,
                         fromWire: Bool) -> RemoteClipboardContent? {
+        // The caller may publish completion as soon as this function returns.
+        defer { RemoteClipboardContentWorker.releasePreparation() }
         let canonical = format == .text ? Wire.canonicalText(bytes, fromWire: fromWire) : png(bytes, fromWire: fromWire)
         guard let canonical else { return nil }
         return Self(format: format, formats: formats, bytes: canonical, digest: Data(SHA256.hash(data: canonical)))
@@ -130,9 +132,20 @@ struct RemoteClipboardContent {
 
 /// One work item across providers and receive validation, with immediate backpressure.
 final class RemoteClipboardContentWorker {
+    private static let releaseKey = DispatchSpecificKey<() -> Void>()
     private let lock = NSLock()
     private let queue = DispatchQueue(label: "Remote clipboard content", qos: .utility)
     private var busy = false
+
+    var isBusy: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return busy
+    }
+
+    fileprivate static func releasePreparation() {
+        DispatchQueue.getSpecific(key: releaseKey)?()
+    }
 
     func submit(_ operation: @escaping () -> Void) -> Bool {
         lock.lock()
@@ -140,10 +153,17 @@ final class RemoteClipboardContentWorker {
         guard !busy else { return false }
         busy = true
         queue.async {
+            // Consume this operation's release exactly once. Another submit may
+            // reserve the serial queue while this operation publishes its result.
+            self.queue.setSpecific(key: Self.releaseKey, value: {
+                self.queue.setSpecific(key: Self.releaseKey, value: nil)
+                self.lock.lock()
+                self.busy = false
+                self.lock.unlock()
+            })
+            // Covers cancellation or retirement before prepare is entered.
+            defer { Self.releasePreparation() }
             operation()
-            self.lock.lock()
-            self.busy = false
-            self.lock.unlock()
         }
         return true
     }

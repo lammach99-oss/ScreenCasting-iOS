@@ -43,17 +43,30 @@ import SwiftUI
 }
 
 @MainActor struct SecondPCChooser: View {
-    let primary: NetworkManager
+    @StateObject private var presence = HostPresenceMonitor()
+    @ObservedObject var primary: NetworkManager
     let firstName: String
     @Environment(\.dismiss) private var dismiss
     @State private var text = ""
     @State private var issue: String?
+    @State private var entries = PairPanelModel.recent(RecentRemoteHostStore.load())
     var body: some View {
+        let live = PresenceTracking.liveAddresses(primary)
         NavigationStack {
             Form {
                 Section("Recent remote hosts") {
-                    ForEach(PairPanelModel.recent(RecentRemoteHostStore.load())) { entry in
-                        Button(entry.host) { add(entry.host) }.frame(minHeight: 44)
+                    ForEach(entries) { entry in
+                        Button { add(entry.host) } label: {
+                            HStack {
+                                Text(entry.host)
+                                Spacer()
+                                if let host = entry.presenceAddress, live.contains(host) {
+                                    Text("Connected").font(.caption)
+                                } else {
+                                    HostPresenceBadge(state: entry.presenceAddress.flatMap { presence.states[$0] } ?? .checking)
+                                }
+                            }.accessibilityElement(children: .combine)
+                        }.frame(minHeight: 44)
                     }
                 }
                 Section("Remote control address") {
@@ -62,6 +75,7 @@ import SwiftUI
                 }
                 if let issue { Text(issue) }
             }
+            .modifier(PresenceTracking(monitor: presence, hosts: entries.compactMap(\.presenceAddress), excluded: live))
             .navigationTitle("Add second PC")
             .toolbar { Button("Cancel") { dismiss() } }
         }

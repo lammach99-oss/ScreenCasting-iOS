@@ -996,7 +996,11 @@ struct RemoteAddressField: View {
 
     @MainActor private struct RecentHosts: View {
         let owner: SessionScreen
+        @StateObject private var presence = HostPresenceMonitor()
         @ViewBuilder var body: some View {
+            let live = owner.focus.map { coordinator in
+                PresenceTracking.liveAddresses(coordinator.manager(.one)).union(PresenceTracking.liveAddresses(coordinator.manager(.two)))
+            } ?? PresenceTracking.liveAddresses(owner.networkManager)
             if !owner.recentRemoteHosts.isEmpty {
                 Text("Recent").font(.footnote).foregroundStyle(Color.inkSecondary)
                 VStack(spacing: 0) {
@@ -1021,6 +1025,10 @@ struct RemoteAddressField: View {
                                         .font(.caption).foregroundStyle(Color.inkSecondary)
                                 }
                                 if !owner.typeSize.isAccessibilitySize { Spacer(minLength: 8) }
+                                if let host = entry.presenceAddress {
+                                    if live.contains(host) { Text("Connected").font(.caption) }
+                                    else { HostPresenceBadge(state: presence.states[host] ?? .checking) }
+                                }
                                 Image(systemName: "chevron.right").foregroundStyle(Color.inkSecondary).accessibilityHidden(true)
                             }
                             .padding(.horizontal, 14)
@@ -1029,6 +1037,7 @@ struct RemoteAddressField: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .accessibilityElement(children: .combine)
                         .disabled(owner.isConnectBusy)
                         .accessibilityHint("Connects to this PC using the saved mode")
                         .contextMenu {
@@ -1043,6 +1052,8 @@ struct RemoteAddressField: View {
                         }
                     }
                 }
+                .modifier(PresenceTracking(monitor: presence, hosts: owner.recentRemoteHosts.compactMap(\.presenceAddress),
+                                           excluded: live, enabled: owner.showIPEntry && !owner.isConnectBusy))
                 .background(Color.inkSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             }
         }
@@ -1429,6 +1440,7 @@ struct RemoteAddressField: View {
 
 
 @MainActor struct PhoneRootView: View {
+    @StateObject private var presence = HostPresenceMonitor()
     @StateObject private var network: NetworkManager
     @StateObject private var discovery: DiscoveryManager
     @Environment(\.scenePhase) private var phase
@@ -1511,7 +1523,7 @@ struct RemoteAddressField: View {
                                 case .recent:
                                     if model.recentHosts.isEmpty { Text("No recent remote hosts.") }
                                     ForEach(model.recentHosts) { host in
-                                        Button(host.host) { selection = .recent(host) }
+                                        PresenceButton(title: host.host, state: host.presenceAddress.flatMap { presence.states[$0] } ?? .checking) { selection = .recent(host) }
                                     }
                                 case .manual:
                                     RemoteAddressField(address: $address)
@@ -1533,7 +1545,7 @@ struct RemoteAddressField: View {
                                             Text("Searching for PCs...")
                                         }
                                         ForEach(discovery.remoteRows) { row in
-                                            Button(row.displayName) { selection = row.intent }
+                                            PresenceButton(title: row.displayName, state: .online) { selection = row.intent }
                                         }
                                     }
                                 }
@@ -1563,6 +1575,8 @@ struct RemoteAddressField: View {
                 }
             }
             .environment(\.defaultMinListRowHeight, 44)
+            .modifier(PresenceTracking(monitor: presence, hosts: history.compactMap(\.presenceAddress),
+                                       enabled: canChooseHost, sightings: discovery.remoteRows.compactMap { RemoteHostAddress.parse($0.target.host) }))
             .navigationTitle("Remote control")
             .toolbar { Button("Settings") { settings = true } }
         }

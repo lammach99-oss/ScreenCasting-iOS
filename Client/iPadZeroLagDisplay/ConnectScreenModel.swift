@@ -93,3 +93,10 @@ public struct ConnectScreenStatus: Equatable {
 public enum CastingPermissionCopy {
     public static let requestSent = "Request sent. Approve it in the pop-up on the PC."
 }
+
+extension RecentRemoteHost {
+    var presenceAddress: RemoteHostAddress? {
+        guard remoteControl else { return nil }
+        return RemoteHostAddress.parse(host)
+    }
+}

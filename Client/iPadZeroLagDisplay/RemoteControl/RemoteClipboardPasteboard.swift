@@ -198,6 +198,10 @@ final class RemoteClipboardPasteboard: ObservableObject {
     func paste(_ providers: [NSItemProvider]) {
         guard canPaste(providers), let grant,
               let selected = Self.representation(providers[0].registeredTypeIdentifiers) else { return }
+        guard !worker.isBusy else {
+            transferNotice = "Clipboard is busy. Use the paste button to try again."
+            return
+        }
         let revision = readSource.changeCount()
         changed(grant, revision)
         load(providers[0], selected: selected, revision: revision, grant: grant, automatic: false)

@@ -28,6 +28,7 @@
 		FB2500000000000000000002 /* TrustedHostSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000002 /* TrustedHostSettings.swift */; };
 		FB2500000000000000000001 /* WireCommands.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000001 /* WireCommands.swift */; };
 		FB2500000000000000000005 /* ScreenPickerModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000005 /* ScreenPickerModel.swift */; };
+		B340B0000000000000000001 /* HostPresence.swift in Sources */ = {isa = PBXBuildFile; fileRef = B340F0000000000000000001 /* HostPresence.swift */; };
 		FB2500000000000000000006 /* SessionPanelOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000006 /* SessionPanelOverlay.swift */; };
 		FB2500000000000000000007 /* ConnectScreenModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000007 /* ConnectScreenModel.swift */; };
 		FB2500000000000000000008 /* GestureHelp.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2400000000000000000008 /* GestureHelp.swift */; };
@@ -112,6 +113,7 @@
 		FA2300000000000000000007 /* GestureHelpTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000007 /* GestureHelpTests.swift */; };
 		FA2300000000000000000008 /* SettingsCopyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000008 /* SettingsCopyTests.swift */; };
 		FA2300000000000000000009 /* RemoteHostDirectoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000009 /* RemoteHostDirectoryTests.swift */; };
+		B340B0000000000000000002 /* HostPresenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B340F0000000000000000002 /* HostPresenceTests.swift */; };
 		A317B0000000000000000004 /* SessionSwitcherTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A317F0000000000000000004 /* SessionSwitcherTests.swift */; };
 		A323B0000000000000000004 /* PairPanelModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A323F0000000000000000004 /* PairPanelModelTests.swift */; };
 		A321B0000000000000000005 /* SlotDataLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A321F0000000000000000005 /* SlotDataLifecycleTests.swift */; };
@@ -193,6 +195,7 @@
 		FB2400000000000000000002 /* TrustedHostSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrustedHostSettings.swift; sourceTree = "<group>"; };
 		FB2400000000000000000001 /* WireCommands.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WireCommands.swift; sourceTree = "<group>"; };
 		FB2400000000000000000005 /* ScreenPickerModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/ScreenPickerModel.swift; sourceTree = "<group>"; };
+		B340F0000000000000000001 /* HostPresence.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/HostPresence.swift; sourceTree = "<group>"; };
 		FB2400000000000000000006 /* SessionPanelOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionPanelOverlay.swift; sourceTree = "<group>"; };
 		FB2400000000000000000007 /* ConnectScreenModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectScreenModel.swift; sourceTree = "<group>"; };
 		FB2400000000000000000008 /* GestureHelp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GestureHelp.swift; sourceTree = "<group>"; };
@@ -278,6 +281,7 @@
 		FA2200000000000000000007 /* GestureHelpTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GestureHelpTests.swift; sourceTree = "<group>"; };
 		FA2200000000000000000008 /* SettingsCopyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsCopyTests.swift; sourceTree = "<group>"; };
 		FA2200000000000000000009 /* RemoteHostDirectoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteHostDirectoryTests.swift; sourceTree = "<group>"; };
+		B340F0000000000000000002 /* HostPresenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HostPresenceTests.swift; sourceTree = "<group>"; };
 		A317F0000000000000000004 /* SessionSwitcherTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionSwitcherTests.swift; sourceTree = "<group>"; };
 		A323F0000000000000000004 /* PairPanelModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairPanelModelTests.swift; sourceTree = "<group>"; };
 		A321F0000000000000000005 /* SlotDataLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SlotDataLifecycleTests.swift; sourceTree = "<group>"; };
@@ -384,6 +388,7 @@
 				F4C140000000000000000001 /* ConnectionControlProtocol.swift */,
 				CA8114000000000000000001 /* CaptureAvailability.swift */,
 				FB2400000000000000000005 /* ScreenPickerModel.swift */,
+				B340F0000000000000000001 /* HostPresence.swift */,
 				FB2400000000000000000006 /* SessionPanelOverlay.swift */,
 				FB2400000000000000000007 /* ConnectScreenModel.swift */,
 				FB2400000000000000000008 /* GestureHelp.swift */,
@@ -476,6 +481,7 @@
 				FA2200000000000000000007 /* GestureHelpTests.swift */,
 				FA2200000000000000000008 /* SettingsCopyTests.swift */,
 				FA2200000000000000000009 /* RemoteHostDirectoryTests.swift */,
+				B340F0000000000000000002 /* HostPresenceTests.swift */,
 				A317F0000000000000000004 /* SessionSwitcherTests.swift */,
 				A323F0000000000000000004 /* PairPanelModelTests.swift */,
 				A321F0000000000000000005 /* SlotDataLifecycleTests.swift */,
@@ -653,6 +659,7 @@
 				F4C150000000000000000001 /* ConnectionControlProtocol.swift in Sources */,
 				CA8115000000000000000001 /* CaptureAvailability.swift in Sources */,
 				FB2500000000000000000005 /* ScreenPickerModel.swift in Sources */,
+				B340B0000000000000000001 /* HostPresence.swift in Sources */,
 				FB2500000000000000000006 /* SessionPanelOverlay.swift in Sources */,
 				FB2500000000000000000007 /* ConnectScreenModel.swift in Sources */,
 				FB2500000000000000000008 /* GestureHelp.swift in Sources */,
@@ -732,6 +739,7 @@
 				FA2300000000000000000007 /* GestureHelpTests.swift in Sources */,
 				FA2300000000000000000008 /* SettingsCopyTests.swift in Sources */,
 				FA2300000000000000000009 /* RemoteHostDirectoryTests.swift in Sources */,
+				B340B0000000000000000002 /* HostPresenceTests.swift in Sources */,
 				A317B0000000000000000004 /* SessionSwitcherTests.swift in Sources */,
 				A323B0000000000000000004 /* PairPanelModelTests.swift in Sources */,
 				A321B0000000000000000005 /* SlotDataLifecycleTests.swift in Sources */,
