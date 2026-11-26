@@ -1091,6 +1091,14 @@ final class TransportTelemetry {
     /// Completion is invoked on the utility queue. The underlying synchronous
     /// file-system calls cannot be cancelled, so lifecycle callers must impose
     /// their own timeout if they need a bounded external wait.
+    // startLogging returns the summary CSV URL. Preserve its exact on-disk bytes.
+    func singleSessionBytes() -> Data {
+        fileQueue.sync {
+            guard let url = exportFileURL else { return Data() }
+            return (try? Data(contentsOf: url)) ?? Data()
+        }
+    }
+
     func stopLogging(completion: (() -> Void)? = nil) {
         let snapshot = takeExportSnapshot(cumulative: true)
         fileQueue.async { [weak self] in

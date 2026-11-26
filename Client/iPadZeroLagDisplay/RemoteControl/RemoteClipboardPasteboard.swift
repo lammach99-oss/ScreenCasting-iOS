@@ -49,6 +49,11 @@ final class RemoteClipboardPasteboard: ObservableObject {
         resetFocus()
     }
 
+    func unbindFocus() {
+        resetFocus()
+        focus = nil
+    }
+
     func resetFocus() {
         update(supported: supported, grant: nil, reason: .ok)
         ownWritePending = false

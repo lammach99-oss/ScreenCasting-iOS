@@ -474,11 +474,42 @@ public class NetworkManager: ObservableObject {
         objectWillChange.send()
     }
 
-    func expireFocusResume(_ binding: FocusBinding) {
-        networkQueue.async { [weak self] in
-            guard let self, self.connectionGeneration == binding.transport,
-                  self.focusTransport == binding.transport, self.remoteInputConnection else { return }
-            self.handleStreamError("Remote video resume timed out.")
+    func focusRoute(_ route: SlotRoute?) -> SlotTransportClass {
+        networkQueue.sync { activeTransportKind == .usb ? .usb : (route == .tailscale ? .tailscale : .wifi) }
+    }
+
+    func singleSessionDiagnostics() -> Data { transportTelemetry.singleSessionBytes() }
+
+    func beginFileSlotFocus(_ slot: SlotOrdinal) {
+        networkQueue.sync {
+            fileSlot = slot
+            revokeRemoteFilesOnQueue()
+        }
+    }
+
+    func promoteFileSlotFocus(epoch: UInt64) {
+        networkQueue.sync {
+            fileSlotEpoch = epoch
+            _ = remoteFileActionClock.advance()
+            fileSlotScope?.promote(epoch: epoch)
+            publishRemoteFileAccessOnQueue()
+        }
+    }
+
+    func cancelFileSlotFocus(epoch: UInt64) {
+        networkQueue.sync {
+            guard fileSlotEpoch == epoch else { return }
+            fileSlotEpoch = nil
+            fileSlotScope?.cancelOnSwap(epoch: epoch)
+            revokeRemoteFilesOnQueue()
+        }
+    }
+
+    func endFileSlotFocus() {
+        networkQueue.sync {
+            revokeRemoteFilesOnQueue()
+            fileSlot = nil
+            fileSlotEpoch = nil
         }
     }
 
@@ -550,6 +581,10 @@ public class NetworkManager: ObservableObject {
     }
     private var remoteFileAccess: RemoteFileAccess?
     private let remoteFileActionClock = ConnectionGenerationClock()
+    // These fields and the file scope are isolated to networkQueue.
+    private var fileSlot: SlotOrdinal?
+    private var fileSlotEpoch: UInt64?
+    private var fileSlotScope: RemoteFileSlotScope?
     private var remoteFileIO: DataTransferManager?
     private var remoteFileBackgrounded = false
     private var remoteFilePacing = RemoteFileMediaPacing()
@@ -5121,15 +5156,17 @@ public class NetworkManager: ObservableObject {
         let generation: UInt64
         let remote: Bool
         let fileEpoch: UInt64
+        let slotAction: RemoteFileSlotScope.Action?
     }
 
     @MainActor var transferActionScope: TransferActionScope {
         TransferActionScope(generation: connectionGenerationClock.current, remote: isRemoteControlSession,
-                            fileEpoch: remoteFileActionClock.current)
+                            fileEpoch: remoteFileActionClock.current, slotAction: transferSnapshot.slotAction)
     }
 
     private func ownsTransferAction(_ scope: TransferActionScope) -> Bool {
         scope.generation == connectionGeneration && scope.remote == remoteInputConnection &&
+            (fileSlot == nil || fileSlotEpoch != nil) &&
             (!scope.remote || scope.fileEpoch == remoteFileActionClock.current) &&
             wireAuthenticatedGeneration == scope.generation && committedTransportGeneration == scope.generation
     }
@@ -5161,6 +5198,9 @@ public class NetworkManager: ObservableObject {
                   self.wireAuthenticatedGeneration == generation, self.committedTransportGeneration == generation else { return }
             if self.remoteInputConnection {
                 guard self.remoteFileAccess?.grant != nil, self.isForegroundActive else { return }
+                if self.fileSlot != nil {
+                    guard let action = consent.slotAction, self.fileSlotScope?.isAuthorized(action) == true else { return }
+                }
                 self.remoteFileIO?.decide(accepted, consent: consent)
             } else { self.dataTransfers?.decide(accepted, consent: consent) }
         }
@@ -5168,8 +5208,11 @@ public class NetworkManager: ObservableObject {
     func cancelTransfer(scope: TransferActionScope) {
         networkQueue.async { [weak self] in
             guard let self, self.ownsTransferAction(scope) else { return }
+            if self.fileSlot != nil {
+                guard let action = scope.slotAction, self.fileSlotScope?.isAuthorized(action) == true else { return }
+            }
             self.controlChannelWriter.cancelBulk()
-            if scope.remote { self.remoteFileIO?.cancel() }
+            if scope.remote { self.remoteFileIO?.cancel(action: scope.slotAction) }
             else { self.dataTransfers?.cancel() }
         }
     }
@@ -5180,7 +5223,9 @@ public class NetworkManager: ObservableObject {
     }
 
     private var mayStartRemoteFiles: Bool {
-        mayReceiveRemoteFiles && committedTransportGeneration == connectionGeneration &&
+        mayReceiveRemoteFiles && focusOutputAllowed &&
+            (fileSlot == nil || (fileSlotEpoch != nil && focusRevision == remoteFeatures.revision)) &&
+            committedTransportGeneration == connectionGeneration &&
             isForegroundActive && !remoteFileBackgrounded && !captureAvailability.inputBlocked &&
             !remoteSecureDesktop.restrictsFeatures && remoteFeatures.inputReady &&
             remoteFeatures.context?.desktop == 1
@@ -5226,6 +5271,7 @@ public class NetworkManager: ObservableObject {
 
     private func retireRemoteFileIOOnQueue() {
         guard let manager = remoteFileIO else { return }
+        fileSlotScope = nil
         remoteFileIO = nil
         pendingRemoteFileWrite?.cancel()
         pendingRemoteFileWrite = nil
@@ -5346,6 +5392,11 @@ public class NetworkManager: ObservableObject {
         }) { packet, completion in
             send(.packet(grantId: grant, transfer: packet), completion)
         }
+        if let fileSlot {
+            let scope = RemoteFileSlotScope(slot: fileSlot, manager: manager)
+            if let fileSlotEpoch { scope.promote(epoch: fileSlotEpoch) }
+            fileSlotScope = scope
+        }
         remoteFileIO = manager
         observeDataTransfer(manager, generation: generation, transport: "Remote", remote: true)
     }
@@ -5357,7 +5408,7 @@ public class NetworkManager: ObservableObject {
         switch message {
         case .state:
             let oldGrant = remoteFileAccess?.grant
-            let effects = remoteFileAccess?.receive(message, allowed: !remoteFileBackgrounded) ?? []
+            let effects = remoteFileAccess?.receive(message, allowed: !remoteFileBackgrounded && focusOutputAllowed && (fileSlot == nil || fileSlotEpoch != nil)) ?? []
             if oldGrant != nil, remoteFileAccess?.grant == nil { _ = remoteFileActionClock.advance() }
             if let grant = remoteFileAccess?.grant, grant != oldGrant { beginRemoteFileIOOnQueue(grant: grant) }
             for effect in effects {
@@ -7917,6 +7968,9 @@ public class NetworkManager: ObservableObject {
                 generation: generation, mode: mode, audioEnabled: audioEnabled)
         }
     }
+
+    var telemetryForFocusTesting: TransportTelemetry { transportTelemetry }
+    var clipboardSceneActiveForTesting: Bool { remoteClipboardAuthority.sceneActive }
 
     var clientDebugLoggingEnabledForTesting: Bool {
         networkQueue.sync { clientDebugLoggingEnabled }

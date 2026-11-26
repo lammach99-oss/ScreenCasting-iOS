@@ -57,6 +57,8 @@ final class FocusCoordinatorTests: XCTestCase {
         }
         XCTAssertEqual(keyActions(oldNetwork, sinks[0]), [0, 1])
         XCTAssertFalse(focus.primary.acceptsFocusInput(old.ticket))
+        XCTAssertFalse(focus.primary.clipboardSceneActiveForTesting)
+        XCTAssertFalse(focus.secondary.clipboardSceneActiveForTesting)
         let new = try XCTUnwrap(focus.binding)
         focus.contextReady(new)
         focus.presented(old)
@@ -65,6 +67,7 @@ final class FocusCoordinatorTests: XCTestCase {
         focus.select(.two, scene: "scene")
         focus.presented(new)
         XCTAssertEqual(focus.outputLease, new.ticket)
+        XCTAssertTrue(focus.secondary.clipboardSceneActiveForTesting)
         XCTAssertTrue(focus.secondary.acceptsFocusInput(new.ticket))
         focus.performInput(old.ticket) { _ in XCTFail("Retired input reached a peer") }
         delayedText()
@@ -80,6 +83,103 @@ final class FocusCoordinatorTests: XCTestCase {
             }
         }
         XCTAssertFalse(focus.primary.acceptsFocusInput(old.ticket))
+        focus.model.recordAuthorizedThumbnail(new.ticket, revision: 1)
+        XCTAssertEqual(focus.model[.two].preview, .thumbnail(revision: 1))
+        focus.appLifecycleChanged(active: false)
+        XCTAssertNil(focus.outputLease)
+        XCTAssertFalse(focus.secondary.acceptsFocusInput(new.ticket))
+        for slot in [SlotOrdinal.one, .two] {
+            XCTAssertFalse(focus.manager(slot).clipboardSceneActiveForTesting)
+            XCTAssertNil(focus.thumbnail(for: slot))
+            XCTAssertEqual(focus.model[slot].preview, .placeholder)
+        }
+        let parkedEpoch = focus.model[.one].epoch
+        focus.appLifecycleChanged(active: true)
+        XCTAssertGreaterThan(focus.model[.one].epoch, parkedEpoch)
+        XCTAssertNil(focus.outputLease)
+        let resumed = try XCTUnwrap(focus.binding)
+        XCTAssertNotEqual(resumed.ticket, new.ticket)
+        focus.presented(new)
+        XCTAssertNil(focus.outputLease)
+        focus.presented(resumed)
+        XCTAssertEqual(focus.outputLease, resumed.ticket)
+        let rows = try XCTUnwrap(JSONSerialization.jsonObject(with: focus.exportDiagnostics()) as? [[String: Any]])
+        XCTAssertTrue(rows.contains { $0["event"] as? String == "parked" })
+        XCTAssertTrue(rows.allSatisfy { Set($0.keys) == ["slot", "epoch", "route", "event", "elapsedMs"] })
+    }
+
+    @MainActor func testSwapRevokesFileGrantCreatedAfterOutputPromotion() async throws {
+        let primary = NetworkManager(role: .secondaryRemote)
+        let focus = FocusCoordinator.forTesting(primary: primary)
+        defer { primary.stopForTesting(); focus.secondary.stopForTesting() }
+        var controls = [RemoteFileProtocol.Message]()
+        primary.controlSendForAudioTesting = { bytes, done in
+            if bytes.count >= 16, bytes[5] == WireMessageType.remoteFileControl.rawValue,
+               let message = RemoteFileProtocol.decode(type: .remoteFileControl, payload: Data(bytes.dropFirst(16)), flags: 0) {
+                Task { @MainActor in controls.append(message) }
+            }
+            done(nil)
+        }
+        focus.secondary.controlSendForAudioTesting = { _, done in done(nil) }
+        let owner = primary.beginRemoteClipboardForTesting(remoteFiles: true)
+        _ = focus.secondary.beginRemoteClipboardForTesting()
+        for (slot, digit) in [(SlotOrdinal.one, "1"), (.two, "2")] {
+            let ticket = try XCTUnwrap(focus.connect(slot, route: .wifi))
+            XCTAssertTrue(focus.authenticate(ticket, transport: focus.manager(slot).remoteKeyboardGeneration,
+                peer: try XCTUnwrap(TrustedPeerReference(String(repeating: digit, count: 64)))))
+        }
+        focus.claimSurface("scene")
+        let binding = try XCTUnwrap(focus.binding)
+        focus.presented(binding)
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: file) }
+        try Data([1]).write(to: file)
+        func waitUntil(_ condition: () -> Bool) async throws {
+            let deadline = ProcessInfo.processInfo.systemUptime + 2
+            while !condition() && ProcessInfo.processInfo.systemUptime < deadline {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            XCTAssertTrue(condition())
+        }
+        try await waitUntil { primary.isRemoteControlSession }
+        primary.sendTransferFiles([file], scope: primary.transferActionScope)
+        try await waitUntil { !controls.isEmpty }
+        guard case let .control(.requestGrant, request, _, _)? = controls.first else {
+            return XCTFail("Expected a grant request")
+        }
+        let grant = UUID()
+        let reply = RemoteFileProtocol.Message.state(phase: .granted, requestId: request, reason: .none,
+                                                     directions: .both, grantId: grant)
+        primary.receiveMirrorWireForTesting(type: .remoteFileState, payload: try XCTUnwrap(RemoteFileProtocol.encode(reply)),
+                                            generation: owner.generation, connection: owner.connection)
+        try await waitUntil { primary.transferSnapshot.slotAction != nil }
+        XCTAssertEqual(primary.transferSnapshot.slotAction?.epoch, binding.ticket.epoch)
+        focus.select(.two, scene: "scene")
+        try await waitUntil {
+            let released = controls.contains { message in
+                guard case let .control(.release, _, _, id) = message else { return false }
+                return id == grant
+            }
+            return released && primary.transferSnapshot.slotAction == nil
+        }
+    }
+
+    @MainActor func testSingleSlotExportPreservesTelemetryFileBytes() async throws {
+        let primary = NetworkManager(role: .secondaryRemote)
+        let focus = FocusCoordinator.forTesting(primary: primary)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let telemetry = primary.telemetryForFocusTesting
+        let url: URL? = await withCheckedContinuation { continuation in
+            _ = telemetry.startLogging(directoryURL: directory) { continuation.resume(returning: $0) }
+        }
+        let original = try Data(contentsOf: XCTUnwrap(url))
+        XCTAssertFalse(original.isEmpty)
+        XCTAssertEqual(focus.exportDiagnostics(), original)
+        await withCheckedContinuation { continuation in
+            telemetry.stopLogging { continuation.resume() }
+        }
     }
 
     func testAudioLeaseStopsPreviousOutputBeforeGrantAndRejectsDelayedCompletion() {
@@ -115,6 +215,12 @@ final class FocusCoordinatorTests: XCTestCase {
         XCTAssertEqual(focus.model.offeredAlternate, .two)
         XCTAssertEqual(focus.model.selected, .one)
         XCTAssertTrue(focus.model[.one].retryRequested)
+        XCTAssertTrue(focus.primary.authenticatedRemoteIP(binding.transport))
+        XCTAssertNil(focus.connect(.one, route: .wifi))
+        focus.select(.one, scene: "scene")
+        let retry = try XCTUnwrap(focus.binding)
+        XCTAssertNotEqual(retry.ticket, binding.ticket)
+        XCTAssertEqual(retry.transport, binding.transport)
         focus.presented(binding)
         XCTAssertNil(focus.outputLease)
     }

@@ -38,7 +38,10 @@
 		A321B0000000000000000003 /* SlotLifecyclePolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A321F0000000000000000003 /* SlotLifecyclePolicy.swift */; };
 		A321B0000000000000000004 /* SlotTimelineExport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A321F0000000000000000004 /* SlotTimelineExport.swift */; };
 		A317B0000000000000000002 /* SessionSwitcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = A317F0000000000000000002 /* SessionSwitcher.swift */; };
-		A321B0000000000000000002 /* FocusCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A321F0000000000000000002 /* FocusCoordinator.swift */; };
+		A323B0000000000000000002 /* PairPanelModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A323F0000000000000000002 /* PairPanelModel.swift */; };
+		A324B0000000000000000002 /* PairSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A324F0000000000000000002 /* PairSession.swift */; };
+		A325B0000000000000000002 /* PairSessionViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A325F0000000000000000002 /* PairSessionViews.swift */; };
+		A322B0000000000000000002 /* FocusCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A322F0000000000000000002 /* FocusCoordinator.swift */; };
 		A317B0000000000000000003 /* RemotePairStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A317F0000000000000000003 /* RemotePairStore.swift */; };
 		A11500000000000000000001 /* RemoteFeatureNegotiation.swift in Sources */ = {isa = PBXBuildFile; fileRef = A11400000000000000000001 /* RemoteFeatureNegotiation.swift */; };
 		A318B0000000000000000001 /* RemoteSlotRole.swift in Sources */ = {isa = PBXBuildFile; fileRef = A318F0000000000000000001 /* RemoteSlotRole.swift */; };
@@ -112,8 +115,9 @@
 		FA2300000000000000000009 /* RemoteHostDirectoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2200000000000000000009 /* RemoteHostDirectoryTests.swift */; };
 		AF22B0000000000000000002 /* RemoteUsbTransportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF22F0000000000000000002 /* RemoteUsbTransportTests.swift */; };
 		A317B0000000000000000004 /* SessionSwitcherTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A317F0000000000000000004 /* SessionSwitcherTests.swift */; };
+		A323B0000000000000000004 /* PairPanelModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A323F0000000000000000004 /* PairPanelModelTests.swift */; };
 		A321B0000000000000000005 /* SlotDataLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A321F0000000000000000005 /* SlotDataLifecycleTests.swift */; };
-		A321B0000000000000000004 /* FocusCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A321F0000000000000000004 /* FocusCoordinatorTests.swift */; };
+		A322B0000000000000000004 /* FocusCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A322F0000000000000000004 /* FocusCoordinatorTests.swift */; };
 		A11500000000000000000002 /* RemoteInputProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A11400000000000000000002 /* RemoteInputProtocolTests.swift */; };
 		C71500000000000000000005 /* RemoteMonitorIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C71400000000000000000005 /* RemoteMonitorIntegrationTests.swift */; };
 		C71500000000000000000004 /* RemoteMonitorStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C71400000000000000000004 /* RemoteMonitorStateTests.swift */; };
@@ -201,7 +205,10 @@
 		A321F0000000000000000003 /* SlotLifecyclePolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SlotLifecyclePolicy.swift; sourceTree = "<group>"; };
 		A321F0000000000000000004 /* SlotTimelineExport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SlotTimelineExport.swift; sourceTree = "<group>"; };
 		A317F0000000000000000002 /* SessionSwitcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionSwitcher.swift; sourceTree = "<group>"; };
-		A321F0000000000000000002 /* FocusCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusCoordinator.swift; sourceTree = "<group>"; };
+		A323F0000000000000000002 /* PairPanelModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairPanelModel.swift; sourceTree = "<group>"; };
+		A324F0000000000000000002 /* PairSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairSession.swift; sourceTree = "<group>"; };
+		A325F0000000000000000002 /* PairSessionViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairSessionViews.swift; sourceTree = "<group>"; };
+		A322F0000000000000000002 /* FocusCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusCoordinator.swift; sourceTree = "<group>"; };
 		A317F0000000000000000003 /* RemotePairStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemotePairStore.swift; sourceTree = "<group>"; };
 		A11400000000000000000001 /* RemoteFeatureNegotiation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteFeatureNegotiation.swift; sourceTree = "<group>"; };
 		A318F0000000000000000001 /* RemoteSlotRole.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl/RemoteSlotRole.swift; sourceTree = "<group>"; };
@@ -276,8 +283,9 @@
 		FA2200000000000000000009 /* RemoteHostDirectoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteHostDirectoryTests.swift; sourceTree = "<group>"; };
 		AF22F0000000000000000002 /* RemoteUsbTransportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteUsbTransportTests.swift; sourceTree = "<group>"; };
 		A317F0000000000000000004 /* SessionSwitcherTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionSwitcherTests.swift; sourceTree = "<group>"; };
+		A323F0000000000000000004 /* PairPanelModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairPanelModelTests.swift; sourceTree = "<group>"; };
 		A321F0000000000000000005 /* SlotDataLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SlotDataLifecycleTests.swift; sourceTree = "<group>"; };
-		A321F0000000000000000004 /* FocusCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusCoordinatorTests.swift; sourceTree = "<group>"; };
+		A322F0000000000000000004 /* FocusCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusCoordinatorTests.swift; sourceTree = "<group>"; };
 		A11400000000000000000002 /* RemoteInputProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteInputProtocolTests.swift; sourceTree = "<group>"; };
 		C71400000000000000000005 /* RemoteMonitorIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteMonitorIntegrationTests.swift; sourceTree = "<group>"; };
 		C71400000000000000000004 /* RemoteMonitorStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteMonitorStateTests.swift; sourceTree = "<group>"; };
@@ -390,7 +398,10 @@
 				A321F0000000000000000003 /* SlotLifecyclePolicy.swift */,
 				A321F0000000000000000004 /* SlotTimelineExport.swift */,
 				A317F0000000000000000002 /* SessionSwitcher.swift */,
-				A321F0000000000000000002 /* FocusCoordinator.swift */,
+				A323F0000000000000000002 /* PairPanelModel.swift */,
+				A324F0000000000000000002 /* PairSession.swift */,
+				A325F0000000000000000002 /* PairSessionViews.swift */,
+				A322F0000000000000000002 /* FocusCoordinator.swift */,
 				A317F0000000000000000003 /* RemotePairStore.swift */,
 				A11400000000000000000001 /* RemoteFeatureNegotiation.swift */,
 				A318F0000000000000000001 /* RemoteSlotRole.swift */,
@@ -472,8 +483,9 @@
 				FA2200000000000000000009 /* RemoteHostDirectoryTests.swift */,
 				AF22F0000000000000000002 /* RemoteUsbTransportTests.swift */,
 				A317F0000000000000000004 /* SessionSwitcherTests.swift */,
+				A323F0000000000000000004 /* PairPanelModelTests.swift */,
 				A321F0000000000000000005 /* SlotDataLifecycleTests.swift */,
-				A321F0000000000000000004 /* FocusCoordinatorTests.swift */,
+				A322F0000000000000000004 /* FocusCoordinatorTests.swift */,
 				A11400000000000000000002 /* RemoteInputProtocolTests.swift */,
 				C71400000000000000000005 /* RemoteMonitorIntegrationTests.swift */,
 				C71400000000000000000004 /* RemoteMonitorStateTests.swift */,
@@ -657,7 +669,10 @@
 				A321B0000000000000000003 /* SlotLifecyclePolicy.swift in Sources */,
 				A321B0000000000000000004 /* SlotTimelineExport.swift in Sources */,
 				A317B0000000000000000002 /* SessionSwitcher.swift in Sources */,
-				A321B0000000000000000002 /* FocusCoordinator.swift in Sources */,
+				A323B0000000000000000002 /* PairPanelModel.swift in Sources */,
+				A324B0000000000000000002 /* PairSession.swift in Sources */,
+				A325B0000000000000000002 /* PairSessionViews.swift in Sources */,
+				A322B0000000000000000002 /* FocusCoordinator.swift in Sources */,
 				A317B0000000000000000003 /* RemotePairStore.swift in Sources */,
 				A11500000000000000000001 /* RemoteFeatureNegotiation.swift in Sources */,
 				A318B0000000000000000001 /* RemoteSlotRole.swift in Sources */,
@@ -726,8 +741,9 @@
 				FA2300000000000000000009 /* RemoteHostDirectoryTests.swift in Sources */,
 				AF22B0000000000000000002 /* RemoteUsbTransportTests.swift in Sources */,
 				A317B0000000000000000004 /* SessionSwitcherTests.swift in Sources */,
+				A323B0000000000000000004 /* PairPanelModelTests.swift in Sources */,
 				A321B0000000000000000005 /* SlotDataLifecycleTests.swift in Sources */,
-				A321B0000000000000000004 /* FocusCoordinatorTests.swift in Sources */,
+				A322B0000000000000000004 /* FocusCoordinatorTests.swift in Sources */,
 				A11500000000000000000002 /* RemoteInputProtocolTests.swift in Sources */,
 				C71500000000000000000005 /* RemoteMonitorIntegrationTests.swift in Sources */,
 				C71500000000000000000004 /* RemoteMonitorStateTests.swift in Sources */,

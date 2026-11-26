@@ -142,6 +142,10 @@ struct SessionConnectionPresentation {
     let onSettings: () -> Void
     let onGestures: () -> Void
 
+    var pairFocus: FocusCoordinator? = nil
+    var pairScene: String = ""
+    @State private var addingSecondPC = false
+    @State private var restartTicket: SlotTicket?
     @State private var moreInputExpanded = false
     @State private var inputBarVisible = false
     @State private var rememberedPhysical = ConfirmedPhysicalScreen()
@@ -680,6 +684,15 @@ struct SessionConnectionPresentation {
                     mirror: !owner.networkManager.isRemoteControlSession, acceptedFeatures: owner.networkManager.remoteMonitorState.enabled ? 7 : 0,
                     typedSources: owner.networkManager.captureTargetState.enabled) { owner.screens }
                 if !owner.networkManager.isRemoteControlSession { owner.connectionPicker }
+                if let focus = owner.pairFocus {
+                    PairSwitcherRow(focus: focus, scene: owner.pairScene)
+                } else if owner.networkManager.isRemoteControlSession {
+                    Button("Add second PC") { owner.addingSecondPC = true }
+                        .frame(minHeight: 44)
+                        .sheet(isPresented: owner.$addingSecondPC) {
+                            SecondPCChooser(primary: owner.networkManager, firstName: owner.hostLabel)
+                        }
+                }
                 owner.tools
                 owner.touchSection
                 if owner.networkManager.isRemoteControlSession { owner.remoteActions }
@@ -1136,10 +1149,18 @@ struct SessionConnectionPresentation {
                         owner.lastInteraction = Date()
                         owner.networkManager.sendRemoteCommand(.lock)
                     }
-                    owner.actionButton("Restart PC", icon: "arrow.clockwise") { owner.confirmRestart = true }
+                    owner.actionButton("Restart PC", icon: "arrow.clockwise") {
+                        owner.restartTicket = owner.pairFocus?.outputLease
+                        owner.confirmRestart = true
+                    }
                 }
                 .confirmationDialog("Restart the PC?", isPresented: owner.$confirmRestart, titleVisibility: .visible) {
-                    Button("Restart", role: .destructive) { owner.networkManager.sendRemoteCommand(.restart, confirmed: true) }
+                    Button("Restart", role: .destructive) {
+                        if let focus = owner.pairFocus {
+                            guard focus.model.surfaceOwner == owner.pairScene, let ticket = owner.restartTicket else { return }
+                            focus.performInput(ticket) { $0.sendRemoteCommand(.restart, confirmed: true) }
+                        } else { owner.networkManager.sendRemoteCommand(.restart, confirmed: true) }
+                    }
                     Button("Cancel", role: .cancel) {}
                 } message: {
                     Text("Unsaved work on the PC may ask to be saved. The iPad reconnects when the PC is back.")

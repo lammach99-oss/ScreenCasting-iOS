@@ -281,7 +281,163 @@ extension View {
     }
 }
 
+struct RemoteAddressField: View {
+    @Binding var address: String
+    var body: some View {
+        TextField("IP address or PC name", text: $address)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .keyboardType(.URL)
+            .textContentType(.URL)
+            .padding(.horizontal, 12)
+            .frame(minHeight: 44)
+            .background(Color.inkRaised, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.inkHairline, lineWidth: 0.5))
+            .accessibilityLabel("PC address")
+    }
+}
+
 @MainActor public struct ContentView: View {
+    @StateObject private var primary = NetworkManager()
+    @ObservedObject private var pair = PairSession.shared
+    @State private var restored = false
+    @State private var scene = UUID().uuidString
+    @Environment(\.scenePhase) private var scenePhase
+
+    public init() {}
+
+    public var body: some View {
+        ZStack {
+            if let focus = pair.focus {
+                PairedSessionScreen(focus: focus, scene: scene)
+            } else if restored {
+                SessionScreen(manager: primary, focus: nil, scene: scene)
+            } else {
+                Color.black.ignoresSafeArea()
+            }
+        }
+        .onAppear {
+            pair.restore(primary: primary)
+            restored = true
+        }
+        .overlay {
+            // Cover parked-PC previews in the app snapshot; single-PC sessions keep today's behavior.
+            if pair.focus != nil && scenePhase != .active {
+                Color.black.ignoresSafeArea().accessibilityLabel("Session hidden").transition(.identity)
+            }
+        }
+    }
+}
+
+@MainActor private struct PairedSessionScreen: View {
+    @ObservedObject var focus: FocusCoordinator
+    let scene: String
+    @Environment(\.scenePhase) private var scenePhase
+
+    var body: some View {
+        ZStack {
+            if scenePhase == .active && focus.model.surfaceOwner == scene {
+                let manager = focus.manager(focus.model.selected)
+                SessionScreen(manager: manager, focus: focus, scene: scene)
+                    .id(focus.model.selected)
+                    .background {
+                        PairTransportObserver(manager: focus.primary, slot: .one)
+                        PairTransportObserver(manager: focus.secondary, slot: .two)
+                    }
+                    .overlay {
+                        let selected = focus.model[focus.model.selected]
+                        let other = focus.model[focus.model.selected.alternate]
+                        if (selected.phase == .offline || selected.phase == .refused || selected.phase == .connecting)
+                            && other.phase == .parked {
+                            VStack {
+                                Text(PairPanelModel.reason(selected.lastError))
+                                Button { PairSession.shared.select(scene: scene) } label: {
+                                    Text(PairPanelModel.switchLabel(PairSession.shared.name(other.ordinal))).frame(minHeight: 44)
+                                }
+                            }.frame(maxWidth: .infinity, maxHeight: .infinity).background(Color.black)
+                        } else if selected.phase == .resuming {
+                            VStack(spacing: 12) {
+                                if focus.binding != nil || other.phase == .connecting {
+                                    ProgressView().accessibilityLabel("Connecting")
+                                }
+                                if focus.binding == nil {
+                                    Text(PairSession.shared.name(other.ordinal))
+                                    Text(other.phase == .refused ? PairPanelModel.reason(other.lastError) : PairPanelModel.label(other.phase))
+                                    if other.phase == .offline {
+                                        Button("Retry") { PairSession.shared.retry(other.ordinal) }
+                                    }
+                                    Button("Remove second PC") { PairSession.shared.remove(scene: scene) }
+                                }
+                            }.frame(maxWidth: .infinity, maxHeight: .infinity).background(Color.black)
+                        }
+                        PairEnrollmentOverlay(manager: focus.manager(focus.model.selected.alternate),
+                                              slot: focus.model.selected.alternate)
+                    }
+            } else {
+                Color.black.ignoresSafeArea().overlay { Text("Session open in another window") }
+            }
+        }
+        .onAppear { lifecycle(scenePhase == .active) }
+        .onChange(of: scenePhase) { _, phase in lifecycle(phase == .active) }
+        .onChange(of: focus.model.surfaceOwner) { _, owner in
+            if owner == nil && scenePhase == .active { focus.claimSurface(scene) }
+        }
+        .onDisappear { lifecycle(false) }
+    }
+
+    private func lifecycle(_ active: Bool) {
+        guard PairSession.shared.focus === focus else { return }
+        PairSession.shared.setScene(scene, active: active)
+        if active {
+            focus.appLifecycleChanged(active: true)
+            focus.claimSurface(scene)
+        } else {
+            focus.releaseSurface(scene)
+            if !PairSession.shared.hasActiveScene { focus.appLifecycleChanged(active: false) }
+        }
+    }
+}
+
+@MainActor private struct PairTransportObserver: View {
+    @ObservedObject var manager: NetworkManager
+    let slot: SlotOrdinal
+    var body: some View {
+        Color.clear
+            .onAppear { PairSession.shared.update(slot) }
+            .onChange(of: manager.connectionState) { _, _ in PairSession.shared.update(slot) }
+            .onChange(of: manager.videoStandby) { _, _ in PairSession.shared.update(slot) }
+            .onChange(of: manager.remoteInputFeatures) { _, _ in PairSession.shared.update(slot) }
+            .onChange(of: manager.hostFingerprint) { _, _ in PairSession.shared.update(slot) }
+    }
+}
+
+@MainActor private struct PairEnrollmentOverlay: View {
+    @ObservedObject var manager: NetworkManager
+    let slot: SlotOrdinal
+    @State private var pin = ""
+
+    @ViewBuilder var body: some View {
+        if PairSession.shared.focus?.model[slot].phase == .connecting {
+            switch manager.connectionState {
+            case .awaitingHostIdentity:
+                HostIdentityConfirmationView(identityCode: manager.hostIdentityCode ?? "Unavailable",
+                                             onConfirm: { manager.confirmHostIdentity() }, onCancel: cancel)
+            case .awaitingPIN, .submittingPIN:
+                PINEntryView(pin: $pin, authFailed: false, failureReason: "",
+                             submitting: manager.connectionState == .submittingPIN,
+                             onSubmit: { manager.sendAuthPIN(pin) }, onCancel: cancel)
+            default: EmptyView()
+            }
+        }
+    }
+
+    private func cancel() {
+        guard let focus = PairSession.shared.focus else { return }
+        focus.drop(focus.model[slot].ticket, error: .refused)
+    }
+}
+
+@MainActor private struct SessionScreen: View {
     @Environment(\.scenePhase) private var scenePhase
     private static let geometryLogger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "com.iPadZeroLagDisplay.client",
@@ -330,8 +486,11 @@ extension View {
     @AppStorage("ScreenCasting.client.lastHostLabel") private var lastHostLabel = ""
     @State private var rootSurfaceSize: CGSize = .zero
 
-    public init() {
-        let netManager = NetworkManager()
+    let focus: FocusCoordinator?
+    let scene: String
+    init(manager netManager: NetworkManager, focus: FocusCoordinator?, scene: String) {
+        self.focus = focus
+        self.scene = scene
         _networkManager = StateObject(wrappedValue: netManager)
         _streamManager  = StateObject(wrappedValue: StreamManager(networkManager: netManager))
     }
@@ -381,8 +540,9 @@ extension View {
             remoteInput.bind(networkManager)
             remoteInput.configure(value)
         }
-        .onAppear { networkManager.setRemoteClipboardSceneActive(scenePhase == .active) }
+        .onAppear { if focus == nil { networkManager.setRemoteClipboardSceneActive(scenePhase == .active) } }
         .onChange(of: scenePhase) { _, phase in
+            guard focus == nil else { return }
             networkManager.setRemoteClipboardSceneActive(phase == .active)
             switch phase {
             case .active:
@@ -409,7 +569,7 @@ extension View {
         }
         .onChange(of: networkManager.mirrorControlState?.mode) { _, _ in offerGestureGuideIfNew() }
         .sheet(isPresented: $isSettingsPresented) {
-            SettingsView(networkManager: networkManager)
+            SettingsView(networkManager: networkManager, pairFocus: focus, pairScene: scene)
         }
         .sheet(isPresented: $isTransferPresented) {
             TransferCenterSheet(networkManager: networkManager)
@@ -460,7 +620,7 @@ extension View {
 
     @ViewBuilder
     private var backgroundLayer: some View {
-        if streamManager.isConnected || networkManager.retainedSwitchRoute != nil {
+        if showsSelectedSurface || networkManager.retainedSwitchRoute != nil {
             connectedVideoSurface
                 .allowsHitTesting(networkManager.retainedSwitchRoute == nil)
                 .overlay {
@@ -486,8 +646,21 @@ extension View {
     // The decoder/renderer owns the viewport it actually draws. Keep the
     // Metal and UIKit touch surfaces in one full-window container so that the
     // same normalized viewport describes both surfaces.
+    private var showsSelectedSurface: Bool {
+        if let focus {
+            let phase = focus.model[focus.model.selected].phase
+            if phase == .offline || phase == .refused { return false }
+        }
+        return streamManager.isConnected
+    }
+
+    private var pairInputAllowed: Bool {
+        guard let focus else { return true }
+        return focus.model.surfaceOwner == scene && focus.outputLease?.ordinal == focus.model.selected
+    }
+
     private var remoteInputConfiguration: RemoteSessionInputConfiguration {
-        let inputActive = scenePhase == .active && !isSheetPresented && !showGestureGuide
+        let inputActive = pairInputAllowed && scenePhase == .active && !isSheetPresented && !showGestureGuide
         return RemoteSessionInputConfiguration(remote: networkManager.isRemoteControlSession,
             connected: streamManager.isConnected,
             active: inputActive && !isSessionPanelOpen,
@@ -584,7 +757,7 @@ extension View {
     }
 
     private func setWifiBrowsing(_ on: Bool) {
-        guard on != isWifiBrowsing else { return }
+        guard (!on || focus == nil), on != isWifiBrowsing else { return }
         isWifiBrowsing = on
         if on { discoveryManager.startBrowsing() } else { discoveryManager.stopBrowsing() }
     }
@@ -741,7 +914,7 @@ extension View {
 
 
     @MainActor private struct SessionLifecycle: ViewModifier {
-        let owner: ContentView
+        let owner: SessionScreen
         func body(content: Content) -> some View {
             content
                 .onAppear {
@@ -752,7 +925,7 @@ extension View {
                     owner.setWifiBrowsing(true)
                     owner.networkManager.setDesiredPipelineMode(
                         owner.gameModeEnabled ? .game : .office)
-                    owner.networkManager.applicationDidBecomeActive()
+                    if owner.focus == nil { owner.networkManager.applicationDidBecomeActive() }
                 }
                 .onChange(of: owner.gameModeEnabled) { _, enabled in
                     owner.networkManager.setDesiredPipelineMode(
@@ -771,7 +944,7 @@ extension View {
     }
 
     @MainActor private struct AuthenticationOverlay: View {
-        let owner: ContentView
+        let owner: SessionScreen
         @ViewBuilder var body: some View {
             if owner.isHostIdentityPhase {
                 HostIdentityConfirmationView(
@@ -807,7 +980,7 @@ extension View {
     }
 
     @MainActor private struct RootGeometryObserver: View {
-        let owner: ContentView
+        let owner: SessionScreen
         var body: some View {
             GeometryReader { proxy in
                 Color.clear
@@ -822,7 +995,7 @@ extension View {
     }
 
     @MainActor private struct RecentHosts: View {
-        let owner: ContentView
+        let owner: SessionScreen
         @ViewBuilder var body: some View {
             if !owner.recentRemoteHosts.isEmpty {
                 Text("Recent").font(.footnote).foregroundStyle(Color.inkSecondary)
@@ -876,7 +1049,7 @@ extension View {
     }
     // Nominal view types bound metadata expansion across independently rendered sections.
     @MainActor private struct ForegroundLayer: View {
-        let owner: ContentView
+        let owner: SessionScreen
         @ViewBuilder var body: some View {
             if let route = owner.networkManager.retainedSwitchRoute {
                 Text("Switching to \(route.label)...")
@@ -886,7 +1059,7 @@ extension View {
                     .background(Color.inkSurface, in: Capsule())
                     .frame(maxHeight: .infinity, alignment: .top)
                     .allowsHitTesting(false)
-            } else if owner.streamManager.isConnected {
+            } else if owner.showsSelectedSurface {
                 ZStack {
                     owner.streamingHUD
                     VStack {
@@ -904,7 +1077,7 @@ extension View {
                     .allowsHitTesting(false)
                     SessionPanelOverlay(
                         networkManager: owner.networkManager,
-                        hostLabel: SessionPanelSnapshot.sessionHost(current: owner.lastHostLabel, lastWifi: owner.lastWifiHostLabel,
+                        hostLabel: owner.focus.map { PairSession.shared.name($0.model.selected) } ?? SessionPanelSnapshot.sessionHost(current: owner.lastHostLabel, lastWifi: owner.lastWifiHostLabel,
                                                                     usb: owner.usbChosen),
                         isOpen: owner.$isSessionPanelOpen,
                         remoteInput: owner.remoteInput,
@@ -914,7 +1087,8 @@ extension View {
                         onPillHeightChange: { owner.sessionPillHeight = $0 },
                         onFiles: { owner.isTransferPresented = true },
                         onSettings: { owner.isSettingsPresented = true },
-                        onGestures: { owner.showGestureGuide = true })
+                        onGestures: { owner.showGestureGuide = true },
+                        pairFocus: owner.focus, pairScene: owner.scene)
                     VStack {
                         Spacer()
                         if let toast = owner.gestureToast {
@@ -941,23 +1115,30 @@ extension View {
     }
 
     @MainActor private struct ConnectedVideoSurface: View {
-        let owner: ContentView
+        let owner: SessionScreen
         @ViewBuilder var body: some View {
             GeometryReader { proxy in
                 let frame = FullscreenSurfaceLayout.edgeToEdgeFrame(
                     proposedBounds: proxy.frame(in: .local),
                     safeAreaInsets: proxy.safeAreaInsets)
 
+                let ticket = owner.focus?.outputLease
                 ConnectedPresentationSurface(
                     networkManager: owner.networkManager,
                     gameModeEnabled: owner.gameModeEnabled,
-                    remoteKeyboardActive: owner.streamManager.isConnected && owner.scenePhase == .active && !owner.isSheetPresented && !owner.showGestureGuide && !owner.isSessionPanelOpen,
-                    sessionInputActive: owner.streamManager.isConnected && owner.scenePhase == .active && !owner.isSheetPresented && !owner.showGestureGuide,
+                    remoteKeyboardActive: owner.streamManager.isConnected && owner.pairInputAllowed && owner.scenePhase == .active && !owner.isSheetPresented && !owner.showGestureGuide && !owner.isSessionPanelOpen,
+                    sessionInputActive: owner.streamManager.isConnected && owner.pairInputAllowed && owner.scenePhase == .active && !owner.isSheetPresented && !owner.showGestureGuide,
                     onKeyboardInput: { command in
-                        owner.networkManager.sendKeyboardInput(command)
+                        if let focus = owner.focus {
+                            guard focus.model.surfaceOwner == owner.scene, let ticket else { return }
+                            focus.performInput(ticket) { $0.sendKeyboardInput(command) }
+                        } else { owner.networkManager.sendKeyboardInput(command) }
                     },
                     onTextCommit: { text in
-                        owner.networkManager.sendTextCommit(text)
+                        if let focus = owner.focus {
+                            guard focus.model.surfaceOwner == owner.scene, let ticket else { return }
+                            focus.performInput(ticket) { $0.sendTextCommit(text) }
+                        } else { owner.networkManager.sendTextCommit(text) }
                     },
                     onFrameRendered: {
                         owner.streamManager.registerFrameRendered()
@@ -1018,7 +1199,7 @@ extension View {
     }
 
     @MainActor private struct DisconnectedDashboard: View {
-        let owner: ContentView
+        let owner: SessionScreen
         var body: some View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
@@ -1032,42 +1213,53 @@ extension View {
                         owner.iPadAddressChip
                     }
                     VStack(alignment: .leading, spacing: 16) {
-                        owner.statusLine
-                        Text(ConnectScreenStatus.connectionRecommendation(owner.networkManager.connectionSwitchState))
-                            .font(.footnote).foregroundStyle(Color.inkSecondary)
-                            .accessibilityIdentifier("connectionRecommendation")
-                        // Hidden, not faded, while a connect or USB wait runs: a faded card read as broken.
-                        if owner.networkManager.connectionSwitchState.offersReconnect {
-                            Button("Reconnect over Wi-Fi") {
-                                owner.usbChosen = false; owner.enteredPIN = ""
-                                owner.networkManager.reconnectConnectionOverWifi()
+                        if let focus = owner.focus {
+                            PairSwitcherRow(focus: focus, scene: owner.scene)
+                            if let failure = focus.model[focus.model.selected].lastError {
+                                Text(PairPanelModel.reason(failure))
                             }
-                            .buttonStyle(.bordered).controlSize(.large).tint(Color.inkAccent)
-                            .frame(minHeight: 44)
-                            .disabled(!owner.networkManager.hasReconnectTarget)
-                        } else if owner.networkManager.hasReconnectTarget && !owner.isConnectBusy { owner.reconnectButton }
-                        if owner.networkManager.hasReconnectTarget && !owner.isConnectBusy {
-                            Button("Forget last PC", role: .destructive) { owner.networkManager.forgetTrustedHost() }
-                                .buttonStyle(.bordered).frame(minHeight: 44)
-                                .accessibilityHint("Removes this PC's saved trust so you can pair again")
+                            if focus.model[focus.model.selected].phase == .offline {
+                                Button("Retry selected PC") { PairSession.shared.retry(focus.model.selected) }
+                            }
+                            Button("Settings") { owner.isSettingsPresented = true }
+                        } else {
+                            owner.statusLine
+                            Text(ConnectScreenStatus.connectionRecommendation(owner.networkManager.connectionSwitchState))
+                                .font(.footnote).foregroundStyle(Color.inkSecondary)
+                                .accessibilityIdentifier("connectionRecommendation")
+                            // Hidden, not faded, while a connect or USB wait runs: a faded card read as broken.
+                            if owner.networkManager.connectionSwitchState.offersReconnect {
+                                Button("Reconnect over Wi-Fi") {
+                                    owner.usbChosen = false; owner.enteredPIN = ""
+                                    owner.networkManager.reconnectConnectionOverWifi()
+                                }
+                                .buttonStyle(.bordered).controlSize(.large).tint(Color.inkAccent)
+                                .frame(minHeight: 44)
+                                .disabled(!owner.networkManager.hasReconnectTarget)
+                            } else if owner.networkManager.hasReconnectTarget && !owner.isConnectBusy { owner.reconnectButton }
+                            if owner.networkManager.hasReconnectTarget && !owner.isConnectBusy {
+                                Button("Forget last PC", role: .destructive) { owner.networkManager.forgetTrustedHost() }
+                                    .buttonStyle(.bordered).frame(minHeight: 44)
+                                    .accessibilityHint("Removes this PC's saved trust so you can pair again")
+                            }
+                            owner.discoveredPCs
+                            Toggle("Allow Windows security screens", isOn: owner.$remoteSecureDesktopEnabled)
+                                .font(.subheadline)
+                                .tint(Color.inkAccent)
+                                .frame(minHeight: 44)
+                                .disabled(owner.isConnectBusy)
+                                .accessibilityHint("Applies to whole-PC connections. The PC must grant permission.")
+                            Toggle("Allow clipboard sync in casting and Remote sessions", isOn: Binding(
+                                get: { owner.networkManager.remoteClipboardEnabled },
+                                set: { owner.networkManager.setRemoteClipboardEnabled($0) }))
+                                .font(.subheadline)
+                                .tint(Color.inkAccent)
+                                .frame(minHeight: 44)
+                                .disabled(owner.isConnectBusy)
+                                .accessibilityHint("Applies to paired PCs that support clipboard sync.")
+                            owner.usbCard
+                            owner.ipEntry
                         }
-                        owner.discoveredPCs
-                        Toggle("Allow Windows security screens", isOn: owner.$remoteSecureDesktopEnabled)
-                            .font(.subheadline)
-                            .tint(Color.inkAccent)
-                            .frame(minHeight: 44)
-                            .disabled(owner.isConnectBusy)
-                            .accessibilityHint("Applies to whole-PC connections. The PC must grant permission.")
-                        Toggle("Allow clipboard sync in casting and Remote sessions", isOn: Binding(
-                            get: { owner.networkManager.remoteClipboardEnabled },
-                            set: { owner.networkManager.setRemoteClipboardEnabled($0) }))
-                            .font(.subheadline)
-                            .tint(Color.inkAccent)
-                            .frame(minHeight: 44)
-                            .disabled(owner.isConnectBusy)
-                            .accessibilityHint("Applies to paired PCs that support clipboard sync.")
-                        owner.usbCard
-                        owner.ipEntry
                     }
                     .frame(maxWidth: 520, alignment: .leading)
                     .frame(maxWidth: .infinity)
@@ -1082,7 +1274,7 @@ extension View {
     }
 
     @MainActor private struct StatusLine: View {
-        let owner: ContentView
+        let owner: SessionScreen
         var body: some View {
             let status = owner.connectStatus
                     let color: Color = status.tone == .warning ? .inkWarning : status.tone == .danger ? .inkDanger : .inkText
@@ -1135,7 +1327,7 @@ extension View {
     }
 
     @MainActor private struct DiscoveredPCs: View {
-        let owner: ContentView
+        let owner: SessionScreen
         var body: some View {
             let hosts = owner.discoveryManager.discoveredHosts
                     return VStack(alignment: .leading, spacing: 8) {
@@ -1188,22 +1380,13 @@ extension View {
     }
 
     @MainActor private struct AddressEntry: View {
-        let owner: ContentView
+        let owner: SessionScreen
         var body: some View {
             DisclosureGroup(isExpanded: owner.$showIPEntry) {
                 VStack(alignment: .leading, spacing: 8) {
                     RecentHosts(owner: owner)
                     owner.rowLayout {
-                        TextField("IP address or PC name", text: owner.$hostIP)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .keyboardType(.URL)
-                            .textContentType(.URL)
-                            .padding(.horizontal, 12)
-                            .frame(minHeight: 44)
-                            .background(Color.inkRaised, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.inkHairline, lineWidth: 0.5))
-                            .accessibilityLabel("PC address")
+                        RemoteAddressField(address: owner.$hostIP)
                         Button("Connect") {
                             guard let host = owner.normalizedManualHost else { return }
                             owner.usbChosen = false

@@ -12,6 +12,11 @@ import SwiftUI
     // MARK: Dependencies
     @ObservedObject var networkManager: NetworkManager
 
+    var pairFocus: FocusCoordinator? = nil
+    var pairScene: String = ""
+    @State private var diagnosticsURL: URL?
+    @State private var exportIssue: String?
+
     // MARK: Local UI State
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var typeSize
@@ -45,6 +50,17 @@ import SwiftUI
         ClientStreamSettingsPreference.supportsAudioAndAuto(remote: networkManager.isRemoteControlSession)
     }
 
+    private func exportPair(_ focus: FocusCoordinator) {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("session-\(UUID().uuidString).json")
+        do {
+            try focus.exportDiagnostics().write(to: url, options: .atomic)
+            diagnosticsURL = url
+            exportIssue = nil
+        } catch {
+            exportIssue = "Couldn't export diagnostics."
+        }
+    }
+
     // MARK: Body
 
     public var body: some View {
@@ -54,6 +70,18 @@ import SwiftUI
                 streamSection
                 ClipboardSection(manager: networkManager, pasteboard: networkManager.remoteClipboardPasteboard,
                                  isTransferPresented: $isTransferPresented)
+                if let focus = pairFocus {
+                    Section("Remote control") {
+                        Text(PairSession.shared.name(.one))
+                        Text(PairSession.shared.name(.two))
+                        Button("Remove second PC", role: .destructive) {
+                            PairSession.shared.remove(scene: pairScene)
+                            dismiss()
+                        }
+                        Button("Export diagnostics") { exportPair(focus) }
+                        if let exportIssue { Text(exportIssue) }
+                    }
+                }
                 connectionSection
                 advancedSection
             }
@@ -61,6 +89,11 @@ import SwiftUI
             .background(Color(uiColor: SessionInk.canvas))
             .sheet(isPresented: $isTransferPresented) {
                 TransferCenterSheet(networkManager: networkManager)
+            }
+            .sheet(isPresented: Binding(get: { diagnosticsURL != nil }, set: { if !$0 { diagnosticsURL = nil } })) {
+                if let url = diagnosticsURL {
+                    TransferExporter(url: url) { try? FileManager.default.removeItem(at: url) }
+                }
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)

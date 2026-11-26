@@ -6,7 +6,7 @@ enum SlotTransportClass: String, Codable { case wifi, tailscale, usb }
 final class SlotTimelineExport {
     enum Event: String, Codable {
         case tap, request, acknowledged, receivedIDR, decoded, presented, inputReady
-        case transportError, unavailable, refused, stale
+        case transportError, unavailable, refused, stale, parked, resume, recovery, offline, drop
     }
 
     private struct Entry: Encodable {

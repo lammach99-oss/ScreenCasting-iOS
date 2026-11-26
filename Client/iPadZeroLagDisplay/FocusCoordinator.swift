@@ -38,9 +38,16 @@ final class FocusSurfaceLifetime {
     let secondary: NetworkManager
     @Published private(set) var binding: FocusBinding?
     @Published private(set) var outputLease: SlotTicket?
+    private let timeline = SlotTimelineExport()
+    private let lifecycle = SlotLifecyclePolicy()
+    private var sceneActive = true
+    private var suspendedScene: String?
+    private lazy var clipboardFocus = RemoteClipboardFocus { [weak self] slot, active in
+        self?.manager(slot).setRemoteClipboardSceneActive(active)
+    }
     private var thumbnails: [SlotOrdinal: Data] = [:]
     func thumbnail(for slot: SlotOrdinal) -> Data? {
-        guard let bytes = thumbnails[slot], let transport = transports[slot],
+        guard sceneActive, let bytes = thumbnails[slot], let transport = transports[slot],
               manager(slot).focusPreviewAllowed(transport) else { return nil }
         return bytes
     }
@@ -81,8 +88,8 @@ final class FocusSurfaceLifetime {
                     MainActor.assumeIsolated {
                         self?.objectWillChange.send()
                         self?.thumbnails.removeAll()
-                        if name == UIApplication.willResignActiveNotification, let scene = self?.model.surfaceOwner {
-                            self?.releaseSurface(scene)
+                        if name == UIApplication.willResignActiveNotification {
+                            self?.appLifecycleChanged(active: false)
                         }
                     }
                 }.store(in: &notifications)
@@ -98,6 +105,11 @@ final class FocusSurfaceLifetime {
     func endPair(scene: String) {
         guard model.surfaceOwner == nil || model.surfaceOwner == scene else { return }
         releaseSurface(scene)
+        if pairActive {
+            primary.remoteClipboardPasteboard.unbindFocus()
+            primary.setRemoteClipboardSceneActive(sceneActive)
+            primary.endFileSlotFocus()
+        }
         secondary.stop()
         primary.focusConnectionEnded = nil
         primary.focusAuthorityChanged = nil
@@ -113,7 +125,21 @@ final class FocusSurfaceLifetime {
 
     func manager(_ slot: SlotOrdinal) -> NetworkManager { slot == .one ? primary : secondary }
 
-    func connect(_ slot: SlotOrdinal, route: SlotRoute) -> SlotTicket? { model.connect(slot, route: route) }
+    func connect(_ slot: SlotOrdinal, route: SlotRoute) -> SlotTicket? {
+        // A streaming observation cannot automatically retry a timed-out picture.
+        if model[slot].retryRequested, let transport = transports[slot],
+           manager(slot).authenticatedRemoteIP(transport) { return nil }
+        return model.connect(slot, route: route)
+    }
+
+    @discardableResult func retryRetainedSlot(_ slot: SlotOrdinal) -> Bool {
+        guard sceneActive, model.surfaceOwner != nil, model[slot].retryRequested,
+              let transport = transports[slot], manager(slot).authenticatedRemoteIP(transport),
+              let peer = model[slot].peer, let retry = model.connect(slot, route: model[slot].route ?? .wifi),
+              model.authenticate(retry, peer: peer) else { return false }
+        reconcile()
+        return true
+    }
 
     @discardableResult func authenticate(_ ticket: SlotTicket, transport: UInt64, peer: TrustedPeerReference) -> Bool {
         let slot = ticket.ordinal, network = manager(slot)
@@ -129,34 +155,48 @@ final class FocusSurfaceLifetime {
             pairActive = true
             for (ordinal, transport) in transports {
                 let network = manager(ordinal)
+                network.remoteClipboardPasteboard.bindFocus(clipboardFocus, slot: ordinal)
+                network.beginFileSlotFocus(ordinal)
                 network.trackFocusTransport(transport)
                 if model[ordinal].phase == .parked {
+                    record(model[ordinal].ticket, .parked)
                     network.requestVideoStandby(park: true, expectedGeneration: transport)
                 }
             }
         } else if pairActive || slot == .two {
             network.trackFocusTransport(transport)
-        }
-        if (pairActive || slot == .two), model[slot].phase == .parked {
-            network.requestVideoStandby(park: true, expectedGeneration: transport)
+            if model[slot].phase == .parked {
+                record(model[slot].ticket, .parked)
+                network.requestVideoStandby(park: true, expectedGeneration: transport)
+            }
         }
         reconcile()
         return true
     }
 
-    func claimSurface(_ scene: String) { if model.claimSurface(scene) { reconcile() } }
+    func claimSurface(_ scene: String) {
+        guard sceneActive else {
+            if suspendedScene == nil { suspendedScene = scene }
+            return
+        }
+        if model.claimSurface(scene) { reconcile() }
+    }
     func releaseSurface(_ scene: String) {
+        if suspendedScene == scene { suspendedScene = nil }
         guard model.surfaceOwner == scene else { return }
         model.releaseSurface(scene)
         reconcile()
         thumbnails.removeAll()
     }
     func select(_ slot: SlotOrdinal, scene: String) {
+        guard sceneActive, model.surfaceOwner == scene else { return }
+        if model[slot].retryRequested { _ = retryRetainedSlot(slot) }
         _ = model.select(slot, scene: scene)
         reconcile()
     }
     func drop(_ ticket: SlotTicket, error: SlotFailure) {
         guard model[ticket.ordinal].ticket == ticket else { return }
+        record(ticket, .drop)
         model.drop(ticket, error: error)
         if error != .transport { manager(ticket.ordinal).stop() }
         transports[ticket.ordinal] = nil
@@ -181,6 +221,7 @@ final class FocusSurfaceLifetime {
     func presented(_ evidence: FocusBinding) {
         guard binding == evidence, manager(evidence.ticket.ordinal).remoteKeyboardGeneration == evidence.transport else { return }
         guard manager(evidence.ticket.ordinal).focusAuthorityMatches(evidence) else { return }
+        if !sawPresentation { record(evidence.ticket, .presented) }
         sawPresentation = true
         timer?.cancel()
         _ = model.presented(evidence.ticket)
@@ -202,13 +243,17 @@ final class FocusSurfaceLifetime {
             if let old {
                 let network = manager(old.ticket.ordinal)
                 let previewEligible = outputLease == old.ticket
+                if let ticket, ticket.ordinal != old.ticket.ordinal { record(ticket, .tap) }
+                clipboardFocus.demote(slot: old.ticket.ordinal, epoch: old.ticket.epoch)
+                network.cancelFileSlotFocus(epoch: old.ticket.epoch)
                 network.retireFocusInput?()
                 network.setFocusOutput(nil)
                 outputLease = nil
                 let park = old.ticket.ordinal != ticket?.ordinal
                 if park {
                     network.requestVideoStandby(park: true, expectedGeneration: old.transport)
-                    if previewEligible && model[old.ticket.ordinal].phase == .parked && model.surfaceOwner != nil {
+                    if model[old.ticket.ordinal].phase == .parked { record(old.ticket, .parked) }
+                    if sceneActive && previewEligible && model[old.ticket.ordinal].phase == .parked && model.surfaceOwner != nil {
                         thumbnails[old.ticket.ordinal] = network.takeFocusThumbnail(old)
                     }
                 }
@@ -225,6 +270,7 @@ final class FocusSurfaceLifetime {
             }
             sawPresentation = false
             requestedRecovery = false
+            record(ticket, .resume)
             binding = next
             network.installFocus(next) { [weak self] in self?.presented(next) }
             timer = Task { [weak self] in
@@ -239,7 +285,59 @@ final class FocusSurfaceLifetime {
         }
         if outputLease != model.outputLease {
             outputLease = model.outputLease
-            if let outputLease { manager(outputLease.ordinal).setFocusOutput(outputLease) }
+            if let outputLease {
+                let network = manager(outputLease.ordinal)
+                network.setFocusOutput(outputLease)
+                network.promoteFileSlotFocus(epoch: outputLease.epoch)
+                clipboardFocus.promote(slot: outputLease.ordinal, epoch: outputLease.epoch)
+            }
+        }
+        objectWillChange.send()
+    }
+
+    private func record(_ ticket: SlotTicket, _ event: SlotTimelineExport.Event) {
+        timeline.record(slot: ticket.ordinal, route: manager(ticket.ordinal).focusRoute(model[ticket.ordinal].route),
+                        epoch: ticket.epoch, event: event)
+    }
+
+    func exportDiagnostics() -> Data {
+        (try? timeline.export(hasSecondary: pairActive) { primary.singleSessionDiagnostics() }) ?? Data()
+    }
+
+    func appLifecycleChanged(active: Bool) {
+        guard sceneActive != active else { return }
+        sceneActive = active
+        let effects = active ? lifecycle.foreground(hasSecondary: model[.two].route != nil)
+            : lifecycle.background(primary: primary.focusRoute(model[.one].route), secondary: model[.two].route)
+        if !active, let scene = model.surfaceOwner {
+            suspendedScene = scene
+            model.releaseSurface(scene)
+            reconcile()
+        }
+        for effect in effects {
+            switch effect {
+            case .releaseAuthority(let slot):
+                if !pairActive { manager(slot).setRemoteClipboardSceneActive(false) }
+                manager(slot).applicationWillResignActive()
+            case .hidePreview(let slot):
+                thumbnails[slot] = nil
+            case .suspendUSB(let slot), .applyWiFiGrace(let slot):
+                manager(slot).applicationDidEnterBackground()
+            case .revalidateSessionPictureAndAuthority(let slot):
+                let network = manager(slot)
+                if !pairActive && slot == .one { network.setRemoteClipboardSceneActive(true) }
+                network.applicationDidBecomeActive()
+                guard let transport = transports[slot] else { continue }
+                if network.authenticatedRemoteIP(transport) {
+                    model.invalidateContext(model[slot].ticket)
+                } else {
+                    drop(model[slot].ticket, error: .transport)
+                }
+            }
+        }
+        if active, let scene = suspendedScene {
+            suspendedScene = nil
+            claimSurface(scene)
         }
         objectWillChange.send()
     }
@@ -247,10 +345,16 @@ final class FocusSurfaceLifetime {
     func watchdog(_ expected: FocusBinding, expired: Bool) {
         guard binding == expected, !sawPresentation else { return }
         if expired {
-            manager(expected.ticket.ordinal).expireFocusResume(expected)
-            drop(expected.ticket, error: .transport)
+            record(expected.ticket, .offline)
+            if manager(expected.ticket.ordinal).authenticatedRemoteIP(expected.transport) {
+                model.drop(expected.ticket, error: .transport)
+                reconcile()
+            } else {
+                drop(expected.ticket, error: .transport)
+            }
         }
         else if !requestedRecovery {
+            record(expected.ticket, .recovery)
             requestedRecovery = true
             manager(expected.ticket.ordinal).requestFocusRecovery(expected.transport)
         }

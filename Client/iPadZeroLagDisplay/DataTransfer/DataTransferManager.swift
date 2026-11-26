@@ -5,7 +5,11 @@ final class DataTransferManager {
     // Serial receive backlog: <= 2 MiB of maximum-size chunk payloads.
     static let maxPendingPackets = 32
     enum Phase: String { case idle = "Connect to your PC first.", offering = "Waiting for approval", awaitingDecision = "Incoming files", sending = "Sending", receiving = "Receiving", verifying = "Verifying", awaitingAck = "Waiting for confirmation", completed = "Completed", rejected = "Rejected", cancelled = "Cancelled", failed = "Failed", retired = "Disconnected" }
-    struct Consent: Equatable { let sessionID: UUID; let transferID: UUID }
+    struct Consent: Equatable {
+        let sessionID: UUID
+        let transferID: UUID
+        var slotAction: RemoteFileSlotScope.Action? = nil
+    }
     private let sessionID = UUID()
     struct Snapshot {
         var slotAction: RemoteFileSlotScope.Action?
@@ -443,7 +447,8 @@ final class DataTransferManager {
     func decide(_ accepted: Bool, consent: Consent) {
         guard let focusTicket = fileFocusTicket else { return }
         queue.async { [weak self] in
-            guard let self, self.fileFocusTicket == focusTicket, consent.sessionID == self.sessionID else { return }
+            guard let self, self.fileFocusTicket == focusTicket, consent.sessionID == self.sessionID,
+                  consent.slotAction == focusTicket.action(id: consent.transferID) else { return }
             self.decideOnQueue(accepted, expectedTransferID: consent.transferID)
         }
     }
@@ -451,7 +456,7 @@ final class DataTransferManager {
     // Existing IO tests capture the currently published owner before queueing a decision.
     func consentForTesting() -> Consent? {
         admission.lock(); defer { admission.unlock() }
-        return wireOwner.map { Consent(sessionID: sessionID, transferID: $0.0) }
+        return wireOwner.map { Consent(sessionID: sessionID, transferID: $0.0, slotAction: slotFocus?.action(id: $0.0)) }
     }
     func decide(_ accepted: Bool) {
         guard let consent = consentForTesting() else { return }
@@ -497,7 +502,16 @@ final class DataTransferManager {
             fail(error: error, reason: remoteWindowSender != nil && storageFull ? .insufficientStorage : .cancelled)
         }
     }
-    func cancel(failed: Bool = false) {queue.async { [weak self] in self?.fail(phase: failed ? .failed : .cancelled) } }
+    func cancel(failed: Bool = false, action: RemoteFileSlotScope.Action? = nil) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if let action {
+                guard let active = self.owner, self.current(active),
+                      active.focus.action(id: active.id) == action else { return }
+            }
+            self.fail(phase: failed ? .failed : .cancelled)
+        }
+    }
     func retire() {
         setAutoAccept(false, localGeneration: generation)
         if remoteWindowSender != nil {
@@ -509,7 +523,7 @@ final class DataTransferManager {
     private func current(_ active: Owner) -> Bool {!retired && owner === active && remoteIsLive && fileFocusTicket == active.focus}
     private func publish(_ phase: Phase, rejectionReason: TransferReason? = nil) {
         snapshot.slotAction = owner.flatMap { $0.focus.action(id: $0.id) }
-        snapshot.consent = owner.flatMap { !$0.outgoing && !$0.accepted && phase == .awaitingDecision ? Consent(sessionID: sessionID, transferID: $0.id) : nil }
+        snapshot.consent = owner.flatMap { !$0.outgoing && !$0.accepted && phase == .awaitingDecision ? Consent(sessionID: sessionID, transferID: $0.id, slotAction: snapshot.slotAction) : nil }
         snapshot.phase=phase
         snapshot.rejectionReason = rejectionReason
         snapshot.transport=transport

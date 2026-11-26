@@ -117,6 +117,7 @@ final class SlotDataLifecycleTests: XCTestCase {
         }
         let ticket = RemoteFileSlotScope.Action(slot: .one, epoch: 1, transferID: id)
         XCTAssertTrue(files.isAuthorized(ticket))
+        XCTAssertEqual(manager.consentForTesting()?.slotAction, ticket)
         XCTAssertThrowsError(try selected.confirmClear())
         files.cancelOnSwap(epoch: 1)
         XCTAssertFalse(files.isAuthorized(ticket))

@@ -1,7 +1,7 @@
 import Foundation
 
 /// Construct per connection. Capture Action when publishing a prompt or starting work.
-@MainActor
+// Confined to the owning NetworkManager network queue.
 final class RemoteFileSlotScope {
     struct Action: Equatable {
         let slot: SlotOrdinal
