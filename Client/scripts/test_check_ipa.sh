@@ -59,7 +59,9 @@ EOF
     /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $bundle_id" "$plist"
     /usr/libexec/PlistBuddy -c 'Add :CFBundleExecutable string iPadCasting' "$plist"
     /usr/libexec/PlistBuddy -c 'Add :CFBundlePackageType string APPL' "$plist"
-    /usr/libexec/PlistBuddy -c 'Add :UIDeviceFamily array' "$plist"
+    if [[ -n "$family" ]]; then
+        /usr/libexec/PlistBuddy -c 'Add :UIDeviceFamily array' "$plist"
+    fi
     index=0
     for value in $family; do
         /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily:$index integer $value" "$plist"
@@ -74,17 +76,19 @@ EOF
 
 positive="$TEMP_DIR/positive.ipa"
 wrong_bundle="$TEMP_DIR/wrong-bundle.ipa"
-iphone_family="$TEMP_DIR/iphone-family.ipa"
+ipad_only="$TEMP_DIR/iphone-family.ipa"
 missing_ipad_family="$TEMP_DIR/missing-ipad-family.ipa"
 fat_architecture="$TEMP_DIR/fat-architecture.ipa"
 unknown_architecture="$TEMP_DIR/unknown-architecture.ipa"
 ambiguous_payload="$TEMP_DIR/ambiguous-payload.ipa"
-make_ipa "$positive" 'com.iPadZeroLagDisplay.client' '2' "$TEMP_DIR/arm64.o"
-make_ipa "$wrong_bundle" 'com.example.wrong' '2' "$TEMP_DIR/arm64.o"
-make_ipa "$iphone_family" 'com.iPadZeroLagDisplay.client' '1 2' "$TEMP_DIR/arm64.o"
+make_ipa "$positive" 'com.iPadZeroLagDisplay.client' '1 2' "$TEMP_DIR/arm64.o"
+make_ipa "$wrong_bundle" 'com.example.wrong' '1 2' "$TEMP_DIR/arm64.o"
+make_ipa "$ipad_only" 'com.iPadZeroLagDisplay.client' '2' "$TEMP_DIR/arm64.o"
 make_ipa "$missing_ipad_family" 'com.iPadZeroLagDisplay.client' '1' "$TEMP_DIR/arm64.o"
-make_ipa "$fat_architecture" 'com.iPadZeroLagDisplay.client' '2' "$TEMP_DIR/fat.o"
-make_ipa "$unknown_architecture" 'com.iPadZeroLagDisplay.client' '2' "$TEMP_DIR/arm64e.o"
+make_ipa "$TEMP_DIR/absent.ipa" 'com.iPadZeroLagDisplay.client' '' "$TEMP_DIR/arm64.o"
+make_ipa "$TEMP_DIR/extra.ipa" 'com.iPadZeroLagDisplay.client' '1 2 3' "$TEMP_DIR/arm64.o"
+make_ipa "$fat_architecture" 'com.iPadZeroLagDisplay.client' '1 2' "$TEMP_DIR/fat.o"
+make_ipa "$unknown_architecture" 'com.iPadZeroLagDisplay.client' '1 2' "$TEMP_DIR/arm64e.o"
 
 ambiguous_stage="$TEMP_DIR/ambiguous-stage"
 mkdir -p "$ambiguous_stage"
@@ -107,7 +111,9 @@ expect_unsigned_failure() {
 }
 
 expect_unsigned_failure 'wrong bundle fixture' "$wrong_bundle"
-expect_unsigned_failure 'iPhone-family fixture' "$iphone_family"
+expect_unsigned_failure 'iPad-only fixture' "$ipad_only"
+expect_unsigned_failure 'absent family fixture' "$TEMP_DIR/absent.ipa"
+expect_unsigned_failure 'extra family fixture' "$TEMP_DIR/extra.ipa"
 expect_unsigned_failure 'missing iPad-family fixture' "$missing_ipad_family"
 expect_unsigned_failure 'fat-architecture fixture' "$fat_architecture"
 expect_unsigned_failure 'unknown-architecture fixture' "$unknown_architecture"
@@ -224,9 +230,9 @@ team_mismatch_ipa="$TEMP_DIR/signed-profile-team-mismatch.ipa"
 write_profile "$valid_profile" "$TEAM_ID.$BUNDLE_ID" "$TEAM_ID" "$TEAM_ID"
 write_profile "$bundle_mismatch_profile" "$TEAM_ID.com.example.wrong" "$TEAM_ID" "$TEAM_ID"
 write_profile "$team_mismatch_profile" "$TEAM_ID.$BUNDLE_ID" "$TEAM_ID" WRONGTEAM
-make_ipa "$signed_ipa" "$BUNDLE_ID" '2' "$TEMP_DIR/arm64.o" "$valid_profile"
-make_ipa "$bundle_mismatch_ipa" "$BUNDLE_ID" '2' "$TEMP_DIR/arm64.o" "$bundle_mismatch_profile"
-make_ipa "$team_mismatch_ipa" "$BUNDLE_ID" '2' "$TEMP_DIR/arm64.o" "$team_mismatch_profile"
+make_ipa "$signed_ipa" "$BUNDLE_ID" '1 2' "$TEMP_DIR/arm64.o" "$valid_profile"
+make_ipa "$bundle_mismatch_ipa" "$BUNDLE_ID" '1 2' "$TEMP_DIR/arm64.o" "$bundle_mismatch_profile"
+make_ipa "$team_mismatch_ipa" "$BUNDLE_ID" '1 2' "$TEMP_DIR/arm64.o" "$team_mismatch_profile"
 
 run_mock_signed_validation() {
     local profile_source ipa_path

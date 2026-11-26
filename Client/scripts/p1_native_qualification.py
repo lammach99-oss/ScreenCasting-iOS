@@ -30,6 +30,10 @@ elif sys.argv[1]=='package':
  app=out/'device/Build/Products/Release-iphoneos/iPadCasting.app'
  assert app.is_dir()
  info=plistlib.loads((app/'Info.plist').read_bytes())
+ from universal_family import validated_family
+ validated_family(app/'Info.plist')
+ assert info['MinimumOSVersion']=='17.0'
+ assert info['CFBundleIdentifier']=='com.iPadZeroLagDisplay.client'
  assert 'iPhoneOS' in info['CFBundleSupportedPlatforms']
  assert not (app/'_CodeSignature').exists() and not (app/'embedded.mobileprovision').exists()
  payload=package/'Payload';payload.mkdir();shutil.copytree(app,payload/app.name)
@@ -42,16 +46,32 @@ elif sys.argv[1]=='package':
  shutil.copyfile(out/'dependency-verification.json',package/'dependency-verification.json')
  (package/'IPA.sha256').write_text(sha(ipa.read_bytes())+'  '+ipa.name+'\n')
 else:
- devices=json.loads(subprocess.check_output(['xcrun','simctl','list','devices','available','-j']))['devices']
- choices=[d for runtime,ds in devices.items() if runtime.endswith('iOS-18-5') for d in ds if 'iPad' in d['name']]
- assert choices,'No iOS 18.5 iPad simulator'
- udid=choices[0]['udid'];subprocess.run(['xcrun','simctl','boot',udid],capture_output=True)
+ phone=sys.argv[1]=='phone'
+ family='iPhone' if phone else 'iPad'
+ runtime=os.environ.get('SIM_RUNTIME','18.5')
+ arch=os.environ.get('NATIVE_SIMULATOR_ARCH','x86_64')
+ if phone:
+  out=out/'iPhone'
+ out.mkdir(parents=True,exist_ok=True)
+ udid=subprocess.check_output([sys.executable,'Client/scripts/select_ios_simulator.py',family,runtime],text=True).strip()
+ subprocess.run(['xcrun','simctl','boot',udid],capture_output=True)
  run(['xcrun','simctl','bootstatus',udid,'-b'],'boot.log')
  base=['xcodebuild','-project','Client/iPadZeroLagDisplay/iPadCasting.xcodeproj','-scheme','iPadCasting',
-  '-destination','platform=iOS Simulator,id='+udid+',arch=x86_64','-derivedDataPath',str(out/'derived'),
-  '-parallel-testing-enabled','NO','ARCHS=x86_64','ONLY_ACTIVE_ARCH=YES','CODE_SIGNING_ALLOWED=NO','CODE_SIGNING_REQUIRED=NO']
+  '-destination','platform=iOS Simulator,id='+udid+',arch='+arch,'-derivedDataPath',str(out/'derived'),
+  '-parallel-testing-enabled','NO','ARCHS='+arch,'ONLY_ACTIVE_ARCH=YES','CODE_SIGNING_ALLOWED=NO','CODE_SIGNING_REQUIRED=NO']
  run(base+['build-for-testing'],'build.log')
  selectors=[x for x in os.environ.get('P1_SELECTORS','').split(',') if x]
+ if phone:
+  selectors=[
+   'iPadCastingTests/ConnectionControlIntegrationTests/testPhoneOnlyDialsExplicitRemoteIntent',
+   'iPadCastingTests/ConnectionControlIntegrationTests/testPhoneDiscoveryAdmitsOnlyLiveRemoteResults',
+   'iPadCastingTests/ConnectionControlIntegrationTests/testPhoneRetryFencesGenerationAndPinsSavedIdentity',
+   'iPadCastingTests/InputGeometryDiagnosticsTests/testPhoneVideoAndInputUseSameTransformAfterResize',
+   'iPadCastingTests/RemoteMouseInputTests/testPhoneSurfaceRejectsNegotiatedDirectContacts',
+   'iPadCastingTests/TrustedReconnectPolicyTests/testWifiLifecycleUsesBoundedBackgroundGrace',
+   'iPadCastingTests/RemoteMonitorIntegrationTests/testActualMonitorAdmissionWaitsForSharedInputAndReopens',
+   'iPadCastingTests/RemoteClipboardTests/testClipboardRequiresPairedOptInAndMatchingMarker',
+  ]
  run(base+['test-without-building','-enumerate-tests','-test-enumeration-style','flat',
   '-test-enumeration-format','json','-test-enumeration-output-path',str(out/'inventory.json')],'enumerate.log')
  expected=set()
@@ -63,6 +83,7 @@ else:
    for y in x:visit(y)
  visit(json.loads((out/'inventory.json').read_text()));assert expected
  if selectors: expected={x for x in expected if any(('iPadCastingTests/'+x)==s or ('iPadCastingTests/'+x).startswith(s+'/') for s in selectors)}
+ if phone: assert {'iPadCastingTests/'+x for x in expected}==set(selectors)
  assert expected
  result=out/'result.xcresult'
  args=base+['test-without-building','-resultBundlePath',str(result)]+['-only-testing:'+s for s in selectors]

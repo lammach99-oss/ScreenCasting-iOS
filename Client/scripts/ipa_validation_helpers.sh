@@ -14,11 +14,6 @@ ipa_require_exact_architecture() {
     [[ "$normalized" == "$expected" ]] || ipa_fail "$label must be exactly $expected, got ${normalized:-<empty>}"
 }
 
-ipa_require_ipad_only_family() {
-    local family_entries
-    family_entries="$(printf '%s\n' "$1" | awk '/^[[:space:]]*[0-9]+[[:space:]]*$/{print $1}')"
-    [[ "$family_entries" == '2' ]] || ipa_fail "UIDeviceFamily must contain only 2, got ${family_entries:-<empty>}"
-}
 
 ipa_require_exact_value() {
     local label actual expected
@@ -62,15 +57,14 @@ ipa_require_no_simulator_linkage() {
 
 ipa_validate_unsigned_app() {
     local app_dir="$1" expected_app_name="$2" expected_bundle_id="$3"
-    local plist bundle_id family executable executable_path architecture
+    local plist bundle_id executable executable_path architecture
     [[ -d "$app_dir" ]] || { ipa_fail "missing unsigned app: $app_dir"; return 1; }
     [[ "$(basename "$app_dir")" == "$expected_app_name" ]] || { ipa_fail "unexpected unsigned app bundle: $(basename "$app_dir")"; return 1; }
     plist="$app_dir/Info.plist"
     [[ -f "$plist" ]] || { ipa_fail 'unsigned app missing Info.plist'; return 1; }
     bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$plist")" || { ipa_fail 'unsigned app missing CFBundleIdentifier'; return 1; }
     ipa_require_exact_value 'unsigned app bundle identifier' "$bundle_id" "$expected_bundle_id" || return 1
-    family="$(/usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily' "$plist" 2>/dev/null || true)"
-    ipa_require_ipad_only_family "$family" || return 1
+    python3 "$(dirname "${BASH_SOURCE[0]}")/universal_family.py" "$plist" >/dev/null || return 1
     executable="$(plutil -extract CFBundleExecutable raw -o - "$plist")" || { ipa_fail 'unsigned app missing CFBundleExecutable'; return 1; }
     executable_path="$app_dir/$executable"
     [[ -f "$executable_path" ]] || { ipa_fail "unsigned app missing declared executable: $executable_path"; return 1; }

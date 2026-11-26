@@ -63,14 +63,18 @@ final class ConnectionControlIntegrationTests: XCTestCase {
 
     private final class PhoneBrowser: DiscoveryBrowser, @unchecked Sendable {
         var publish: (@Sendable ([NWEndpoint]) -> Void)?
+        var changeState: (@Sendable (NWBrowser.State) -> Void)?
         func start(queue: DispatchQueue, results: @escaping @Sendable ([NWEndpoint]) -> Void,
-                   state: @escaping @Sendable (NWBrowser.State) -> Void) { publish = results }
+                   state: @escaping @Sendable (NWBrowser.State) -> Void) {
+            publish = results
+            changeState = state
+        }
         func cancel() {}
     }
 
     @MainActor func testPhoneDiscoveryAdmitsOnlyLiveRemoteResults() async throws {
         let browser = PhoneBrowser()
-        var completions: [String: (RemoteIntent.Target?) -> Void] = [:]
+        var completions: [String: (RemoteServiceRecord?) -> Void] = [:]
         let discovery = DiscoveryManager(capabilities: .init(family: .phone), browserForType: { type in
             XCTAssertEqual(type, "_sc-remote._tcp")
             return browser
@@ -86,19 +90,73 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         let deadline = Date().addingTimeInterval(3)
         while completions.count < 3 && Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         XCTAssertEqual(Set(completions.keys), Set(["A", "B", "C"]))
-        completions["A"]?(.init(host: "127.0.0.1", port: 27020))
-        completions["B"]?(.init(host: "127.0.0.1", port: 27020))
-        completions["C"]?(.init(host: "127.0.0.1", port: 27015))
+        // Darwin sockaddr_in containing an RFC 5737 documentation address.
+        let numeric = Data([16, 2, 0, 0, 192, 0, 2, 1] + Array(repeating: UInt8(0), count: 8))
+        let record = RemoteServiceRecord(host: "Test\\032PC_.local.", port: 27020, addresses: [Data(), numeric])
+        completions["A"]?(record)
+        completions["B"]?(record)
+        var other = numeric
+        other[7] = 2
+        completions["C"]?(.init(host: record.host, port: 27015, addresses: [other]))
         await Task.yield()
         while discovery.discoveredRemoteIntents.isEmpty && Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         XCTAssertEqual(discovery.discoveredRemoteIntents.count, 1)
+        XCTAssertEqual(discovery.remoteRows.first?.displayName, "Test PC_")
+        guard case .discovered(_, let target)? = discovery.discoveredRemoteIntents.first else {
+            return XCTFail("Missing admitted result")
+        }
+        XCTAssertEqual(target?.host, "192.0.2.1")
+        XCTAssertEqual(target?.port, 27020)
         XCTAssertTrue(discovery.discoveredHosts.isEmpty)
-        discovery.stopBrowsing()
-        completions["A"]?(.init(host: "127.0.0.1", port: 27020))
+        // Withdraw the service while another result remains in this generation.
+        browser.publish?([endpoints[2]])
+        while !discovery.remoteRows.isEmpty && Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
+        completions["A"]?(record)
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
             DispatchQueue.main.async { done.resume() }
         }
         XCTAssertTrue(discovery.discoveredRemoteIntents.isEmpty)
+        discovery.stopBrowsing()
+    }
+
+    @MainActor func testPadDiscoveryStillPublishesCastingEndpointWithoutRemoteResolution() async throws {
+        let browser = PhoneBrowser()
+        let discovery = DiscoveryManager(capabilities: .init(family: .pad), browserForType: { type in
+            XCTAssertEqual(type, "_screencasting._tcp")
+            return browser
+        }, resolveService: { _, _, _ in
+            XCTFail("Unexpected Remote resolution on iPad")
+            return {}
+        })
+        discovery.startBrowsing()
+        let endpoint = NWEndpoint.service(name: "A", type: "_screencasting._tcp", domain: "local.", interface: nil)
+        browser.publish?([endpoint])
+        let deadline = Date().addingTimeInterval(2)
+        while discovery.discoveredHosts.isEmpty && Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertEqual(discovery.discoveredHosts.map(\.endpoint), [endpoint])
+        XCTAssertTrue(discovery.remoteRows.isEmpty)
+        discovery.stopBrowsing()
+    }
+
+    @MainActor func testPhoneDiscoveryReportsPolicyDenialAndRecovery() async throws {
+        let browser = PhoneBrowser()
+        let discovery = DiscoveryManager(capabilities: .init(family: .phone), browserForType: { _ in browser })
+        discovery.startBrowsing()
+        func expect(_ status: DiscoveryManager.Status) async throws {
+            let deadline = Date().addingTimeInterval(2)
+            while discovery.status != status && Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
+            XCTAssertEqual(discovery.status, status)
+        }
+        browser.changeState?(.waiting(.dns(-65570)))
+        browser.publish?([])
+        try await expect(.denied)
+        browser.changeState?(.ready)
+        try await expect(.empty)
+        browser.changeState?(.failed(.dns(-65570)))
+        try await expect(.denied)
+        discovery.startBrowsing()
+        browser.changeState?(.failed(.dns(-65568)))
+        try await expect(.failed)
     }
 
     @MainActor func testPhoneDeclinesCastingAfterRemoteAuthentication() async {

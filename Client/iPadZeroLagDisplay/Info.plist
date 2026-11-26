@@ -27,10 +27,11 @@
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>ScreenCasting requires local network access to discover and connect to your Windows PC secondary monitor host.</string>
+	<string>ScreenCasting uses the local network to find and connect to your Windows PC for remote control or, on iPad, as a secondary display.</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_screencasting._tcp</string>
+		<string>_sc-remote._tcp</string>
 	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
@@ -45,6 +46,12 @@
 	<true/>
 	<key>UIViewControllerBasedStatusBarAppearance</key>
 	<false/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
 	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array>
 		<string>UIInterfaceOrientationLandscapeLeft</string>

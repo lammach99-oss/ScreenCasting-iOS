@@ -67,8 +67,7 @@ PLIST="$APP_DIR/Info.plist"
 bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$PLIST")" || ipa_fail 'missing CFBundleIdentifier'
 ipa_require_exact_value 'bundle identifier' "$bundle_id" "$EXPECTED_BUNDLE_IDENTIFIER"
 
-family="$(/usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily' "$PLIST" 2>/dev/null || true)"
-ipa_require_ipad_only_family "$family"
+python3 "$SCRIPT_DIR/scripts/universal_family.py" "$PLIST" >/dev/null
 
 executable="$(plutil -extract CFBundleExecutable raw -o - "$PLIST")" || ipa_fail 'missing CFBundleExecutable'
 EXEC_PATH="$APP_DIR/$executable"

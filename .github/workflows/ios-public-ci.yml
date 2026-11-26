@@ -249,7 +249,11 @@ jobs:
 
   build-and-test:
     if: ${{ !inputs.p1_client_qualification && !inputs.g02_consumer_provenance_only && (!inputs.g02_dependencies_only && (!inputs.c1_native_stability)) }}
-    name: Build and XCTest
+    name: XCTest (${{ matrix.family }})
+    strategy:
+      fail-fast: false
+      matrix:
+        family: [iPad, iPhone]
     needs: prepare-native-deps
     runs-on: macos-15-intel
     timeout-minutes: 45
@@ -257,7 +261,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
-      - name: Verify iPad-only target
+      - name: Verify universal target
         run: ./Client/scripts/verify_ipad_target.sh
       - name: Verify identity persistence boundary
         run: |
@@ -297,24 +301,26 @@ jobs:
           echo "NATIVE_DEPENDENCY_ARTIFACT_VERIFY_SECONDS=$(( $(date +%s) - started_epoch ))"
           echo 'NATIVE_DEPENDENCY_CONSUMER_VERIFY=PASS'
       - name: Build unsigned iOS Simulator app
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_xctest != false }}
+        if: matrix.family == 'iPad' && (github.event_name != 'workflow_dispatch' || inputs.run_xctest != false || inputs.build_unsigned_ipa)
         run: |
           set -euo pipefail
           started_epoch=$(date +%s)
           xcodebuild -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj \
+            -derivedDataPath "$RUNNER_TEMP/derived-iPad" \
             -scheme iPadCasting -destination 'generic/platform=iOS Simulator' \
-            ARCHS=x86_64 ONLY_ACTIVE_ARCH=YES \
+            ARCHS="$NATIVE_SIMULATOR_ARCH" ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
           echo "SIMULATOR_BUILD_SECONDS=$(( $(date +%s) - started_epoch ))"
       - name: Run XCTest
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_xctest != false }}
+        if: matrix.family == 'iPad' && (github.event_name != 'workflow_dispatch' || inputs.run_xctest != false || inputs.build_unsigned_ipa)
         env:
           XCTEST_FILTER: ${{ inputs.xctest_filter }}
           REPEAT_COUNT: ${{ inputs.repeat_count || '1' }}
         run: |
           set -euo pipefail
           started_epoch=$(date +%s)
-          destination=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(("platform=iOS Simulator,id="+device["udid"]+",arch=x86_64" for devices in data.get("devices", {}).values() for device in devices if device.get("isAvailable") and "iPad" in device.get("name", "")), ""))')
+          udid=$(python3 Client/scripts/select_ios_simulator.py iPad latest)
+          destination="platform=iOS Simulator,id=$udid,arch=$NATIVE_SIMULATOR_ARCH"
           test -n "$destination"
           [[ "$REPEAT_COUNT" =~ ^([1-9]|1[0-9]|20)$ ]]
           test_args=()
@@ -330,9 +336,12 @@ jobs:
           failed=0
           for ((iteration=1; iteration<=REPEAT_COUNT; iteration++)); do
             if xcodebuild test -project Client/iPadZeroLagDisplay/iPadCasting.xcodeproj \
+              -derivedDataPath "$RUNNER_TEMP/derived-iPad" -resultBundlePath "$RUNNER_TEMP/iPad-$iteration.xcresult" \
               -scheme iPadCasting -destination "$destination" \
-              ARCHS=x86_64 ONLY_ACTIVE_ARCH=YES \
+              ARCHS="$NATIVE_SIMULATOR_ARCH" ONLY_ACTIVE_ARCH=YES \
               CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO ${test_args[@]+"${test_args[@]}"}; then
+              xcrun xcresulttool get test-results summary --path "$RUNNER_TEMP/iPad-$iteration.xcresult" |
+                python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["passedTests"] > 0 and r["failedTests"] == 0'
               echo "XCTEST_ITERATION=$iteration RESULT=PASS"
             else
               echo "XCTEST_ITERATION=$iteration RESULT=FAIL"
@@ -341,6 +350,17 @@ jobs:
           done
           echo "XCTEST_SECONDS=$(( $(date +%s) - started_epoch ))"
           exit "$failed"
+      - name: Run focused iPhone Remote XCTest
+        if: matrix.family == 'iPhone' && (github.event_name != 'workflow_dispatch' || inputs.run_xctest != false || inputs.build_unsigned_ipa)
+        env:
+          SIM_RUNTIME: latest
+        run: python3 Client/scripts/p1_native_qualification.py phone
+      - uses: actions/upload-artifact@v7
+        if: always() && (github.event_name != 'workflow_dispatch' || inputs.run_xctest != false || inputs.build_unsigned_ipa)
+        with:
+          name: XCTest-${{ matrix.family }}
+          path: ${{ matrix.family == 'iPhone' && 'evidence/iPhone/result.xcresult' || format('{0}/iPad-*.xcresult', runner.temp) }}
+          if-no-files-found: error
 
   build-unsigned-ipad-app:
     name: Build unsigned iPad app
@@ -355,7 +375,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
-      - name: Verify iPad-only target
+      - name: Verify universal target
         run: ./Client/scripts/verify_ipad_target.sh
       - name: Download verified native dependency artifact
         uses: actions/download-artifact@v8
@@ -429,10 +449,20 @@ jobs:
           set -euo pipefail
           rm -rf "$APP_ARTIFACT_ROOT"
           mkdir -p "$APP_ARTIFACT_ROOT"
+          family="$(python3 Client/scripts/universal_family.py "$APP_PATH/Info.plist")"
           executable="$(plutil -extract CFBundleExecutable raw -o - "$APP_PATH/Info.plist")"
           bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$APP_PATH/Info.plist")"
           bundle_version="$(plutil -extract CFBundleVersion raw -o - "$APP_PATH/Info.plist")"
           short_version="$(plutil -extract CFBundleShortVersionString raw -o - "$APP_PATH/Info.plist")"
+          python3 - "$APP_PATH/Info.plist" <<'PY'
+          import plistlib, sys
+          with open(sys.argv[1], 'rb') as stream:
+              info = plistlib.load(stream)
+          phone = {'UIInterfaceOrientation' + x for x in ('Portrait', 'LandscapeLeft', 'LandscapeRight')}
+          assert set(info['UISupportedInterfaceOrientations']) == phone
+          assert set(info['UISupportedInterfaceOrientations~ipad']) == phone | {'UIInterfaceOrientationPortraitUpsideDown'}
+          assert info['MinimumOSVersion'] == '17.0'
+          PY
           [[ "$bundle_id" == 'com.iPadZeroLagDisplay.client' ]]
           [[ "$(lipo -archs "$APP_PATH/$executable")" == 'arm64' ]]
           cp -R "$APP_PATH" "$APP_ARTIFACT_ROOT/iPadCasting.app"
@@ -444,7 +474,7 @@ jobs:
           CFBundleIdentifier: $bundle_id
           CFBundleVersion: $bundle_version
           CFBundleShortVersionString: $short_version
-          Targeted Device Family: 2
+          Targeted Device Family: $family
           Architecture: arm64
           Signing: unsigned
           Native Dependencies Manifest SHA-256: $NATIVE_MANIFEST_SHA256
@@ -497,7 +527,8 @@ jobs:
           [[ "$manifest_sha256" == "$EXPECTED_APP_MANIFEST_SHA256" ]]
           field() { awk -F': ' -v key="$1" '$1 == key { print substr($0, length($1) + 3); exit }' "$manifest_path"; }
           [[ "$(field 'Public SHA')" == "$GITHUB_SHA" ]]
-          [[ "$(field 'Targeted Device Family')" == '2' ]]
+          family="$(python3 Client/scripts/universal_family.py "$app_path/Info.plist")"
+          [[ "$(field 'Targeted Device Family')" == "$family" ]]
           [[ "$(field 'Architecture')" == 'arm64' ]]
           [[ "$(field 'Native Dependencies Manifest SHA-256')" == "$EXPECTED_NATIVE_MANIFEST_SHA256" ]]
           EXPECTED_BUNDLE_IDENTIFIER=com.iPadZeroLagDisplay.client \
@@ -537,6 +568,7 @@ jobs:
           MANIFEST_PATH: ${{ runner.temp }}/ScreenCasting-iPad-unsigned.manifest.txt
         run: |
           set -euo pipefail
+          family="$(python3 Client/scripts/universal_family.py "$IPA_PATH")"
           ipa_sha256="$(shasum -a 256 "$IPA_PATH" | awk '{print $1}')"
           cat > "$MANIFEST_PATH" <<EOF
           Manifest-Version: 1
@@ -546,7 +578,7 @@ jobs:
           Configuration: Release
           Platform: iOS device
           Architecture: arm64
-          Targeted Device Family: 2
+          Targeted Device Family: $family
           Signing: unsigned
           Validator: PASS
           App Manifest SHA-256: $APP_MANIFEST_SHA256
@@ -610,7 +642,8 @@ jobs:
           [[ -n "$expected_sha256" && "$actual_sha256" == "$expected_sha256" ]]
           [[ "$(field 'Public SHA')" == "$GITHUB_SHA" ]]
           [[ "$(field 'Architecture')" == 'arm64' ]]
-          [[ "$(field 'Targeted Device Family')" == '2' ]]
+          family="$(python3 Client/scripts/universal_family.py "$ipa_path")"
+          [[ "$(field 'Targeted Device Family')" == "$family" ]]
           [[ "$(field 'App Manifest SHA-256')" == "$EXPECTED_APP_MANIFEST_SHA256" ]]
           [[ "$(field 'Native Dependencies Manifest SHA-256')" == "$EXPECTED_NATIVE_MANIFEST_SHA256" ]]
           EXPECTED_BUNDLE_IDENTIFIER=com.iPadZeroLagDisplay.client \
@@ -659,7 +692,7 @@ jobs:
           runtimes=json.loads((entry/'runtimes.json').read_text())['runtimes']
           runtime=next(x for x in runtimes if x['version']=='18.5' and x.get('isAvailable') and 'iOS' in x['name'])
           devices=json.loads((entry/'devices.json').read_text())['devices'][runtime['identifier']]
-          device=sorted((x for x in devices if x.get('isAvailable') and 'iPad' in x['name']), key=lambda x:(x['name'],x['udid']))[0]
+          device=sorted((x for x in devices if x.get('isAvailable') and x.get('deviceTypeIdentifier','').startswith('com.apple.CoreSimulator.SimDeviceType.iPad-')), key=lambda x:(x['name'],x['udid']))[0]
           (entry/'selected-simulator.json').write_text(json.dumps({'runtime':runtime,'device':device,'policy':'one UDID; no erase/reboot between variants or repetitions; single test worker'},indent=2))
           with open(os.environ['GITHUB_ENV'],'a') as env:env.write('C1_SIMULATOR_UDID='+device['udid']+'\n')
           PY
@@ -965,10 +998,10 @@ jobs:
         env:
           P1_SELECTORS: ${{ inputs.xctest_filter }}
         run: |
+          python3 Client/scripts/p1_native_qualification.py test
+          python3 Client/scripts/p1_native_qualification.py phone
           if [ "${{ inputs.p1_production_ipa }}" = true ]; then
             python3 Client/scripts/p1_native_qualification.py package
-          else
-            python3 Client/scripts/p1_native_qualification.py test
           fi
       - uses: actions/upload-artifact@v4
         if: success() && inputs.p1_production_ipa

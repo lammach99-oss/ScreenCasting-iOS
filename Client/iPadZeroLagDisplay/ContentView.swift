@@ -1521,12 +1521,19 @@ struct RemoteAddressField: View {
                                         selection = .manual(.init(host: address, port: NetworkManager.remoteControlPort))
                                     }.disabled(address.isEmpty)
                                 case .discovered:
-                                    if discovery.discoveredRemoteIntents.isEmpty {
-                                        Text("No PCs found. If local network access is off, use Manual address.")
-                                    }
-                                    ForEach(Array(discovery.discoveredRemoteIntents.enumerated()), id: \.offset) { entry in
-                                        if let preview = model.preview(entry.element) {
-                                            Button(preview.destination) { selection = entry.element }
+                                    switch discovery.status {
+                                    case .denied:
+                                        Text("Allow access in Settings > Privacy & Security > Local Network, or use Manual address.")
+                                    case .failed:
+                                        Text("Discovery is unavailable. Use Manual address.")
+                                    case .empty:
+                                        Text("No PCs found. Use Manual address to enter an IP address or Tailscale DNS name.")
+                                    case .browsing:
+                                        if discovery.remoteRows.isEmpty {
+                                            Text("Searching for PCs...")
+                                        }
+                                        ForEach(discovery.remoteRows) { row in
+                                            Button(row.displayName) { selection = row.intent }
                                         }
                                     }
                                 }
