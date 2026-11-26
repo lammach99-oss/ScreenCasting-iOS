@@ -252,6 +252,7 @@ jobs:
     name: XCTest (${{ matrix.family }})
     strategy:
       fail-fast: false
+      max-parallel: 1  # iPad and iPhone simulators one at a time: in parallel the iPad job slowed 13 -> 27 min and short waits timed out
       matrix:
         family: [iPad, iPhone]
     needs: prepare-native-deps
