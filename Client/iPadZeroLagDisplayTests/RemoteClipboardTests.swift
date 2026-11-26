@@ -135,6 +135,7 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         let manager: NetworkManager
         private let defaults: UserDefaults
         private var writes: [Data] = [] // Network queue only.
+        private var observeWrite: ((Data) -> Void)? // Network queue only.
         private var heldPing: ((NWError?) -> Void)?
         private var offerWritten: XCTestExpectation? // Network queue only.
         private var holdNextPing = false
@@ -152,6 +153,7 @@ final class CastingClipboardIntegrationTests: XCTestCase {
             manager.controlSendForAudioTesting = { [weak self] bytes, complete in
                 guard let self else { complete(nil); return }
                 self.writes.append(bytes)
+                self.observeWrite?(bytes)
                 if let offer = self.offerWritten, bytes.count >= WireProtocol.headerSize,
                    bytes[5] == WireMessageType.remoteFilePacket.rawValue,
                    case .packet(_, let packet)? = RemoteFileProtocol.decode(type: .remoteFilePacket,
@@ -179,6 +181,36 @@ final class CastingClipboardIntegrationTests: XCTestCase {
                 writes.filter { $0.count >= 16 && $0[5] == type && $0[6] == UInt8(truncatingIfNeeded: flags) && $0[7] == UInt8(flags >> 8) }
                     .map { Data($0.dropFirst(16)) }
             }
+        }
+
+        // Replay writes and install the live observer on the same serial queue.
+        // A fast response can arrive before the test starts awaiting it.
+        func frame(_ type: UInt8, flags: UInt16 = 0, skipping: Int = 0,
+                   file: StaticString = #filePath, line: UInt = #line) async throws -> Data {
+            let seen = XCTestExpectation(description: "Wire frame \(type) after \(skipping)")
+            var payload: Data?
+            manager.networkQueueForTesting.sync {
+                var remaining = skipping
+                let inspect: (Data) -> Void = { bytes in
+                    guard bytes.count >= WireProtocol.headerSize, bytes[5] == type,
+                          bytes[6] == UInt8(truncatingIfNeeded: flags), bytes[7] == UInt8(flags >> 8) else { return }
+                    if remaining > 0 { remaining -= 1; return }
+                    payload = Data(bytes.dropFirst(WireProtocol.headerSize))
+                    seen.fulfill()
+                    self.observeWrite = nil
+                }
+                for bytes in writes {
+                    inspect(bytes)
+                    if payload != nil { return }
+                }
+                observeWrite = inspect
+            }
+            defer { manager.networkQueueForTesting.sync { observeWrite = nil } }
+            guard await XCTWaiter.fulfillment(of: [seen], timeout: 15) == .completed else {
+                XCTFail("Missing wire frame \(type) after \(skipping)", file: file, line: line)
+                throw ClipboardWaitError.timedOut
+            }
+            return try manager.networkQueueForTesting.sync { try XCTUnwrap(payload, file: file, line: line) }
         }
 
         func send(_ type: UInt8, _ payload: Data, flags: UInt16 = 0, to owner: Owner) {
@@ -236,16 +268,15 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         throw ClipboardWaitError.timedOut
     }
 
-    private enum ClipboardWaitError: Error { case timedOut }
+    private enum ClipboardWaitError: Error { case timedOut, unexpectedResponse }
 
     @MainActor private func acknowledgeProbe(_ host: Host, owner: Owner) async throws -> UUID {
-        try await waitFor { !host.frames(6, flags: 0x1000).isEmpty }
-        let probe = try XCTUnwrap(host.frames(6, flags: 0x1000).last)
+        let probeIndex = max(0, host.frames(6, flags: 0x1000).count - 1)
+        let probe = try await host.frame(6, flags: 0x1000, skipping: probeIndex)
         XCTAssertEqual(probe.count, 16)
         let previousHellos = host.frames(111).count
         host.send(7, probe, flags: 0x1000, to: owner)
-        try await waitFor { host.frames(111).count > previousHellos }
-        let hello = try XCTUnwrap(host.frames(111).last)
+        let hello = try await host.frame(111, skipping: previousHellos)
         XCTAssertEqual(hello.count, 32)
         guard case .hello(3, 10_000_000, 16_384, let nonce)? = Wire.decode(type: .clipboardHello, payload: hello) else {
             XCTFail("Invalid casting Hello")
@@ -255,16 +286,24 @@ final class CastingClipboardIntegrationTests: XCTestCase {
     }
 
     @MainActor private func grant(_ host: Host, owner: Owner, nonce: UUID) async throws -> Wire.State {
+        let controlCount = host.frames(86).count
         host.send(.state(.init(kind: .disabled, directions: 0, maxBytes: 10_000_000, maxChunk: 16_384,
             formats: 3, nonce: nonce, token: Wire.emptyID, epoch: 1, requestID: 0, reason: .viewerDisabled)), to: owner)
         let expected = Wire.Message.control(.request, 3, 1, true, nonce)
-        try await waitFor { host.frames(86).contains { Wire.decode(type: .clipboardControl, payload: $0) == expected } }
+        let request = try await host.frame(86, skipping: controlCount)
+        XCTAssertEqual(Wire.decode(type: .clipboardControl, payload: request), expected)
         host.send(.state(.init(kind: .pendingConsent, directions: 0, maxBytes: 10_000_000, maxChunk: 16_384,
             formats: 3, nonce: nonce, token: Wire.emptyID, epoch: 1, requestID: 1, reason: .ok)), to: owner)
         let state = Wire.State(kind: .enabled, directions: 3, maxBytes: 10_000_000, maxChunk: 16_384,
             formats: 3, nonce: nonce, token: UUID(), epoch: 2, requestID: 1, reason: .ok)
         host.send(.state(state), to: owner)
-        try await waitFor { host.manager.remoteClipboardPasteboard.canSend }
+        let enabled = expectation(description: "Clipboard grant published")
+        let observation = host.manager.remoteClipboardPasteboard.$canSend.first(where: { $0 }).sink { _ in enabled.fulfill() }
+        defer { observation.cancel() }
+        guard await XCTWaiter.fulfillment(of: [enabled], timeout: 15) == .completed else {
+            XCTFail("Clipboard grant missing")
+            throw ClipboardWaitError.timedOut
+        }
         return state
     }
 
@@ -379,11 +418,15 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         XCTAssertTrue(host.manager.remoteClipboardPasteboard.automatic)
 
         var notices: [String] = []
-        let observer = host.manager.$clipboardMissedCopyNotice.compactMap { $0 }.sink { notices.append($0) }
+        let missed = expectation(description: "Missed copy notice published")
+        let observer = host.manager.$clipboardMissedCopyNotice.compactMap { $0 }.sink {
+            notices.append($0)
+            if notices.count == 1 { missed.fulfill() }
+        }
         defer { observer.cancel() }
         let status = Wire.Message.cancel(.init(token: state.token, epoch: state.epoch, update: UUID()), .clipboardBusy)
         host.send(status, to: owner)
-        try await waitFor { notices.count == 1 }
+        guard await XCTWaiter.fulfillment(of: [missed], timeout: 15) == .completed else { return XCTFail("Missing copy notice") }
         host.send(status, to: owner)
 
         let origin = UUID()
@@ -395,15 +438,19 @@ final class CastingClipboardIntegrationTests: XCTestCase {
             let resultCount = host.frames(91).count
             host.send(.offer(.init(prefix: prefix, format: .text, formats: 1, length: bytes.count,
                                    origin: origin, counter: counter, revision: counter, digest: digest)), to: owner)
-            try await waitFor { host.frames(88).count > responseCount }
+            let response = try await host.frame(88, skipping: responseCount)
+            guard case .response(let accepted, true, .ok, _)? = Wire.decode(type: .clipboardOfferResponse, payload: response),
+                  accepted == prefix else {
+                XCTFail("Expected acceptance of this PC offer")
+                throw ClipboardWaitError.unexpectedResponse
+            }
             if let retired {
                 host.send(.cancel(retired, .timeout), to: owner)
                 host.send(status, to: owner)
             }
             host.send(.chunk(prefix, 0, 0, bytes), to: owner)
             host.send(.end(prefix, bytes.count, digest), to: owner)
-            try await waitFor { host.frames(91).count > resultCount }
-            let result = try XCTUnwrap(host.frames(91).last)
+            let result = try await host.frame(91, skipping: resultCount)
             if case .result(let appliedPrefix, true, .ok, _)? = Wire.decode(type: .clipboardResult, payload: result) {
                 XCTAssertEqual(appliedPrefix, prefix)
             } else { XCTFail("Expected iPad to apply the PC copy") }
@@ -427,15 +474,14 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         XCTAssertEqual(provider.fileReads, 0)
         XCTAssertTrue(host.manager.remoteClipboardPasteboard.canPaste([provider]))
         host.manager.remoteClipboardPasteboard.paste([provider])
-        try await waitFor { !host.frames(87).isEmpty }
-        let payload = try XCTUnwrap(host.frames(87).last)
+        let payload = try await host.frame(87)
         guard case .offer(let offer)? = Wire.decode(type: .clipboardOffer, payload: payload) else {
             return XCTFail("Expected iPad offer")
         }
         XCTAssertEqual(provider.fileReads, 1)
         XCTAssertEqual(offer.digest, Data(SHA256.hash(data: seed)))
         host.send(.response(offer.prefix, true, .ok, 1), to: owner)
-        try await waitFor { !host.frames(90).isEmpty }
+        _ = try await host.frame(90)
         XCTAssertEqual(host.frames(89).compactMap { Wire.decode(type: .clipboardChunk, payload: $0) },
                        [.chunk(offer.prefix, 0, 0, seed)])
         host.send(.result(offer.prefix, true, .ok, 2), to: owner)
@@ -446,8 +492,8 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         localRevision = (localRevision ?? board.changeCount) + 1
         host.manager.remoteClipboardPasteboard.pollForTesting()
         host.manager.remoteClipboardPasteboard.pollForTesting()
-        try await waitFor { host.frames(87).count == 2 }
-        let automaticPayload = try XCTUnwrap(host.frames(87).last)
+        let automaticPayload = try await host.frame(87, skipping: 1)
+        XCTAssertEqual(host.frames(87).count, 2)
         guard case .offer(let automaticOffer)? = Wire.decode(type: .clipboardOffer, payload: automaticPayload) else {
             return XCTFail("Expected automatic iPad offer")
         }

@@ -4,10 +4,11 @@ import XCTest
 final class RemoteMonitorIntegrationTests: XCTestCase {
     #if targetEnvironment(simulator)
     @MainActor private func drain(_ network: NetworkManager) async {
-        network.networkQueueForTesting.sync {}
-        let done = expectation(description: "monitor publication")
-        DispatchQueue.main.async { done.fulfill() }
-        await fulfillment(of: [done], timeout: 2)
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            network.networkQueueForTesting.async {
+                DispatchQueue.main.async { done.resume() }
+            }
+        }
         network.networkQueueForTesting.sync {}
     }
     @MainActor func testActualRemoteCatalogueAndTapSend68And70Never56() async throws {

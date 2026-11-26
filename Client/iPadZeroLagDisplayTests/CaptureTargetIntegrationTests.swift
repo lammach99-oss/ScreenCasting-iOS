@@ -44,9 +44,11 @@ final class CaptureTargetIntegrationTests: XCTestCase {
     #if targetEnvironment(simulator)
     @MainActor private func drain(_ network: NetworkManager) async {
         for _ in 0..<4 {
-            network.networkQueueForTesting.sync {}
-            let done=expectation(description: "typed source publication")
-            DispatchQueue.main.async { done.fulfill() };await fulfillment(of: [done], timeout: 2)
+            await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+                network.networkQueueForTesting.async {
+                    DispatchQueue.main.async { done.resume() }
+                }
+            }
         }
         network.networkQueueForTesting.sync {}
     }

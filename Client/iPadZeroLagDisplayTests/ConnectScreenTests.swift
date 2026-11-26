@@ -80,9 +80,9 @@ final class DiscoveryLifecycleTests: XCTestCase {
     }
 
     @MainActor private func drainMainQueue() async {
-        let done = expectation(description: "Discovery publication")
-        DispatchQueue.main.async { done.fulfill() }
-        await fulfillment(of: [done], timeout: 2)
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async { done.resume() }
+        }
     }
 }
 

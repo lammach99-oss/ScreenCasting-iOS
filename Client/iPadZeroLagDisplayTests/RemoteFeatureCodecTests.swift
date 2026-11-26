@@ -1,3 +1,4 @@
+import Combine
 import CryptoKit
 import Foundation
 import XCTest
@@ -476,8 +477,11 @@ final class RemoteFeatureCodecTests: XCTestCase {
             left: 0, top: 0, width: 100, height: 100)
         network.receiveRemoteMonitorContextForTesting(context, keyframe: true)
         let published = expectation(description: "Authenticated remote connection published")
-        DispatchQueue.main.async { published.fulfill() }
-        await fulfillment(of: [published], timeout: 2)
+        let observation = network.$isRemoteControlSession.first(where: { $0 }).sink { _ in published.fulfill() }
+        defer { observation.cancel() }
+        guard await XCTWaiter.fulfillment(of: [published], timeout: 15) == .completed else {
+            return XCTFail("Remote role missing after authentication")
+        }
 
         let scope = network.transferActionScope
         network.requestRemoteFiles(scope: scope)
