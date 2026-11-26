@@ -8,6 +8,7 @@ final class DataTransferManager {
     struct Consent: Equatable { let sessionID: UUID; let transferID: UUID }
     private let sessionID = UUID()
     struct Snapshot {
+        var slotAction: RemoteFileSlotScope.Action?
         var consent: Consent?
         var outgoing = false
         var stage = "idle"
@@ -67,6 +68,7 @@ final class DataTransferManager {
         }
     }
     private final class Owner {
+        var focus = FileFocus(slot: nil, epoch: 0)
         let id: UUID, generation: UInt64, outgoing: Bool, files: [TransferFile]
         var sources: [URL] = [], scoped: [URL] = []
         var accepted = false, index = 0, published = 0
@@ -112,6 +114,34 @@ final class DataTransferManager {
         return !remoteRetired
     }
     // Short admission-lock state only; no IO or callbacks while locked.
+    // Single-session owners start eligible. A slot adapter closes this gate on attachment.
+    private struct FileFocus: Equatable {
+        let slot: SlotOrdinal?
+        let epoch: UInt64
+
+        func action(id: UUID) -> RemoteFileSlotScope.Action? {
+            slot.map { RemoteFileSlotScope.Action(slot: $0, epoch: epoch, transferID: id) }
+        }
+    }
+
+    private var slotFocus: FileFocus? = FileFocus(slot: nil, epoch: 0)
+
+    func setSlotFileFocus(slot: SlotOrdinal, epoch: UInt64?) {
+        admission.lock(); defer { admission.unlock() }
+        slotFocus = epoch.map { FileFocus(slot: slot, epoch: $0) }
+        autoAcceptRevision &+= 1
+    }
+
+    private var fileFocusTicket: FileFocus? {
+        admission.lock(); defer { admission.unlock() }
+        return slotFocus
+    }
+
+    var activeTransferID: UUID? {
+        admission.lock(); defer { admission.unlock() }
+        return wireOwner?.0
+    }
+
     private var autoAcceptEnabled = false
     private var autoAcceptRevision: UInt64 = 0
     func setAutoAccept(_ enabled: Bool, localGeneration: UInt64) {
@@ -126,7 +156,7 @@ final class DataTransferManager {
     }
     private func ownsAutoAcceptToken(_ token: UInt64) -> Bool {
         admission.lock(); defer { admission.unlock() }
-        return autoAcceptEnabled && token == autoAcceptRevision
+        return slotFocus != nil && autoAcceptEnabled && token == autoAcceptRevision
     }
     private var wireOwner: (UUID,UInt64)?
     var hasActiveTransfer: Bool {
@@ -169,6 +199,7 @@ final class DataTransferManager {
     @discardableResult func post(_ packet: TransferPacket, completion: @escaping () -> Void = {}) -> Bool {
         admission.lock()
         if remoteRetired { admission.unlock(); return false }
+        let focusTicket = slotFocus
         if remoteWindowSender != nil, packet.kind == .chunk {
             guard wireOwner?.0 == packet.id, wireOwner?.1 == packet.generation else {
                 admission.unlock(); return false
@@ -198,7 +229,15 @@ final class DataTransferManager {
         queue.async { [weak self] in
             guard let self else {return}
             defer {self.admission.lock();self.pending -= 1;self.admission.unlock();completion()}
-            do { try self.receive(packet, autoAcceptToken: policyToken) }
+            guard let focusTicket, self.fileFocusTicket == focusTicket else {
+                if packet.kind == .offer {
+                    var refused = TransferPacket(kind: .response, generation: packet.generation, id: packet.id)
+                    refused.reason = .busy
+                    self.sender(refused) { _ in }
+                }
+                return
+            }
+            do { try self.receive(packet, autoAcceptToken: policyToken, focus: focusTicket) }
             catch {
                 let reason: TransferReason
                 if self.remoteWindowSender != nil, let problem = error as? TransferStore.VerificationFailure {
@@ -324,6 +363,7 @@ final class DataTransferManager {
         }
     }
     func sendFiles(_ urls: [URL]) {
+        guard let focusTicket = fileFocusTicket else { return }
         if remoteWindowSender != nil {
             admission.lock()
             guard !remoteRetired, wireOwner == nil, pending == 0, !remoteUploadQueued else { admission.unlock(); return }
@@ -333,16 +373,18 @@ final class DataTransferManager {
         queue.async { [weak self] in
             guard let self else { return }
             defer { self.admission.lock(); self.remoteUploadQueued = false; self.admission.unlock() }
-            self.startUpload(urls)
+            guard self.fileFocusTicket == focusTicket else { return }
+            self.startUpload(urls, focus: focusTicket)
         }
     }
     func retryRemoteFiles() {
+        guard let focusTicket = fileFocusTicket else { return }
         queue.async { [weak self] in
-            guard let self, self.remoteWindowSender != nil, !self.retrySources.isEmpty else { return }
-            self.startUpload(self.retrySources)
+            guard let self, self.fileFocusTicket == focusTicket, self.remoteWindowSender != nil, !self.retrySources.isEmpty else { return }
+            self.startUpload(self.retrySources, focus: focusTicket)
         }
     }
-    private func startUpload(_ urls: [URL]) {
+    private func startUpload(_ urls: [URL], focus: FileFocus) {
         guard !retired, remoteIsLive, owner == nil else { return }
         retrySources = []
         snapshot.retryCount = 0
@@ -362,6 +404,7 @@ final class DataTransferManager {
             }
             _ = try TransferProtocol.validate(files)
             let active = Owner(id: UUID(), generation: generation, outgoing: true, files: files)
+            active.focus = focus
             if remoteWindowSender != nil {
                 var offer = packet(active, .offer)
                 offer.files = files
@@ -398,8 +441,9 @@ final class DataTransferManager {
         }
     }
     func decide(_ accepted: Bool, consent: Consent) {
+        guard let focusTicket = fileFocusTicket else { return }
         queue.async { [weak self] in
-            guard let self, consent.sessionID == self.sessionID else { return }
+            guard let self, self.fileFocusTicket == focusTicket, consent.sessionID == self.sessionID else { return }
             self.decideOnQueue(accepted, expectedTransferID: consent.transferID)
         }
     }
@@ -462,8 +506,9 @@ final class DataTransferManager {
         queue.async { self.retired = true; self.finish(.retired) }
     }
     private func packet(_ active: Owner,_ kind: TransferKind) -> TransferPacket {TransferPacket(kind:kind,generation:active.generation,id:active.id)}
-    private func current(_ active: Owner) -> Bool {!retired && owner === active && remoteIsLive}
+    private func current(_ active: Owner) -> Bool {!retired && owner === active && remoteIsLive && fileFocusTicket == active.focus}
     private func publish(_ phase: Phase, rejectionReason: TransferReason? = nil) {
+        snapshot.slotAction = owner.flatMap { $0.focus.action(id: $0.id) }
         snapshot.consent = owner.flatMap { !$0.outgoing && !$0.accepted && phase == .awaitingDecision ? Consent(sessionID: sessionID, transferID: $0.id) : nil }
         snapshot.phase=phase
         snapshot.rejectionReason = rejectionReason
@@ -507,7 +552,7 @@ final class DataTransferManager {
     private func send(_ active: Owner,_ kind: TransferKind,_ done: @escaping (Bool)->Void) {
         var p=packet(active,kind);if kind == .offer {p.files=active.files};write(active,p,done)
     }
-    private func receive(_ p: TransferPacket, autoAcceptToken: UInt64?) throws {
+    private func receive(_ p: TransferPacket, autoAcceptToken: UInt64?, focus: FileFocus) throws {
         guard !retired, remoteIsLive else {return}
         if p.kind == .offer {
             guard !retiredIDs.contains(p.id), peerGeneration == nil || peerGeneration == p.generation else {return}
@@ -515,6 +560,7 @@ final class DataTransferManager {
             guard owner == nil else {var busy=TransferPacket(kind:.response,generation:p.generation,id:p.id);busy.reason = .busy;sender(busy){_ in};return}
             _ = try TransferProtocol.validate(p.files)
             let active=Owner(id:p.id,generation:p.generation,outgoing:false,files:p.files)
+            active.focus = focus
             // Invalid storage preserves the existing F03 manual admission failure stage.
             // An available authority must fence Clear/export before exposing pending consent.
             if receivedLibrary != nil && !acquireStorage(active) {

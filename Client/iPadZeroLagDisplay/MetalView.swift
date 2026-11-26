@@ -852,6 +852,11 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     ) {
         let presentationMode: PresentationCadenceMode =
             gameModeEnabled ? .game : .office
+        let focus = networkManager.focusBinding
+        let focusTicket = networkManager.focusInputTicket
+        let inputAllowed = networkManager.acceptsFocusInput(focusTicket)
+        let remoteKeyboardActive = self.remoteKeyboardActive && inputAllowed
+        let replacingBinding = focus != coordinator.focusBinding
         coordinator.renderer?.setPresentationMode(presentationMode)
 
         coordinator.onFrameRendered = onFrameRendered
@@ -865,7 +870,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         container.setNeedsLayout()
 
         let touchView = container.touchView
-        if let remoteInput, networkManager.isRemoteControlSession {
+        if let remoteInput, inputAllowed, networkManager.isRemoteControlSession {
             remoteInput.bind(networkManager)
             touchView.remoteSessionInput = remoteInput
             if coordinator.remoteInputRevision != networkManager.remoteInputRevision ||
@@ -883,6 +888,16 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             container?.retireRemotePointerInputs()
             container?.retireRemoteKeyboard()
         }
+        if focus != nil {
+            networkManager.retireFocusInput = { [weak container, weak touchView] in
+                touchView?.inputSession?.retireFocus()
+                container?.retireRemotePointerInputs()
+                touchView?.remoteSessionInput?.suspend(reason: 0, preserveMonitorContext: true)
+                touchView?.discardRemoteTouches()
+                container?.retireRemoteKeyboard()
+                container?.softwareTextView.clearCommittedHistory()
+            }
+        }
         let binding = networkManager.mirrorInputRevision
         let ticket = networkManager.mirrorTicketAtRegistration
         let legacy = networkManager.permitsLegacyVirtualInput
@@ -897,13 +912,14 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         let inputGeneration = networkManager.remoteKeyboardGeneration
         let legacyStartsEnabled = legacy && remoteKeyboardActive
         let legacySend: (MirrorInputKind, Data) -> Bool = { [weak networkManager, weak coordinator] kind, payload in
-            guard networkManager?.remoteKeyboardGeneration == inputGeneration else { return false }
+            guard networkManager?.acceptsFocusInput(focusTicket) == true, networkManager?.remoteKeyboardGeneration == inputGeneration else { return false }
             guard let coordinator else { return false }
             return coordinator.legacyLifetime.accept(kind: kind, payload: payload, generation: inputGeneration,
                 revision: binding, mayStart: legacyStartsEnabled && networkManager?.permitsLegacyVirtualInput == true && networkManager?.legacyInputIsCurrent(revision: binding) == true)
         }
         let pencilInput = onPencilInput
-        touchView.onPencilInput = { [weak container] packet in
+        touchView.onPencilInput = { [weak container, weak networkManager] packet in
+            guard networkManager?.acceptsFocusInput(focusTicket) == true else { return }
             pencilInput?(packet)
             if packet.pointerFlags == 1 || packet.pointerFlags == 4 {
                 container?.recordKeyboardAuthority(reason: packet.pointerFlags == 1 ? "pencil_down" : "pencil_up")
@@ -911,7 +927,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         }
         let sendTouchEvent = onSendTouchEvent
         touchView.onSendTouchEvent = { [weak networkManager] type, x, y, pressure in
-            guard networkManager?.remoteKeyboardGeneration == inputGeneration else { return }
+            guard networkManager?.acceptsFocusInput(focusTicket) == true, networkManager?.remoteKeyboardGeneration == inputGeneration else { return }
             if let ticket {
                 networkManager?.sendMirrorInput(ticket: ticket, kind: .pencil,
                     payload: NetworkManager.mirrorPencilPayload(type: type, x: x, y: y, pressure: pressure))
@@ -922,7 +938,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         let keyInput = onKeyboardInput
         let inputToken = networkManager.remoteInputContext?.token
         touchView.onKeyboardInput = { [weak networkManager, weak remoteInput] command in
-            guard networkManager?.remoteKeyboardGeneration == inputGeneration else { return }
+            guard networkManager?.acceptsFocusInput(focusTicket) == true, networkManager?.remoteKeyboardGeneration == inputGeneration else { return }
             if networkManager?.isRemoteControlSession == true {
                 if remoteInput?.usesScanKeyboard == true {
                     if remoteInput?.acceptsText(token: inputToken, generation: inputGeneration) == true {
@@ -935,7 +951,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         let textInput = onTextCommit
         container.onTextCommit = { [weak networkManager, weak remoteInput] text in
             if networkManager?.isRemoteControlSession == true {
-                guard networkManager?.remoteKeyboardGeneration == inputGeneration,
+                guard networkManager?.acceptsFocusInput(focusTicket) == true, networkManager?.remoteKeyboardGeneration == inputGeneration,
                       networkManager?.remoteInputContext?.token == inputToken else { return }
                 if remoteInput == nil || remoteInput?.acceptsText(token: inputToken, generation: inputGeneration) == true {
                     networkManager?.sendTextCommit(text)
@@ -954,7 +970,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             generation: networkManager.remoteKeyboardGeneration, active: remoteKeyboardActive)
         let directInput = onDirectTouchContact
         touchView.onDirectTouchContact = { [weak networkManager] command in
-            guard networkManager?.remoteKeyboardGeneration == inputGeneration else { return }
+            guard networkManager?.acceptsFocusInput(focusTicket) == true, networkManager?.remoteKeyboardGeneration == inputGeneration else { return }
             if let ticket { networkManager?.sendMirrorInput(ticket: ticket, kind: .directTouch, payload: command.encode()) }
             else if legacySend(.directTouch, command.encode()) { directInput?(command) }
         }
@@ -963,7 +979,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         touchView.configureExternalPointer(active: admitted, generation: binding)
         let pointerInput = onPointerInput
         touchView.onPointerInput = { [weak networkManager] command in
-            guard networkManager?.remoteKeyboardGeneration == inputGeneration else { return }
+            guard networkManager?.acceptsFocusInput(focusTicket) == true, networkManager?.remoteKeyboardGeneration == inputGeneration else { return }
             if networkManager?.isRemoteControlSession == true {
                 if legacySend(.pointer, command.encode()) { networkManager?.sendPointerInput(command) }
             }
@@ -1003,13 +1019,17 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             metalView.contentScaleFactor = screen.scale
         }
 
-        guard createRenderer,
+        guard !networkManager.focusManaged || focus != nil else { return }
+        guard createRenderer || replacingBinding,
               let renderer = Renderer(
                   metalView: metalView,
                   presentationMode: presentationMode) else {
             return
         }
 
+        coordinator.renderer?.setPresentationSurfaceActive(false)
+        coordinator.focusBinding = focus
+        let lifetime = focus.map { _ in FocusSurfaceLifetime() }
         coordinator.renderer = renderer
         coordinator.touchView = touchView
         renderer.diagnosticSink = { [weak networkManager] line in
@@ -1017,33 +1037,39 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
         }
         renderer.beginSession(generation: networkManager.decoder.currentSessionGeneration)
         renderer.onFramePresented = { [weak networkManager] sequence, generation, size in
-            networkManager?.recordCapturePresentation(sequence: sequence, generation: generation, sourceSize: size)
+            guard lifetime?.isLive != false else { return }
+            networkManager?.recordCapturePresentation(sequence: sequence, generation: generation, sourceSize: size, focus: focus)
         }
         renderer.remotePresentationDeadline = { [weak networkManager] sequence, generation, now in
             networkManager?.remoteVideoPresentationDeadline(sequence: sequence, generation: generation, now: now) ?? now
         }
         renderer.onFrameRendered = { [weak coordinator, weak networkManager] sequence, generation in
+            guard lifetime?.isLive != false else { return }
             networkManager?.recordRenderCompletion(
                 sequence: sequence,
                 generation: generation)
             coordinator?.onFrameRendered?()
         }
         renderer.onDrawableCommitted = { [weak networkManager] sequence, generation in
+            guard lifetime?.isLive != false else { return }
             networkManager?.recordDrawableCommitted(
                 sequence: sequence,
                 generation: generation)
         }
         renderer.onFrameDropped = { [weak networkManager] sequence, generation in
+            guard lifetime?.isLive != false else { return }
             networkManager?.recordRenderDrop(
                 sequence: sequence,
                 generation: generation)
         }
         renderer.onContentViewportChanged = { [weak coordinator] viewport in
+            guard lifetime?.isLive != false else { return }
             coordinator?.touchView?.contentViewport = viewport
             coordinator?.onContentViewportChanged?(viewport)
         }
         renderer.onGeometrySnapshotChanged = {
             [weak coordinator, weak networkManager] snapshot in
+            guard lifetime?.isLive != false else { return }
             if let networkManager {
                 let inputGeometryContext = InputGeometryDiagnosticContext(
                     sessionGeneration:
@@ -1056,6 +1082,24 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             coordinator?.onGeometrySnapshotChanged?(snapshot)
         }
 
+        if let focus {
+            renderer.installFocusPresentation { [weak networkManager, weak renderer] decoderGeneration in
+                DispatchQueue.main.async {
+                    guard let networkManager, renderer != nil, networkManager.focusBinding == focus,
+                          networkManager.remoteKeyboardGeneration == focus.transport,
+                          networkManager.decoder.currentSessionGeneration == decoderGeneration else { return }
+                    networkManager.focusPresented?()
+                }
+            }
+            networkManager.focusSnapshot = { [weak renderer] in renderer?.focusThumbnail() }
+            networkManager.retireFocusRenderer = { [weak renderer, weak networkManager] in
+                lifetime?.retire()
+                renderer?.retireFocusPresentation()
+                networkManager?.decoder.detachFocusRenderer(focus)
+            }
+            networkManager.decoder.installFocusRenderer(renderer, binding: focus)
+            return
+        }
         networkManager.decoder.onSessionBegan = { [weak renderer] generation in
             renderer?.beginSession(generation: generation)
         }
@@ -1080,6 +1124,7 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
     #endif
 
     public final class Coordinator {
+        var focusBinding: FocusBinding?
         var remoteInputRevision: UInt64?
         var remoteInputWaiting = false
         var legacyLifetime = InputLifetime()

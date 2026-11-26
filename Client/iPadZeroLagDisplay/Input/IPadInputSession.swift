@@ -128,6 +128,19 @@ enum IPadNudgeDirection { case up, down, left, right }
         engine.setHardwareCaptureEnabled(!open && surfaceActive)
         if open { releaseAll() }
     }
+    // Retire through the captured old sink before discarding it. Quarantine
+    // held physical keys so a repeat cannot become a new press on the next PC.
+    func retireFocus() {
+        retireQueuedInput?()
+        engine.setHardwareCaptureEnabled(false)
+        releaseAll()
+        sink = nil
+        retireQueuedInput = nil
+        canPoint = false
+        canType = false
+        canDirect = false
+    }
+
     func releaseAll() {
         tickTimer?.invalidate(); tickTimer = nil
         clearTextHistory?(); retireQueuedInput?(); engine.retire()

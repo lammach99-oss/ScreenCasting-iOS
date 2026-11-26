@@ -527,6 +527,36 @@ public final class DecoderManager {
 
     // The initial State may precede SwiftUI surface construction. Rehydrate
     // the renderer under the same output lock without rebuilding VT or input.
+    private var surfaceBinding: FocusBinding?
+    func installFocusRenderer(_ renderer: Renderer, binding: FocusBinding) {
+        captureDeliveryLock.lock()
+        defer { captureDeliveryLock.unlock() }
+        surfaceBinding = binding
+        renderer.beginSession(generation: currentSessionGeneration)
+        onSessionBegan = { [weak renderer] in renderer?.beginSession(generation: $0) }
+        onCaptureFenced = { [weak renderer] in renderer?.fenceCaptureContinuation(generation: $0) }
+        onFrameDecoded = { [weak renderer] in renderer?.updateFrame($0, sequence: $1, generation: $2) }
+        adaptiveRendererActive = { [weak renderer] in renderer?.isPresentationSurfaceActive == true }
+        onAdaptiveMedia = { [weak renderer] geometry in
+            guard let renderer else { return false }
+            renderer.setAdaptiveMediaGeometry(geometry)
+            return true
+        }
+        if let adaptiveMediaValue { _ = onAdaptiveMedia?(adaptiveMediaValue) }
+    }
+
+    func detachFocusRenderer(_ binding: FocusBinding) {
+        captureDeliveryLock.lock()
+        defer { captureDeliveryLock.unlock() }
+        guard surfaceBinding == binding else { return }
+        surfaceBinding = nil
+        onSessionBegan = nil
+        onCaptureFenced = nil
+        onFrameDecoded = nil
+        onAdaptiveMedia = nil
+        adaptiveRendererActive = nil
+    }
+
     func installAdaptiveMediaRenderer(isActive: @escaping () -> Bool = { true }, _ sink: @escaping (AdaptiveMediaEffective?) -> Bool) {
         captureDeliveryLock.lock(); defer { captureDeliveryLock.unlock() }
         onAdaptiveMedia = sink; adaptiveRendererActive = isActive

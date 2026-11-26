@@ -8,6 +8,7 @@ extension IPadInputSession {
         engine.physicalKeyIsDown = { usage in
             GCKeyboard.coalesced?.keyboardInput?.button(forKeyCode: GCKeyCode(rawValue: Int(usage)))?.isPressed
         }
+        let focusTicket = network.focusInputTicket
         let generation = network.remoteKeyboardGeneration
         let revision = network.mirrorInputRevision
         let ticket = network.mirrorTicketAtRegistration
@@ -16,7 +17,7 @@ extension IPadInputSession {
         let features = network.remoteInputFeatures
         let pointerV2 = network.iPadPointerV2Supported && network.iPadPointerV2Generation == generation
         let legacy = network.permitsLegacyVirtualInput
-        let available = active && !network.captureInputBlocked
+        let available = active && network.acceptsFocusInput(focusTicket) && !network.captureInputBlocked
         let ready = context?.state == 1 && network.remoteInputReady
         let point = available && (remote ? (features & 2 == 0 ? legacy : ready) : ticket != nil || legacy)
         let type = available && (remote ? (features & 1 == 0 ? legacy : ready) : ticket != nil || legacy)
@@ -26,13 +27,14 @@ extension IPadInputSession {
         if remote, let context { sourceSize = CGSize(width: CGFloat(context.width),height: CGFloat(context.height)) }
         else if let geometry = network.mirrorControlState?.geometry { sourceSize = CGSize(width: CGFloat(geometry.width),height: CGFloat(geometry.height)) }
         else { sourceSize = network.adaptiveDesktopSize }
-        let identity = "\(generation):\(revision):\(remote):\(network.remoteInputRevision):\(context?.token ?? 0):\(context?.desktopEpoch ?? 0):\(features):\(pointerV2)"
+        let scope = focusTicket.map { "\($0.ordinal.rawValue):\($0.epoch):" } ?? ""
+        let identity = scope + "\(generation):\(revision):\(remote):\(network.remoteInputRevision):\(context?.token ?? 0):\(context?.desktopEpoch ?? 0):\(features):\(pointerV2)"
         let route = IPadInputRoute(generation: generation,revision: revision,remote: remote,
             features: features,context: context,ticket: ticket,pointerV2: pointerV2)
         engine.precisePencilAvailable = remote ? features & 2 != 0 && ready : pointerV2
         configure(identity: identity, point: point, type: type, direct: direct, zoom: zoom,
                   reason: !available ? "Input is temporarily unavailable" : (!remote && !pointerV2 ? "Trackpad and enhanced pointer actions require an updated PC host" : nil)) { [weak self, weak network] event in
-            guard let self, let network, network.remoteKeyboardGeneration == generation else { return }
+            guard let self, let network, network.acceptsFocusInput(focusTicket), network.remoteKeyboardGeneration == generation else { return }
             guard let packet = route.encode(event) else {
                 if (remote && features & 2 == 0) || (!remote && !pointerV2) {
                     switch event {

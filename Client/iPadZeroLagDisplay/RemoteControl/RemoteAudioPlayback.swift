@@ -1,6 +1,28 @@
 import AVFoundation
 import QuartzCore
 
+// All calls run on the process-wide remote audio queue.
+final class RemoteAudioOutputLease {
+    private var serial: UInt64 = 0
+    private var stop: (() -> Void)?
+
+    func acquire(stop: @escaping () -> Void) -> UInt64 {
+        self.stop?()
+        serial += 1
+        self.stop = stop
+        return serial
+    }
+
+    func owns(_ ticket: UInt64?) -> Bool { ticket == serial && stop != nil }
+
+    func release(_ ticket: UInt64?) {
+        guard owns(ticket) else { return }
+        let previous = stop
+        stop = nil
+        previous?()
+    }
+}
+
 final class RemoteAudioPlayback {
     struct Timing {
         fileprivate var firstQueuedAt: TimeInterval?
@@ -37,7 +59,14 @@ final class RemoteAudioPlayback {
     }
 
     private enum Failure: Error { case format }
-    private let queue = DispatchQueue(label: "ScreenCasting.remoteAudio", qos: .userInitiated)
+    private static let lease = RemoteAudioOutputLease()
+    private var outputTicket: UInt64?
+    private static let outputQueue = DispatchQueue(label: "ScreenCasting.remoteAudio", qos: .userInitiated)
+    private var queue: DispatchQueue { Self.outputQueue }
+    // Called after setEpoch(0) has fenced all pending packet and timer callbacks.
+    func flushRevokedOutput() {
+        queue.sync { stopOutput() }
+    }
     private let lock = NSLock()
     // Lock-owned data can be fenced from the network queue without waiting for AVAudioEngine.
     private var revision: UInt64 = 0
@@ -69,6 +98,7 @@ final class RemoteAudioPlayback {
             self.stopOutput()
             guard epoch != 0 else { return }
             do {
+                self.outputTicket = Self.lease.acquire { [weak self] in self?.flushOutputOnQueue() }
                 self.output = try Output()
             } catch {
                 self.fail(revision, notify: failed)
@@ -108,9 +138,17 @@ final class RemoteAudioPlayback {
     }
 
     private func stopOutput() {
+        Self.lease.release(outputTicket)
+        outputTicket = nil
+    }
+
+    private func flushOutputOnQueue() {
         timer?.cancel()
         timer = nil
+        output?.player.stop()
+        output?.engine.stop()
         output = nil
+
     }
 
     private func fail(_ revision: UInt64, notify: () -> Void) {
@@ -127,7 +165,7 @@ final class RemoteAudioPlayback {
     }
 
     private func play(_ revision: UInt64, failed: () -> Void) {
-        guard let output, isCurrent(revision) else { return }
+        guard let output, Self.lease.owns(outputTicket), isCurrent(revision) else { return }
         let now = CACurrentMediaTime()
         guard output.engine.isRunning, output.queued == 0 || now - output.lastProgressAt < 0.250 else {
             fail(revision, notify: failed)
@@ -162,7 +200,7 @@ final class RemoteAudioPlayback {
         output.player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self, weak output] _ in
             let playedAt = CACurrentMediaTime() - 0.010
             self?.queue.async { [weak self, weak output] in
-                guard let self, let output else { return }
+                guard let self, let output, self.isCurrent(revision), Self.lease.owns(self.outputTicket), self.output === output else { return }
                 output.queued -= 1
                 output.lastProgressAt = playedAt + 0.010
                 self.lock.lock()

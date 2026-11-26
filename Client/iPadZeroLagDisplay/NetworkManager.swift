@@ -327,6 +327,168 @@ public class NetworkManager: ObservableObject {
     private var remoteTimedVideoNeedsIDR = false
     private var remoteTimedVideo = RemoteTimedVideoAssembler()
     private let remoteVideoTiming = RemoteVideoPresentationTiming()
+    // Focus UI hooks are main-actor owned. Packet and decoder admission below
+    // live on networkQueue, beside the existing DS6 and DS7 checks.
+    @MainActor private(set) var focusManaged = false
+    @MainActor private(set) var focusBinding: FocusBinding?
+    @MainActor private(set) var focusInputTicket: SlotTicket?
+    @MainActor var retireFocusInput: (() -> Void)?
+    @MainActor var focusSnapshot: (() -> Data?)?
+    @MainActor var retireFocusRenderer: (() -> Void)?
+    @MainActor var focusPresented: (() -> Void)?
+    @MainActor var focusAuthorityChanged: ((Bool) -> Void)?
+    @MainActor var focusConnectionEnded: ((UInt64, SlotFailure) -> Void)?
+    private var focusParked = false
+    private var focusOutputAllowed = true
+    @MainActor private var lastFocusRevision: UInt64?
+    private var focusRevision: UInt64?
+    private var focusMediaBinding: FocusBinding?
+    private var focusDecoder: UInt64?
+    private var focusTransport: UInt64?
+
+    @MainActor func enterFocusMode() {
+        captureTargetRetireInput?()
+        focusManaged = true
+        networkQueue.sync {
+            focusParked = true
+            focusOutputAllowed = false
+            updateRemoteAudioSuspensionOnQueue()
+            remoteAudioPlayback.flushRevokedOutput()
+            decoder.invalidate()
+        }
+    }
+
+    @MainActor func acceptsFocusInput(_ ticket: SlotTicket?) -> Bool {
+        guard focusManaged else { return true }
+        return ticket != nil && ticket == focusInputTicket &&
+            focusBinding?.transport == remoteKeyboardGeneration &&
+            networkQueue.sync { focusRevision == remoteFeatures.revision && remoteFeatures.inputReady }
+    }
+
+    @MainActor func setFocusOutput(_ ticket: SlotTicket?) {
+        focusInputTicket = ticket
+        networkQueue.sync {
+            focusOutputAllowed = ticket != nil
+            updateRemoteAudioSuspensionOnQueue()
+            if ticket == nil { remoteAudioPlayback.flushRevokedOutput() }
+        }
+    }
+
+    func focusContextReady(_ transport: UInt64) -> Bool {
+        networkQueue.sync {
+            guard transport == connectionGeneration, wireAuthenticatedGeneration == transport,
+                  remoteInputConnection, isForegroundActive, !captureAvailability.inputBlocked, remoteFeatures.inputReady,
+                  focusRevision == remoteFeatures.revision, let context = remoteFeatures.context else { return false }
+            return context.token != 0 && context.width > 0 && context.height > 0 &&
+                (1...3).contains(context.desktop) && (!remoteSecureDesktop.supported || remoteSecureDesktop.allowsScanAndPointer)
+        }
+    }
+
+    @MainActor func takeFocusThumbnail(_ binding: FocusBinding) -> Data? {
+        guard focusBinding == binding, focusPreviewAllowed(binding.transport) else { return nil }
+        let preview = focusSnapshot?()
+        return focusPreviewAllowed(binding.transport) ? preview : nil
+    }
+
+    func focusPreviewAllowed(_ transport: UInt64) -> Bool {
+        networkQueue.sync {
+            connectionGeneration == transport && wireAuthenticatedGeneration == transport &&
+            focusRevision == remoteFeatures.revision && remoteFeatures.inputReady &&
+            remoteFeatures.context?.desktop == 1 && remoteSecureDesktop.supported &&
+            !remoteSecureDesktop.restrictsFeatures && isForegroundActive && !captureAvailability.inputBlocked
+        }
+    }
+
+    func authenticatedRemoteIP(_ transport: UInt64) -> Bool {
+        networkQueue.sync {
+            transport == connectionGeneration && wireAuthenticatedGeneration == transport &&
+                remoteInputConnection && activeTransportKind == .wifi
+        }
+    }
+
+    func trackFocusTransport(_ generation: UInt64) {
+        networkQueue.sync { focusTransport = generation }
+    }
+
+    func focusAuthorityMatches(_ binding: FocusBinding) -> Bool {
+        networkQueue.sync { connectionGeneration == binding.transport && focusRevision == remoteFeatures.revision }
+    }
+
+    @MainActor func installFocus(_ binding: FocusBinding, presented: @escaping () -> Void) {
+        focusBinding = binding
+        focusPresented = presented
+        networkQueue.sync {
+            guard connectionGeneration == binding.transport else { return }
+            focusMediaBinding = binding
+            focusRevision = remoteFeatures.revision
+            focusTransport = binding.transport
+            if focusParked && standby.phase == .idle {
+                // No parked acknowledgement to trigger a host resume IDR.
+                sendVideoFeedback(reportDecodeLoss: true)
+            }
+            if focusParked || focusDecoder == decoder.currentSessionGeneration {
+                nextMirrorDecoder += 1
+                decoder.beginSession(generation: nextMirrorDecoder)
+            }
+            focusDecoder = decoder.currentSessionGeneration
+            focusParked = false
+        }
+    }
+
+    @MainActor func detachFocus(_ binding: FocusBinding, park: Bool) {
+        guard focusBinding == binding else { return }
+        retireFocusRenderer?()
+        retireFocusRenderer = nil
+        retireFocusInput = nil
+        focusSnapshot = nil
+        focusPresented = nil
+        focusBinding = nil
+        networkQueue.sync {
+            focusMediaBinding = nil
+            if park {
+                focusParked = true
+                resetRemoteTimedVideoOnQueue()
+                decoder.invalidate()
+            }
+        }
+    }
+
+    @MainActor func leaveFocusMode() {
+        guard focusManaged else { return }
+        let generation = remoteKeyboardGeneration
+        requestVideoStandby(park: false, expectedGeneration: generation)
+        networkQueue.sync {
+            if focusParked && generation == connectionGeneration {
+                nextMirrorDecoder += 1
+                decoder.beginSession(generation: nextMirrorDecoder)
+                sendVideoFeedback(reportDecodeLoss: true)
+            }
+            focusParked = false
+            focusOutputAllowed = true
+            focusRevision = nil
+            focusTransport = nil
+            focusDecoder = nil
+            updateRemoteAudioSuspensionOnQueue()
+        }
+        focusManaged = false
+        objectWillChange.send()
+    }
+
+    func expireFocusResume(_ binding: FocusBinding) {
+        networkQueue.async { [weak self] in
+            guard let self, self.connectionGeneration == binding.transport,
+                  self.focusTransport == binding.transport, self.remoteInputConnection else { return }
+            self.handleStreamError("Remote video resume timed out.")
+        }
+    }
+
+    func requestFocusRecovery(_ transport: UInt64) {
+        networkQueue.async { [weak self] in
+            guard let self, !self.focusParked, self.connectionGeneration == transport else { return }
+            self.sendVideoFeedback(reportDecodeLoss: true)
+        }
+    }
+
     private let remoteAudioPlayback = RemoteAudioPlayback()
     private var remoteAudio = RemoteAudioSession()
     private var remoteAudioRequested = false
@@ -1782,12 +1944,18 @@ public class NetworkManager: ObservableObject {
         if remoteClipboardLease.nonce != nil { tickRemoteClipboard() }
         let generation = connectionGeneration, context = remoteFeatures.context, features = remoteFeatures.accepted
         let ready = remoteFeatures.inputReady
+        let revision = remoteFeatures.revision
         remoteMonitors.receiveContext(context, session: remoteMonitors.session)
         publishRemoteMonitorsOnQueue()
         DispatchQueue.main.async { [weak self] in
             guard let self, self.connectionGenerationClock.current == generation else { return }
             self.remoteInputContext = context; self.remoteInputFeatures = features; self.remoteInputReady = ready
             if contextChanged { self.remoteInputRevision &+= 1 }
+            if self.focusManaged {
+                let changed = self.lastFocusRevision != revision
+                self.lastFocusRevision = revision
+                self.focusAuthorityChanged?(changed)
+            }
         }
     }
     private var standbyNegotiated: Bool {
@@ -1806,14 +1974,18 @@ public class NetworkManager: ObservableObject {
     func requestVideoStandby(park: Bool, expectedGeneration: UInt64? = nil) {
         let generation = expectedGeneration ?? connectionGeneration
         networkQueue.async { [weak self] in
-            guard let self, self.connectionGeneration == generation, self.standbyNegotiated else { return }
-            guard self.standby.serial < UInt64.max else { self.handleStreamError("Standby serial exhausted."); return }
-            guard let message = self.standby.request(park: park), let bytes = message.encode() else { return }
-            self.resetRemoteTimedVideoOnQueue()
-            self.decoder.fenceCaptureContinuation(requiringAuthorization: false)
-            self.publishStandbyOnQueue()
-            self.sendWireMessage(type: .remoteVideoStandby, payload: bytes, sequence: 0)
+            self?.requestVideoStandbyOnQueue(park: park, generation: generation)
         }
+    }
+
+    private func requestVideoStandbyOnQueue(park: Bool, generation: UInt64) {
+        guard connectionGeneration == generation, standbyNegotiated else { return }
+        guard standby.serial < UInt64.max else { handleStreamError("Standby serial exhausted."); return }
+        guard let message = standby.request(park: park), let bytes = message.encode() else { return }
+        resetRemoteTimedVideoOnQueue()
+        decoder.fenceCaptureContinuation(requiringAuthorization: false)
+        publishStandbyOnQueue()
+        sendWireMessage(type: .remoteVideoStandby, payload: bytes, sequence: 0)
     }
 
     private func resetRemoteInputOnQueue() {
@@ -1847,7 +2019,7 @@ public class NetworkManager: ObservableObject {
         let generation = connectionGenerationClock.current
         networkQueue.async { [weak self] in
             guard let self, self.wireAuthenticatedGeneration == generation,
-                  self.connectionGeneration == generation, !enabled || self.isForegroundActive,
+                  self.connectionGeneration == generation, !enabled || (self.isForegroundActive && self.focusOutputAllowed),
                   let request = self.remoteSecureDesktop.setControl(enabled) else { return }
             self.remoteSecureControlIntent = enabled
             if !enabled && self.remoteSecureDesktop.desktop != .standard {
@@ -1869,6 +2041,7 @@ public class NetworkManager: ObservableObject {
             self.remoteSecureDesktopCovered = secure.covered
             self.remoteSecureDesktopControl = secure.control
             self.remoteSecureDesktopCanSas = secure.canSas
+            if self.focusManaged { self.focusAuthorityChanged?(false) }
         }
     }
 
@@ -1990,13 +2163,13 @@ public class NetworkManager: ObservableObject {
     }
 
     private func updateRemoteAudioSuspensionOnQueue() {
-        let request = remoteAudio.suspend(!isForegroundActive || remoteSecureDesktop.restrictsFeatures || remoteAudioOutputFailed)
+        let request = remoteAudio.suspend(!focusOutputAllowed || !isForegroundActive || remoteSecureDesktop.restrictsFeatures || remoteAudioOutputFailed)
         sendRemoteAudioOnQueue(request)
         updateRemoteAudioPlaybackOnQueue()
     }
 
     private func updateRemoteAudioPlaybackOnQueue() {
-        let epoch = remoteAudio.activeEpoch, generation = connectionGeneration
+        let epoch = focusOutputAllowed ? remoteAudio.activeEpoch : 0, generation = connectionGeneration
         let timing = remoteAudioPlayback.setEpoch(epoch) { [weak self] in
             self?.networkQueue.async { [weak self] in
                 guard let self, self.connectionGeneration == generation, self.remoteAudio.activeEpoch == epoch else { return }
@@ -2077,7 +2250,7 @@ public class NetworkManager: ObservableObject {
                 handleStreamError("Timed video arrived before remote audio streaming.")
                 return
             }
-            if standby.dropsVideo { return }
+            if standby.dropsVideo || focusParked { return }
             if offset == 0 && remoteTimedVideo.hasPartial { recoverRemoteTimedVideoOnQueue() }
             switch remoteTimedVideo.push(flags: flags, frame: frame, total: total, offset: offset,
                                          captureUs: captureUs, fragment: fragment, receivedAt: message.firstByteAt) {
@@ -2688,6 +2861,11 @@ public class NetworkManager: ObservableObject {
                   case let .set(operation, id)? = RemoteAudioProtocol.decode(type: type, payload: Data(data.dropFirst(16))),
                   operation != .enable || !remoteSecureDesktop.restrictsFeatures else { return false }
             return admitRemoteAudioOnQueue(.init(operation: operation, id: id))
+        }
+        if remoteInputConnection, focusTransport != nil,
+           !focusOutputAllowed || focusTransport != connectionGeneration || focusRevision != remoteFeatures.revision {
+            if isNewRemoteV2InputPacket(data) || CaptureAvailabilityProtocol.isNewInputPacket(data) ||
+                type == .remoteCommand || type == .remoteMonitorSelectRequest { return false }
         }
         if !remoteInputConnection { return !(61...71).contains(type.rawValue) && type != .remoteDirectTouch }
         let payload = Data(data.dropFirst(16))
@@ -4564,7 +4742,7 @@ public class NetworkManager: ObservableObject {
             payload: payload,
             sequence: feedback.0,
             flags: feedbackFlags,
-            coalesceFeedback: !(reportDecodeLoss && activeTransportKind == .usb))
+            coalesceFeedback: !(reportDecodeLoss && activeTransportKind == .usb) && !(reportDecodeLoss && focusTransport != nil))
         // The legacy 8-byte stage packet remains valid for older hosts and carries
         // receive p95, which intentionally has no slot in v1 VideoFeedback.
         sendLegacyFrameStagePacket(
@@ -5270,6 +5448,16 @@ public class NetworkManager: ObservableObject {
         bulk: Bool = false,
         completion: @escaping (NWError?) -> Void = { _ in }
     ) {
+        if remoteInputConnection && (!focusOutputAllowed || (focusTransport != nil &&
+            (focusTransport != connectionGeneration || focusRevision != remoteFeatures.revision))) {
+            switch type {
+            case .remoteCommand, .remoteScanKey, .remotePointer, .remoteDirectTouch, .remoteCommittedText,
+                 .keyboardInput, .textCommit, .pointerInput, .directTouchContact, .iPadPointerV2,
+                 .remoteMonitorSelectRequest:
+                return
+            default: break
+            }
+        }
         guard payload.count <= WireProtocol.maxPayloadSize else { return }
         let sendGeneration = connectionGeneration
         let sendConnection = connection
@@ -5913,7 +6101,7 @@ public class NetworkManager: ObservableObject {
             if captureTargets.applied != nil { abandonCaptureTargetPresentationOnQueue() }
             let accepted: Bool
             let errorCode: UInt16
-            if configuration.codec == .h264,
+            if !focusParked && configuration.codec == .h264,
                configuration.parameterSets.count == 2,
                configuration.width.isMultiple(of: 2),
                configuration.height.isMultiple(of: 2) {
@@ -6251,6 +6439,7 @@ public class NetworkManager: ObservableObject {
                 handleStreamError("Invalid remote feature result."); return
             }
             publishStandbyOnQueue()
+            if focusParked { requestVideoStandbyOnQueue(park: true, generation: generation) }
             beginRemoteClipboard()
             let intent = remoteSecureDesktop.begin(accepted: remoteFeatures.accepted,
                                                    control: remoteSecureControlIntent && remoteSecureDesktopEnabled)
@@ -6333,8 +6522,8 @@ public class NetworkManager: ObservableObject {
         }
         let isIDR = header.flags & WireProtocol.videoFlagIDR != 0
         let lengthPrefixed = header.flags & WireProtocol.videoFlagLengthPrefixed != 0
-        if standby.phase != .idle {
-            if standby.dropsVideo && remoteSecureDesktop.expectsIDR {
+        if standby.phase != .idle || focusParked {
+            if (standby.dropsVideo || focusParked) && remoteSecureDesktop.expectsIDR {
                 // Drain an in-flight DS7 atomic pair without installing or presenting it.
                 let verified = isIDR && RemoteSecureDesktopState.hasIDR(payload, lengthPrefixed: lengthPrefixed)
                 if case .invalid = remoteSecureDesktop.admit(sequence: header.sequence, isIDR: verified,
@@ -6343,6 +6532,7 @@ public class NetworkManager: ObservableObject {
                 }
                 return
             }
+            guard !focusParked else { return }
             let fresh = !standby.dropsVideo && RemoteStandbyClient.isResumePicture(payload, isIDR: isIDR,
                                                                                    lengthPrefixed: lengthPrefixed)
             guard standby.admitVideo(parameterSetIDR: fresh) else { return }
@@ -7949,7 +8139,13 @@ public class NetworkManager: ObservableObject {
             triedWifiReconnectTargets.removeAll()
             publishAutoReconnectAttempt(0)
         }
+        let endedTransport = focusTransport ?? connectionGeneration
         DispatchQueue.main.async {
+            switch newState {
+            case .disconnected: self.focusConnectionEnded?(endedTransport, .transport)
+            case .authFailed: self.focusConnectionEnded?(endedTransport, .refused)
+            default: break
+            }
             self.connectionState = newState
         }
     }
@@ -9699,10 +9895,10 @@ public class NetworkManager: ObservableObject {
 
     // Device: positive drawable presentation time. Simulator: successful current
     // present command completion (the Simulator SDK omits presentation handlers).
-    func recordCapturePresentation(sequence: UInt32, generation: UInt64, sourceSize: CGSize? = nil) {
+    func recordCapturePresentation(sequence: UInt32, generation: UInt64, sourceSize: CGSize? = nil, focus: FocusBinding? = nil) {
         let presentedAt = CACurrentMediaTime()
         networkQueue.async { [weak self] in
-            guard let self, self.decoder.currentSessionGeneration == generation else { return }
+            guard let self, self.focusMediaBinding == focus, self.decoder.currentSessionGeneration == generation else { return }
             if let watch = self.usbRotationRecovery, presentedAt >= watch.ack,
                let sourceSize, sourceSize.matchesPresentation(width: watch.display.width, height: watch.display.height) {
                 self.usbRotationRecovery = nil
@@ -10460,11 +10656,21 @@ struct RemoteSessionInputConfiguration: Equatable {
     }
 
     func bind(_ network: NetworkManager) {
+        let ticket = network.focusInputTicket
         boundNetwork = network
         publishMonitorControl()
-        sendKey = { [weak network] in network?.sendRemoteScanKey($0, expectedGeneration: $1) }
-        sendPointer = { [weak network] in network?.sendRemotePointer($0, expectedGeneration: $1) }
-        sendReset = { [weak network] in network?.sendRemoteInputReset($0, expectedGeneration: $1) }
+        sendKey = { [weak network] key, generation in
+            guard let network, network.acceptsFocusInput(ticket) else { return }
+            network.sendRemoteScanKey(key, expectedGeneration: generation)
+        }
+        sendPointer = { [weak network] pointer, generation in
+            guard let network, network.acceptsFocusInput(ticket) else { return }
+            network.sendRemotePointer(pointer, expectedGeneration: generation)
+        }
+        sendReset = { [weak network] reset, generation in
+            guard let network, network.acceptsFocusInput(ticket) else { return }
+            network.sendRemoteInputReset(reset, expectedGeneration: generation)
+        }
     }
 
     func configure(_ value: RemoteSessionInputConfiguration) {

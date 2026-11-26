@@ -1,3 +1,4 @@
+import CoreImage
 import Foundation
 import Metal
 import MetalKit
@@ -613,6 +614,55 @@ public class Renderer: NSObject, MTKViewDelegate {
         case gameRepeated
     }
 
+    // Only the device drawable presentation handler records this frame.
+    // Each renderer belongs to one binding for its entire lifetime.
+    private var focusRetired = false
+    private var focusLive = false
+    private var focusedSequence: UInt32?
+    private var focusedFrame: CVPixelBuffer?
+    private var notifyFirstPresentation: ((UInt64) -> Void)?
+
+    func installFocusPresentation(_ first: @escaping (UInt64) -> Void) {
+        lock.lock()
+        focusLive = true
+        notifyFirstPresentation = first
+        lock.unlock()
+    }
+
+    func retireFocusPresentation() {
+        lock.lock()
+        focusRetired = true
+        focusLive = false
+        officeReadyFrame = nil
+        officeLookAheadFrame = nil
+        gameReadyFrame = nil
+        gameLookAheadFrame = nil
+        gameLastPresentedFrame = nil
+        focusedSequence = nil
+        focusedFrame = nil
+        notifyFirstPresentation = nil
+        freshness.fenceCaptureContinuation()
+        presentationSurfaceActive = false
+        lock.unlock()
+    }
+
+    func focusThumbnail() -> Data? {
+        lock.lock()
+        let frame = focusedFrame
+        lock.unlock()
+        guard let frame else { return nil }
+        let source = CIImage(cvPixelBuffer: frame)
+        let bounds = CGRect(x: 0, y: 0, width: 320, height: 180)
+        let scaled = source.transformed(by: CGAffineTransform(scaleX: bounds.width / source.extent.width,
+                                                              y: bounds.height / source.extent.height))
+        var bytes = Data(count: 320 * 180 * 4)
+        bytes.withUnsafeMutableBytes { (storage: UnsafeMutableRawBufferPointer) in
+            guard let address = storage.baseAddress else { return }
+            CIContext().render(scaled, toBitmap: address, rowBytes: 320 * 4, bounds: bounds,
+                               format: .BGRA8, colorSpace: CGColorSpaceCreateDeviceRGB())
+        }
+        return bytes
+    }
     var onFramePresented: ((UInt32, UInt64, CGSize) -> Void)?
     var remotePresentationDeadline: ((UInt32, UInt64, TimeInterval) -> TimeInterval)?
     public var onFrameRendered: ((UInt32, UInt64) -> Void)?
@@ -733,6 +783,8 @@ public class Renderer: NSObject, MTKViewDelegate {
         gameReadyFrame = nil
         gameLookAheadFrame = nil
         gameLastPresentedFrame = nil
+        focusedSequence = nil
+        focusedFrame = nil
         freshness.beginSession(generation: generation)
         adaptiveAwaitingPresentation = nil
         cadenceCounters = RenderCadenceCounters()
@@ -941,6 +993,7 @@ public class Renderer: NSObject, MTKViewDelegate {
         applyPresentationCadence(reason: "screen_refresh")
         recordCadence(.drawCallback)
         lock.lock()
+        guard !focusRetired else { lock.unlock(); return }
         let ready = presentationCadenceMode == .game ? gameReadyFrame?.identity : officeReadyFrame?.identity
         if let ready, let remotePresentationDeadline {
             let now = CACurrentMediaTime()
@@ -1104,11 +1157,20 @@ public class Renderer: NSObject, MTKViewDelegate {
             guard let self, CapturePresentationPolicy.confirmed(time: presented.presentedTime) else { return }
             self.lock.lock()
             let current = self.freshness.isCurrent(identity)
+            var first: ((UInt64) -> Void)?
+            if current, self.focusLive, drawKind != .gameRepeated,
+               self.focusedSequence.map({ RenderFreshnessTracker.isNewer(identity.sequence, than: $0) }) ?? true {
+                self.focusedSequence = identity.sequence
+                self.focusedFrame = pixelBuffer
+                first = self.notifyFirstPresentation
+                self.notifyFirstPresentation = nil
+            }
             if current, self.adaptiveAwaitingPresentation == identity.sequence { self.adaptiveAwaitingPresentation = nil }
             self.lock.unlock()
             guard current else { return }
             if drawKind != .gameRepeated {
                 self.onFramePresented?(identity.sequence, identity.generation, sourceFrameSize)
+                first?(identity.generation)
             }
         }
         #endif
@@ -1117,7 +1179,7 @@ public class Renderer: NSObject, MTKViewDelegate {
         // Neither callback execution nor GPU completion is awaited under this lock.
         lock.lock()
         let commitDecision: RenderCommitDecision =
-            freshness.isCurrent(identity) ? .commit : .superseded
+            !focusRetired && freshness.isCurrent(identity) ? .commit : .superseded
         guard commitDecision == .commit else {
             lock.unlock()
             recordCadence(

@@ -39,6 +39,33 @@ final class RemoteClipboardPasteboard: ObservableObject {
     private let send: (Grant, Int, RemoteClipboardContent, Bool) -> Void
     private let changed: (Grant, Int) -> Void
     private let readSource: ReadSource
+    private var focus: (owner: RemoteClipboardFocus, slot: SlotOrdinal)?
+    private var inboundRevision: (prefix: Wire.Prefix, epoch: UInt64)?
+    private var grantFocusEpoch: UInt64?
+
+    func bindFocus(_ owner: RemoteClipboardFocus, slot: SlotOrdinal) {
+        focus = (owner, slot)
+        owner.bind(self, slot: slot)
+        resetFocus()
+    }
+
+    func resetFocus() {
+        update(supported: supported, grant: nil, reason: .ok)
+        ownWritePending = false
+        ownRevision = nil
+        inboundRevision = nil
+        grantFocusEpoch = nil
+        if let focus, let epoch = focus.owner.epoch, focus.owner.isAuthorized(slot: focus.slot, epoch: epoch) {
+            lastCount = readSource.changeCount()
+        }
+    }
+
+    private func focusAllows(_ epoch: UInt64?) -> Bool {
+        guard let focus else { return true }
+        guard let epoch else { return false }
+        return focus.owner.isAuthorized(slot: focus.slot, epoch: epoch)
+    }
+
     private var grant: Grant?
     private var pollTask: Task<Void, Never>?
     private var progress: Progress?
@@ -65,11 +92,13 @@ final class RemoteClipboardPasteboard: ObservableObject {
         if self.supported != supported { self.supported = supported }
         if self.reason != reason { self.reason = reason }
         if !supported { automatic = false }
-        let current = grant.flatMap { value in
+        let epoch = focus?.owner.epoch
+        let current = (focusAllows(epoch) ? grant : nil).flatMap { value in
             authority.allows(value, direction: 1) || authority.allows(value, direction: 2) ? value : nil
         }
         guard self.grant != current else { return }
         self.grant = current
+        grantFocusEpoch = epoch
         canSend = current.map { $0.directions & 1 != 0 } ?? false
         transferNotice = nil
         pendingAutomaticRevision = nil
@@ -98,7 +127,7 @@ final class RemoteClipboardPasteboard: ObservableObject {
         automatic = enabled && canSend
         pendingAutomaticRevision = nil
         stopReading()
-        if canSend, let grant, authority.allows(grant, direction: 1) { lastCount = readSource.changeCount() }
+        if focusAllows(grantFocusEpoch), canSend, let grant, authority.allows(grant, direction: 1) { lastCount = readSource.changeCount() }
     }
 
     func setTransferNotice(_ notice: String?, grant: Grant?) {
@@ -106,16 +135,25 @@ final class RemoteClipboardPasteboard: ObservableObject {
     }
 
     func revision(grant: Grant, prefix: Wire.Prefix) -> Int? {
-        guard self.grant == grant, authority.allows(grant, direction: 2, prefix: prefix) else { return nil }
+        guard focusAllows(grantFocusEpoch), self.grant == grant, authority.allows(grant, direction: 2, prefix: prefix) else { return nil }
+        if let epoch = grantFocusEpoch { inboundRevision = (prefix, epoch) }
         return Self.board.changeCount
     }
 
     func apply(_ content: RemoteClipboardContent, revision: Int, grant: Grant, prefix: Wire.Prefix,
                completion: @escaping (Wire.Reason, Int) -> Void) {
-        guard self.grant == grant, authority.allows(grant, direction: 2, prefix: prefix) else {
+        guard focusAllows(grantFocusEpoch), self.grant == grant, authority.allows(grant, direction: 2, prefix: prefix) else {
             completion(.staleGrant, revision)
             return
         }
+        if focus != nil {
+            guard let inboundRevision, inboundRevision.prefix == prefix, focusAllows(inboundRevision.epoch) else {
+                completion(.staleGrant, revision)
+                return
+            }
+            self.inboundRevision = nil
+        }
+        let epoch = grantFocusEpoch
         let board = Self.board
         guard board.changeCount == revision else {
             completion(.superseded, board.changeCount)
@@ -130,6 +168,7 @@ final class RemoteClipboardPasteboard: ObservableObject {
         board.setItems([item], options: [.localOnly: true])
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            guard self.focusAllows(epoch) else { completion(.staleGrant, revision); return }
             self.ownWritePending = false
             guard self.grant == grant, self.authority.allows(grant, direction: 2) else {
                 completion(.staleGrant, revision)
@@ -147,7 +186,7 @@ final class RemoteClipboardPasteboard: ObservableObject {
     }
 
     func canPaste(_ providers: [NSItemProvider]) -> Bool {
-        guard let grant, authority.allows(grant, direction: 1), providers.count == 1 else { return false }
+        guard focusAllows(grantFocusEpoch), let grant, authority.allows(grant, direction: 1), providers.count == 1 else { return false }
         return Self.representation(providers[0].registeredTypeIdentifiers) != nil
     }
 
@@ -181,7 +220,7 @@ final class RemoteClipboardPasteboard: ObservableObject {
     }
 
     private func poll(grant: Grant) {
-        guard self.grant == grant,
+        guard focusAllows(grantFocusEpoch), self.grant == grant,
               authority.allows(grant, direction: 1) || authority.allows(grant, direction: 2) else { return }
         let count = readSource.changeCount()
         guard !ownWritePending else { return }
@@ -230,20 +269,22 @@ final class RemoteClipboardPasteboard: ObservableObject {
         stopReading()
         reading = true
         let id = readID
+        let epoch = grantFocusEpoch
+        let permit = focus?.owner.readPermit
         let worker = self.worker
         let authority = self.authority
         let limit = selected.format == .text ? 2 * grant.maxBytes : Wire.maxBytes
         let complete: (RemoteClipboardContent?, Bool) -> Void = { [weak self] content, unavailable in
             DispatchQueue.main.async {
-                guard let self, self.readID == id else { return }
+                guard let self, self.focusAllows(epoch), self.readID == id else { return }
                 self.stopReading()
                 guard self.grant == grant, self.authority.allows(grant, direction: 1), !self.ownWritePending,
                       self.readSource.changeCount() == revision else { return }
                 guard let content, content.bytes.count <= grant.maxBytes else {
                     if automatic && unavailable { self.setAutomatic(false) }
                     self.transferNotice = unavailable
-                        ? "Couldn’t read this copy. Check paste permission or use the paste button."
-                        : "This clipboard item couldn’t be sent."
+                        ? "CouldnÃ¢â‚¬â„¢t read this copy. Check paste permission or use the paste button."
+                        : "This clipboard item couldnÃ¢â‚¬â„¢t be sent."
                     return
                 }
                 self.send(grant, revision, content, automatic)
@@ -251,7 +292,7 @@ final class RemoteClipboardPasteboard: ObservableObject {
         }
         // The provider owns this temporary URL only for the completion handler.
         progress = provider.loadFileRepresentation(forTypeIdentifier: selected.identifier) { url, _ in
-            guard authority.allows(grant, direction: 1) else { return }
+            guard permit?.isValid != false, authority.allows(grant, direction: 1) else { return }
             guard let url else { complete(nil, true); return }
             let bytes: Data
             switch RemoteClipboardContent.read(url, limit: limit) {
@@ -260,7 +301,7 @@ final class RemoteClipboardPasteboard: ObservableObject {
             case .unavailable: complete(nil, true); return
             }
             if !worker.submit({
-                guard authority.allows(grant, direction: 1) else { return }
+                guard permit?.isValid != false, authority.allows(grant, direction: 1) else { return }
                 complete(RemoteClipboardContent.prepare(bytes, format: selected.format,
                                                         formats: selected.formats, fromWire: false), false)
             }) { complete(nil, false) }
