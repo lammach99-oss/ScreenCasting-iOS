@@ -6897,7 +6897,7 @@ final class RemoteKeyboardV1Tests: XCTestCase {
     }
 
     @MainActor func testDisableReleasesBeforeResigning() {
-        let view = KeyboardResponderOrderView(frame: .zero)
+        let view = KeyboardResponderOrderView(frame: .zero, pencilInteractionsEnabled: true)
         var commands: [KeyboardInputCommand] = []
         view.onKeyboardInput = {
             XCTAssertTrue(view.keyboardCaptureEnabled || $0.action == .keyUp)
