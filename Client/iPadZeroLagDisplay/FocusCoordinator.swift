@@ -97,8 +97,8 @@ final class FocusSurfaceLifetime {
     }
 
     #if targetEnvironment(simulator)
-    static func forTesting(primary: NetworkManager) -> FocusCoordinator {
-        FocusCoordinator(primary: primary)
+    static func forTesting(primary: NetworkManager, pair: RemotePairStore.Pair = .empty) -> FocusCoordinator {
+        FocusCoordinator(primary: primary, model: SessionSwitcher(pair: pair))
     }
     #endif
 
@@ -109,6 +109,8 @@ final class FocusSurfaceLifetime {
             primary.remoteClipboardPasteboard.unbindFocus()
             primary.setRemoteClipboardSceneActive(sceneActive)
             primary.endFileSlotFocus()
+            secondary.remoteClipboardPasteboard.unbindFocus()
+            secondary.endFileSlotFocus()
         }
         secondary.stop()
         primary.focusConnectionEnded = nil
@@ -149,29 +151,25 @@ final class FocusSurfaceLifetime {
             objectWillChange.send()
             return false
         }
-        transports[slot] = transport
-        if !pairActive, transports.count == 2 {
-            primary.enterFocusMode()
-            pairActive = true
-            for (ordinal, transport) in transports {
-                let network = manager(ordinal)
-                network.remoteClipboardPasteboard.bindFocus(clipboardFocus, slot: ordinal)
-                network.beginFileSlotFocus(ordinal)
-                network.trackFocusTransport(transport)
-                if model[ordinal].phase == .parked {
-                    record(model[ordinal].ticket, .parked)
-                    network.requestVideoStandby(park: true, expectedGeneration: transport)
-                }
-            }
-        } else if pairActive || slot == .two {
-            network.trackFocusTransport(transport)
-            if model[slot].phase == .parked {
-                record(model[slot].ticket, .parked)
-                network.requestVideoStandby(park: true, expectedGeneration: transport)
-            }
-        }
+        activateSlot(slot, transport: transport)
         reconcile()
         return true
+    }
+
+    private func activateSlot(_ slot: SlotOrdinal, transport: UInt64) {
+        if !pairActive {
+            primary.enterFocusMode()
+            pairActive = true
+        }
+        transports[slot] = transport
+        let network = manager(slot)
+        network.remoteClipboardPasteboard.bindFocus(clipboardFocus, slot: slot)
+        network.beginFileSlotFocus(slot)
+        network.trackFocusTransport(transport)
+        if model[slot].phase == .parked {
+            record(model[slot].ticket, .parked)
+            network.requestVideoStandby(park: true, expectedGeneration: transport)
+        }
     }
 
     func claimSurface(_ scene: String) {

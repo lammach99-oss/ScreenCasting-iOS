@@ -227,6 +227,93 @@ final class FocusCoordinatorTests: XCTestCase {
 }
 
 extension FocusCoordinatorTests {
+    @MainActor private func restoredPair(selected: SlotOrdinal) throws -> FocusCoordinator {
+        let first = try XCTUnwrap(TrustedPeerReference(String(repeating: "1", count: 64)))
+        let second = try XCTUnwrap(TrustedPeerReference(String(repeating: "2", count: 64)))
+        return FocusCoordinator.forTesting(primary: NetworkManager(role: .secondaryRemote),
+            pair: .init(first: first, second: second, selected: selected))
+    }
+
+    @MainActor private func authenticateSavedSlot(_ ticket: SlotTicket, in focus: FocusCoordinator) throws {
+        let network = focus.manager(ticket.ordinal)
+        network.controlSendForAudioTesting = { _, done in done(nil) }
+        _ = network.beginRemoteClipboardForTesting()
+        XCTAssertTrue(focus.authenticate(ticket, transport: network.remoteKeyboardGeneration,
+            peer: try XCTUnwrap(focus.model[ticket.ordinal].peer)))
+    }
+
+    @MainActor func testFirstSlotOwnsOutputWhileSecondConnectsAndAfterRefusal() throws {
+        let focus = try restoredPair(selected: .one)
+        defer { focus.primary.stopForTesting(); focus.secondary.stopForTesting() }
+        let first = try XCTUnwrap(focus.connect(.one, route: .wifi))
+        try authenticateSavedSlot(first, in: focus)
+        let second = try XCTUnwrap(focus.connect(.two, route: .wifi))
+        focus.claimSurface("scene")
+        let live = try XCTUnwrap(focus.binding)
+        XCTAssertEqual(live.ticket.ordinal, .one)
+        XCTAssertNil(focus.outputLease)
+        focus.presented(live)
+        XCTAssertTrue(focus.ownsOutput(live.ticket))
+        focus.drop(second, error: .refused)
+        XCTAssertEqual(focus.binding, live)
+        XCTAssertTrue(focus.ownsOutput(live.ticket))
+        focus.endPair(scene: "scene")
+        XCTAssertNil(focus.binding)
+        XCTAssertNil(focus.outputLease)
+        XCTAssertFalse(focus.primary.focusManaged)
+        XCTAssertTrue(focus.primary.acceptsFocusInput(nil))
+        XCTAssertTrue(focus.primary.clipboardSceneActiveForTesting)
+        XCTAssertTrue(focus.primary.authenticatedRemoteIP(live.transport))
+    }
+
+    @MainActor func testOfflineSavedSelectionNeedsTapBeforeSurvivorOwnsOutput() throws {
+        let focus = try restoredPair(selected: .two)
+        defer { focus.endPair(scene: "scene"); focus.primary.stopForTesting(); focus.secondary.stopForTesting() }
+        focus.claimSurface("scene")
+        let second = try XCTUnwrap(focus.connect(.two, route: .wifi))
+        focus.drop(second, error: .transport)
+        try authenticateSavedSlot(XCTUnwrap(focus.connect(.one, route: .wifi)), in: focus)
+        XCTAssertEqual(focus.model.selected, .two)
+        XCTAssertNil(focus.binding)
+        XCTAssertNil(focus.outputLease)
+        XCTAssertEqual(focus.model.offeredAlternate, .one)
+        let target = try XCTUnwrap(PairPanelModel.tapTarget(focus.model, scene: "scene"))
+        XCTAssertEqual(target, .one)
+        focus.select(target, scene: "scene")
+        let live = try XCTUnwrap(focus.binding)
+        XCTAssertEqual(live.ticket.ordinal, .one)
+        XCTAssertNil(focus.outputLease)
+        focus.presented(live)
+        XCTAssertTrue(focus.ownsOutput(live.ticket))
+    }
+
+    @MainActor func testLateJoinParksAndFencesClipboardAndFileActions() async throws {
+        let focus = try restoredPair(selected: .one)
+        defer { focus.endPair(scene: "scene"); focus.primary.stopForTesting(); focus.secondary.stopForTesting() }
+        focus.claimSurface("scene")
+        try authenticateSavedSlot(XCTUnwrap(focus.connect(.one, route: .wifi)), in: focus)
+        let live = try XCTUnwrap(focus.binding)
+        focus.presented(live)
+        let late = focus.secondary
+        late.controlSendForAudioTesting = { _, done in done(nil) }
+        let owner = late.beginRemoteClipboardForTesting(remoteFiles: true)
+        let deadline = ProcessInfo.processInfo.systemUptime + 2
+        while !late.isRemoteControlSession && ProcessInfo.processInfo.systemUptime < deadline {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertTrue(late.isRemoteControlSession)
+        late.setRemoteClipboardSceneActive(true)
+        let oldScope = late.transferActionScope
+        let second = try XCTUnwrap(focus.connect(.two, route: .wifi))
+        XCTAssertTrue(focus.authenticate(second, transport: owner.generation, peer: try XCTUnwrap(focus.model[.two].peer)))
+        XCTAssertEqual(focus.model[.two].phase, .parked)
+        XCTAssertEqual(focus.model.selected, .one)
+        XCTAssertEqual(focus.binding, live)
+        XCTAssertTrue(focus.ownsOutput(live.ticket))
+        XCTAssertFalse(late.clipboardSceneActiveForTesting)
+        XCTAssertGreaterThan(late.transferActionScope.fileEpoch, oldScope.fileEpoch)
+    }
+
     @MainActor func testUnnegotiatedParkDropsVideoBeforeDecodeAndSingleSlotKeepsOriginalAdmission() throws {
         let primary = NetworkManager(role: .secondaryRemote)
         let focus = FocusCoordinator.forTesting(primary: primary)
@@ -238,7 +325,7 @@ extension FocusCoordinatorTests {
         let oldHost = focus.secondary.beginRemoteClipboardForTesting()
         let first = try XCTUnwrap(focus.connect(.one, route: .wifi))
         XCTAssertTrue(focus.authenticate(first, transport: focus.primary.remoteKeyboardGeneration, peer: try XCTUnwrap(TrustedPeerReference(String(repeating: "3", count: 64)))))
-        XCTAssertFalse(primary.focusManaged)
+        XCTAssertTrue(primary.focusManaged)
         let second = try XCTUnwrap(focus.connect(.two, route: .wifi))
         XCTAssertTrue(focus.authenticate(second, transport: focus.secondary.remoteKeyboardGeneration, peer: try XCTUnwrap(TrustedPeerReference(String(repeating: "4", count: 64)))))
         var decoded = [UInt32]()
