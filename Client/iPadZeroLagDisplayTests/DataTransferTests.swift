@@ -225,10 +225,10 @@ final class DataTransferTests: XCTestCase {
     }
     func testDisplayedOfferConsentCannotApproveReplacementOrAnotherSession() async throws {
         let f = try UX02Session(), a = UUID(), b = UUID()
-        await ux02Offer(f, id: a)
+        try await ux02Offer(f, id: a)
         let consent = try XCTUnwrap(f.manager.consentForTesting())
-        await ux03Post(TransferPacket(kind: .cancel, generation: 7, id: a), to: f.manager)
-        await ux02Offer(f, id: b)
+        try await ux03Post(TransferPacket(kind: .cancel, generation: 7, id: a), to: f.manager)
+        try await ux02Offer(f, id: b)
         f.network.decideTransfer(true, consent: consent)
         f.network.networkQueueForTesting.sync {}
         await ux03Barrier(f.manager)
@@ -252,20 +252,20 @@ final class DataTransferTests: XCTestCase {
         f.network.stopForTesting(); f.manager.retire(); await ux03Barrier(f.manager)
         try? FileManager.default.removeItem(at: f.root)
     }
-    private func ux02Offer(_ f: UX02Session, id: UUID, name: String = "received.bin", length: UInt64 = 0) async {
-        await ux03Post(TransferPacket(kind: .offer, generation: 7, id: id,
+    private func ux02Offer(_ f: UX02Session, id: UUID, name: String = "received.bin", length: UInt64 = 0) async throws {
+        try await ux03Post(TransferPacket(kind: .offer, generation: 7, id: id,
                        files: [TransferFile(name: name, length: length)]), to: f.manager)
     }
-    private func ux02Complete(_ f: UX02Session, id: UUID, bytes: Data = Data(), digest: Data? = nil) async {
+    private func ux02Complete(_ f: UX02Session, id: UUID, bytes: Data = Data(), digest: Data? = nil) async throws {
         guard f.responses(id).contains(where: { $0.accepted }) else { return }
         if !bytes.isEmpty {
             var p = TransferPacket(kind: .chunk, generation: 7, id: id); p.bytes = bytes
-            await ux03Post(p, to: f.manager)
+            try await ux03Post(p, to: f.manager)
         }
         var end = TransferPacket(kind: .fileEnd, generation: 7, id: id)
         end.offset = UInt64(bytes.count); end.bytes = digest ?? Data(SHA256.hash(data: bytes))
-        await ux03Post(end, to: f.manager)
-        await ux03Post(TransferPacket(kind: .end, generation: 7, id: id), to: f.manager)
+        try await ux03Post(end, to: f.manager)
+        try await ux03Post(TransferPacket(kind: .end, generation: 7, id: id), to: f.manager)
         await ux03Barrier(f.manager)
     }
 
@@ -274,14 +274,14 @@ final class DataTransferTests: XCTestCase {
             let f = try UX02Session(usb: usb), id = UUID()
             await ux03Barrier(f.manager)
             await ux02AssertEnabled(f, false)
-            await ux02Offer(f, id: id)
+            try await ux02Offer(f, id: id)
             XCTAssertTrue(f.responses(id).isEmpty, "No passive approval without an opt-in")
             f.manager.decide(false); await ux03Barrier(f.manager); await ux03Barrier(f.manager)
             XCTAssertEqual(f.responses(id).count, 1); XCTAssertFalse(f.responses(id).first?.accepted ?? true)
-            let next = UUID(); await ux02Offer(f, id: next)
+            let next = UUID(); try await ux02Offer(f, id: next)
             f.manager.decide(true); await ux03Barrier(f.manager)
             XCTAssertEqual(f.responses(next).filter(\.accepted).count, 1)
-            await ux02Complete(f, id: next); XCTAssertEqual(try f.library.snapshot().eligibleCount, 1)
+            try await ux02Complete(f, id: next); XCTAssertEqual(try f.library.snapshot().eligibleCount, 1)
             await ux02Finish(f)
         }
     }
@@ -289,9 +289,9 @@ final class DataTransferTests: XCTestCase {
         let f = try UX02Session(); await ux02Toggle(f, true)
         await ux02AssertEnabled(f, true)
         for value in [UInt8(1), 2] {
-            let id = UUID(); await ux02Offer(f, id: id, name: "same.bin", length: 1)
+            let id = UUID(); try await ux02Offer(f, id: id, name: "same.bin", length: 1)
             XCTAssertEqual(f.responses(id).filter(\.accepted).count, 1, "ON must use real admission exactly once")
-            await ux02Complete(f, id: id, bytes: Data([value]))
+            try await ux02Complete(f, id: id, bytes: Data([value]))
             XCTAssertEqual(f.packets.filter { $0.id == id && $0.kind == .fileAck && $0.reason == .ok }.count, 1)
         }
         XCTAssertEqual(try f.library.snapshot().eligibleCount, 2)
@@ -306,20 +306,20 @@ final class DataTransferTests: XCTestCase {
                 await ux02Toggle(f, true)
                 let enabled = await MainActor.run { f.network.autoAcceptIncomingFiles }
                 XCTAssertEqual(enabled, auth && commit)
-                let id = UUID(); await ux02Offer(f, id: id)
+                let id = UUID(); try await ux02Offer(f, id: id)
                 XCTAssertEqual(f.responses(id).filter(\.accepted).count, auth && commit ? 1 : 0)
                 await ux02Finish(f)
             }
         }
     }
     func testUX02TurningOnWithPendingOfferDoesNotAutoAcceptOldOffer() async throws {
-        let f = try UX02Session(), id = UUID(); await ux02Offer(f, id: id)
+        let f = try UX02Session(), id = UUID(); try await ux02Offer(f, id: id)
         await ux02Toggle(f, true)
         await ux02AssertEnabled(f, true)
         XCTAssertTrue(f.responses(id).isEmpty)
         f.manager.decide(true); f.manager.decide(true); await ux03Barrier(f.manager)
         XCTAssertEqual(f.responses(id).filter(\.accepted).count, 1)
-        await ux02Complete(f, id: id); await ux02Finish(f)
+        try await ux02Complete(f, id: id); await ux02Finish(f)
     }
     func testUX02TurningOffBeforeQueuedOfferDecisionFencesAutoResponse() async throws {
         let f = try UX02Session(); await ux02Toggle(f, true)
@@ -351,7 +351,7 @@ final class DataTransferTests: XCTestCase {
         f.network.configureTransferAuthorizationForTesting(manager: f.manager, authenticated: true, committed: true, usb: true)
         await MainActor.run { }; await ux03Barrier(f.manager)
         await ux02AssertEnabled(f, false)
-        let id = UUID(); await ux02Offer(f, id: id); XCTAssertTrue(f.responses(id).isEmpty)
+        let id = UUID(); try await ux02Offer(f, id: id); XCTAssertTrue(f.responses(id).isEmpty)
         await ux02Toggle(f, true); await ux02AssertEnabled(f, true)
         XCTAssertTrue(f.responses(id).isEmpty, "Handover requires a fresh opt-in and old offers stay manual")
         await ux02Finish(f)
@@ -368,20 +368,20 @@ final class DataTransferTests: XCTestCase {
     }
     func testUX02StaleCancelAndWrongPeerGenerationCannotPurgeCurrentBatch() async throws {
         let f = try UX02Session(); await ux02Toggle(f, true)
-        let id = UUID(); await ux02Offer(f, id: id)
+        let id = UUID(); try await ux02Offer(f, id: id)
         XCTAssertEqual(f.responses(id).filter(\.accepted).count, 1)
-        await ux03Post(TransferPacket(kind: .cancel, generation: 999, id: id), to: f.manager)
-        await ux03Post(TransferPacket(kind: .cancel, generation: 7, id: UUID()), to: f.manager)
-        await ux02Complete(f, id: id)
+        try await ux03Post(TransferPacket(kind: .cancel, generation: 999, id: id), to: f.manager)
+        try await ux03Post(TransferPacket(kind: .cancel, generation: 7, id: UUID()), to: f.manager)
+        try await ux02Complete(f, id: id)
         XCTAssertEqual(try f.library.snapshot().eligibleCount, 1)
         await ux02Finish(f)
     }
     func testUX02AutoAcceptInvalidMetadataAndNoQuotaCannotBypassAdmission() async throws {
         let f = try UX02Session(); await ux02Toggle(f, true)
-        let invalid = UUID(); await ux02Offer(f, id: invalid, name: "../escape")
+        let invalid = UUID(); try await ux02Offer(f, id: invalid, name: "../escape")
         XCTAssertTrue(f.responses(invalid).isEmpty)
         for n in 0..<256 { try Data().write(to: f.root.appendingPathComponent("legacy-\(n)")) }
-        let id = UUID(); await ux02Offer(f, id: id)
+        let id = UUID(); try await ux02Offer(f, id: id)
         XCTAssertEqual(f.responses(id).filter(\.accepted).count, 0)
         XCTAssertEqual(f.packets.filter { $0.kind == .cancel && $0.id == id }.count, 1,
                        "ON must actually attempt existing quota admission and fail closed")
@@ -393,9 +393,9 @@ final class DataTransferTests: XCTestCase {
             var hooks = ReceivedFileLibrary.Hooks()
             if receiptFailure { hooks.beforeReceiptCommit = { throw CocoaError(.fileWriteOutOfSpace) } }
             let f = try UX02Session(hooks: hooks); await ux02Toggle(f, true)
-            let id = UUID(); await ux02Offer(f, id: id, length: 1)
+            let id = UUID(); try await ux02Offer(f, id: id, length: 1)
             XCTAssertEqual(f.responses(id).filter(\.accepted).count, 1)
-            await ux02Complete(f, id: id, bytes: Data([1]), digest: receiptFailure ? nil : Data(repeating: 0, count: 32))
+            try await ux02Complete(f, id: id, bytes: Data([1]), digest: receiptFailure ? nil : Data(repeating: 0, count: 32))
             XCTAssertEqual(f.packets.filter { $0.kind == .fileAck && $0.reason == .ok }.count, 0)
             XCTAssertEqual(try f.library.snapshot().eligibleCount, 0)
             XCTAssertEqual(try f.library.snapshot().retainedCount, receiptFailure ? 1 : 0)
@@ -417,17 +417,17 @@ final class DataTransferTests: XCTestCase {
         f.network.configureTransferAuthorizationForTesting(manager: f.manager, authenticated: false, committed: true)
         await ux02Toggle(f, true)
         await ux02AssertEnabled(f, false)
-        let id = UUID(); await ux02Offer(f, id: id); XCTAssertTrue(f.responses(id).isEmpty)
+        let id = UUID(); try await ux02Offer(f, id: id); XCTAssertTrue(f.responses(id).isEmpty)
         await ux02Finish(f)
     }
     func testUX02ConcurrentManualDecisionAndDuplicateOfferNeverDoubleAdmit() async throws {
         let f = try UX02Session(); await ux02Toggle(f, true)
-        let id = UUID(); await ux02Offer(f, id: id)
+        let id = UUID(); try await ux02Offer(f, id: id)
         f.manager.decide(true); f.manager.decide(false); await ux03Barrier(f.manager)
         XCTAssertEqual(f.responses(id).count, 1)
-        let other = UUID(); await ux02Offer(f, id: other)
+        let other = UUID(); try await ux02Offer(f, id: other)
         XCTAssertEqual(f.responses(other).count, 1); XCTAssertEqual(f.responses(other).first?.reason, .busy)
-        await ux02Complete(f, id: id); XCTAssertEqual(try f.library.snapshot().eligibleCount, 1)
+        try await ux02Complete(f, id: id); XCTAssertEqual(try f.library.snapshot().eligibleCount, 1)
         await ux02Finish(f)
     }
 
@@ -473,28 +473,41 @@ final class DataTransferTests: XCTestCase {
         var packets: [TransferPacket] { lock.lock(); defer { lock.unlock() }; return sent }
         var snapshot: DataTransferManager.Snapshot { lock.lock(); defer { lock.unlock() }; return state }
     }
-    private func ux03Post(_ packet: TransferPacket, to manager: DataTransferManager) async {
-        let processed = expectation(description: "exact packet processed")
-        XCTAssertTrue(manager.post(packet) { processed.fulfill() })
-        await fulfillment(of: [processed], timeout: 3)
+    private func ux03Post(_ packet: TransferPacket, to manager: DataTransferManager) async throws {
+        let processed = XCTestExpectation(description: "exact packet processed")
+        let admitted = manager.post(packet) { processed.fulfill() }
+        guard admitted else { throw PacketProcessingError.rejected(packet.kind) }
+        // Fence disk IO before checking that the exact packet's completion ran.
+        await ux03Barrier(manager)
+        guard await XCTWaiter.fulfillment(of: [processed], timeout: 3) == .completed else {
+            throw PacketProcessingError.missingCompletion(packet.kind)
+        }
+    }
+    private enum PacketProcessingError: Error {
+        case rejected(TransferKind)
+        case missingCompletion(TransferKind)
     }
     private func ux03Barrier(_ manager: DataTransferManager) async {
-        // Foreign CANCEL is inert; its completion fences earlier IO work.
-        await ux03Post(TransferPacket(kind: .cancel, generation: 999, id: UUID()), to: manager)
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async {
+                manager.drainRemoteIOForTesting()
+                done.resume()
+            }
+        }
     }
-    private func ux03Offer(_ files: [TransferFile], id: UUID, receiver: UX03Receiver) async {
-        await ux03Post(TransferPacket(kind: .offer, generation: 7, id: id, files: files), to: receiver.manager)
+    private func ux03Offer(_ files: [TransferFile], id: UUID, receiver: UX03Receiver) async throws {
+        try await ux03Post(TransferPacket(kind: .offer, generation: 7, id: id, files: files), to: receiver.manager)
         receiver.manager.decide(true); await ux03Barrier(receiver.manager)
     }
-    private func ux03File(_ bytes: Data, index: UInt16, id: UUID, receiver: UX03Receiver, digest: Data? = nil) async {
+    private func ux03File(_ bytes: Data, index: UInt16, id: UUID, receiver: UX03Receiver, digest: Data? = nil) async throws {
         if !bytes.isEmpty {
             var chunk = TransferPacket(kind: .chunk, generation: 7, id: id)
             chunk.fileIndex = index; chunk.bytes = bytes
-            await ux03Post(chunk, to: receiver.manager)
+            try await ux03Post(chunk, to: receiver.manager)
         }
         var end = TransferPacket(kind: .fileEnd, generation: 7, id: id)
         end.fileIndex = index; end.offset = UInt64(bytes.count); end.bytes = digest ?? Data(SHA256.hash(data: bytes))
-        await ux03Post(end, to: receiver.manager)
+        try await ux03Post(end, to: receiver.manager)
     }
 
     func testUX03FileAckOccursOnlyAfterReceiptIsDurablyReadable() async throws {
@@ -512,10 +525,10 @@ final class DataTransferTests: XCTestCase {
                 XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(ReceivedFileLibrary.metadataName).appendingPathComponent("receipts.json").path))
             } catch { XCTFail("Receipt not readable before FileAck: \(error)") }
         }
-        await ux03Offer([TransferFile(name: "empty.bin", length: 0), TransferFile(name: name, length: 2)], id: id, receiver: receiver)
-        await ux03File(Data(), index: 0, id: id, receiver: receiver)
-        await ux03File(Data([1, 2]), index: 1, id: id, receiver: receiver)
-        await ux03Post(TransferPacket(kind: .end, generation: 7, id: id), to: receiver.manager); await ux03Barrier(receiver.manager)
+        try await ux03Offer([TransferFile(name: "empty.bin", length: 0), TransferFile(name: name, length: 2)], id: id, receiver: receiver)
+        try await ux03File(Data(), index: 0, id: id, receiver: receiver)
+        try await ux03File(Data([1, 2]), index: 1, id: id, receiver: receiver)
+        try await ux03Post(TransferPacket(kind: .end, generation: 7, id: id), to: receiver.manager); await ux03Barrier(receiver.manager)
         XCTAssertEqual(receiver.packets.filter { $0.kind == .fileAck && $0.reason == .ok }.map(\.fileIndex), [0, 1])
         XCTAssertEqual(receiver.snapshot.phase, .completed)
         let inventory = try library.snapshot()
@@ -532,8 +545,8 @@ final class DataTransferTests: XCTestCase {
         var hooks = ReceivedFileLibrary.Hooks(); hooks.beforeReceiptCommit = { throw CocoaError(.fileWriteOutOfSpace) }
         let library = try ReceivedFileLibrary(directory: root, hooks: hooks), id = UUID()
         let receiver = UX03Receiver(root: root, library: library)
-        await ux03Offer([TransferFile(name: "retained.bin", length: 2)], id: id, receiver: receiver)
-        await ux03File(Data([3, 4]), index: 0, id: id, receiver: receiver)
+        try await ux03Offer([TransferFile(name: "retained.bin", length: 2)], id: id, receiver: receiver)
+        try await ux03File(Data([3, 4]), index: 0, id: id, receiver: receiver)
         XCTAssertEqual(receiver.packets.filter { $0.kind == .fileAck && $0.reason == .ok }.count, 0)
         XCTAssertEqual(receiver.snapshot.phase, .failed)
         XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("retained.bin")), Data([3, 4]))
@@ -552,13 +565,14 @@ final class DataTransferTests: XCTestCase {
         try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: false)
         try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("alias"), withDestinationURL: nested)
         let receiver = UX03Receiver(root: root, library: library)
-        await ux03Offer([TransferFile(name: "last.bin", length: 1)], id: id, receiver: receiver)
+        try await ux03Offer([TransferFile(name: "last.bin", length: 1)], id: id, receiver: receiver)
         XCTAssertEqual(receiver.snapshot.phase, .receiving, "Internal metadata, directories and symlinks are not file slots")
-        await ux03File(Data([2]), index: 0, id: id, receiver: receiver)
-        await ux03Post(TransferPacket(kind: .end, generation: 7, id: id), to: receiver.manager); await ux03Barrier(receiver.manager)
-        XCTAssertEqual(try library.snapshot().retainedCount, 256); XCTAssertEqual(try library.snapshot().retainedBytes, 256)
-        XCTAssertEqual(try library.snapshot().eligibleCount, 1)
-        await ux03Offer([TransferFile(name: "overflow.bin", length: 0)], id: UUID(), receiver: receiver)
+        try await ux03File(Data([2]), index: 0, id: id, receiver: receiver)
+        try await ux03Post(TransferPacket(kind: .end, generation: 7, id: id), to: receiver.manager); await ux03Barrier(receiver.manager)
+        let inventory = try library.snapshot()
+        XCTAssertEqual(inventory.retainedCount, 256); XCTAssertEqual(inventory.retainedBytes, 256)
+        XCTAssertEqual(inventory.eligibleCount, 1)
+        try await ux03Offer([TransferFile(name: "overflow.bin", length: 0)], id: UUID(), receiver: receiver)
         XCTAssertEqual(receiver.snapshot.phase, .failed)
         XCTAssertEqual(receiver.packets.filter { $0.kind == .response && $0.accepted }.count, 1)
         receiver.manager.retire(); await ux03Barrier(receiver.manager)
@@ -569,7 +583,7 @@ final class DataTransferTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let library = try ReceivedFileLibrary(directory: root), id = UUID()
         let receiver = UX03Receiver(root: root, library: library)
-        await ux03Post(TransferPacket(kind: .offer, generation: 7, id: id, files: [TransferFile(name: "x", length: 1)]), to: receiver.manager)
+        try await ux03Post(TransferPacket(kind: .offer, generation: 7, id: id, files: [TransferFile(name: "x", length: 1)]), to: receiver.manager)
         XCTAssertEqual(receiver.snapshot.phase, .awaitingDecision); XCTAssertTrue(try library.snapshot().busy)
         XCTAssertThrowsError(try library.confirmClear(), "Pending consent must fence Clear")
         let foreign = UUID(); XCTAssertFalse(library.beginTransfer(owner: foreign)); library.endTransfer(owner: foreign)
@@ -585,9 +599,9 @@ final class DataTransferTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let library = try ReceivedFileLibrary(directory: root), id = UUID()
         let receiver = UX03Receiver(root: root, library: library)
-        await ux03Offer([TransferFile(name: "x", length: 2)], id: id, receiver: receiver)
+        try await ux03Offer([TransferFile(name: "x", length: 2)], id: id, receiver: receiver)
         var chunk = TransferPacket(kind: .chunk, generation: 7, id: id); chunk.bytes = Data([1])
-        await ux03Post(chunk, to: receiver.manager); XCTAssertTrue(try library.snapshot().busy)
+        try await ux03Post(chunk, to: receiver.manager); XCTAssertTrue(try library.snapshot().busy)
         receiver.manager.retire(); await ux03Barrier(receiver.manager)
         XCTAssertFalse(try library.snapshot().busy); XCTAssertEqual(try library.confirmClear().count, 0)
         XCTAssertFalse(try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).contains { $0.pathExtension == "part" })
@@ -599,7 +613,7 @@ final class DataTransferTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let library = try ReceivedFileLibrary(directory: root), id = UUID()
         let first = UX03Receiver(root: root, library: library)
-        await ux03Offer([TransferFile(name: "first", length: 1)], id: id, receiver: first)
+        try await ux03Offer([TransferFile(name: "first", length: 1)], id: id, receiver: first)
         let files = FileManager.default
         let stages = try files.contentsOfDirectory(at: files.temporaryDirectory, includingPropertiesForKeys: nil)
             .filter { $0.lastPathComponent.hasPrefix(".scdt-\(id.uuidString)-") && $0.pathExtension == "part" }
@@ -610,7 +624,7 @@ final class DataTransferTests: XCTestCase {
         XCTAssertThrowsError(try library.confirmClear())
         first.manager.retire(); await ux03Barrier(first.manager)
         XCTAssertTrue(stages.allSatisfy { !files.fileExists(atPath: $0.path) })
-        await ux03Post(TransferPacket(kind: .offer, generation: 8, id: UUID(), files: [TransferFile(name: "next", length: 0)]), to: second.manager)
+        try await ux03Post(TransferPacket(kind: .offer, generation: 8, id: UUID(), files: [TransferFile(name: "next", length: 0)]), to: second.manager)
         XCTAssertEqual(second.snapshot.phase, .awaitingDecision)
         first.manager.retire(); await ux03Barrier(first.manager)
         XCTAssertThrowsError(try library.confirmClear(), "Stale retirement cannot release the successor")
@@ -626,9 +640,9 @@ final class DataTransferTests: XCTestCase {
         hooks.beforeReceiptCommit = { commits += 1; if commits == 2 { throw CocoaError(.fileWriteNoPermission) } }
         let library = try ReceivedFileLibrary(directory: root, hooks: hooks), id = UUID()
         let receiver = UX03Receiver(root: root, library: library)
-        await ux03Offer([TransferFile(name: "first", length: 1), TransferFile(name: "later", length: 2)], id: id, receiver: receiver)
-        await ux03File(Data([1]), index: 0, id: id, receiver: receiver)
-        await ux03File(Data([2, 3]), index: 1, id: id, receiver: receiver)
+        try await ux03Offer([TransferFile(name: "first", length: 1), TransferFile(name: "later", length: 2)], id: id, receiver: receiver)
+        try await ux03File(Data([1]), index: 0, id: id, receiver: receiver)
+        try await ux03File(Data([2, 3]), index: 1, id: id, receiver: receiver)
         XCTAssertEqual(receiver.packets.filter { $0.kind == .fileAck && $0.reason == .ok }.map(\.fileIndex), [0])
         XCTAssertEqual(receiver.snapshot.phase, .failed); XCTAssertEqual(receiver.snapshot.published, 1)
         let inventory = try library.snapshot()
@@ -651,7 +665,7 @@ final class DataTransferTests: XCTestCase {
         rejected.reason = .insufficientStorage
         let payload = try TransferProtocol.encode(rejected)
         let decoded = try TransferProtocol.decode(.response, payload)
-        await ux03Post(decoded, to: receiver.manager)
+        try await ux03Post(decoded, to: receiver.manager)
         let snapshot = receiver.snapshot
         XCTAssertEqual(snapshot.phase, .rejected)
         XCTAssertEqual(snapshot.rejectionReason, .insufficientStorage)
@@ -674,7 +688,7 @@ final class DataTransferTests: XCTestCase {
         XCTAssertThrowsError(try library.confirmClear())
         let offer = try XCTUnwrap(receiver.packets.first { $0.kind == .offer })
         var rejected = TransferPacket(kind: .response, generation: offer.generation, id: offer.id); rejected.reason = .userRejected
-        await ux03Post(rejected, to: receiver.manager)
+        try await ux03Post(rejected, to: receiver.manager)
         XCTAssertFalse(try library.snapshot().busy); XCTAssertEqual(try library.snapshot().eligibleCount, 0)
         XCTAssertEqual(try Data(contentsOf: source), Data([4]))
         receiver.manager.retire(); await ux03Barrier(receiver.manager)
@@ -687,8 +701,8 @@ final class DataTransferTests: XCTestCase {
             let library = try ReceivedFileLibrary(directory: root), id = UUID()
             if corrupt { try Data("torn{".utf8).write(to: root.appendingPathComponent(ReceivedFileLibrary.metadataName).appendingPathComponent("receipts.json")) }
             let receiver = UX03Receiver(root: root, library: library)
-            await ux03Offer([TransferFile(name: "x", length: 1)], id: id, receiver: receiver)
-            await ux03File(Data([1]), index: 0, id: id, receiver: receiver, digest: corrupt ? nil : Data(count: 32))
+            try await ux03Offer([TransferFile(name: "x", length: 1)], id: id, receiver: receiver)
+            try await ux03File(Data([1]), index: 0, id: id, receiver: receiver, digest: corrupt ? nil : Data(count: 32))
             XCTAssertEqual(receiver.packets.filter { $0.kind == .fileAck && $0.reason == .ok }.count, 0)
             XCTAssertEqual(receiver.snapshot.phase, .failed); XCTAssertEqual(try library.snapshot().eligibleCount, 0)
             XCTAssertEqual(try library.snapshot().retainedCount, corrupt ? 1 : 0); XCTAssertFalse(try library.snapshot().busy)
@@ -702,7 +716,7 @@ final class DataTransferTests: XCTestCase {
         let library = try ReceivedFileLibrary(directory: root), source = root.appendingPathComponent("legacy.bin"), id = UUID()
         try Data([1]).write(to: source)
         let token = try library.beginExport(source), receiver = UX03Receiver(root: root, library: library)
-        await ux03Post(TransferPacket(kind: .offer, generation: 7, id: id, files: [TransferFile(name: "x", length: 1)]), to: receiver.manager)
+        try await ux03Post(TransferPacket(kind: .offer, generation: 7, id: id, files: [TransferFile(name: "x", length: 1)]), to: receiver.manager)
         XCTAssertFalse(receiver.manager.owns(TransferPacket(kind: .cancel, generation: 7, id: id)))
         XCTAssertEqual(receiver.packets.filter { $0.kind == .response && $0.reason == .busy }.count, 1)
         XCTAssertThrowsError(try library.confirmClear())

@@ -44,6 +44,14 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         let fingerprint = String(repeating: "A", count: 64)
         defaults.set(["host": "127.0.0.1", "fingerprint": fingerprint], forKey: "ScreenCasting.phone.remoteResume.v1")
         let phone = NetworkManager(userDefaults: defaults, capabilities: .init(family: .phone))
+        // Both requests run on the serial network queue. Its rejection publishes on main.
+        func finishRequest() async {
+            await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+                phone.networkQueueForTesting.async {
+                    DispatchQueue.main.async { done.resume() }
+                }
+            }
+        }
         var dials = 0
         phone.dialForTesting = { endpoint, expected in
             XCTAssertEqual(endpoint, .hostPort(host: .ipv4(.loopback), port: 27020))
@@ -53,11 +61,11 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         let target = RemoteIntent.Target(host: "127.0.0.1", port: 27020)
         phone.connect(remote: .resume(target, remoteControl: true,
             saved: .init(generation: phone.remoteKeyboardGeneration &+ 1, fingerprint: fingerprint)))
-        await drain(phone)
+        await finishRequest()
         XCTAssertEqual(phone.admissionError, .staleResume)
         XCTAssertEqual(dials, 0)
         phone.reconnectLastPC()
-        await drain(phone)
+        await finishRequest()
         XCTAssertEqual(dials, 1)
     }
 
