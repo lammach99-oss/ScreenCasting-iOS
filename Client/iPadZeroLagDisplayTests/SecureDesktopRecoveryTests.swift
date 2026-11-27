@@ -4,6 +4,52 @@ import UIKit
 @testable import iPadCasting
 
 final class SecureDesktopRecoveryTests: XCTestCase {
+    func testSecureSoftwareScanMapping() {
+        var events: [RemoteScanKeyCommand] = []
+        let dropped = SecureSoftwareKeyboard.emit("aZ0!_? \u{8}\r\t\n\u{e9}", token: 7) { events.append($0) }
+        XCTAssertEqual(dropped, 1)
+        let strokes: [(UInt16, Bool)] = [(30,false),(44,true),(11,false),(2,true),(12,true),
+                                         (53,true),(57,false),(14,false),(28,false),(15,false),(28,false)]
+        var expected: [RemoteScanKeyCommand] = []
+        for (scan, shifted) in strokes {
+            if shifted { expected.append(.init(action: 0, flags: 0, scan: 42, token: 7)) }
+            expected.append(.init(action: 0, flags: 0, scan: scan, token: 7))
+            expected.append(.init(action: 1, flags: 0, scan: scan, token: 7))
+            if shifted { expected.append(.init(action: 1, flags: 0, scan: 42, token: 7)) }
+        }
+        XCTAssertTrue(events == expected)
+        for byte in UInt8(32)...126 {
+            let symbol = String(UnicodeScalar(byte))
+            var strokes = 0
+            let drops = SecureSoftwareKeyboard.emit(symbol, token: 7) { _ in strokes += 1 }
+            XCTAssertEqual(drops, 0)
+            XCTAssertTrue(strokes == 2 || strokes == 4)
+        }
+    }
+
+    func testSoftwareDispatchSelectsExactlyOneSink() {
+        for route in [SecureSoftwareKeyboard.Route.committed, .blocked, .scan] {
+            var scans = 0, commits = 0
+            route.deliver("x", scan: { _ in scans += 1 }, commit: { _ in commits += 1 })
+            XCTAssertEqual(scans, route == .scan ? 1 : 0)
+            XCTAssertEqual(commits, route == .committed ? 1 : 0)
+        }
+    }
+
+    @MainActor func testSecureSoftwareEntryBypassesCorrectionHistory() {
+        let view = RemoteSoftwareKeyboardTextView(frame: .zero, textContainer: nil)
+        view.secureEntry = true
+        view.deliveryEnabled = true
+        XCTAssertTrue(view.hasText)
+        XCTAssertEqual(view.autocapitalizationType, .none)
+        var emissions = 0
+        view.onEmission = { _ in emissions += 1 }
+        view.insertText("a")
+        view.deleteBackward()
+        XCTAssertEqual(emissions, 2)
+        XCTAssertTrue(view.text.isEmpty)
+    }
+
     func testRemoteSecureDesktopOptInAndOldHostFallback() throws {
         for enabled in [false, true] {
             var features = RemoteFeatureNegotiation(requestedFeatures: 0x1f)
@@ -14,7 +60,31 @@ final class SecureDesktopRecoveryTests: XCTestCase {
             var secure = RemoteSecureDesktopState()
             XCTAssertNil(secure.begin(accepted: features.accepted, control: true))
             XCTAssertFalse(secure.covered)
+            XCTAssertEqual(secure.softwareRoute, .committed)
             XCTAssertTrue(secure.canSas)
+        }
+    }
+
+    func testPhoneKeyboardRequiresAdmittedScanInputOnWinlogon() {
+        func enabled(_ route: SecureSoftwareKeyboard.Route, _ desktop: UInt8,
+                     _ ready: Bool, _ features: UInt64 = 1) -> Bool {
+            route.phoneKeyboardAvailable(desktop: desktop, features: features, ready: ready, legacy: true)
+        }
+        XCTAssertTrue(enabled(.committed, 1, false, 0))
+        XCTAssertFalse(enabled(.committed, 2, true))
+        XCTAssertFalse(enabled(.blocked, 2, true))
+        XCTAssertFalse(enabled(.scan, 2, false))
+        XCTAssertFalse(enabled(.scan, 2, true, 2))
+        XCTAssertTrue(enabled(.scan, 2, true))
+    }
+
+    func testPhoneRequestsSecureFeaturesOnlyWithPreference() throws {
+        let mask = ClientDeviceCapabilities.resolve(.phone).remoteInputFeatureMask
+        for enabled in [false, true] {
+            var features = RemoteFeatureNegotiation(requestedFeatures: mask)
+            XCTAssertTrue(features.begin(now: 0))
+            let request = try XCTUnwrap(features.pong(flags: 0x4000, now: 1, requestSecureDesktop: enabled))
+            XCTAssertEqual(RemoteFeaturesMessage.decode(request)?.features, enabled ? 0xc17 : 0x17)
         }
     }
 
@@ -59,6 +129,7 @@ final class SecureDesktopRecoveryTests: XCTestCase {
             .request(operation: .controlOn, videoSequence: 0, captureRevision: 0, sourceEpoch: 0))
         XCTAssertEqual(secure.receive(remoteState(.winlogon, .firstFrame, revision: 3, epoch: 7, sequence: 21),
             adaptiveOwner: false, timedVideo: false), .fence)
+        XCTAssertEqual(secure.softwareRoute, .blocked)
         XCTAssertTrue(secure.covered)
         XCTAssertFalse(secure.canSas)
         XCTAssertEqual(secure.admit(sequence: 21, isIDR: true, decoder: 4), .barrier)
@@ -70,12 +141,18 @@ final class SecureDesktopRecoveryTests: XCTestCase {
         XCTAssertEqual(ack, .request(operation: .presented, videoSequence: 21, captureRevision: 3, sourceEpoch: 7))
         XCTAssertFalse(secure.covered)
         XCTAssertFalse(secure.canSas)
+        XCTAssertEqual(secure.softwareRoute, .blocked)
         XCTAssertNotNil(ack)
         if let ack { XCTAssertTrue(secure.admitRequest(ack)) }
         XCTAssertTrue(secure.canSas)
+        XCTAssertEqual(secure.softwareRoute, .scan)
         XCTAssertNil(secure.presented(sequence: 21, decoder: 4))
         XCTAssertEqual(secure.admit(sequence: 23, isIDR: false, decoder: 4), .drop)
         XCTAssertEqual(secure.admit(sequence: 24, isIDR: true, decoder: 4), .pass)
+        _ = secure.receive(remoteState(.winlogon, .hidden, revision: 4, epoch: 7, sequence: 0),
+                           adaptiveOwner: false, timedVideo: false)
+        XCTAssertTrue(secure.covered)
+        XCTAssertEqual(secure.softwareRoute, .blocked)
     }
 
     func testRemoteSecureDesktopRejectsWrongPairAndKeepsCoverOnRevocation() {
@@ -89,6 +166,7 @@ final class SecureDesktopRecoveryTests: XCTestCase {
         XCTAssertEqual(secure.setControl(false),
             .request(operation: .controlOff, videoSequence: 0, captureRevision: 0, sourceEpoch: 0))
         XCTAssertNil(secure.presented(sequence: 21, decoder: 4))
+        XCTAssertEqual(secure.softwareRoute, .blocked)
         _ = secure.setControl(true)
         XCTAssertEqual(secure.receive(first, adaptiveOwner: false, timedVideo: false), .unchanged)
         XCTAssertEqual(secure.admit(sequence: 21, isIDR: true, decoder: 4), .drop)
@@ -110,6 +188,7 @@ final class SecureDesktopRecoveryTests: XCTestCase {
         XCTAssertFalse(secure.covered)
         XCTAssertFalse(secure.canSas)
         XCTAssertFalse(secure.allowsScanAndPointer)
+        XCTAssertEqual(secure.softwareRoute, .blocked)
     }
 
     func testRemoteSecureDesktopReconnectsAdaptiveOwnerOrTimedVideo() {

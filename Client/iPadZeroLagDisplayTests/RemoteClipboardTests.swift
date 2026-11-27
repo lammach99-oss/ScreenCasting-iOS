@@ -591,7 +591,6 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         defer { host.stop() }
         host.manager.setAutomaticClipboardSending(false)
         let owner = host.manager.beginRemoteClipboardForTesting(remoteFiles: true)
-        let state = try await grantRemoteClipboard(host, owner: owner)
         XCTAssertNotEqual(host.manager.remoteInputFeatures & RemoteFeatureNegotiation.remoteFileFeature, 0)
         // The upload takes a storage lease before it can send the offer.
         let loaded = XCTestExpectation(description: "Remote File storage ready")
@@ -636,6 +635,9 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         host.manager.setRemoteFilePacingForTesting(healthy: false)
         try host.releasePing()
 
+        // Renewals share the writer. Start the three-second grant after releasing
+        // the fixture ping, while the queued file chunk is still paused.
+        let state = try await grantRemoteClipboard(host, owner: owner)
         try await acceptEmptyTextOffer(host, owner: owner, state: state)
         XCTAssertEqual(host.filePackets().map(\.kind), [.offer])
 

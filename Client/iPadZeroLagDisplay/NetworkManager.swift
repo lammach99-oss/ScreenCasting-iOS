@@ -320,6 +320,8 @@ public class NetworkManager: ObservableObject {
     @Published private(set) var remoteSecureDesktopCovered = false
     @Published private(set) var remoteSecureDesktopControl = false
     @Published private(set) var remoteSecureDesktopCanSas = true
+    @Published private(set) var secureSoftwareRoute: SecureSoftwareKeyboard.Route = .committed
+    private(set) var unsupportedSecureCharacterCount = 0
     private var remoteSecureDesktop = RemoteSecureDesktopState()
     private let remoteSecureDesktopPublicationClock = ConnectionGenerationClock()
     private var remoteSecureControlIntent = false
@@ -1969,6 +1971,8 @@ public class NetworkManager: ObservableObject {
             guard self.transportState == .streaming,
                   self.committedTransportGeneration == generation,
                   TextCommitDeliveryPolicy.maySend(inputSuppressed: self.displayRequestGate.isInputSuppressed) else { return }
+            guard !self.remoteInputConnection || (self.remoteSecureDesktop.softwareRoute == .committed &&
+                (self.remoteFeatures.context == nil || self.remoteFeatures.context?.desktop == 1)) else { return }
             for command in TextCommitCommand.chunks(text) {
                 if self.remoteInputConnection, self.remoteFeatures.accepted & 1 != 0 {
                     guard let token = requestedInputToken,
@@ -2156,6 +2160,7 @@ public class NetworkManager: ObservableObject {
                   self.remoteSecureDesktopPublicationClock.current == publication else { return }
             self.remoteSecureDesktopSupported = secure.supported
             self.remoteSecureDesktopCovered = secure.covered
+            self.secureSoftwareRoute = secure.softwareRoute
             self.remoteSecureDesktopControl = secure.control
             self.remoteSecureDesktopCanSas = secure.canSas
             if self.focusManaged { self.focusAuthorityChanged?(false) }
@@ -3000,6 +3005,11 @@ public class NetworkManager: ObservableObject {
         if type == .remoteSecureDesktopRequest {
             guard let request = RemoteSecureDesktopProtocol.decode(type: type, payload: payload),
                   remoteSecureDesktop.admitRequest(request) else { return false }
+            if case .request(.presented, _, _, _) = request,
+               remoteSecureDesktop.softwareRoute == .scan, remoteFeatures.context?.desktop == 2 {
+                remoteFeatures.keyframeArrived()
+                publishRemoteInputOnQueue(contextChanged: false)
+            }
             publishRemoteSecureDesktopOnQueue()
             return true
         }
@@ -3047,12 +3057,29 @@ public class NetworkManager: ObservableObject {
         }
     }
 
+    func sendSecureSoftwareText(_ text: String, context: RemoteInputContextCommand, generation: UInt64) {
+        guard secureSoftwareRoute == .scan, context.desktop == 2 else { return }
+        let dropped = SecureSoftwareKeyboard.emit(text, token: context.token) { command in
+            enqueueRemoteScanKey(command, generation: generation, secureContext: context)
+        }
+        unsupportedSecureCharacterCount &+= dropped
+    }
+
     public func sendRemoteScanKey(_ command: RemoteScanKeyCommand, expectedGeneration: UInt64) {
+        enqueueRemoteScanKey(command, generation: expectedGeneration, secureContext: nil)
+    }
+
+    private func enqueueRemoteScanKey(_ command: RemoteScanKeyCommand, generation expectedGeneration: UInt64,
+                                      secureContext: RemoteInputContextCommand?) {
         networkQueue.async { [weak self] in
             guard let self, self.remoteInputConnection, self.connectionGeneration == expectedGeneration,
                   self.transportState == .streaming, self.committedTransportGeneration == expectedGeneration,
                   (command.action == 1 || !self.displayRequestGate.isInputSuppressed),
                   self.remoteFeatures.maySend(feature: 1, token: command.token), let payload = command.encode() else { return }
+            if let secureContext {
+                guard self.remoteSecureDesktop.softwareRoute == .scan,
+                      self.remoteFeatures.context == secureContext else { return }
+            }
             self.sendWireMessage(type: .remoteScanKey, payload: payload, sequence: 0)
         }
     }

@@ -463,7 +463,6 @@ struct RemoteAddressField: View {
     /// The last Wi-Fi PC by name or typed address; Reconnect uses the matching saved target.
     @AppStorage("ScreenCasting.client.lastWifiHostLabel") private var lastWifiHostLabel = ""
     @AppStorage("ScreenCasting.client.remoteControlMode") private var remoteControlMode = false
-    @AppStorage(RemoteSecureDesktopState.preferenceKey) private var remoteSecureDesktopEnabled = false
 
     // UI States
     @AppStorage(ClientPreferenceKeys.showPerformanceHUD)
@@ -624,18 +623,7 @@ struct RemoteAddressField: View {
             connectedVideoSurface
                 .allowsHitTesting(networkManager.retainedSwitchRoute == nil)
                 .overlay {
-                    if networkManager.remoteSecureDesktopCovered {
-                        ZStack {
-                            Color.black.ignoresSafeArea()
-                            Text("Remote picture hidden")
-                                .font(.headline)
-                                .foregroundStyle(Color.white)
-                                .padding(24)
-                        }
-                        .allowsHitTesting(false)
-                        .accessibilityIdentifier("session.secureDesktopCover")
-                        .transition(.identity)
-                    }
+                    SecureDesktopCover(covered: networkManager.remoteSecureDesktopCovered)
                 }
         } else {
             Color.inkCanvas
@@ -1254,12 +1242,7 @@ struct RemoteAddressField: View {
                                     .accessibilityHint("Removes this PC's saved trust so you can pair again")
                             }
                             owner.discoveredPCs
-                            Toggle("Allow Windows security screens", isOn: owner.$remoteSecureDesktopEnabled)
-                                .font(.subheadline)
-                                .tint(Color.inkAccent)
-                                .frame(minHeight: 44)
-                                .disabled(owner.isConnectBusy)
-                                .accessibilityHint("Applies to whole-PC connections. The PC must grant permission.")
+                            SecurityScreenPreference().disabled(owner.isConnectBusy)
                             Toggle("Allow clipboard sync in casting and Remote sessions", isOn: Binding(
                                 get: { owner.networkManager.remoteClipboardEnabled },
                                 set: { owner.networkManager.setRemoteClipboardEnabled($0) }))
@@ -1439,6 +1422,35 @@ struct RemoteAddressField: View {
 }
 
 
+struct SecurityScreenPreference: View {
+    @AppStorage(RemoteSecureDesktopState.preferenceKey) private var remoteSecureDesktopEnabled = false
+    var body: some View {
+        Toggle("Allow Windows security screens", isOn: $remoteSecureDesktopEnabled)
+            .font(.subheadline)
+            .tint(Color.inkAccent)
+            .frame(minHeight: 44)
+            .accessibilityHint("Applies to whole-PC connections. The PC must grant permission.")
+    }
+}
+
+struct SecureDesktopCover: View {
+    let covered: Bool
+    var body: some View {
+        if covered {
+            ZStack {
+                Color.black.ignoresSafeArea()
+                Text("Remote picture hidden")
+                    .font(.headline)
+                    .foregroundStyle(Color.white)
+                    .padding(24)
+            }
+            .allowsHitTesting(false)
+            .accessibilityIdentifier("session.secureDesktopCover")
+            .transition(.identity)
+        }
+    }
+}
+
 @MainActor struct PhoneRootView: View {
     @StateObject private var presence = HostPresenceMonitor()
     @StateObject private var network: NetworkManager
@@ -1510,6 +1522,7 @@ struct RemoteAddressField: View {
             Form {
                 if let model = PhoneConnectScreenModel(capabilities: network.capabilities, history: history) {
                     Group {
+                        SecurityScreenPreference()
                         if network.hasReconnectTarget {
                             Button("Reconnect last PC") {
                                 destination = "Last paired PC"

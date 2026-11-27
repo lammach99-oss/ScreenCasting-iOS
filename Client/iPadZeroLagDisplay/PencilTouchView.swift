@@ -2183,6 +2183,19 @@ final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate, UISc
     var onHardwareChanged: ((Set<UIPress>) -> Void)?
     var onHardwareFocusLost: (() -> Void)?
     var keySourceRoutingEnabled = false
+    private var normalCapitalization: UITextAutocapitalizationType = .sentences
+    override var hasText: Bool { secureEntry && deliveryEnabled || super.hasText }
+
+    var secureEntry = false {
+        didSet {
+            guard oldValue != secureEntry else { return }
+            discardBuffer()
+            if secureEntry { normalCapitalization = autocapitalizationType }
+            autocapitalizationType = secureEntry ? .none : normalCapitalization
+            isSecureTextEntry = secureEntry
+            reloadInputViews()
+        }
+    }
     func clearCommittedHistory() { discardBuffer() }
     private var consuming = false
     private var committedShadow = SoftwareKeyboardCommittedShadow()
@@ -2227,6 +2240,7 @@ final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate, UISc
     func consumeCommittedBuffer() {
         guard !consuming else { return }
         guard deliveryEnabled else { discardBuffer(); return }
+        guard !secureEntry else { discardBuffer(); return }
         guard markedTextRange == nil else { return }
         let committed = text ?? ""
         guard let delta = committedShadow.delta(to: committed) else {
@@ -2254,10 +2268,23 @@ final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate, UISc
         selectedRange = NSRange(location: committedShadow.text.utf16.count, length: 0)
     }
     func textViewDidChange(_ textView: UITextView) { consumeCommittedBuffer() }
-    override func insertText(_ text: String) { super.insertText(text); consumeCommittedBuffer() }
+    override func insertText(_ text: String) {
+        if secureEntry {
+            if deliveryEnabled { onEmission?(.text(text)) }
+            return
+        }
+        super.insertText(text)
+        consumeCommittedBuffer()
+    }
+
+    override func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
+        guard !secureEntry else { return }
+        super.setMarkedText(markedText, selectedRange: selectedRange)
+    }
     override func unmarkText() { super.unmarkText(); consumeCommittedBuffer() }
     override func deleteBackward() {
         guard deliveryEnabled else { discardBuffer(); return }
+        if secureEntry { onEmission?(.text("\u{8}")); return }
         if markedTextRange != nil || !(text ?? "").isEmpty || !committedShadow.text.isEmpty {
             super.deleteBackward()
             consumeCommittedBuffer()

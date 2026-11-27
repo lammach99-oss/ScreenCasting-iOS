@@ -103,6 +103,70 @@ enum RemoteSecureDesktopProtocol {
     }
 }
 
+/// Software-keyboard routing on Winlogon: fixed US-QWERTY scan codes, never logged.
+enum SecureSoftwareKeyboard {
+    enum Route {
+        case committed, blocked, scan
+
+        func deliver(_ text: String, scan: (String) -> Void, commit: (String) -> Void) {
+            switch self {
+            case .scan: scan(text)
+            case .committed: commit(text)
+            case .blocked: break
+            }
+        }
+
+        func phoneKeyboardAvailable(desktop: UInt8?, features: UInt64, ready: Bool, legacy: Bool) -> Bool {
+            switch self {
+            case .committed:
+                return (desktop == nil || desktop == 1) && (features & 1 == 0 ? legacy : ready)
+            case .blocked:
+                return false
+            case .scan:
+                return desktop == 2 && features & 1 != 0 && ready
+            }
+        }
+    }
+
+    // Set 1 make codes, ordered by physical row on a US keyboard.
+    private static let keys: [Character: (scan: UInt16, shifted: Bool)] = {
+        var result: [Character: (UInt16, Bool)] = [:]
+        func row(_ plain: String, _ shifted: String, from start: UInt16) {
+            for (offset, pair) in zip(plain, shifted).enumerated() {
+                let scan = start + UInt16(offset)
+                result[pair.0] = (scan, false)
+                result[pair.1] = (scan, true)
+            }
+        }
+        row("1234567890-=", "!@#$%^&*()_+", from: 0x02)
+        row("qwertyuiop[]", "QWERTYUIOP{}", from: 0x10)
+        row("asdfghjkl;'`", "ASDFGHJKL:\"~", from: 0x1e)
+        row("\\", "|", from: 0x2b)
+        row("zxcvbnm,./", "ZXCVBNM<>?", from: 0x2c)
+        result[" "] = (0x39, false)
+        result["\u{8}"] = (0x0e, false)
+        result["\t"] = (0x0f, false)
+        result["\r"] = (0x1c, false)
+        result["\n"] = (0x1c, false)
+        return result
+    }()
+
+    static func emit(_ text: String, token: UInt64, send: (RemoteScanKeyCommand) -> Void) -> Int {
+        var dropped = 0
+        for character in text {
+            guard character.isASCII, let key = keys[character] else { dropped += 1; continue }
+            func emitKey(_ scan: UInt16, _ action: UInt8) {
+                send(.init(action: action, flags: 0, scan: scan, token: token))
+            }
+            if key.shifted { emitKey(0x2a, 0) }
+            emitKey(key.scan, 0)
+            emitKey(key.scan, 1)
+            if key.shifted { emitKey(0x2a, 1) }
+        }
+        return dropped
+    }
+}
+
 /// Connection-scoped publication and input gate, owned by the network queue.
 struct RemoteSecureDesktopState {
     static let preferenceKey = "ScreenCasting.client.remoteSecureDesktop"
@@ -142,6 +206,10 @@ struct RemoteSecureDesktopState {
         return true
     }
     var allowsScanAndPointer: Bool { !restrictsFeatures || (desktop == .winlogon && canSas) }
+    var softwareRoute: SecureSoftwareKeyboard.Route {
+        if !restrictsFeatures { return .committed }
+        return desktop == .winlogon && allowsScanAndPointer ? .scan : .blocked
+    }
     var hasPresentedBarrier: Bool { ackAdmitted }
 
     mutating func begin(accepted: UInt64, control: Bool) -> ProtocolMessage? {

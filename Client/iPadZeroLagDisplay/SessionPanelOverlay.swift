@@ -1129,14 +1129,7 @@ struct SessionConnectionPresentation {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            if owner.networkManager.remoteSecureDesktopSupported {
-                Toggle("Control Windows security screens", isOn: Binding(
-                    get: { owner.networkManager.remoteSecureDesktopControl },
-                    set: { owner.networkManager.setRemoteSecureControl($0) }))
-                    .font(.subheadline)
-                    .tint(Color(ink: SessionInk.accent))
-                    .frame(minHeight: 44)
-            }
+            SecureControlToggle(network: owner.networkManager)
             if !owner.session.reconnecting {
                 SessionActionLayout(accessibility: owner.typeSize.isAccessibilitySize) {
                     if owner.networkManager.remoteSecureDesktopCanSas {
@@ -1611,6 +1604,21 @@ struct CaptureAvailabilityNotice: View {
 }
 
 
+private struct SecureControlToggle: View {
+    @ObservedObject var network: NetworkManager
+
+    var body: some View {
+        if network.remoteSecureDesktopSupported {
+            Toggle("Control Windows security screens", isOn: Binding(
+                get: { network.remoteSecureDesktopControl },
+                set: { network.setRemoteSecureControl($0) }))
+                .font(.subheadline)
+                .tint(Color(ink: SessionInk.accent))
+                .frame(minHeight: 44)
+        }
+    }
+}
+
 enum PhonePanelSection: String, CaseIterable {
     case input = "Input", monitors = "PC monitors", clipboard = "Clipboard", audio = "Audio", actions = "PC actions"
 }
@@ -1662,6 +1670,7 @@ enum PhonePanelSection: String, CaseIterable {
                 .remoteSessionInput(remote)
                 .iPadInputSession(input)
                 .ignoresSafeArea()
+                .overlay { SecureDesktopCover(covered: network.remoteSecureDesktopCovered) }
                 .allowsHitTesting(foreground && !panel && (inputReady || viewport.isZoomMode))
             VStack(spacing: 4) {
                 if keys {
@@ -1754,7 +1763,9 @@ enum PhonePanelSection: String, CaseIterable {
                                 viewport.fit()
                                 keyboardAfterPanel = true
                                 panel = false
-                            }.disabled(!network.remoteInputReady && !network.permitsLegacyVirtualInput)
+                            }.disabled(!network.secureSoftwareRoute.phoneKeyboardAvailable(
+                                desktop: network.remoteInputContext?.desktop, features: network.remoteInputFeatures,
+                                ready: network.remoteInputReady, legacy: network.permitsLegacyVirtualInput))
                             zoomButton
                             Button("Fit") { viewport.fit() }
                             DisclosureGroup("Trackpad gestures") {
@@ -1779,6 +1790,10 @@ enum PhonePanelSection: String, CaseIterable {
                         }
                     case .actions:
                         Section(section.rawValue) {
+                            SecureControlToggle(network: network)
+                            if network.remoteSecureDesktopCanSas {
+                                Button("Ctrl+Alt+Del") { network.sendRemoteCommand(.secureAttention) }
+                            }
                             Button("Lock PC") { command = .lock }
                             Button("Restart PC") { command = .restart }
                             NavigationLink("Settings") { SettingsView(networkManager: network) }

@@ -1108,12 +1108,21 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             else if legacySend(.keyboard, command.encode()) { keyInput?(command) }
         }
         let textInput = onTextCommit
+        let inputContext = networkManager.remoteInputContext
+        var softwareRoute = networkManager.secureSoftwareRoute
+        if softwareRoute == .committed, let inputContext, inputContext.desktop != 1 {
+            softwareRoute = .blocked
+        }
+        container.softwareTextView.secureEntry = networkManager.isRemoteControlSession && softwareRoute != .committed
         container.onTextCommit = { [weak networkManager, weak remoteInput] text in
             if networkManager?.isRemoteControlSession == true {
                 guard networkManager?.acceptsFocusInput(focusTicket) == true, networkManager?.remoteKeyboardGeneration == inputGeneration,
                       networkManager?.remoteInputContext?.token == inputToken else { return }
                 if remoteInput == nil || remoteInput?.acceptsText(token: inputToken, generation: inputGeneration) == true {
-                    networkManager?.sendTextCommit(text)
+                    softwareRoute.deliver(text, scan: {
+                        guard let inputContext else { return }
+                        networkManager?.sendSecureSoftwareText($0, context: inputContext, generation: inputGeneration)
+                    }, commit: { networkManager?.sendTextCommit($0) })
                 }
             }
             else if let ticket {
