@@ -807,12 +807,13 @@ final class USBControlTLSIntegrationTests: XCTestCase {
 
     private func read(_ host: NWConnection, type: WireMessageType, flags: UInt16 = 0,
                       rejectClipboardHello: Bool = false, streaming: Bool = false) async throws -> Data {
-        // Five seconds of streaming queues both framed feedback and 8-byte legacy stage packets.
+        // Once the session is streaming, the feedback timer also queues 8-byte legacy stage packets
+        // between framed messages; any read may meet one, so always skip them.
         let deadline = ProcessInfo.processInfo.systemUptime + 10
         var framesRead = 0
         while ProcessInfo.processInfo.systemUptime < deadline, streaming || framesRead < 20 {
             guard let prefix = try await receive(host, count: 8, timeout: deadline - ProcessInfo.processInfo.systemUptime), prefix.count == 8 else { throw TestError.closed }
-            if streaming && prefix.prefix(4) == Data([0x45, 0x54, 0, 0]) { continue }
+            if prefix.prefix(4) == Data([0x45, 0x54, 0, 0]) { continue }
             guard let suffix = try await receive(host, count: 8, timeout: deadline - ProcessInfo.processInfo.systemUptime), suffix.count == 8 else { throw TestError.closed }
             let header = prefix + suffix
             framesRead += 1
