@@ -4653,7 +4653,7 @@ final class USBListenerLifetimeTests: XCTestCase {
     private func withC2Candidate(committed: Bool,
         _ body: (NWConnection, NWConnection, UInt64, () -> [Data]) throws -> Void) throws {
         manager.manualUsbCandidateDeadlineForTesting = true
-        let incumbent = try connect()
+        let incumbent = try connect(stage: "C2 incumbent")
         if committed { manager.simulateSessionAuthenticatedAndCommitted() }
         var pings: [Data] = []
         manager.networkQueueForTesting.sync {
@@ -4665,7 +4665,7 @@ final class USBListenerLifetimeTests: XCTestCase {
             }
         }
         let generation = manager.usbSessionSnapshot().generation
-        let candidate = try connect()
+        let candidate = try connect(stage: "C2 challenger")
         manager.networkQueueForTesting.sync { }
         try body(incumbent, candidate, generation, { self.manager.networkQueueForTesting.sync { pings } })
     }
@@ -4775,7 +4775,7 @@ final class USBListenerLifetimeTests: XCTestCase {
             XCTAssertNil(manager.usbCandidateArbitrationForTesting)
             XCTAssertNil(manager.usbSessionSnapshot().connection)
             manager.startListening(port: 0)
-            let replacement = try connect()
+            let replacement = try connect(stage: "C2 restarted listener")
             let next = manager.usbSessionSnapshot().generation
             manager.expireUsbCandidateForTesting(id: old.id)
             manager.receiveUsbWireForTesting(type: .pong, payload: c2Pong(nonce), generation: generation, connection: incumbent)
@@ -5086,18 +5086,27 @@ final class USBListenerLifetimeTests: XCTestCase {
         let probe = queue.sync { armListenerReadiness(listener, stage: stage) }
         try finishListenerReadiness(probe, waitResult: XCTWaiter.wait(for: [probe.ready], timeout: 5))
         let port = try XCTUnwrap(listener.port)
-        let acceptedReady = expectation(description: "USB candidate ready or rejected")
+        let acceptedReady = XCTestExpectation(description: "USB candidate ready or rejected")
+        var terminalBeforeReady: NWConnection.State?
         var acceptedPeer: NWConnection?
         let owner = try XCTUnwrap(manager)
         queue.sync {
             owner.usbCandidateInstalledForTesting = { connection in
                 let handler = connection.stateUpdateHandler
+                var observed = false
                 connection.stateUpdateHandler = { state in
                     handler?(state)
-                    if case .ready = state {
+                    guard !observed else { return }
+                    switch state {
+                    case .failed, .cancelled:
+                        terminalBeforeReady = state
+                    case .ready:
                         connection.stateUpdateHandler = handler
-                        acceptedReady.fulfill()
+                    default:
+                        return
                     }
+                    observed = true
+                    acceptedReady.fulfill()
                 }
             }
             listener.newConnectionHandler = { connection in
@@ -5107,7 +5116,7 @@ final class USBListenerLifetimeTests: XCTestCase {
             }
         }
         defer {
-            queue.async {
+            queue.sync {
                 owner.usbCandidateInstalledForTesting = nil
                 listener.newConnectionHandler = acceptHandler
             }
@@ -5118,6 +5127,10 @@ final class USBListenerLifetimeTests: XCTestCase {
         guard XCTWaiter.wait(for: [acceptedReady], timeout: 10) == .completed else {
             client.cancel()
             XCTFail("USB candidate did not reach ready or rejection [\(stage)]")
+            throw USBListenerFixtureError.readinessFailure(stage)
+        }
+        if let terminal = queue.sync(execute: { terminalBeforeReady }) {
+            XCTFail("USB candidate reached \(terminal) before ready [\(stage)]")
             throw USBListenerFixtureError.readinessFailure(stage)
         }
         let accepted = try queue.sync { try XCTUnwrap(acceptedPeer) }

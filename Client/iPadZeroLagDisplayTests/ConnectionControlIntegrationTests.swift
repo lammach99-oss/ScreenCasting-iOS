@@ -442,33 +442,58 @@ final class ConnectionControlIntegrationTests: XCTestCase {
     @MainActor func testFailedWifiAttemptKeepsUSBListenerAndReauthenticatesRestoredOwner() async throws {
         let network = NetworkManager()
         let writes = Writes()
+        // The host drives the failure explicitly. Simulator scheduling must not expire USB proof.
+        let now = ProcessInfo.processInfo.systemUptime
+        network.connectionControlNowForTesting = { now }
         network.usbIdentityCredentialLoadForTesting = { ConnectionControlProtocolTests.usbCredential }
-        network.controlSendForAudioTesting = { data, done in writes.append(data); done(nil) }
+        func observeWrite(_ type: WireMessageType) -> XCTestExpectation {
+            let sent = XCTestExpectation(description: "USB rollback fixture wrote \(type)")
+            network.networkQueueForTesting.sync {
+                var observed = false
+                network.controlSendForAudioTesting = { data, done in
+                    writes.append(data)
+                    done(nil)
+                    guard !observed, data.count >= WireProtocol.headerSize, data[5] == type.rawValue else { return }
+                    observed = true
+                    sent.fulfill()
+                }
+            }
+            return sent
+        }
+        enum WaitError: Error { case timedOut }
+        func wait(_ signal: XCTestExpectation, timeout: TimeInterval = 10, line: UInt = #line) async throws {
+            guard await XCTWaiter.fulfillment(of: [signal], timeout: timeout) == .completed else {
+                XCTFail("Missing rollback fixture signal: \(signal)", line: line)
+                throw WaitError.timedOut
+            }
+        }
         defer { network.stopForTesting() }
 
-        let usbReady = expectation(description: "incumbent USB listener ready")
+        let usbReady = XCTestExpectation(description: "incumbent USB listener ready")
         network.connectionListenerReadyForTesting = { usbReady.fulfill() }
         network.startListening(port: 0)
-        await fulfillment(of: [usbReady], timeout: 3)
+        try await wait(usbReady, timeout: 3)
         let usbListener = try XCTUnwrap(network.usbSessionSnapshot().listener)
         let usbPort = try XCTUnwrap(usbListener.port)
         let incumbent = network.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS)
         network.beginTransferWriterForTesting()
         network.configureUsbIdentityForTesting()
+        let hello = observeWrite(.clientHello)
         network.receiveIdentityWireForTesting(type: .ping, payload: Data(0..<16), flags: 0x0100)
-        await drain(network)
+        try await wait(hello)
+        let proof = observeWrite(.trustedDeviceProof)
         network.receiveIdentityWireForTesting(type: .trustedDeviceChallenge, payload: ConnectionControlProtocolTests.usbChallenge)
-        await drain(network)
+        try await wait(proof)
         network.receiveIdentityWireForTesting(type: .trustedAuthResult, payload: Data([1]))
         network.receiveIdentityWireForTesting(type: .displayCapabilities, payload: CaptureTargetIntegrationTests.modes, flags: 0x0300)
         network.receiveIdentityWireForTesting(type: .connectionState,
             payload: try ConnectionSwitchStateTests.snapshot(route: .usb).encode())
-        await drain(network)
+        // Identity and state injection above run synchronously on the network queue.
         XCTAssertTrue(network.usbIdentityBoundForTesting)
 
         let wifiListener = try NWListener(using: .tcp)
-        let wifiReady = expectation(description: "test Wi-Fi endpoint ready")
-        let wifiConnected = expectation(description: "Wi-Fi attempt reached the test endpoint")
+        let wifiReady = XCTestExpectation(description: "test Wi-Fi endpoint ready")
+        let wifiConnected = XCTestExpectation(description: "Wi-Fi attempt reached the test endpoint")
         var wifiPeer: NWConnection?
         wifiListener.stateUpdateHandler = { if case .ready = $0 { wifiReady.fulfill() } }
         wifiListener.newConnectionHandler = { peer in
@@ -478,10 +503,11 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         }
         wifiListener.start(queue: network.networkQueueForTesting)
         defer { network.networkQueueForTesting.sync { wifiPeer?.cancel(); wifiListener.cancel() } }
-        await fulfillment(of: [wifiReady], timeout: 3)
+        try await wait(wifiReady, timeout: 3)
         network.seedRouteEndpointForTesting(port: try XCTUnwrap(wifiListener.port))
+        let select = observeWrite(.connectionSelectRequest)
         network.requestConnectionRoute(.wifi)
-        await drain(network)
+        try await wait(select)
         network.receiveIdentityWireForTesting(type: .connectionState,
             payload: try ConnectionSwitchStateTests.prepare(target: .wifi).encode())
         network.receiveIdentityWireForTesting(type: .connectionState,
@@ -489,23 +515,17 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         network.receiveIdentityWireForTesting(type: .connectionSelectResult,
             payload: try ConnectionSwitchStateTests.wifiResult().encode())
         network.retireConnectionRouteForTesting()
-        await fulfillment(of: [wifiConnected], timeout: 3)
+        try await wait(wifiConnected, timeout: 3)
         XCTAssertTrue(network.usbSessionSnapshot().listener === usbListener)
         XCTAssertTrue(network.usbSessionSnapshot().listenerIntent)
 
-        let identityHello = expectation(description: "fresh USB identity hello")
-        network.networkQueueForTesting.sync {
-            network.controlSendForAudioTesting = { data, done in
-                writes.append(data); done(nil)
-                if data[5] == WireMessageType.clientHello.rawValue { identityHello.fulfill() }
-            }
-            wifiPeer?.cancel()
-        }
+        let identityHello = observeWrite(.clientHello)
         let rollback = XCTestExpectation(description: "Wi-Fi failure opened the USB rollback route")
         let observation = network.$connectionSwitchState
             .first(where: { $0.pending?.rollbackRoute == .usb })
             .sink { _ in rollback.fulfill() }
         defer { observation.cancel() }
+        network.networkQueueForTesting.sync { wifiPeer?.cancel() }
         guard await XCTWaiter.fulfillment(of: [rollback], timeout: 10) == .completed else {
             return XCTFail("USB rollback route never opened")
         }
@@ -514,27 +534,33 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         restored.start(queue: DispatchQueue.global())
         let readinessPing = Data([0x53, 0x43, 0x53, 0x54, 1, 6, 0, 1, 16, 0, 0, 0, 0, 0, 0, 0]) + Data(0..<16)
         restored.send(content: readinessPing, completion: .contentProcessed { XCTAssertNil($0) })
-        await fulfillment(of: [identityHello], timeout: 3)
-        await drain(network)
+        try await wait(identityHello, timeout: 3)
         XCTAssertEqual(network.connectionSwitchState.pending?.rollbackRoute, .usb)
         XCTAssertNil(network.retainedSwitchRoute)
         XCTAssertFalse(network.usbIdentityBoundForTesting)
         XCTAssertNotEqual(network.usbSessionSnapshot().generation, incumbent.generation)
+        let restoredProof = observeWrite(.trustedDeviceProof)
         network.receiveIdentityWireForTesting(type: .trustedDeviceChallenge, payload: ConnectionControlProtocolTests.usbChallenge)
-        await drain(network)
+        try await wait(restoredProof)
+        let optIn = observeWrite(.connectionHello)
         network.receiveIdentityWireForTesting(type: .trustedAuthResult, payload: Data([1]))
         network.receiveIdentityWireForTesting(type: .displayCapabilities, payload: CaptureTargetIntegrationTests.modes, flags: 0x0300)
         network.receiveIdentityWireForTesting(type: .connectionState,
             payload: try ConnectionSwitchStateTests.snapshot(revision: 4, owner: 3, route: .usb, hostState: .failed).encode())
         network.receiveIdentityWireForTesting(type: .connectionSelectResult,
             payload: try ConnectionSwitchStateTests.wifiResult(failure: .firstFrameTimeout).encode())
-        await drain(network)
+        let failed = XCTestExpectation(description: "Restored USB owner published first-frame timeout")
+        let failureObservation = network.$connectionSwitchState.first(where: { $0.issue == .firstFrameTimeout })
+            .sink { _ in failed.fulfill() }
+        defer { failureObservation.cancel() }
+        try await wait(failed)
+        try await wait(optIn)
         XCTAssertTrue(network.usbIdentityBoundForTesting)
         XCTAssertEqual(network.connectionSwitchState.issue, .firstFrameTimeout)
         XCTAssertTrue(network.connectionSwitchState.inputBlocked)
-        let hellos = try writes.snapshot.filter { $0[5] == 76 }.map { try ConnectionHello.decode(Data($0.dropFirst(16))) }
+        let hellos = try writes.snapshot.filter { $0.count >= WireProtocol.headerSize && $0[5] == WireMessageType.connectionHello.rawValue }.map { try ConnectionHello.decode(Data($0.dropFirst(16))) }
         XCTAssertEqual(hellos.map { $0.kind }, [.optIn, .optIn])
-        XCTAssertTrue(writes.snapshot.contains { $0[5] == WireMessageType.trustedDeviceProof.rawValue })
+        XCTAssertTrue(writes.snapshot.contains { $0.count >= WireProtocol.headerSize && $0[5] == WireMessageType.trustedDeviceProof.rawValue })
     }
     @MainActor func testNetworkPreflightRetainsProofAndFenceUntilFifteenSeconds() async throws {
         for accepts in [false, true] {

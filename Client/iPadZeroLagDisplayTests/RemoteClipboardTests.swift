@@ -180,8 +180,8 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         private var writes: [Data] = [] // Network queue only.
         private var observeWrite: ((Data) -> Void)? // Network queue only.
         private var heldPing: ((NWError?) -> Void)?
-        private var offerWritten: XCTestExpectation? // Network queue only.
-        private var holdNextPing = false
+        private var packetWritten: (TransferKind, XCTestExpectation)? // Network queue only.
+        private var pingToHold: XCTestExpectation?
 
         init(receivedFilesDirectory: URL? = nil) {
             let suite = "ClipboardTests." + UUID().uuidString
@@ -197,16 +197,19 @@ final class CastingClipboardIntegrationTests: XCTestCase {
                 guard let self else { complete(nil); return }
                 self.writes.append(bytes)
                 self.observeWrite?(bytes)
-                if let offer = self.offerWritten, bytes.count >= WireProtocol.headerSize,
+                if let (kind, written) = self.packetWritten, bytes.count >= WireProtocol.headerSize,
                    bytes[5] == WireMessageType.remoteFilePacket.rawValue,
                    case .packet(_, let packet)? = RemoteFileProtocol.decode(type: .remoteFilePacket,
-                       payload: Data(bytes.dropFirst(WireProtocol.headerSize)), flags: 0), packet.kind == .offer {
-                    self.offerWritten = nil
-                    offer.fulfill()
+                       payload: Data(bytes.dropFirst(WireProtocol.headerSize)), flags: 0), packet.kind == kind {
+                    self.packetWritten = nil
+                    written.fulfill()
                 }
-                if self.holdNextPing, bytes.count >= WireProtocol.headerSize, bytes[5] == WireMessageType.ping.rawValue {
-                    self.holdNextPing = false
+                if let held = self.pingToHold, bytes.count == WireProtocol.headerSize + 16,
+                   bytes[5] == WireMessageType.ping.rawValue, bytes[6] == 0, bytes[7] == 0,
+                   bytes.suffix(16) == Data(count: 16) {
+                    self.pingToHold = nil
                     self.heldPing = complete
+                    held.fulfill()
                 } else {
                     complete(nil)
                 }
@@ -229,7 +232,7 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         // Replay writes and install the live observer on the same serial queue.
         // A fast response can arrive before the test starts awaiting it.
         func frame(_ type: UInt8, flags: UInt16 = 0, skipping: Int = 0,
-                   file: StaticString = #filePath, line: UInt = #line) async throws -> Data {
+                   timeout: TimeInterval = 15, file: StaticString = #filePath, line: UInt = #line) async throws -> Data {
             let seen = XCTestExpectation(description: "Wire frame \(type) after \(skipping)")
             var payload: Data?
             manager.networkQueueForTesting.sync {
@@ -249,7 +252,7 @@ final class CastingClipboardIntegrationTests: XCTestCase {
                 observeWrite = inspect
             }
             defer { manager.networkQueueForTesting.sync { observeWrite = nil } }
-            guard await XCTWaiter.fulfillment(of: [seen], timeout: 15) == .completed else {
+            guard await XCTWaiter.fulfillment(of: [seen], timeout: timeout) == .completed else {
                 XCTFail("Missing wire frame \(type) after \(skipping)", file: file, line: line)
                 throw ClipboardWaitError.timedOut
             }
@@ -269,8 +272,8 @@ final class CastingClipboardIntegrationTests: XCTestCase {
             send(message.type.rawValue, try XCTUnwrap(RemoteFileProtocol.encode(message)), to: owner)
         }
 
-        func observeNextFileOffer(_ expectation: XCTestExpectation) {
-            manager.networkQueueForTesting.sync { offerWritten = expectation }
+        func observeNextFilePacket(_ kind: TransferKind, _ expectation: XCTestExpectation) {
+            manager.networkQueueForTesting.sync { packetWritten = (kind, expectation) }
         }
 
         func filePackets() -> [TransferPacket] {
@@ -281,8 +284,8 @@ final class CastingClipboardIntegrationTests: XCTestCase {
             }
         }
 
-        func holdWriterWithPing() {
-            manager.networkQueueForTesting.sync { holdNextPing = true }
+        func holdWriterWithPing(_ held: XCTestExpectation) {
+            manager.networkQueueForTesting.sync { pingToHold = held }
             manager.enqueueTransferWireForTesting(bulk: false) { _ in }
         }
 
@@ -351,8 +354,7 @@ final class CastingClipboardIntegrationTests: XCTestCase {
     }
 
     @MainActor private func grantRemoteClipboard(_ host: Host, owner: Owner) async throws -> Wire.State {
-        try await waitFor("Remote ClipboardHello") { !host.frames(84).isEmpty }
-        let hello = try XCTUnwrap(host.frames(84).last)
+        let hello = try await host.frame(84, timeout: 10)
         let nonce = try XCTUnwrap(Wire.decode(type: .clipboardHello, payload: hello).flatMap { message -> UUID? in
             guard case .hello(_, _, _, let nonce) = message else { return nil }
             return nonce
@@ -365,8 +367,7 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         let prefix = Wire.Prefix(token: state.token, epoch: state.epoch, update: UUID())
         host.send(.offer(.init(prefix: prefix, format: .text, formats: 1, length: 0,
                                origin: UUID(), counter: 1, revision: 1, digest: Data(SHA256.hash(data: Data())))), to: owner)
-        try await waitFor("ClipboardOfferResponse") { host.frames(88).count > responseCount }
-        let response = try XCTUnwrap(host.frames(88).dropFirst(responseCount).first)
+        let response = try await host.frame(88, skipping: responseCount, timeout: 10)
         guard case .response(let acceptedPrefix, true, .ok, _)? = Wire.decode(type: .clipboardOfferResponse, payload: response) else {
             return XCTFail("Expected the clipboard offer to be accepted")
         }
@@ -593,19 +594,22 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         let state = try await grantRemoteClipboard(host, owner: owner)
         XCTAssertNotEqual(host.manager.remoteInputFeatures & RemoteFeatureNegotiation.remoteFileFeature, 0)
         // The upload takes a storage lease before it can send the offer.
-        try await waitFor("Remote File storage setup") { host.manager.receivedFilesViewState.loaded }
-        guard host.manager.receivedFilesViewState.loaded else { return }
+        let loaded = XCTestExpectation(description: "Remote File storage ready")
+        let storage = host.manager.$receivedFilesViewState.first(where: { $0.loaded }).sink { _ in loaded.fulfill() }
+        defer { storage.cancel() }
+        guard await XCTWaiter.fulfillment(of: [loaded], timeout: 10) == .completed else {
+            return XCTFail("Storage did not load before upload")
+        }
 
         let control = WireMessageType.remoteFileControl
         host.manager.sendTransferFiles([source], scope: host.manager.transferActionScope)
-        try await waitFor("Remote File grant request") { !host.frames(control.rawValue).isEmpty }
-        let request = try XCTUnwrap(host.frames(control.rawValue).first)
+        let request = try await host.frame(control.rawValue, timeout: 10)
         guard case .control(.requestGrant, let id, .both, _)? = RemoteFileProtocol.decode(type: control, payload: request, flags: 0) else {
             return XCTFail("Expected a Remote File grant request")
         }
         let grant = UUID()
         let offered = XCTestExpectation(description: "Remote File offer written after grant")
-        host.observeNextFileOffer(offered)
+        host.observeNextFilePacket(.offer, offered)
         try host.sendFile(.state(phase: .granted, requestId: id, reason: .none, directions: .both, grantId: grant), to: owner)
         guard await XCTWaiter.fulfillment(of: [offered], timeout: 10) == .completed else {
             return XCTFail("Granted upload did not write an offer (stage: \(host.manager.transferSnapshot.stage))")
@@ -618,9 +622,11 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         XCTAssertEqual(offer.files, [TransferFile(name: "sample.bin", length: UInt64(bytes.count))])
 
         // Hold an earlier send so the healthy chunk queues, then pause pacing before it can start writing.
-        let pingCount = host.frames(WireMessageType.ping.rawValue).count
-        host.holdWriterWithPing()
-        try await waitFor("held ping") { host.frames(WireMessageType.ping.rawValue).count > pingCount }
+        let held = XCTestExpectation(description: "Writer holds the fixture ping completion")
+        host.holdWriterWithPing(held)
+        guard await XCTWaiter.fulfillment(of: [held], timeout: 10) == .completed else {
+            return XCTFail("Writer never held the fixture ping")
+        }
         host.manager.setRemoteFilePacingForTesting(healthy: true)
         let accepted = TransferPacket(kind: .response, generation: offer.generation, id: offer.id, accepted: true)
         try host.sendFile(.packet(grantId: grant, transfer: accepted), to: owner)
@@ -633,8 +639,12 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         try await acceptEmptyTextOffer(host, owner: owner, state: state)
         XCTAssertEqual(host.filePackets().map(\.kind), [.offer])
 
+        let chunk = XCTestExpectation(description: "Queued file chunk written")
+        host.observeNextFilePacket(.chunk, chunk)
         host.manager.setRemoteFilePacingForTesting(healthy: true)
-        try await waitFor("Remote File chunk after pacing resumes") { host.filePackets().contains { $0.kind == .chunk } }
+        guard await XCTWaiter.fulfillment(of: [chunk], timeout: 10) == .completed else {
+            return XCTFail("Writer did not resume the reserved file chunk")
+        }
         XCTAssertEqual(host.filePackets().first { $0.kind == .chunk }?.bytes, bytes)
     }
 

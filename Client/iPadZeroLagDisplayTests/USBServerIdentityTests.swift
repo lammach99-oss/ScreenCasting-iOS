@@ -2,6 +2,7 @@ import XCTest
 @testable import iPadCasting
 
 #if targetEnvironment(simulator)
+import Combine
 import CoreVideo
 import CryptoKit
 import Network
@@ -23,8 +24,16 @@ final class USBControlTLSIntegrationTests: XCTestCase {
             priorProbe = probe
             try await send(host, .pong, probe, flags: 0x1000)
             _ = try await read(host, type: .castingClipboardHello)
+            let listening = XCTestExpectation(description: "USB listener available after authenticated peer closes")
+            let observation = session.manager.$connectionState.first(where: {
+                $0 == .listening && session.manager.usbSessionSnapshot().connection == nil
+            })
+                .sink { _ in listening.fulfill() }
+            defer { observation.cancel() }
             host.cancel()
-            try await waitUntil { session.manager.connectionState == .listening }
+            guard await XCTWaiter.fulfillment(of: [listening], timeout: 10) == .completed else {
+                return XCTFail("USB listener did not resume after authenticated peer closed")
+            }
         }
     }
 
@@ -269,7 +278,7 @@ final class USBControlTLSIntegrationTests: XCTestCase {
         try await Task.sleep(nanoseconds: 5_200_000_000)
         XCTAssertEqual(manager.usbSessionSnapshot().generation, authenticated)
         try await send(replacement, .ping, Self.readiness)
-        let pong = try await read(replacement, type: .pong, streaming: true)
+        let pong = try await read(replacement, type: .pong)
         XCTAssertEqual(pong, Self.readiness)
     }
 
@@ -686,11 +695,14 @@ final class USBControlTLSIntegrationTests: XCTestCase {
     }
 
     @MainActor private func start(_ session: Session) async throws -> NWEndpoint.Port {
-        let ready = expectation(description: "USB listener ready")
+        let ready = XCTestExpectation(description: "USB listener ready")
         session.manager.connectionListenerReadyForTesting = { ready.fulfill() }
         session.manager.setRemoteClipboardSceneActive(true)
         session.manager.startListening(port: 0)
-        await fulfillment(of: [ready], timeout: 3)
+        guard await XCTWaiter.fulfillment(of: [ready], timeout: 3) == .completed else {
+            XCTFail("USB listener never became ready")
+            throw TestError.timedOut
+        }
         return try XCTUnwrap(session.manager.usbSessionSnapshot().listener?.port)
     }
 
@@ -806,17 +818,15 @@ final class USBControlTLSIntegrationTests: XCTestCase {
     }
 
     private func read(_ host: NWConnection, type: WireMessageType, flags: UInt16 = 0,
-                      rejectClipboardHello: Bool = false, streaming: Bool = false) async throws -> Data {
+                      rejectClipboardHello: Bool = false) async throws -> Data {
         // Once the session is streaming, the feedback timer also queues 8-byte legacy stage packets
         // between framed messages; any read may meet one, so always skip them.
         let deadline = ProcessInfo.processInfo.systemUptime + 10
-        var framesRead = 0
-        while ProcessInfo.processInfo.systemUptime < deadline, streaming || framesRead < 20 {
+        while ProcessInfo.processInfo.systemUptime < deadline {
             guard let prefix = try await receive(host, count: 8, timeout: deadline - ProcessInfo.processInfo.systemUptime), prefix.count == 8 else { throw TestError.closed }
             if prefix.prefix(4) == Data([0x45, 0x54, 0, 0]) { continue }
             guard let suffix = try await receive(host, count: 8, timeout: deadline - ProcessInfo.processInfo.systemUptime), suffix.count == 8 else { throw TestError.closed }
             let header = prefix + suffix
-            framesRead += 1
             let length = Int(header.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 8, as: UInt32.self).littleEndian })
             guard header.prefix(5) == Data([0x53, 0x43, 0x53, 0x54, 1]), length <= 65_536 else {
                 throw TestError.invalidFrame
@@ -829,7 +839,8 @@ final class USBControlTLSIntegrationTests: XCTestCase {
                 return payload
             }
         }
-        throw TestError.invalidFrame
+        XCTFail("TLS fixture timed out waiting for \(type) with flags \(flags)")
+        throw TestError.timedOut
     }
 
     private final class HostTLSFramer: NWProtocolFramerImplementation {
