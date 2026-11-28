@@ -417,7 +417,7 @@ jobs:
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$DERIVED_DATA" \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
-            TARGETED_DEVICE_FAMILY=2 \
+            TARGETED_DEVICE_FAMILY=1,2 \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' build \
             2>&1 | tee "$RUNNER_TEMP/r3-device-build.log"
           echo "DEVICE_APP_BUILD_SECONDS=$(( $(date +%s) - started_epoch ))"
