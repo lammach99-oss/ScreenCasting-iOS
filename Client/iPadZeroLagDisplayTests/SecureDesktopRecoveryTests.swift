@@ -6,8 +6,8 @@ import UIKit
 final class SecureDesktopRecoveryTests: XCTestCase {
     func testSecureSoftwareScanMapping() {
         var events: [RemoteScanKeyCommand] = []
-        let dropped = SecureSoftwareKeyboard.emit("aZ0!_? \u{8}\r\t\n\u{e9}", token: 7) { events.append($0) }
-        XCTAssertEqual(dropped, 1)
+        let dropped = SecureSoftwareKeyboard.emit("aZ0!_? \u{8}\r\t\n", token: 7) { events.append($0) }
+        XCTAssertEqual(dropped, 0)
         let strokes: [(UInt16, Bool)] = [(30,false),(44,true),(11,false),(2,true),(12,true),
                                          (53,true),(57,false),(14,false),(28,false),(15,false),(28,false)]
         var expected: [RemoteScanKeyCommand] = []
@@ -25,6 +25,23 @@ final class SecureDesktopRecoveryTests: XCTestCase {
             XCTAssertEqual(drops, 0)
             XCTAssertTrue(strokes == 2 || strokes == 4)
         }
+    }
+
+    func testMixedSecureInsertionRejectsOnceWithoutSendingAnyScans() {
+        var notices = [String]()
+        _ = SecureSoftwareKeyboard.emit("x\u{e9}y", token: 7, rejected: { notices.append($0) }) { _ in
+            XCTFail("Rejected insertion emitted a scan")
+        }
+        XCTAssertEqual(notices, ["That character can't be typed on the sign-in screen."])
+    }
+
+    @MainActor func testSecureKeyboardShowsLayoutHintOnlyDuringSecureEntry() {
+        let view = RemoteSoftwareKeyboardTextView(frame: .zero, textContainer: nil)
+        view.secureEntry = true
+        XCTAssertEqual((view.inputAccessoryView as? UILabel)?.text,
+                       "Types with a US keyboard layout. Check Caps Lock on the PC.")
+        view.secureEntry = false
+        XCTAssertNil(view.inputAccessoryView)
     }
 
     func testSoftwareDispatchSelectsExactlyOneSink() {

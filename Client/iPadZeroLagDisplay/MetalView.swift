@@ -748,7 +748,7 @@ public final class ConnectedPresentationContainer: UIView {
             self.recordKeyboardAuthority(reason: "native_keyboard_withheld")
         }
     }
-    private func showKeyboardHint(_ text: String) {
+    fileprivate func showKeyboardHint(_ text: String) {
         keyboardHintLabel.text = text
         keyboardHintLabel.isHidden = false
         setNeedsLayout()
@@ -1114,14 +1114,16 @@ public struct ConnectedPresentationSurface: UIViewRepresentable {
             softwareRoute = .blocked
         }
         container.softwareTextView.secureEntry = networkManager.isRemoteControlSession && softwareRoute != .committed
-        container.onTextCommit = { [weak networkManager, weak remoteInput] text in
+        container.onTextCommit = { [weak networkManager, weak remoteInput, weak container] text in
             if networkManager?.isRemoteControlSession == true {
                 guard networkManager?.acceptsFocusInput(focusTicket) == true, networkManager?.remoteKeyboardGeneration == inputGeneration,
                       networkManager?.remoteInputContext?.token == inputToken else { return }
                 if remoteInput == nil || remoteInput?.acceptsText(token: inputToken, generation: inputGeneration) == true {
                     softwareRoute.deliver(text, scan: {
                         guard let inputContext else { return }
-                        networkManager?.sendSecureSoftwareText($0, context: inputContext, generation: inputGeneration)
+                        networkManager?.sendSecureSoftwareText($0, context: inputContext, generation: inputGeneration) { notice in
+                            container?.showKeyboardHint(notice)
+                        }
                     }, commit: { networkManager?.sendTextCommit($0) })
                 }
             }

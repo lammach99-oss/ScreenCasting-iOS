@@ -151,10 +151,15 @@ enum SecureSoftwareKeyboard {
         return result
     }()
 
-    static func emit(_ text: String, token: UInt64, send: (RemoteScanKeyCommand) -> Void) -> Int {
-        var dropped = 0
-        for character in text {
-            guard character.isASCII, let key = keys[character] else { dropped += 1; continue }
+    static func emit(_ text: String, token: UInt64, rejected: (String) -> Void = { _ in },
+                     send: (RemoteScanKeyCommand) -> Void) -> Int {
+        let mapped = text.compactMap { $0.isASCII ? keys[$0] : nil }
+        let dropped = text.count - mapped.count
+        guard dropped == 0 else {
+            rejected("That character can't be typed on the sign-in screen.")
+            return dropped
+        }
+        for key in mapped {
             func emitKey(_ scan: UInt16, _ action: UInt8) {
                 send(.init(action: action, flags: 0, scan: scan, token: token))
             }
@@ -163,8 +168,9 @@ enum SecureSoftwareKeyboard {
             emitKey(key.scan, 1)
             if key.shifted { emitKey(0x2a, 1) }
         }
-        return dropped
+        return 0
     }
+
 }
 
 /// Connection-scoped publication and input gate, owned by the network queue.

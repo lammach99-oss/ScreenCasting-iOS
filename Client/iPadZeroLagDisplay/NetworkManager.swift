@@ -339,6 +339,16 @@ public class NetworkManager: ObservableObject {
     @MainActor var retireFocusRenderer: (() -> Void)?
     @MainActor var focusPresented: (() -> Void)?
     @MainActor var focusAuthorityChanged: ((Bool) -> Void)?
+    @MainActor var focusStage: ((FocusBinding, SlotTimelineExport.Event, UInt64) -> Void)?
+    private var focusSawIDR = false
+    private var focusSawDecode = false
+
+    private func publishFocusStageOnQueue(_ event: SlotTimelineExport.Event) {
+        guard let binding = focusMediaBinding, binding.transport == connectionGeneration else { return }
+        let instant = DispatchTime.now().uptimeNanoseconds
+        DispatchQueue.main.async { [weak self] in self?.focusStage?(binding, event, instant) }
+    }
+
     @MainActor var focusConnectionEnded: ((UInt64, SlotFailure) -> Void)?
     private var focusParked = false
     private var focusOutputAllowed = true
@@ -416,12 +426,15 @@ public class NetworkManager: ObservableObject {
         networkQueue.sync { connectionGeneration == binding.transport && focusRevision == remoteFeatures.revision }
     }
 
-    @MainActor func installFocus(_ binding: FocusBinding, presented: @escaping () -> Void) {
+    @MainActor func installFocus(_ binding: FocusBinding, resume: Bool = false, presented: @escaping () -> Void) {
         focusBinding = binding
         focusPresented = presented
         networkQueue.sync {
             guard connectionGeneration == binding.transport else { return }
             focusMediaBinding = binding
+            focusSawIDR = false
+            focusSawDecode = false
+            if resume { requestVideoStandbyOnQueue(park: false, generation: binding.transport) }
             focusRevision = remoteFeatures.revision
             focusTransport = binding.transport
             if focusParked && standby.phase == .idle {
@@ -1216,6 +1229,11 @@ public class NetworkManager: ObservableObject {
             [weak self] sequence, generation, succeeded in
             guard let self else { return }
             self.networkQueue.async {
+                if succeeded, self.focusMediaBinding != nil, !self.focusSawDecode,
+                   self.focusDecoder == generation, self.decoder.currentSessionGeneration == generation {
+                    self.focusSawDecode = true
+                    self.publishFocusStageOnQueue(.decoded)
+                }
                 let networkGeneration: UInt64
                 if let owner = self.currentConnectionDecoder, owner.decoder == generation { networkGeneration = owner.network }
                 else if let owner = self.currentCaptureTargetDecoderOwner, owner.decoder == generation { networkGeneration = owner.generation }
@@ -1327,6 +1345,11 @@ public class NetworkManager: ObservableObject {
             rejectAdmission(reason)
             return nil
         case .success(let address):
+            // Keep the browse interface so same-named services on two links dial their own link.
+            if case .discovered(_, let target) = intent, let link = target?.discoveryLink {
+                guard let host = link.dialHost(address.host) else { rejectAdmission(.unresolvedService); return nil }
+                return .hostPort(host: host, port: 27020)
+            }
             return .hostPort(host: RemoteHostAddress.networkHost(address.host), port: 27020)
         }
     }
@@ -1365,9 +1388,6 @@ public class NetworkManager: ObservableObject {
         }
         self.triedWifiReconnectTargets.removeAll()
         self.publishAutoReconnectAttempt(0)
-        if !capabilities.allowsCasting, phoneResumeRecord?["host"] != WifiReconnectTargetPolicy.target(from: endpoint)?.host {
-            streamSettingsDefaults.removeObject(forKey: Self.phoneResumeKey)
-        }
         var fingerprint: String?
         if case .some(.resume(_, _, let saved)) = intent { fingerprint = saved.fingerprint }
         self.connectOnQueue(to: endpoint, expectedFingerprint: fingerprint, intent: intent)
@@ -2106,6 +2126,7 @@ public class NetworkManager: ObservableObject {
         resetRemoteTimedVideoOnQueue()
         decoder.fenceCaptureContinuation(requiringAuthorization: false)
         publishStandbyOnQueue()
+        if !park { publishFocusStageOnQueue(.request) }
         sendWireMessage(type: .remoteVideoStandby, payload: bytes, sequence: 0)
     }
 
@@ -3057,9 +3078,10 @@ public class NetworkManager: ObservableObject {
         }
     }
 
-    func sendSecureSoftwareText(_ text: String, context: RemoteInputContextCommand, generation: UInt64) {
+    func sendSecureSoftwareText(_ text: String, context: RemoteInputContextCommand, generation: UInt64,
+                                rejected: (String) -> Void) {
         guard secureSoftwareRoute == .scan, context.desktop == 2 else { return }
-        let dropped = SecureSoftwareKeyboard.emit(text, token: context.token) { command in
+        let dropped = SecureSoftwareKeyboard.emit(text, token: context.token, rejected: rejected) { command in
             enqueueRemoteScanKey(command, generation: generation, secureContext: context)
         }
         unsupportedSecureCharacterCount &+= dropped
@@ -3480,6 +3502,12 @@ public class NetworkManager: ObservableObject {
     }
 
     private func reconnectTargetBelongsTo(endpoint: NWEndpoint?, fingerprint: String?) -> Bool {
+        if !capabilities.allowsCasting {
+            guard let record = phoneResumeRecord else { return false }
+            if let fingerprint { return record["fingerprint"] == fingerprint }
+            guard let endpoint, let host = WifiReconnectTargetPolicy.target(from: endpoint)?.host else { return false }
+            return record["host"] == host
+        }
         guard let target = savedWifiReconnectTarget, let savedEndpoint = target.endpoint else { return false }
         return endpoint.flatMap(WifiReconnectTargetPolicy.target(from:)) == target ||
             fingerprint != nil && trustedHostFingerprintStore.fingerprintForCleanup(endpoint: savedEndpoint) == fingerprint
@@ -6663,7 +6691,9 @@ public class NetworkManager: ObservableObject {
                 handleStreamError("Malformed standby reply."); return
             }
             let previous = standby.phase
+            let acknowledged = standby.resumeAcknowledged
             standby.receive(reply)
+            if !acknowledged && standby.resumeAcknowledged { publishFocusStageOnQueue(.acknowledged) }
             if standby.phase != previous { publishStandbyOnQueue() }
         case .remoteFileControl, .remoteAudioSet, .remoteSecureDesktopRequest:
             handleStreamError("Unnegotiated remote feature message.")
@@ -6775,6 +6805,10 @@ public class NetworkManager: ObservableObject {
                                                                                    lengthPrefixed: lengthPrefixed)
             guard standby.admitVideo(parameterSetIDR: fresh) else { return }
             publishStandbyOnQueue()
+        }
+        if isIDR, focusMediaBinding != nil, !focusSawIDR {
+            focusSawIDR = true
+            publishFocusStageOnQueue(.receivedIDR)
         }
         #if targetEnvironment(simulator)
         let receivedAt = connectionVideoReceivedAtForTesting ?? CACurrentMediaTime()
@@ -7896,7 +7930,14 @@ public class NetworkManager: ObservableObject {
         return owner
     }
 
-    func beginRemoteClipboardForTesting(remoteFiles: Bool = false) -> (connection: NWConnection, generation: UInt64) {
+    var focusAudioFencedForTesting: Bool {
+        networkQueue.sync {
+            mayReceiveRemoteAudio && remoteAudio.preferred && remoteAudio.phase == .streaming &&
+                remoteAudio.suspended && remoteAudio.activeEpoch == 0 && !focusOutputAllowed
+        }
+    }
+
+    func beginRemoteClipboardForTesting(remoteFiles: Bool = false, standbyEnabled: Bool = false, audioEnabled: Bool = false) -> (connection: NWConnection, generation: UInt64) {
         let owner = simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS, remote: true)
         networkQueue.sync {
             controlChannelWriter.begin(generation: owner.generation)
@@ -7905,9 +7946,13 @@ public class NetworkManager: ObservableObject {
             trustedCredential = TrustedHostCredential(fingerprint: "", hostID: Data(count: 16), deviceID: Data(),
                                                        secret: Data(), sessionID: Data())
             _ = remoteFeatures.begin(now: 0)
-            _ = remoteFeatures.pong(flags: Clipboard.marker, now: 1, requestRemoteFiles: remoteFiles, requestClipboard: true)
+            if audioEnabled { remoteAudio = RemoteAudioSession(preferred: true) }
+            _ = remoteFeatures.pong(flags: Clipboard.marker, now: 1, requestRemoteFiles: remoteFiles,
+                                    requestRemoteAudio: audioEnabled, requestClipboard: true)
             let fileFeatures = remoteFiles ? RemoteFeatureNegotiation.remoteFileFeature : 0
-            let payload = RemoteFeaturesMessage(features: Clipboard.features | 3 | fileFeatures).encode()
+            let standbyFeature = standbyEnabled ? RemoteFeatureNegotiation.remoteVideoStandby : 0
+            let audioFeature = audioEnabled ? RemoteFeatureNegotiation.remoteAudioFeature : 0
+            let payload = RemoteFeaturesMessage(features: Clipboard.features | 3 | fileFeatures | standbyFeature | audioFeature).encode()
             handleWireMessage(WireMessage(header: WireHeader(type: .remoteFeaturesResult, flags: 0,
                 payloadLength: payload.count, sequence: 0), payload: payload, firstByteAt: 0), generation: owner.generation)
         }

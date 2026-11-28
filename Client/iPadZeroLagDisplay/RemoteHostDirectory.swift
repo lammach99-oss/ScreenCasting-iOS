@@ -110,6 +110,7 @@ enum RemoteIntent {
     struct Target {
         let host: String
         let port: UInt16
+        var discoveryLink: RemoteDiscoveryLink? = nil
     }
 
     struct ResumeContext: Equatable {
@@ -150,7 +151,7 @@ enum RemoteSessionPolicy {
         case .discovered(let serviceType, let resolved):
             let type = serviceType?.lowercased()
             guard type == remoteServiceType || type == remoteServiceType + "." else { return .failure(.unclassifiedService) }
-            guard let resolved else { return .failure(.unresolvedService) }
+            guard let resolved, resolved.discoveryLink?.isLive != false else { return .failure(.unresolvedService) }
             target = resolved
         case .resume(let savedTarget, let remoteControl, let saved):
             guard remoteControl else { return .failure(.castingMode) }

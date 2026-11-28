@@ -1,4 +1,8 @@
 import XCTest
+import UIKit
+import MetalKit
+import CoreImage
+import Combine
 @testable import iPadCasting
 
 #if targetEnvironment(simulator)
@@ -240,6 +244,150 @@ extension FocusCoordinatorTests {
         _ = network.beginRemoteClipboardForTesting()
         XCTAssertTrue(focus.authenticate(ticket, transport: network.remoteKeyboardGeneration,
             peer: try XCTUnwrap(focus.model[ticket.ordinal].peer)))
+    }
+
+    @MainActor func testRestoreFencesBothSlotsBeforeAuthentication() throws {
+        let focus = try restoredPair(selected: .two)
+        defer { focus.primary.stopForTesting(); focus.secondary.stopForTesting() }
+        focus.prepareForRestore()
+        for network in [focus.primary, focus.secondary] {
+            XCTAssertTrue(network.focusManaged)
+            XCTAssertFalse(network.acceptsFocusInput(nil))
+        }
+        XCTAssertNil(focus.outputLease)
+        let network = focus.primary
+        network.controlSendForAudioTesting = { _, done in done(nil) }
+        let owner = network.beginRemoteClipboardForTesting(audioEnabled: true)
+        var decoded = false
+        network.captureTargetDecodeForTesting = { _, _, _ in decoded = true }
+        network.receiveCaptureTargetWireForTesting(type: .video, payload: Data([0, 0, 0, 2, 38, 1]),
+            flags: WireProtocol.videoFlagIDR | WireProtocol.videoFlagLengthPrefixed, sequence: 1,
+            generation: owner.generation, connection: owner.connection)
+        XCTAssertFalse(decoded)
+        for message in [RemoteAudioProtocol.Message.state(phase: .streaming, reason: .none, requestId: 0,
+                                                           audioEpoch: 1, startUs: 1),
+                        .packet(audioSequence: 1, audioEpoch: 1, captureUs: 2, opus: Data([0]))] {
+            network.receiveCaptureTargetWireForTesting(type: message.type,
+                payload: try XCTUnwrap(RemoteAudioProtocol.encode(message)), flags: 0,
+                generation: owner.generation, connection: owner.connection)
+        }
+        XCTAssertTrue(network.authenticatedRemoteIP(owner.generation))
+        XCTAssertTrue(network.focusAudioFencedForTesting)
+    }
+
+    @MainActor func testPresentedWithoutContextExpiresAndCanReturn() async throws {
+        let focus = try restoredPair(selected: .one)
+        defer { focus.primary.stopForTesting(); focus.secondary.stopForTesting() }
+        try authenticateSavedSlot(try XCTUnwrap(focus.connect(.one, route: .wifi)), in: focus)
+        let second = try XCTUnwrap(focus.connect(.two, route: .wifi))
+        focus.secondary.controlSendForAudioTesting = { _, done in done(nil) }
+        let peer = focus.secondary.simulateCommittedWifiSessionForTesting(mode: RealtimeTransportMode.legacyTLS, remote: true)
+        XCTAssertTrue(focus.authenticate(second, transport: peer.generation, peer: try XCTUnwrap(focus.model[.two].peer)))
+        focus.claimSurface("scene")
+        focus.presented(try XCTUnwrap(focus.binding))
+        focus.select(.two, scene: "scene")
+        let waiting = try XCTUnwrap(focus.binding)
+        focus.presented(waiting)
+        XCTAssertNil(focus.outputLease)
+        let expired = expectation(description: "Lease deadline released the waiting slot")
+        let observer = focus.$binding.dropFirst().sink { if $0 == nil { expired.fulfill() } }
+        await fulfillment(of: [expired], timeout: 9)
+        observer.cancel()
+        XCTAssertNil(focus.model.inFlight)
+        XCTAssertTrue(focus.model[.two].retryRequested)
+        focus.select(.one, scene: "scene")
+        focus.presented(try XCTUnwrap(focus.binding))
+        XCTAssertEqual(focus.outputLease?.ordinal, .one)
+    }
+
+    @MainActor func testSwapTimelineUsesWireAndDecoderCallbacks() async throws {
+        let focus = try restoredPair(selected: .one)
+        defer { focus.primary.stopForTesting(); focus.secondary.stopForTesting() }
+        try authenticateSavedSlot(try XCTUnwrap(focus.connect(.one, route: .wifi)), in: focus)
+        let ticket = try XCTUnwrap(focus.connect(.two, route: .wifi))
+        let network = focus.secondary
+        network.controlSendForAudioTesting = { _, done in done(nil) }
+        let peer = network.beginRemoteClipboardForTesting(standbyEnabled: true)
+        XCTAssertTrue(focus.authenticate(ticket, transport: peer.generation, peer: try XCTUnwrap(focus.model[.two].peer)))
+        func receive(_ type: WireMessageType, _ data: Data, flags: UInt16 = 0) {
+            network.receiveCaptureTargetWireForTesting(type: type, payload: data, flags: flags, sequence: 1,
+                                                      generation: peer.generation, connection: peer.connection)
+        }
+        receive(.remoteVideoStandby, try XCTUnwrap(RemoteVideoStandbyMessage(operation: .parked, serial: 1).encode()))
+        focus.claimSurface("scene")
+        focus.presented(try XCTUnwrap(focus.binding))
+        focus.select(.two, scene: "scene")
+        let binding = try XCTUnwrap(focus.binding)
+        receive(.remoteVideoStandby, try XCTUnwrap(RemoteVideoStandbyMessage(operation: .resuming, serial: 2).encode()))
+        network.captureTargetDecodeForTesting = { _, sequence, generation in
+            network.decoder.onDecodeCompleted?(sequence, generation, true)
+        }
+        defer { network.captureTargetDecodeForTesting = nil }
+        let idr = Data([UInt8(32), 33, 34, 19].flatMap { [UInt8(0), 0, 0, 2, $0 << 1, 1] })
+        receive(.video, idr, flags: WireProtocol.videoFlagIDR | WireProtocol.videoFlagLengthPrefixed)
+        network.networkQueueForTesting.sync {}
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async { done.resume() }
+        }
+        focus.presented(binding)
+        let rows = try XCTUnwrap(JSONSerialization.jsonObject(with: focus.exportDiagnostics()) as? [[String: Any]])
+        let stages = rows.filter { $0["slot"] as? Int == 2 && $0["epoch"] as? UInt64 == binding.ticket.epoch }
+                         .compactMap { $0["event"] as? String }
+        XCTAssertEqual(stages.filter { ["request", "acknowledged", "receivedIDR", "decoded", "presented", "outputGranted"].contains($0) },
+                       ["request", "acknowledged", "receivedIDR", "decoded", "presented", "outputGranted"])
+        XCTAssertEqual(stages.filter { $0 == "inputReady" }.count, 1)
+    }
+
+    @MainActor func testSimulatorDrawGrantsLeaseAndProducesReadableThumbnail() async throws {
+        let focus = try restoredPair(selected: .one)
+        defer { focus.primary.stopForTesting(); focus.secondary.stopForTesting() }
+        try authenticateSavedSlot(try XCTUnwrap(focus.connect(.one, route: .wifi)), in: focus)
+        focus.claimSurface("scene")
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let view = MTKView(frame: CGRect(x: 0, y: 0, width: 64, height: 64), device: MTLCreateSystemDefaultDevice())
+        controller.view.addSubview(view)
+        window.isHidden = false
+        window.layoutIfNeeded()
+        defer { window.isHidden = true }
+        let renderer = try XCTUnwrap(Renderer(metalView: view))
+        let generation = focus.primary.decoder.currentSessionGeneration
+        renderer.beginSession(generation: generation)
+        let presented = expectation(description: "Simulator rendered frame")
+        renderer.installFocusPresentation { _ in
+            DispatchQueue.main.async {
+                focus.primary.focusPresented?()
+                presented.fulfill()
+            }
+        }
+        var storage: CVPixelBuffer?
+        var attributes = DecoderOutputBufferAttributes.make()
+        attributes[kCVPixelBufferIOSurfacePropertiesKey as String] = [String: Any]()
+        XCTAssertEqual(CVPixelBufferCreate(nil, 64, 64, DecoderOutputBufferAttributes.pixelFormat,
+                                           attributes as CFDictionary, &storage), kCVReturnSuccess)
+        let frame = try XCTUnwrap(storage)
+        XCTAssertEqual(CVPixelBufferLockBaseAddress(frame, []), kCVReturnSuccess)
+        for plane in 0..<2 {
+            if let base = CVPixelBufferGetBaseAddressOfPlane(frame, plane) {
+                let length = CVPixelBufferGetBytesPerRowOfPlane(frame, plane) * CVPixelBufferGetHeightOfPlane(frame, plane)
+                memset(base, plane == 0 ? 255 : 128, length)
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(frame, [])
+        renderer.updateFrame(frame, sequence: 1, generation: generation)
+        view.draw()
+        await fulfillment(of: [presented], timeout: 3)
+        XCTAssertEqual(focus.outputLease?.ordinal, .one)
+        let image = try XCTUnwrap(renderer.focusThumbnail().flatMap { UIImage(data: $0) }?.cgImage)
+        XCTAssertEqual(image.width, 320)
+        XCTAssertEqual(image.height, 180)
+        var pixel = [UInt8](repeating: 0, count: 4)
+        CIContext().render(CIImage(cgImage: image), toBitmap: &pixel, rowBytes: 4,
+                           bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBA8,
+                           colorSpace: CGColorSpaceCreateDeviceRGB())
+        XCTAssertTrue(pixel.prefix(3).allSatisfy { $0 > 230 })
     }
 
     @MainActor func testFirstSlotOwnsOutputWhileSecondConnectsAndAfterRefusal() throws {

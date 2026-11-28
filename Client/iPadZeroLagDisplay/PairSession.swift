@@ -29,6 +29,7 @@ import SwiftUI
         let pair = store.load()
         guard focus == nil, pair.first != nil, pair.second != nil else { return }
         let coordinator = FocusCoordinator.shared(primary: primary, pair: pair)
+        coordinator.prepareForRestore()
         focus = coordinator
         for slot in [SlotOrdinal.one, .two] {
             if let target = address(for: coordinator.model[slot].peer) { connect(slot, target) }
@@ -71,10 +72,10 @@ import SwiftUI
     }
 
     func retry(_ slot: SlotOrdinal) {
-        guard let focus, focus.manager(.one).capabilities.allowsSecondPC, [.idle, .offline].contains(focus.model[slot].phase),
-              let target = address(for: focus.model[slot].peer) ?? names[slot].flatMap(PairPanelModel.address) else { return }
+        guard let focus, focus.manager(.one).capabilities.allowsSecondPC, [.idle, .offline].contains(focus.model[slot].phase) else { return }
         // A watchdog-offline slot keeps its authenticated connection; resume it before dialing again.
         if focus.retryRetainedSlot(slot) { objectWillChange.send(); return }
+        guard let target = address(for: focus.model[slot].peer) ?? names[slot].flatMap(PairPanelModel.address) else { return }
         let manager = focus.manager(slot)
         if manager.connectionState == .streaming, manager.authenticatedRemoteIP(manager.remoteKeyboardGeneration) {
             _ = focus.connect(slot, route: focus.model[slot].route ?? .wifi)

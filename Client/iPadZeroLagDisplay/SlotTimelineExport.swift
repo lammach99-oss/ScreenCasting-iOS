@@ -5,7 +5,7 @@ enum SlotTransportClass: String, Codable { case wifi, tailscale, usb }
 @MainActor
 final class SlotTimelineExport {
     enum Event: String, Codable {
-        case tap, request, acknowledged, receivedIDR, decoded, presented, inputReady
+        case tap, request, acknowledged, receivedIDR, decoded, presented, inputReady, outputGranted
         case transportError, unavailable, refused, stale, parked, resume, recovery, offline, drop
     }
 
@@ -20,8 +20,9 @@ final class SlotTimelineExport {
     private let start = DispatchTime.now().uptimeNanoseconds
     private var timelines: [SlotOrdinal: [Entry]] = [:]
 
-    func record(slot: SlotOrdinal, route: SlotTransportClass, epoch: UInt64, event: Event) {
-        let elapsed = (DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+    func record(slot: SlotOrdinal, route: SlotTransportClass, epoch: UInt64, event: Event,
+                at instant: UInt64 = DispatchTime.now().uptimeNanoseconds) {
+        let elapsed = (instant - start) / 1_000_000
         if timelines[slot]?.count == 256 { timelines[slot]?.removeFirst() }
         timelines[slot, default: []].append(Entry(slot: slot, route: route, epoch: epoch,
                                                   event: event, elapsedMs: elapsed))

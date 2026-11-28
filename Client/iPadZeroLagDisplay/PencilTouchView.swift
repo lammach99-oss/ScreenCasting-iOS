@@ -2192,6 +2192,18 @@ final class RemoteSoftwareKeyboardTextView: UITextView, UITextViewDelegate, UISc
             discardBuffer()
             if secureEntry { normalCapitalization = autocapitalizationType }
             autocapitalizationType = secureEntry ? .none : normalCapitalization
+            if secureEntry {
+                let label = UILabel(frame: CGRect(x: 0, y: 0, width: 320, height: 44))
+                label.font = .preferredFont(forTextStyle: .footnote)
+                label.textColor = .secondaryLabel
+                label.backgroundColor = .systemBackground
+                label.textAlignment = .center
+                label.numberOfLines = 2
+                label.text = "Types with a US keyboard layout. Check Caps Lock on the PC."
+                inputAccessoryView = label
+            } else {
+                inputAccessoryView = nil
+            }
             isSecureTextEntry = secureEntry
             reloadInputViews()
         }

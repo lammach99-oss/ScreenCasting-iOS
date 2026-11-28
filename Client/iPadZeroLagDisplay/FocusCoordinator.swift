@@ -64,6 +64,7 @@ final class FocusSurfaceLifetime {
     private var transports: [SlotOrdinal: UInt64] = [:]
     private var timer: Task<Void, Never>?
     private var pairActive = false
+    private var sawInputReady = false
     private var sawPresentation = false
     private var requestedRecovery = false
     private var notifications = Set<AnyCancellable>()
@@ -76,6 +77,10 @@ final class FocusSurfaceLifetime {
         for ordinal in [SlotOrdinal.one, .two] {
             let peer = manager(ordinal)
             if ordinal == .two { peer.enterFocusMode() }
+            peer.focusStage = { [weak self] binding, event, instant in
+                guard let self, self.binding == binding else { return }
+                self.record(binding.ticket, event, at: instant)
+            }
             peer.focusAuthorityChanged = { [weak self] changed in self?.authorityChanged(ordinal, changed: changed) }
             peer.focusConnectionEnded = { [weak self] transport, error in
                 guard let self, self.transports[ordinal] == transport else { return }
@@ -102,6 +107,11 @@ final class FocusSurfaceLifetime {
     }
     #endif
 
+    func prepareForRestore() {
+        // Secondary was fenced at construction. Close primary admission before either dial.
+        primary.enterFocusMode()
+    }
+
     func endPair(scene: String) {
         guard model.surfaceOwner == nil || model.surfaceOwner == scene else { return }
         releaseSurface(scene)
@@ -115,6 +125,8 @@ final class FocusSurfaceLifetime {
         secondary.stop()
         primary.focusConnectionEnded = nil
         primary.focusAuthorityChanged = nil
+        primary.focusStage = nil
+        secondary.focusStage = nil
         secondary.focusConnectionEnded = nil
         secondary.focusAuthorityChanged = nil
         primary.leaveFocusMode()
@@ -158,7 +170,7 @@ final class FocusSurfaceLifetime {
 
     private func activateSlot(_ slot: SlotOrdinal, transport: UInt64) {
         if !pairActive {
-            primary.enterFocusMode()
+            if !primary.focusManaged { primary.enterFocusMode() }
             pairActive = true
         }
         transports[slot] = transport
@@ -221,15 +233,20 @@ final class FocusSurfaceLifetime {
         guard manager(evidence.ticket.ordinal).focusAuthorityMatches(evidence) else { return }
         if !sawPresentation { record(evidence.ticket, .presented) }
         sawPresentation = true
-        timer?.cancel()
         _ = model.presented(evidence.ticket)
         reconcile()
     }
     func contextReady(_ evidence: FocusBinding) {
         guard binding == evidence, manager(evidence.ticket.ordinal).remoteKeyboardGeneration == evidence.transport else { return }
         guard manager(evidence.ticket.ordinal).focusContextReady(evidence.transport) else { return }
-        _ = model.contextReady(evidence.ticket)
+        noteInputReady(evidence.ticket)
         reconcile()
+    }
+
+    private func noteInputReady(_ ticket: SlotTicket) {
+        if !sawInputReady { record(ticket, .inputReady) }
+        sawInputReady = true
+        _ = model.contextReady(ticket)
     }
 
     private func reconcile() {
@@ -263,14 +280,12 @@ final class FocusSurfaceLifetime {
             let network = manager(ticket.ordinal)
             guard network.remoteKeyboardGeneration == transport else { drop(ticket, error: .transport); return }
             thumbnails[ticket.ordinal] = nil
-            if old?.ticket.ordinal != ticket.ordinal {
-                network.requestVideoStandby(park: false, expectedGeneration: transport)
-            }
+            sawInputReady = false
             sawPresentation = false
             requestedRecovery = false
             record(ticket, .resume)
             binding = next
-            network.installFocus(next) { [weak self] in self?.presented(next) }
+            network.installFocus(next, resume: old?.ticket.ordinal != ticket.ordinal) { [weak self] in self?.presented(next) }
             timer = Task { [weak self] in
                 do {
                     try await Task.sleep(nanoseconds: 3_000_000_000)
@@ -279,13 +294,15 @@ final class FocusSurfaceLifetime {
                     self?.watchdog(next, expired: true)
                 } catch {}
             }
-            if network.focusContextReady(transport) { _ = model.contextReady(ticket) }
+            if network.focusContextReady(transport) { noteInputReady(ticket) }
         }
         if outputLease != model.outputLease {
             outputLease = model.outputLease
             if let outputLease {
+                timer?.cancel()
                 let network = manager(outputLease.ordinal)
                 network.setFocusOutput(outputLease)
+                record(outputLease, .outputGranted)
                 network.promoteFileSlotFocus(epoch: outputLease.epoch)
                 clipboardFocus.promote(slot: outputLease.ordinal, epoch: outputLease.epoch)
             }
@@ -293,9 +310,9 @@ final class FocusSurfaceLifetime {
         objectWillChange.send()
     }
 
-    private func record(_ ticket: SlotTicket, _ event: SlotTimelineExport.Event) {
+    private func record(_ ticket: SlotTicket, _ event: SlotTimelineExport.Event, at instant: UInt64 = DispatchTime.now().uptimeNanoseconds) {
         timeline.record(slot: ticket.ordinal, route: manager(ticket.ordinal).focusRoute(model[ticket.ordinal].route),
-                        epoch: ticket.epoch, event: event)
+                        epoch: ticket.epoch, event: event, at: instant)
     }
 
     func exportDiagnostics() -> Data {
@@ -341,7 +358,7 @@ final class FocusSurfaceLifetime {
     }
 
     func watchdog(_ expected: FocusBinding, expired: Bool) {
-        guard binding == expected, !sawPresentation else { return }
+        guard binding == expected, outputLease != expected.ticket else { return }
         if expired {
             record(expected.ticket, .offline)
             if manager(expected.ticket.ordinal).authenticatedRemoteIP(expected.transport) {
@@ -351,7 +368,7 @@ final class FocusSurfaceLifetime {
                 drop(expected.ticket, error: .transport)
             }
         }
-        else if !requestedRecovery {
+        else if !sawPresentation && !requestedRecovery {
             record(expected.ticket, .recovery)
             requestedRecovery = true
             manager(expected.ticket.ordinal).requestFocusRecovery(expected.transport)

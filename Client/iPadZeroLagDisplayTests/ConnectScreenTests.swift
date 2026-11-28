@@ -32,9 +32,9 @@ final class DiscoveryLifecycleTests: XCTestCase {
         var state: (@Sendable (NWBrowser.State) -> Void)?
         private(set) var cancelled = false
 
-        func start(queue: DispatchQueue, results: @escaping @Sendable ([NWEndpoint]) -> Void,
+        func start(queue: DispatchQueue, results: @escaping @Sendable ([DiscoveryAdvertisement]) -> Void,
                    state: @escaping @Sendable (NWBrowser.State) -> Void) {
-            self.results = results
+            self.results = { endpoints in results(endpoints.map { DiscoveryAdvertisement(endpoint: $0) }) }
             self.state = state
         }
 

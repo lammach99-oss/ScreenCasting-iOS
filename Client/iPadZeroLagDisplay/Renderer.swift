@@ -658,6 +658,26 @@ public class Renderer: NSObject, MTKViewDelegate {
         lock.unlock()
     }
 
+    private func notifyPresentation(_ identity: RenderFrameIdentity, frame: CVPixelBuffer, size: CGSize, repeated: Bool) {
+        lock.lock()
+        let current = freshness.isCurrent(identity)
+        var first: ((UInt64) -> Void)?
+        if current, focusLive, !repeated,
+           focusedSequence.map({ RenderFreshnessTracker.isNewer(identity.sequence, than: $0) }) ?? true {
+            focusedSequence = identity.sequence
+            focusedFrame = frame
+            first = notifyFirstPresentation
+            notifyFirstPresentation = nil
+        }
+        if current, adaptiveAwaitingPresentation == identity.sequence { adaptiveAwaitingPresentation = nil }
+        lock.unlock()
+        guard current else { return }
+        if !repeated {
+            onFramePresented?(identity.sequence, identity.generation, size)
+            first?(identity.generation)
+        }
+    }
+
     func focusThumbnail() -> Data? {
         lock.lock()
         let frame = focusedFrame
@@ -667,13 +687,8 @@ public class Renderer: NSObject, MTKViewDelegate {
         let bounds = CGRect(x: 0, y: 0, width: 320, height: 180)
         let scaled = source.transformed(by: CGAffineTransform(scaleX: bounds.width / source.extent.width,
                                                               y: bounds.height / source.extent.height))
-        var bytes = Data(count: 320 * 180 * 4)
-        bytes.withUnsafeMutableBytes { (storage: UnsafeMutableRawBufferPointer) in
-            guard let address = storage.baseAddress else { return }
-            CIContext().render(scaled, toBitmap: address, rowBytes: 320 * 4, bounds: bounds,
-                               format: .BGRA8, colorSpace: CGColorSpaceCreateDeviceRGB())
-        }
-        return bytes
+        guard let image = CIContext().createCGImage(scaled, from: bounds) else { return nil }
+        return UIImage(cgImage: image).pngData()
     }
     var onFramePresented: ((UInt32, UInt64, CGSize) -> Void)?
     var remotePresentationDeadline: ((UInt32, UInt64, TimeInterval) -> TimeInterval)?
@@ -1167,23 +1182,7 @@ public class Renderer: NSObject, MTKViewDelegate {
         // telemetry. A dropped drawable reports zero presentedTime.
         drawable.addPresentedHandler { [weak self] (presented: MTLDrawable) in
             guard let self, CapturePresentationPolicy.confirmed(time: presented.presentedTime) else { return }
-            self.lock.lock()
-            let current = self.freshness.isCurrent(identity)
-            var first: ((UInt64) -> Void)?
-            if current, self.focusLive, drawKind != .gameRepeated,
-               self.focusedSequence.map({ RenderFreshnessTracker.isNewer(identity.sequence, than: $0) }) ?? true {
-                self.focusedSequence = identity.sequence
-                self.focusedFrame = pixelBuffer
-                first = self.notifyFirstPresentation
-                self.notifyFirstPresentation = nil
-            }
-            if current, self.adaptiveAwaitingPresentation == identity.sequence { self.adaptiveAwaitingPresentation = nil }
-            self.lock.unlock()
-            guard current else { return }
-            if drawKind != .gameRepeated {
-                self.onFramePresented?(identity.sequence, identity.generation, sourceFrameSize)
-                first?(identity.generation)
-            }
+            self.notifyPresentation(identity, frame: pixelBuffer, size: sourceFrameSize, repeated: drawKind == .gameRepeated)
         }
         #endif
 
@@ -1242,7 +1241,7 @@ public class Renderer: NSObject, MTKViewDelegate {
             // after present is a proxy, not confirmation of physical display scanout.
             if drawKind != .gameRepeated, CapturePresentationPolicy.simulatorCompleted(
                 succeeded: RenderCommandCompletionPolicy.succeeded(completedBuffer.status), current: isCurrent) {
-                self.onFramePresented?(identity.sequence, identity.generation, sourceFrameSize)
+                self.notifyPresentation(identity, frame: pixelBuffer, size: sourceFrameSize, repeated: false)
             }
             #endif
             self.publishGeometrySnapshot(for: view, identity: identity,

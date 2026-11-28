@@ -2,6 +2,7 @@ import Combine
 import XCTest
 import Network
 import CoreVideo
+import Darwin
 @testable import iPadCasting
 
 final class ConnectionControlIntegrationTests: XCTestCase {
@@ -39,6 +40,28 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         XCTAssertNil(phone.admissionError)
     }
 
+    @MainActor func testFailedOtherPhoneDialPreservesPinnedResume() async throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: UUID().uuidString))
+        let fingerprint = String(repeating: "A", count: 64)
+        defaults.set(["host": "192.0.2.1", "fingerprint": fingerprint], forKey: "ScreenCasting.phone.remoteResume.v1")
+        let phone = NetworkManager(userDefaults: defaults, capabilities: .init(family: .phone))
+        var pins = [String?]()
+        var endpoints = [NWEndpoint]()
+        phone.dialForTesting = { endpoint, pin in
+            endpoints.append(endpoint)
+            pins.append(pin)
+        }
+        phone.connect(remote: .manual(.init(host: "192.0.2.2", port: 27020)))
+        await drain(phone)
+        phone.stop()
+        await drain(phone)
+        XCTAssertTrue(phone.hasReconnectTarget)
+        phone.reconnectLastPC()
+        await drain(phone)
+        XCTAssertEqual(pins, [nil, fingerprint])
+        XCTAssertEqual(endpoints.last, .hostPort(host: RemoteHostAddress.networkHost("192.0.2.1"), port: 27020))
+    }
+
     @MainActor func testPhoneRetryFencesGenerationAndPinsSavedIdentity() async throws {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: UUID().uuidString))
         let fingerprint = String(repeating: "A", count: 64)
@@ -70,11 +93,14 @@ final class ConnectionControlIntegrationTests: XCTestCase {
     }
 
     private final class PhoneBrowser: DiscoveryBrowser, @unchecked Sendable {
-        var publish: (@Sendable ([NWEndpoint]) -> Void)?
+        var records: (@Sendable ([DiscoveryAdvertisement]) -> Void)?
         var changeState: (@Sendable (NWBrowser.State) -> Void)?
-        func start(queue: DispatchQueue, results: @escaping @Sendable ([NWEndpoint]) -> Void,
+        func publish(_ endpoints: [NWEndpoint]) {
+            records?(endpoints.map { DiscoveryAdvertisement(endpoint: $0) })
+        }
+        func start(queue: DispatchQueue, results: @escaping @Sendable ([DiscoveryAdvertisement]) -> Void,
                    state: @escaping @Sendable (NWBrowser.State) -> Void) {
-            publish = results
+            records = results
             changeState = state
         }
         func cancel() {}
@@ -86,7 +112,7 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         let discovery = DiscoveryManager(capabilities: .init(family: .phone), browserForType: { type in
             XCTAssertEqual(type, "_sc-remote._tcp")
             return browser
-        }, resolveService: { name, _, complete in
+        }, resolveService: { name, _, _, complete in
             completions[name] = complete
             return {}
         })
@@ -94,7 +120,7 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         let endpoints: [NWEndpoint] = ["A", "B", "C"].map {
             .service(name: $0, type: "_sc-remote._tcp", domain: "local.", interface: nil)
         }
-        browser.publish?(endpoints + [.service(name: "D", type: "_screencasting._tcp", domain: "local.", interface: nil)])
+        browser.publish(endpoints + [.service(name: "D", type: "_screencasting._tcp", domain: "local.", interface: nil)])
         let deadline = Date().addingTimeInterval(3)
         while completions.count < 3 && Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         XCTAssertEqual(Set(completions.keys), Set(["A", "B", "C"]))
@@ -117,7 +143,7 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         XCTAssertEqual(target?.port, 27020)
         XCTAssertTrue(discovery.discoveredHosts.isEmpty)
         // Withdraw the service while another result remains in this generation.
-        browser.publish?([endpoints[2]])
+        browser.publish([endpoints[2]])
         while !discovery.remoteRows.isEmpty && Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         completions["A"]?(record)
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
@@ -132,7 +158,7 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         var replies: [(RemoteServiceRecord?) -> Void] = []
         var cancelled: [Int] = []
         let discovery = DiscoveryManager(capabilities: .init(family: .phone), browserForType: { _ in browser },
-                                        resolveService: { _, _, reply in
+                                        resolveService: { _, _, _, reply in
             let index = replies.count
             replies.append(reply)
             return { cancelled.append(index) }
@@ -148,33 +174,34 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         let numeric = Data([16, 2, 0, 0, 192, 0, 2, 1] + Array(repeating: UInt8(0), count: 8))
         discovery.startBrowsing()
         browser.changeState?(.ready)
-        browser.publish?([endpoint])
+        browser.publish([endpoint])
         try await waitFor { replies.count == 1 }
         try XCTUnwrap(replies.first)(nil) // Timeout through the resolver seam.
         try await waitFor { cancelled == [0] && discovery.status == .empty }
-        browser.publish?([endpoint])
         try await waitFor { replies.count == 2 }
-        browser.publish?([])
-        try await waitFor { cancelled == [0, 1] }
-        browser.publish?([endpoint])
+        replies[1](srv)
+        try await waitFor { discovery.remoteRows.first?.target.host == "srv.example" }
+        browser.publish([])
+        try await waitFor { cancelled == [0, 1] && discovery.remoteRows.isEmpty }
+        browser.publish([endpoint])
         try await waitFor { replies.count == 3 }
         replies[1](srv) // Withdrawn generation of the same endpoint.
         replies[2](.init(host: nil, port: 27015, addresses: [numeric]))
         try await waitFor { discovery.status == .empty && cancelled.contains(2) }
         XCTAssertTrue(discovery.remoteRows.isEmpty)
-        browser.publish?([endpoint])
+        browser.publish([endpoint])
         try await waitFor { replies.count == 4 }
         replies[3](srv)
         try await waitFor { discovery.remoteRows.first?.target.host == "srv.example" }
         discovery.stopBrowsing()
         discovery.startBrowsing()
-        browser.publish?([endpoint])
+        browser.publish([endpoint])
         try await waitFor { replies.count == 5 }
         discovery.stopBrowsing()
         XCTAssertTrue(cancelled.contains(4))
         replies[4](srv)
         discovery.startBrowsing()
-        browser.publish?([endpoint])
+        browser.publish([endpoint])
         try await waitFor { replies.count == 6 }
         XCTAssertTrue(discovery.remoteRows.isEmpty)
         replies[5](.init(host: nil, port: 27020, addresses: [numeric]))
@@ -182,18 +209,77 @@ final class ConnectionControlIntegrationTests: XCTestCase {
         discovery.stopBrowsing()
     }
 
+    @MainActor func testSameNameOnTwoLinksRefreshAndWithdrawal() async throws {
+        let browser = PhoneBrowser()
+        var replies: [UInt32: [(RemoteServiceRecord?) -> Void]] = [:]
+        let discovery = DiscoveryManager(capabilities: .init(family: .phone), browserForType: { _ in browser },
+                                        resolveService: { _, _, index, reply in
+            replies[index, default: []].append(reply)
+            return {}
+        })
+        discovery.startBrowsing()
+        defer { discovery.stopBrowsing() }
+        func drain() async {
+            await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+                DispatchQueue.main.async { done.resume() }
+            }
+        }
+        let endpoint = NWEndpoint.service(name: "A", type: "_sc-remote._tcp", domain: "local.", interface: nil)
+        let first = DiscoveryAdvertisement(endpoint: endpoint, interfaceIndex: 11)
+        let second = DiscoveryAdvertisement(endpoint: endpoint, interfaceIndex: 12)
+        func record(_ last: UInt8) -> RemoteServiceRecord {
+            .init(host: nil, port: 27020, addresses: [Data([16, 2, 0, 0, 192, 0, 2, last] + Array(repeating: 0, count: 8))])
+        }
+        browser.records?([first, second])
+        await drain()
+        try XCTUnwrap(replies[11]?.first)(record(1))
+        try XCTUnwrap(replies[12]?.first)(record(2))
+        await drain()
+        let old = try XCTUnwrap(discovery.remoteRows.first { $0.target.host == "192.0.2.1" })
+        let other = try XCTUnwrap(discovery.remoteRows.first { $0.target.host == "192.0.2.2" })
+        XCTAssertEqual(old.target.discoveryLink?.index, 11)
+        XCTAssertEqual(other.target.discoveryLink?.index, 12)
+        browser.records?([.init(endpoint: endpoint, interfaceIndex: 11, changed: true), second])
+        await drain()
+        XCTAssertThrowsError(try RemoteSessionPolicy.admit(old.intent, for: .init(family: .phone)).get())
+        XCTAssertEqual(discovery.remoteRows.map(\.target.host), ["192.0.2.2"])
+        try XCTUnwrap(replies[11]?.last)(record(3))
+        await drain()
+        browser.records?([first])
+        await drain()
+        XCTAssertEqual(discovery.remoteRows.map(\.target.host), ["192.0.2.3"])
+        XCTAssertThrowsError(try RemoteSessionPolicy.admit(other.intent, for: .init(family: .phone)).get())
+        XCTAssertEqual(replies[12]?.count, 1)
+    }
+
+    func testLinkLocalRequiresKnownScope() throws {
+        var bytes = sockaddr_in6()
+        bytes.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+        bytes.sin6_family = sa_family_t(AF_INET6)
+        XCTAssertEqual(inet_pton(AF_INET6, "fe80::1", &bytes.sin6_addr), 1)
+        func target() -> RemoteIntent.Target? {
+            let data = withUnsafeBytes(of: &bytes) { Data($0) }
+            return RemoteServiceRecord(host: nil, port: 27020, addresses: [data])
+                .admittedTarget(type: RemoteSessionPolicy.remoteServiceType, capabilities: .init(family: .phone))
+        }
+        XCTAssertNil(target())
+        bytes.sin6_scope_id = if_nametoindex("lo0")
+        XCTAssertNotEqual(bytes.sin6_scope_id, 0)
+        XCTAssertTrue(try XCTUnwrap(target()).host.hasPrefix("fe80::1%"))
+    }
+
     @MainActor func testPadDiscoveryStillPublishesCastingEndpointWithoutRemoteResolution() async throws {
         let browser = PhoneBrowser()
         let discovery = DiscoveryManager(capabilities: .init(family: .pad), browserForType: { type in
             XCTAssertEqual(type, "_screencasting._tcp")
             return browser
-        }, resolveService: { _, _, _ in
+        }, resolveService: { _, _, _, _ in
             XCTFail("Unexpected Remote resolution on iPad")
             return {}
         })
         discovery.startBrowsing()
         let endpoint = NWEndpoint.service(name: "A", type: "_screencasting._tcp", domain: "local.", interface: nil)
-        browser.publish?([endpoint])
+        browser.publish([endpoint])
         let deadline = Date().addingTimeInterval(2)
         while discovery.discoveredHosts.isEmpty && Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         XCTAssertEqual(discovery.discoveredHosts.map(\.endpoint), [endpoint])
@@ -211,7 +297,7 @@ final class ConnectionControlIntegrationTests: XCTestCase {
             XCTAssertEqual(discovery.status, status)
         }
         browser.changeState?(.waiting(.dns(-65570)))
-        browser.publish?([])
+        browser.publish([])
         try await expect(.denied)
         browser.changeState?(.ready)
         try await expect(.empty)

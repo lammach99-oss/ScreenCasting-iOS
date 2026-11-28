@@ -347,7 +347,17 @@ struct RemoteAddressField: View {
                     .overlay {
                         let selected = focus.model[focus.model.selected]
                         let other = focus.model[focus.model.selected.alternate]
-                        if (selected.phase == .offline || selected.phase == .refused || selected.phase == .connecting)
+                        if selected.phase == .offline && selected.retryRequested {
+                            VStack {
+                                Text("Connection unavailable.")
+                                Button("Retry") { PairSession.shared.retry(selected.ordinal) }
+                                if other.phase == .parked {
+                                    Button("Back to \(PairSession.shared.name(other.ordinal))") {
+                                        PairSession.shared.select(scene: scene)
+                                    }
+                                }
+                            }.frame(maxWidth: .infinity, maxHeight: .infinity).background(Color.black)
+                        } else if (selected.phase == .offline || selected.phase == .refused || selected.phase == .connecting)
                             && other.phase == .parked {
                             VStack {
                                 Text(PairPanelModel.reason(selected.lastError))
