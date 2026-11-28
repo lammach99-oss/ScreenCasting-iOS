@@ -591,7 +591,10 @@ final class CastingClipboardIntegrationTests: XCTestCase {
         defer { host.stop() }
         host.manager.setAutomaticClipboardSending(false)
         let owner = host.manager.beginRemoteClipboardForTesting(remoteFiles: true)
-        XCTAssertNotEqual(host.manager.remoteInputFeatures & RemoteFeatureNegotiation.remoteFileFeature, 0)
+        // Feature publication is asynchronous; the clipboard grant no longer precedes this check.
+        try await waitFor("Remote File feature published") {
+            host.manager.remoteInputFeatures & RemoteFeatureNegotiation.remoteFileFeature != 0
+        }
         // The upload takes a storage lease before it can send the offer.
         let loaded = XCTestExpectation(description: "Remote File storage ready")
         let storage = host.manager.$receivedFilesViewState.first(where: { $0.loaded }).sink { _ in loaded.fulfill() }
